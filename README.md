@@ -103,6 +103,37 @@ Recovery modes:
 
 Recovery is bounded by `recovery_timeout_ms`. If recovery times out or the protocol state remains uncertain, pg-kinetic discards the backend rather than returning it to the pool.
 
+## Backpressure And QoS
+
+pg-kinetic applies queueing and timeout limits per route key. A route key groups traffic by database, user, application name, client address, and query class so one noisy path does not starve the rest of the pool.
+
+Backpressure is enforced with both route and global limits:
+
+- `max_route_in_flight` caps concurrent checkouts for a single route key.
+- `max_route_waiters` caps queued waiters for a single route key.
+- the global gate prevents the whole proxy from overcommitting even when several routes are active at once.
+
+When a route is saturated, pg-kinetic returns a PostgreSQL overload error instead of hanging indefinitely. The SQLSTATE is configured by `overload_error_code`, and the default is `53300` (`too many connections`).
+
+Timeouts and budgets:
+
+- `query_timeout_ms` bounds the time spent on a query cycle once a backend is assigned.
+- `idle_client_timeout_ms` bounds how long an idle client connection may sit without activity.
+- `idle_transaction_timeout_ms` bounds pinned sessions that remain in a transaction.
+- `max_client_buffer_bytes` caps client-side buffering.
+- `max_backend_buffer_bytes` caps backend response buffering.
+
+If a timeout or buffer limit is hit, pg-kinetic tries to recover the backend when the protocol state is still safe. If recovery cannot prove the session is reusable, the backend is discarded instead of being returned to the pool.
+
+The relevant QoS metrics are:
+
+- `pg_kinetic_backpressure_events_total`
+- `pg_kinetic_route_checkout_wait_ms`
+- `pg_kinetic_route_in_flight`
+- `pg_kinetic_route_waiting`
+- `pg_kinetic_timeout_total`
+- `pg_kinetic_buffer_limit_total`
+
 Metrics:
 
 - `pg_kinetic_backend_pin_total`
