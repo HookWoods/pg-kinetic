@@ -62,6 +62,8 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
         },
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
+            recovery_timeout_ms: 5_000,
             backend_reset_query: "DISCARD ALL".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },

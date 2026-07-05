@@ -1,5 +1,9 @@
 use std::net::SocketAddr;
 
+use crate::{
+    recovery::{RecoveryAction, RecoveryTrigger},
+    virtual_session::PinReason,
+};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[derive(Clone, Debug)]
@@ -33,6 +37,34 @@ pub fn increment_prepared_event(event: &'static str) {
     metrics_crate::counter!("pg_kinetic_prepared_events_total", "event" => event).increment(1);
 }
 
+pub fn increment_pin(reason: PinReason) {
+    metrics_crate::counter!(
+        "pg_kinetic_backend_pin_total",
+        "reason" => reason.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn increment_cleanup(action: &'static str) {
+    metrics_crate::counter!("pg_kinetic_backend_cleanup_total", "action" => action)
+        .increment(1);
+}
+
+pub fn increment_recovery(trigger: RecoveryTrigger, action: RecoveryAction, outcome: &'static str) {
+    metrics_crate::counter!(
+        "pg_kinetic_backend_recovery_total",
+        "trigger" => trigger.metric_label(),
+        "action" => action.metric_label(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn increment_sqlstate(sqlstate: &str) {
+    metrics_crate::counter!("pg_kinetic_backend_sqlstate_total", "sqlstate" => sqlstate.to_string())
+        .increment(1);
+}
+
 fn describe_metrics() {
     metrics_crate::describe_counter!(
         "pg_kinetic_client_connections_total",
@@ -45,5 +77,21 @@ fn describe_metrics() {
     metrics_crate::describe_counter!(
         "pg_kinetic_prepared_events_total",
         "Prepared statement virtualization events"
+    );
+    metrics_crate::describe_counter!(
+        "pg_kinetic_backend_pin_total",
+        "Backend pin decisions by reason"
+    );
+    metrics_crate::describe_counter!(
+        "pg_kinetic_backend_cleanup_total",
+        "Backend cleanup decisions by action"
+    );
+    metrics_crate::describe_counter!(
+        "pg_kinetic_backend_recovery_total",
+        "Backend recovery attempts by trigger, action, and outcome"
+    );
+    metrics_crate::describe_counter!(
+        "pg_kinetic_backend_sqlstate_total",
+        "Backend ErrorResponse counts by SQLSTATE"
     );
 }
