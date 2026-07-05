@@ -25,9 +25,10 @@ use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::PreparedEvent,
     pin::PinnedBackend,
+    route::{QueryClass, RouteKey},
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
-    sql::classify,
+    sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
 use pg_kinetic_wire::{
@@ -64,6 +65,8 @@ impl Proxy {
             config.connection.backend_addr,
             config.capacity.max_backends,
             config.capacity.max_checkout_waiters,
+            config.qos.max_route_in_flight,
+            config.qos.max_route_waiters,
             config.performance.checkout_timeout(),
             config.performance.backend_reset_query.clone(),
         );
@@ -124,7 +127,20 @@ async fn handle_client(
         StartupRead::ClientClosed => return Ok(()),
     };
 
-    let mut backend = checkout_backend(&pool, "checkout backend for startup").await?;
+    let (route_database, route_user, mut route_application_name) =
+        startup_route_key(&startup_packet)?;
+
+    let mut backend = checkout_backend(
+        &pool,
+        route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        ),
+        "checkout backend for startup",
+    )
+    .await?;
     if let Err(error) = proxy_startup(&mut client, &mut backend, &startup_packet).await {
         backend.discard();
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
@@ -173,7 +189,17 @@ async fn handle_client(
             let mut backend = if let Some(backend) = held_backend.take() {
                 backend
             } else {
-                checkout_backend(&pool, "checkout backend for cycle").await?
+                checkout_backend(
+                    &pool,
+                    route_key(
+                        &route_database,
+                        &route_user,
+                        route_application_name.as_deref(),
+                        client_addr,
+                    ),
+                    "checkout backend for cycle",
+                )
+                .await?
             };
 
             if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
@@ -193,6 +219,7 @@ async fn handle_client(
                 &mut session,
                 &mut prepared,
                 frames,
+                &mut route_application_name,
             )
             .await;
 
@@ -272,12 +299,52 @@ async fn handle_client(
 
 async fn checkout_backend(
     pool: &Arc<BackendPool>,
+    route: RouteKey,
     context: &'static str,
 ) -> anyhow::Result<PooledBackend> {
     let started = Instant::now();
-    let backend = pool.checkout().await.context(context)?;
+    let backend = pool.checkout(route).await.context(context)?;
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
     Ok(backend)
+}
+
+fn startup_route_key(startup_packet: &[u8]) -> anyhow::Result<(String, String, Option<String>)> {
+    let startup = parse_startup_packet(startup_packet).context("parse startup packet")?;
+    let StartupPacket::Startup { parameters, .. } = startup else {
+        anyhow::bail!("unexpected startup packet kind");
+    };
+
+    let database = startup_parameter(&parameters, "database")
+        .context("startup packet missing database")?
+        .to_owned();
+    let user = startup_parameter(&parameters, "user")
+        .context("startup packet missing user")?
+        .to_owned();
+    let application_name = startup_parameter(&parameters, "application_name").map(str::to_owned);
+
+    Ok((database, user, application_name))
+}
+
+fn startup_parameter<'a>(parameters: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    parameters
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.as_str())
+}
+
+fn route_key(
+    database: &str,
+    user: &str,
+    application_name: Option<&str>,
+    client_addr: SocketAddr,
+) -> RouteKey {
+    RouteKey::new(
+        database,
+        user,
+        application_name,
+        Some(client_addr),
+        QueryClass::Default,
+    )
 }
 
 async fn next_client_cycle(
@@ -473,12 +540,13 @@ async fn forward_message_cycle(
     session: &mut VirtualSession,
     prepared: &mut PreparedCatalog,
     frames: Vec<FrontendFrame>,
+    route_application_name: &mut Option<String>,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let mut outbound = BytesMut::new();
     for frame in frames {
         let plan = prepare_frame_for_backend(backend.backend_id(), prepared, frame)?;
-        update_virtual_session_from_frame(session, &plan.frame)?;
+        update_virtual_session_from_frame(session, &plan.frame, route_application_name)?;
 
         for prelude in &plan.prelude {
             outbound.extend_from_slice(&encode_frontend_frame(prelude));
@@ -669,9 +737,28 @@ fn sync_frame() -> FrontendFrame {
 fn update_virtual_session_from_frame(
     session: &mut VirtualSession,
     frame: &FrontendFrame,
+    route_application_name: &mut Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(query) = parse_simple_query(frame)? {
-        session.apply_sql(classify(query));
+        let command = classify(query);
+        match &command {
+            SqlCommand::Set {
+                scope: SetScope::Session,
+                key,
+                value,
+            } if key == "application_name" => {
+                *route_application_name = Some(value.clone());
+            }
+            SqlCommand::Reset { key } if key == "application_name" => {
+                *route_application_name = None;
+            }
+            SqlCommand::DiscardAll => {
+                *route_application_name = None;
+            }
+            _ => {}
+        }
+
+        session.apply_sql(command);
     } else if [
         FrontendTag::Parse,
         FrontendTag::Bind,

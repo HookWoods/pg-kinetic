@@ -189,7 +189,7 @@ impl BackpressurePermit {
         }
     }
 
-    fn join(mut route: BackpressurePermit, mut global: BackpressurePermit) -> Self {
+    pub fn join(mut route: BackpressurePermit, mut global: BackpressurePermit) -> Self {
         route.permits.append(&mut global.permits);
         route
             .in_flight_counters

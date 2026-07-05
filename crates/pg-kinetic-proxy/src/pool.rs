@@ -1,18 +1,25 @@
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::{HashMap, VecDeque}, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use crate::backend::Backend;
-use pg_kinetic_core::backpressure::{BackpressureError, BackpressureGate, BackpressurePermit};
+use pg_kinetic_core::{
+    backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
+    route::RouteKey,
+};
 
 #[derive(Debug)]
 pub struct BackendPool {
     backend_addr: SocketAddr,
     reset_query: Arc<str>,
     gate: BackpressureGate,
+    route_gates: Mutex<HashMap<RouteKey, BackpressureGate>>,
     idle: Mutex<VecDeque<Backend>>,
     max_backends: usize,
     max_waiters: usize,
+    route_max_in_flight: usize,
+    route_max_waiters: usize,
     checkout_timeout: Duration,
 }
 
@@ -39,6 +46,8 @@ impl BackendPool {
         backend_addr: SocketAddr,
         max_backends: usize,
         max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
         checkout_timeout: Duration,
         reset_query: impl Into<Arc<str>>,
     ) -> Arc<Self> {
@@ -46,35 +55,47 @@ impl BackendPool {
             backend_addr,
             reset_query: reset_query.into(),
             gate: BackpressureGate::new(max_backends, max_waiters),
+            route_gates: Mutex::new(HashMap::new()),
             idle: Mutex::new(VecDeque::new()),
             max_backends,
             max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
             checkout_timeout,
         })
     }
 
-    pub async fn checkout(self: &Arc<Self>) -> Result<PooledBackend, PoolError> {
-        let permit = self.gate.checkout(self.checkout_timeout).await?;
+    pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
+        let route_gate = self.route_gate(&route).await;
+        let checkout = async {
+            let route_permit = route_gate.checkout(self.checkout_timeout).await?;
+            let permit = self.gate.checkout(self.checkout_timeout).await?;
 
-        if let Some(backend) = self.idle.lock().await.pop_front() {
+            if let Some(backend) = self.idle.lock().await.pop_front() {
+                return Ok(PooledBackend {
+                    backend: Some(backend),
+                    pool: self.clone(),
+                    _permit: BackpressurePermit::join(route_permit, permit),
+                    requires_startup: false,
+                });
+            }
+
+            let backend = Backend::connect(self.backend_addr)
+                .await
+                .map_err(PoolError::Connect)?;
+
             return Ok(PooledBackend {
                 backend: Some(backend),
                 pool: self.clone(),
-                _permit: permit,
-                requires_startup: false,
+                _permit: BackpressurePermit::join(route_permit, permit),
+                requires_startup: true,
             });
+        };
+
+        match timeout(self.checkout_timeout, checkout).await {
+            Ok(result) => result,
+            Err(_) => Err(PoolError::Backpressure(BackpressureError::Timeout)),
         }
-
-        let backend = Backend::connect(self.backend_addr)
-            .await
-            .map_err(PoolError::Connect)?;
-
-        Ok(PooledBackend {
-            backend: Some(backend),
-            pool: self.clone(),
-            _permit: permit,
-            requires_startup: true,
-        })
     }
 
     #[must_use]
@@ -88,8 +109,26 @@ impl BackendPool {
     }
 
     #[must_use]
+    pub const fn route_max_in_flight(&self) -> usize {
+        self.route_max_in_flight
+    }
+
+    #[must_use]
+    pub const fn route_max_waiters(&self) -> usize {
+        self.route_max_waiters
+    }
+
+    #[must_use]
     pub fn reset_query(&self) -> &str {
         &self.reset_query
+    }
+
+    async fn route_gate(&self, route: &RouteKey) -> BackpressureGate {
+        let mut route_gates = self.route_gates.lock().await;
+        route_gates
+            .entry(route.clone())
+            .or_insert_with(|| BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters))
+            .clone()
     }
 
     async fn return_backend(&self, backend: Backend) {

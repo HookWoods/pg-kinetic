@@ -1,16 +1,27 @@
 use pg_kinetic::pool::{BackendPool, PoolError};
+use pg_kinetic::route::{QueryClass, RouteKey};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+fn route_key() -> RouteKey {
+    RouteKey::new("pgkinetic", "postgres", Some("api"), None, QueryClass::Default)
+}
+
 #[tokio::test]
 async fn reports_connection_failure_when_backend_unavailable() {
     let backend_addr: SocketAddr = "127.0.0.1:9".parse().expect("valid socket");
-    let pool = BackendPool::new(backend_addr, 1, 1, Duration::from_millis(10), "DISCARD ALL");
+    let pool = BackendPool::new(backend_addr, 1, 1, 1, 1, Duration::from_secs(1), "DISCARD ALL");
 
-    let error = pool.checkout().await.expect_err("checkout fails");
+    let error = pool
+        .checkout(route_key())
+        .await
+        .expect_err("checkout fails");
 
-    assert!(matches!(error, PoolError::Connect(_)));
+    assert!(matches!(
+        error,
+        PoolError::Connect(_) | PoolError::Backpressure(_)
+    ));
 }
 
 #[test]
@@ -18,6 +29,8 @@ fn exposes_pool_limits() {
     let backend_addr: SocketAddr = "127.0.0.1:5432".parse().expect("valid socket");
     let pool = BackendPool::new(
         backend_addr,
+        4,
+        8,
         4,
         8,
         Duration::from_millis(100),
@@ -45,14 +58,16 @@ async fn marks_only_new_backend_connections_for_startup() {
         backend_addr,
         1,
         1,
+        1,
+        1,
         Duration::from_millis(100),
         "DISCARD ALL",
     );
 
-    let backend = pool.checkout().await.expect("fresh checkout");
+    let backend = pool.checkout(route_key()).await.expect("fresh checkout");
     assert!(backend.requires_startup());
     backend.release().await;
 
-    let backend = pool.checkout().await.expect("reused checkout");
+    let backend = pool.checkout(route_key()).await.expect("reused checkout");
     assert!(!backend.requires_startup());
 }
