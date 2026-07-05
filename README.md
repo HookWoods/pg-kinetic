@@ -39,3 +39,31 @@ Ports:
 - `56432`: PgBouncer
 - `57432`: PgDog
 - `58432`: pg-kinetic
+
+## Driver Compatibility Smoke Tests
+
+Start the local stack before running compatibility checks:
+
+```bash
+docker compose -f bench/compose.yml up -d --build postgres pg-kinetic
+```
+
+Windows:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
+```
+
+Unix:
+
+```bash
+chmod +x scripts/smoke/compat.sh
+scripts/smoke/compat.sh
+```
+
+The smoke clients exercise prepared queries through:
+
+- Rust `tokio-postgres`
+- Go `pgx`
+- Node.js `pg`
+- Python `psycopg`
