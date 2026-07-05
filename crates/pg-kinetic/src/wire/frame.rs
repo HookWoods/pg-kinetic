@@ -8,9 +8,7 @@ pub struct FrontendFrame {
     pub payload: Bytes,
 }
 
-pub fn parse_frontend_frame(
-    buffer: &mut BytesMut,
-) -> Result<Option<FrontendFrame>, WireError> {
+pub fn parse_frontend_frame(buffer: &mut BytesMut) -> Result<Option<FrontendFrame>, WireError> {
     const HEADER_LEN: usize = 5;
 
     if buffer.len() < HEADER_LEN {

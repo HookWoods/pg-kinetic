@@ -40,5 +40,7 @@ fn rejects_invalid_frame_length() {
     buffer.put_i32(3);
 
     let error = parse_frontend_frame(&mut buffer).expect_err("length below four fails");
-    assert!(error.to_string().contains("frontend frame length is invalid"));
+    assert!(error
+        .to_string()
+        .contains("frontend frame length is invalid"));
 }

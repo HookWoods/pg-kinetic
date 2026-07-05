@@ -9,7 +9,11 @@ pub struct Config {
     #[arg(long, env = "PG_KINETIC_LISTEN_ADDR", default_value = "127.0.0.1:6543")]
     pub listen_addr: SocketAddr,
 
-    #[arg(long, env = "PG_KINETIC_BACKEND_ADDR", default_value = "127.0.0.1:5432")]
+    #[arg(
+        long,
+        env = "PG_KINETIC_BACKEND_ADDR",
+        default_value = "127.0.0.1:5432"
+    )]
     pub backend_addr: SocketAddr,
 
     #[arg(long, env = "PG_KINETIC_MAX_CLIENTS", default_value_t = 10_000)]
@@ -80,9 +84,7 @@ mod tests {
 
         assert_eq!(
             config.listen_addr,
-            "0.0.0.0:6432"
-                .parse::<SocketAddr>()
-                .expect("valid socket")
+            "0.0.0.0:6432".parse::<SocketAddr>().expect("valid socket")
         );
         assert_eq!(
             config.backend_addr,
