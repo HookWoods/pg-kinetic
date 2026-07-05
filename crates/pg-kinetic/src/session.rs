@@ -21,6 +21,7 @@ pub enum PinReason {
     SessionState,
     Copy,
     ListenNotify,
+    ExtendedQueryCycle,
     UnknownProtocolState,
 }
 
@@ -28,14 +29,25 @@ pub enum PinReason {
 pub struct SessionState {
     pub transaction: TransactionState,
     pin_reason: Option<PinReason>,
+    in_extended_cycle: bool,
 }
 
 impl SessionState {
     pub fn apply(&mut self, event: ClientEvent) {
         match event {
             ClientEvent::SimpleQuery(sql) => self.apply_simple_query(&sql),
-            ClientEvent::ExtendedQuery => {}
-            ClientEvent::Sync => {}
+            ClientEvent::ExtendedQuery => {
+                self.in_extended_cycle = true;
+                if self.pin_reason.is_none() {
+                    self.pin_reason = Some(PinReason::ExtendedQueryCycle);
+                }
+            }
+            ClientEvent::Sync => {
+                self.in_extended_cycle = false;
+                if self.pin_reason == Some(PinReason::ExtendedQueryCycle) {
+                    self.pin_reason = None;
+                }
+            }
             ClientEvent::Error => {
                 if self.transaction == TransactionState::InTransaction {
                     self.transaction = TransactionState::FailedTransaction;
@@ -50,6 +62,11 @@ impl SessionState {
     #[must_use]
     pub const fn pin_reason(&self) -> Option<PinReason> {
         self.pin_reason
+    }
+
+    #[must_use]
+    pub const fn in_extended_cycle(&self) -> bool {
+        self.in_extended_cycle
     }
 
     fn apply_simple_query(&mut self, sql: &str) {
