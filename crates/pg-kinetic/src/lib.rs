@@ -1,4 +1,5 @@
 pub mod config;
+pub mod wire;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
     tracing::info!(
