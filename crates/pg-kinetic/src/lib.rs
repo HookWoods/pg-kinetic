@@ -3,6 +3,7 @@ pub mod backpressure;
 pub mod cleanup;
 pub mod config;
 pub mod metrics;
+pub mod pin;
 pub mod pool;
 pub mod prepare;
 pub mod proxy;
