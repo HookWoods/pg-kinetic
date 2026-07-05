@@ -1,6 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::wire::{error::WireError, frame::FrontendFrame};
+use crate::{error::WireError, frame::FrontendFrame};
 
 pub fn rewrite_parse_statement_name(
     frame: &FrontendFrame,

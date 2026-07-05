@@ -2,10 +2,8 @@ use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::sync::Mutex;
 
-use crate::{
-    backend::Backend,
-    backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
-};
+use crate::backend::Backend;
+use pg_kinetic_core::backpressure::{BackpressureError, BackpressureGate, BackpressurePermit};
 
 #[derive(Debug)]
 pub struct BackendPool {

@@ -1,21 +1,12 @@
-pub mod backend;
-pub mod backpressure;
-pub mod cleanup;
-pub mod config;
-pub mod metrics;
-pub mod pin;
-pub mod pool;
-pub mod prepare;
-pub mod proxy;
-pub mod recovery;
-pub mod session;
-pub mod sql;
-pub mod virtual_session;
-pub mod wire;
+pub use pg_kinetic_core as core;
+pub use pg_kinetic_proxy as proxy_runtime;
+pub use pg_kinetic_wire as wire;
+
+pub use pg_kinetic_core::{
+    backpressure, cleanup, pin, prepare, recovery, session, sql, virtual_session,
+};
+pub use pg_kinetic_proxy::{backend, config, metrics, pool, proxy};
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
-    metrics::install(metrics::MetricsConfig {
-        listen_addr: config.observability.metrics_addr,
-    })?;
-    proxy::Proxy::new(config).run().await
+    pg_kinetic_proxy::run(config).await
 }

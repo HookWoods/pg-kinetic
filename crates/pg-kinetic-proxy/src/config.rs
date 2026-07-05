@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
-use crate::recovery::RecoveryMode;
+use pg_kinetic_core::recovery::RecoveryMode;
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "pg-kinetic")]
@@ -126,7 +126,7 @@ mod tests {
         );
         assert_eq!(
             config.performance.recovery_mode,
-            crate::recovery::RecoveryMode::Recover
+            pg_kinetic_core::recovery::RecoveryMode::Recover
         );
         assert_eq!(
             config.performance.recovery_timeout(),
@@ -180,7 +180,7 @@ mod tests {
         );
         assert_eq!(
             config.performance.recovery_mode,
-            crate::recovery::RecoveryMode::Drop
+            pg_kinetic_core::recovery::RecoveryMode::Drop
         );
         assert_eq!(
             config.performance.recovery_timeout(),

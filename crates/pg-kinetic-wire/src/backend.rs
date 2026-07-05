@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::wire::error::WireError;
+use crate::error::WireError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadyStatus {

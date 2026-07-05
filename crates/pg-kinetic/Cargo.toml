@@ -7,16 +7,14 @@ readme.workspace = true
 
 [dependencies]
 anyhow = "1"
-bytes = "1"
-clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
-metrics_crate = { package = "metrics", version = "0.24" }
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
-thiserror = "2"
+pg-kinetic-core = { path = "../pg-kinetic-core" }
+pg-kinetic-proxy = { path = "../pg-kinetic-proxy" }
+pg-kinetic-wire = { path = "../pg-kinetic-wire" }
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
+bytes = "1"
 pretty_assertions = "1"
 
 [lints]

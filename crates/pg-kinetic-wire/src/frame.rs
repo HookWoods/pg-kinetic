@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::wire::error::WireError;
+use crate::error::WireError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrontendFrame {

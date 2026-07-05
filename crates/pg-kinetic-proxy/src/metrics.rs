@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
-use crate::{
+use metrics_exporter_prometheus::PrometheusBuilder;
+use pg_kinetic_core::{
     recovery::{RecoveryAction, RecoveryTrigger},
     virtual_session::PinReason,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {

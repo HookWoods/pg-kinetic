@@ -1,7 +1,5 @@
-use crate::{
-    virtual_session::{PinReason, VirtualSession},
-    wire::backend::ReadyStatus,
-};
+use crate::virtual_session::{PinReason, VirtualSession};
+use pg_kinetic_wire::backend::ReadyStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupAction {

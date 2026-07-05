@@ -500,14 +500,50 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "pg-kinetic-core",
+ "pg-kinetic-proxy",
+ "pg-kinetic-wire",
+ "pretty_assertions",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pg-kinetic-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "pg-kinetic-wire",
+ "pretty_assertions",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "pg-kinetic-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
  "clap",
  "metrics",
  "metrics-exporter-prometheus",
+ "pg-kinetic-core",
+ "pg-kinetic-wire",
  "pretty_assertions",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
+]
+
+[[package]]
+name = "pg-kinetic-wire"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pretty_assertions",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

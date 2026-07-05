@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes};
 
-use crate::wire::error::WireError;
+use crate::error::WireError;
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;

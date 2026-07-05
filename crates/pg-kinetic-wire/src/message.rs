@@ -1,4 +1,4 @@
-use crate::wire::{error::WireError, frame::FrontendFrame};
+use crate::{error::WireError, frame::FrontendFrame};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseMessage {

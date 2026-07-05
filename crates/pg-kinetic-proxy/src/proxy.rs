@@ -17,30 +17,32 @@ use tokio::{
 };
 
 use crate::{
-    cleanup::{cleanup_action, CleanupAction},
     config::Config,
     metrics,
-    pin::PinnedBackend,
     pool::{BackendPool, PooledBackend},
+};
+use pg_kinetic_core::{
+    cleanup::{cleanup_action, CleanupAction},
+    pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     sql::classify,
     virtual_session::{PinReason, VirtualSession},
-    wire::{
-        backend::{parse_backend_frame, ReadyStatus},
-        error::WireError,
-        frame::{parse_frontend_frame, FrontendFrame},
-        message::{
-            parse_bind_statement_name, parse_close_target, parse_describe_target,
-            parse_parse_message, parse_simple_query, CloseTarget, DescribeTarget,
-        },
-        rewrite::{
-            build_parse_frame, encode_frontend_frame, rewrite_bind_statement_name,
-            rewrite_close_statement_name, rewrite_describe_statement_name,
-            rewrite_parse_statement_name,
-        },
-        startup::{parse_startup_packet, StartupPacket},
+};
+use pg_kinetic_wire::{
+    backend::{parse_backend_frame, BackendFrame, ReadyStatus},
+    error::WireError,
+    frame::{parse_frontend_frame, FrontendFrame},
+    message::{
+        parse_bind_statement_name, parse_close_target, parse_describe_target, parse_parse_message,
+        parse_simple_query, CloseTarget, DescribeTarget,
     },
+    rewrite::{
+        build_parse_frame, encode_frontend_frame, rewrite_bind_statement_name,
+        rewrite_close_statement_name, rewrite_describe_statement_name,
+        rewrite_parse_statement_name,
+    },
+    startup::{parse_startup_packet, StartupPacket},
 };
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -433,7 +435,7 @@ async fn proxy_startup(
     }
 }
 
-fn encode_backend_frame(frame: &crate::wire::backend::BackendFrame) -> BytesMut {
+fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
     let mut encoded = BytesMut::with_capacity(frame.payload.len() + 5);
     encoded.put_u8(frame.tag);
     encoded.put_i32((frame.payload.len() + 4) as i32);
