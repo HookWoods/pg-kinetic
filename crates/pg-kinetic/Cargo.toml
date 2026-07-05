@@ -8,9 +8,9 @@ readme.workspace = true
 [dependencies]
 anyhow = "1"
 bytes = "1"
-clap = { version = "4", features = ["derive", "env"] }
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+metrics_crate = { package = "metrics", version = "0.24" }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

@@ -33,6 +33,7 @@ use crate::{
             rewrite_close_statement_name, rewrite_describe_statement_name,
             rewrite_parse_statement_name,
         },
+        startup::{parse_startup_packet, StartupPacket},
     },
 };
 
@@ -110,7 +111,12 @@ async fn handle_client(
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
 
     loop {
-        if client.read_buf(&mut client_buffer).await.context("read client")? == 0 {
+        if client
+            .read_buf(&mut client_buffer)
+            .await
+            .context("read client")?
+            == 0
+        {
             return Ok(());
         }
 
@@ -127,7 +133,9 @@ async fn handle_client(
             .await;
 
             match result {
-                Ok(ReadyStatus::Idle | ReadyStatus::InTransaction | ReadyStatus::FailedTransaction) => {
+                Ok(
+                    ReadyStatus::Idle | ReadyStatus::InTransaction | ReadyStatus::FailedTransaction,
+                ) => {
                     backend.release().await;
                 }
                 Err(error) => {
@@ -168,7 +176,12 @@ async fn next_client_cycle(
             continue;
         }
 
-        if client.read_buf(client_buffer).await.context("read extended query frame")? == 0 {
+        if client
+            .read_buf(client_buffer)
+            .await
+            .context("read extended query frame")?
+            == 0
+        {
             anyhow::bail!("client disconnected during extended query cycle");
         }
     }
@@ -177,8 +190,28 @@ async fn next_client_cycle(
 }
 
 async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> anyhow::Result<()> {
+    let mut client_buffer = BytesMut::with_capacity(8192);
     let mut buffer = BytesMut::with_capacity(8192);
-    client.read_buf(&mut buffer).await.context("read startup")?;
+    loop {
+        buffer.clear();
+        client.read_buf(&mut buffer).await.context("read startup")?;
+
+        match parse_startup_packet(&buffer) {
+            Ok(StartupPacket::SslRequest) => {
+                client
+                    .write_all(b"N")
+                    .await
+                    .context("reject startup ssl request")?;
+                continue;
+            }
+            Ok(StartupPacket::CancelRequest { .. }) => {
+                anyhow::bail!("cancel requests are not supported during startup");
+            }
+            Ok(StartupPacket::Startup { .. }) => break,
+            Err(error) => return Err(error).context("parse startup packet"),
+        }
+    }
+
     backend
         .backend_mut()
         .stream_mut()
@@ -194,16 +227,39 @@ async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> a
             .read_buf(&mut backend_buffer)
             .await
             .context("read startup response")?;
-        client
-            .write_all(&backend_buffer)
-            .await
-            .context("forward startup response")?;
+        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            client
+                .write_all(&encode_backend_frame(&frame))
+                .await
+                .context("forward startup response")?;
 
-        if backend_buffer.windows(6).any(|window| window == b"Z\0\0\0\x05I") {
-            return Ok(());
+            if frame.tag == b'R' && !frame.payload.starts_with(&[0, 0, 0, 0]) {
+                client_buffer.clear();
+                client
+                    .read_buf(&mut client_buffer)
+                    .await
+                    .context("read startup auth response")?;
+                backend
+                    .backend_mut()
+                    .stream_mut()
+                    .write_all(&client_buffer)
+                    .await
+                    .context("forward startup auth response")?;
+            }
+
+            if frame.ready_status() == Some(ReadyStatus::Idle) {
+                return Ok(());
+            }
         }
-        backend_buffer.clear();
     }
+}
+
+fn encode_backend_frame(frame: &crate::wire::backend::BackendFrame) -> BytesMut {
+    let mut encoded = BytesMut::with_capacity(frame.payload.len() + 5);
+    encoded.put_u8(frame.tag);
+    encoded.put_i32((frame.payload.len() + 4) as i32);
+    encoded.extend_from_slice(&frame.payload);
+    encoded
 }
 
 async fn forward_message_cycle(
@@ -350,7 +406,10 @@ impl PreparedForwardPlan {
     }
 }
 
-fn update_session_from_frame(session: &mut SessionState, frame: &FrontendFrame) -> anyhow::Result<()> {
+fn update_session_from_frame(
+    session: &mut SessionState,
+    frame: &FrontendFrame,
+) -> anyhow::Result<()> {
     if let Some(query) = parse_simple_query(frame)? {
         session.apply(ClientEvent::SimpleQuery(query.to_string()));
     } else if matches!(frame.tag, b'P' | b'B' | b'D' | b'E' | b'C') {

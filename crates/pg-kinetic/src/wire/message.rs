@@ -127,6 +127,7 @@ fn read_cstr(bytes: &[u8], start: usize) -> Result<(&str, usize), WireError> {
         .map(|offset| start + offset)
         .ok_or(WireError::IncompleteFrame)?;
 
-    let value = std::str::from_utf8(&bytes[start..terminator]).map_err(|_| WireError::InvalidUtf8)?;
+    let value =
+        std::str::from_utf8(&bytes[start..terminator]).map_err(|_| WireError::InvalidUtf8)?;
     Ok((value, terminator + 1))
 }

@@ -13,7 +13,10 @@ fn parses_simple_query_text() {
         payload: Bytes::from_static(b"select 1\0"),
     };
 
-    assert_eq!(parse_simple_query(&frame).expect("query parses"), Some("select 1"));
+    assert_eq!(
+        parse_simple_query(&frame).expect("query parses"),
+        Some("select 1")
+    );
 }
 
 #[test]

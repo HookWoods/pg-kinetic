@@ -15,7 +15,13 @@ async fn reports_connection_failure_when_backend_unavailable() {
 #[test]
 fn exposes_pool_limits() {
     let backend_addr: SocketAddr = "127.0.0.1:5432".parse().expect("valid socket");
-    let pool = BackendPool::new(backend_addr, 4, 8, Duration::from_millis(100), "DISCARD ALL");
+    let pool = BackendPool::new(
+        backend_addr,
+        4,
+        8,
+        Duration::from_millis(100),
+        "DISCARD ALL",
+    );
 
     assert_eq!(pool.max_backends(), 4);
     assert_eq!(pool.max_waiters(), 8);

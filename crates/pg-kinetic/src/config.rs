@@ -102,7 +102,10 @@ mod tests {
         assert_eq!(config.capacity.max_clients, 10_000);
         assert_eq!(config.capacity.max_backends, 100);
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
-        assert_eq!(config.performance.checkout_timeout(), Duration::from_secs(1));
+        assert_eq!(
+            config.performance.checkout_timeout(),
+            Duration::from_secs(1)
+        );
         assert_eq!(config.performance.backend_reset_query, "DISCARD ALL");
         assert_eq!(config.observability.metrics_addr, None);
     }
@@ -141,7 +144,10 @@ mod tests {
         assert_eq!(config.capacity.max_clients, 500);
         assert_eq!(config.capacity.max_backends, 25);
         assert_eq!(config.capacity.max_checkout_waiters, 12);
-        assert_eq!(config.performance.checkout_timeout(), Duration::from_millis(250));
+        assert_eq!(
+            config.performance.checkout_timeout(),
+            Duration::from_millis(250)
+        );
         assert_eq!(config.performance.backend_reset_query, "DISCARD TEMP");
     }
 

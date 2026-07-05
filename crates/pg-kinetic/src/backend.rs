@@ -20,7 +20,9 @@ impl Backend {
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connect backend {addr}"))?;
-        stream.set_nodelay(true).context("set backend TCP_NODELAY")?;
+        stream
+            .set_nodelay(true)
+            .context("set backend TCP_NODELAY")?;
 
         Ok(Self {
             id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),

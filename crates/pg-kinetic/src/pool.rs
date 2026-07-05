@@ -3,8 +3,8 @@ use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 use crate::{
-    backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
     backend::Backend,
+    backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
 };
 
 #[derive(Debug)]

@@ -14,7 +14,9 @@ use tokio::{
 
 #[tokio::test]
 async fn proxy_accepts_two_clients_with_one_backend_capacity() {
-    let backend = TcpListener::bind("127.0.0.1:0").await.expect("bind backend");
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
     let backend_addr = backend.local_addr().expect("backend addr");
 
     tokio::spawn(async move {
@@ -23,7 +25,10 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             tokio::spawn(async move {
                 let mut startup = [0_u8; 1024];
                 let _ = stream.read(&mut startup).await.expect("read startup");
-                stream.write_all(&auth_ok_ready()).await.expect("auth ready");
+                stream
+                    .write_all(&auth_ok_ready())
+                    .await
+                    .expect("auth ready");
 
                 loop {
                     let mut query = [0_u8; 1024];

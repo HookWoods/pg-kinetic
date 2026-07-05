@@ -21,27 +21,28 @@ pub fn install(config: MetricsConfig) -> anyhow::Result<()> {
 }
 
 pub fn record_pool_checkout(wait_ms: f64, outcome: &'static str) {
-    metrics::histogram!("pg_kinetic_pool_checkout_wait_ms", "outcome" => outcome).record(wait_ms);
+    metrics_crate::histogram!("pg_kinetic_pool_checkout_wait_ms", "outcome" => outcome)
+        .record(wait_ms);
 }
 
 pub fn increment_client_connections() {
-    metrics::counter!("pg_kinetic_client_connections_total").increment(1);
+    metrics_crate::counter!("pg_kinetic_client_connections_total").increment(1);
 }
 
 pub fn increment_prepared_event(event: &'static str) {
-    metrics::counter!("pg_kinetic_prepared_events_total", "event" => event).increment(1);
+    metrics_crate::counter!("pg_kinetic_prepared_events_total", "event" => event).increment(1);
 }
 
 fn describe_metrics() {
-    metrics::describe_counter!(
+    metrics_crate::describe_counter!(
         "pg_kinetic_client_connections_total",
         "Total accepted client connections"
     );
-    metrics::describe_histogram!(
+    metrics_crate::describe_histogram!(
         "pg_kinetic_pool_checkout_wait_ms",
         "Backend checkout wait time in milliseconds"
     );
-    metrics::describe_counter!(
+    metrics_crate::describe_counter!(
         "pg_kinetic_prepared_events_total",
         "Prepared statement virtualization events"
     );
