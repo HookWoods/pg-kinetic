@@ -31,6 +31,51 @@ async fn client_disconnect_after_begin_rolls_back_before_release() {
 }
 
 #[tokio::test]
+async fn client_terminate_after_begin_rolls_back_before_release() {
+    let (proxy_addr, mut seen) =
+        spawn_proxy_with_backend(RecoveryMode::Recover, 1_000, StreamBehavior::RespondToSync).await;
+
+    run_client_query_then_terminate(proxy_addr, "begin").await;
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.iter().any(|event| event == "begin"));
+    assert!(events.iter().any(|event| event == "ROLLBACK"));
+}
+
+#[tokio::test]
+async fn client_disconnect_before_startup_does_not_touch_backend() {
+    let (proxy_addr, mut seen) =
+        spawn_proxy_with_backend(RecoveryMode::Recover, 1_000, StreamBehavior::RespondToSync).await;
+
+    connect_and_close(proxy_addr).await;
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn fragmented_startup_packet_is_accepted() {
+    let (proxy_addr, mut seen) =
+        spawn_proxy_with_backend(RecoveryMode::Recover, 1_000, StreamBehavior::RespondToSync).await;
+
+    run_client_fragmented_startup_query(proxy_addr, "select 1").await;
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.iter().any(|event| event == "select 1"));
+}
+
+#[tokio::test]
+async fn startup_encryption_negotiation_is_rejected_then_startup_continues() {
+    let (proxy_addr, mut seen) =
+        spawn_proxy_with_backend(RecoveryMode::Recover, 1_000, StreamBehavior::RespondToSync).await;
+
+    run_client_negotiated_startup_query(proxy_addr, "select 1").await;
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.iter().any(|event| event == "select 1"));
+}
+
+#[tokio::test]
 async fn client_disconnect_during_streamed_response_drains_and_syncs() {
     let (proxy_addr, mut seen) =
         spawn_proxy_with_backend(RecoveryMode::Recover, 1_000, StreamBehavior::RespondToSync).await;
@@ -120,6 +165,10 @@ async fn spawn_proxy_with_backend(
                 let mut startup = [0_u8; 2048];
                 let read = stream.read(&mut startup).await.expect("read startup");
                 if read == 0 {
+                    sender
+                        .send("STARTUP_CLOSED".to_string())
+                        .await
+                        .expect("send startup close");
                     return;
                 }
 
@@ -252,6 +301,86 @@ async fn run_client_query_and_read_response(addr: SocketAddr, query: &str) {
     let _ = stream.read(&mut response).await.expect("query response");
 }
 
+async fn run_client_query_then_terminate(addr: SocketAddr, query: &str) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
+    stream.write_all(&startup_packet()).await.expect("startup");
+
+    let mut startup_response = [0_u8; 128];
+    let _ = stream
+        .read(&mut startup_response)
+        .await
+        .expect("startup response");
+
+    stream.write_all(&query_packet(query)).await.expect("query");
+    let mut response = [0_u8; 256];
+    let _ = stream.read(&mut response).await.expect("query response");
+
+    stream
+        .write_all(&terminate_packet())
+        .await
+        .expect("terminate");
+}
+
+async fn connect_and_close(addr: SocketAddr) {
+    let stream = TcpStream::connect(addr).await.expect("connect proxy");
+    drop(stream);
+}
+
+async fn run_client_fragmented_startup_query(addr: SocketAddr, query: &str) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
+    let startup = startup_packet();
+    let (prefix, suffix) = startup.split_at(4);
+    stream.write_all(prefix).await.expect("startup prefix");
+    time::sleep(Duration::from_millis(25)).await;
+    stream.write_all(suffix).await.expect("startup suffix");
+
+    let mut startup_response = [0_u8; 128];
+    let _ = stream
+        .read(&mut startup_response)
+        .await
+        .expect("startup response");
+
+    stream.write_all(&query_packet(query)).await.expect("query");
+    let mut response = [0_u8; 256];
+    let _ = stream.read(&mut response).await.expect("query response");
+}
+
+async fn run_client_negotiated_startup_query(addr: SocketAddr, query: &str) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
+
+    stream
+        .write_all(&gssenc_request_packet())
+        .await
+        .expect("gssenc request");
+    expect_rejection(&mut stream).await;
+
+    stream
+        .write_all(&ssl_request_packet())
+        .await
+        .expect("ssl request");
+    expect_rejection(&mut stream).await;
+
+    stream.write_all(&startup_packet()).await.expect("startup");
+    let mut startup_response = [0_u8; 128];
+    let _ = stream
+        .read(&mut startup_response)
+        .await
+        .expect("startup response");
+
+    stream.write_all(&query_packet(query)).await.expect("query");
+    let mut response = [0_u8; 256];
+    let _ = stream.read(&mut response).await.expect("query response");
+}
+
+async fn expect_rejection(stream: &mut TcpStream) {
+    let mut response = [0_u8; 1];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("encryption rejection");
+    assert_eq!(response, *b"N");
+}
+
 async fn run_client_extended_query_and_drop(addr: SocketAddr, query: &str) {
     let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
     stream.write_all(&startup_packet()).await.expect("startup");
@@ -284,6 +413,21 @@ fn startup_packet() -> Vec<u8> {
     let mut packet = BytesMut::new();
     packet.put_i32((body.len() + 4) as i32);
     packet.extend_from_slice(&body);
+    packet.to_vec()
+}
+
+fn gssenc_request_packet() -> Vec<u8> {
+    startup_request_packet(80_877_104)
+}
+
+fn ssl_request_packet() -> Vec<u8> {
+    startup_request_packet(80_877_103)
+}
+
+fn startup_request_packet(code: i32) -> Vec<u8> {
+    let mut packet = BytesMut::new();
+    packet.put_i32(8);
+    packet.put_i32(code);
     packet.to_vec()
 }
 
@@ -338,6 +482,13 @@ fn execute_frame(portal_name: &str) -> Vec<u8> {
 fn sync_packet() -> Vec<u8> {
     let mut packet = BytesMut::new();
     packet.put_u8(b'S');
+    packet.put_i32(4);
+    packet.to_vec()
+}
+
+fn terminate_packet() -> Vec<u8> {
+    let mut packet = BytesMut::new();
+    packet.put_u8(b'X');
     packet.put_i32(4);
     packet.to_vec()
 }

@@ -49,6 +49,18 @@ fn parses_ssl_request() {
 }
 
 #[test]
+fn parses_gssenc_request() {
+    let mut packet = BytesMut::new();
+    packet.put_i32(8);
+    packet.put_i32(80_877_104);
+
+    assert_eq!(
+        parse_startup_packet(&packet).expect("gssenc request parses"),
+        StartupPacket::GssEncRequest
+    );
+}
+
+#[test]
 fn parses_cancel_request() {
     let mut packet = BytesMut::new();
     packet.put_i32(16);

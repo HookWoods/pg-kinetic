@@ -28,6 +28,7 @@ use crate::{
     virtual_session::{PinReason, VirtualSession},
     wire::{
         backend::{parse_backend_frame, ReadyStatus},
+        error::WireError,
         frame::{parse_frontend_frame, FrontendFrame},
         message::{
             parse_bind_statement_name, parse_close_target, parse_describe_target,
@@ -91,7 +92,8 @@ impl Proxy {
                 drop(permit);
 
                 if let Err(error) = result {
-                    tracing::warn!(%client_addr, error = %error, "client connection closed with error");
+                    let error_chain = format!("{error:#}");
+                    tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
                 }
             });
         }
@@ -110,8 +112,16 @@ async fn handle_client(
     let mut prepared = PreparedCatalog::new(session_id);
     let mut held_backend: Option<PooledBackend> = None;
 
+    let startup_packet = match read_startup_packet(&mut client)
+        .await
+        .with_context(|| format!("proxy client {client_addr}"))?
+    {
+        StartupRead::Packet(packet) => packet,
+        StartupRead::ClientClosed => return Ok(()),
+    };
+
     let mut backend = checkout_backend(&pool, "checkout backend for startup").await?;
-    if let Err(error) = proxy_startup(&mut client, &mut backend).await {
+    if let Err(error) = proxy_startup(&mut client, &mut backend, &startup_packet).await {
         backend.discard();
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
     }
@@ -140,7 +150,22 @@ async fn handle_client(
             return Ok(());
         }
 
-        while let Some(frames) = next_client_cycle(&mut client, &mut client_buffer).await? {
+        while let Some(cycle) = next_client_cycle(&mut client, &mut client_buffer).await? {
+            let ClientCycle::Frames(frames) = cycle else {
+                if let Some(backend) = held_backend.take() {
+                    finalize_backend_on_disconnect(
+                        backend,
+                        &pool,
+                        &performance,
+                        &mut session,
+                        &mut pinned_backend,
+                    )
+                    .await?;
+                }
+
+                return Ok(());
+            };
+
             let mut backend = if let Some(backend) = held_backend.take() {
                 backend
             } else {
@@ -167,8 +192,12 @@ async fn handle_client(
             )
             .await;
 
+            let client_disconnected_after_ready =
+                matches!(&result, Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)));
+
             match result {
-                Ok(ForwardOutcome::Ready(status)) => {
+                Ok(ForwardOutcome::Ready(status))
+                | Ok(ForwardOutcome::ClientDisconnectedAfterReady(status)) => {
                     session.mark_ready_after_copy();
                     let action = cleanup_action(&session, status);
                     metrics::increment_cleanup(cleanup_metric_label(action));
@@ -204,6 +233,10 @@ async fn handle_client(
                             pinned_backend.clear();
                             backend.discard();
                         }
+                    }
+
+                    if client_disconnected_after_ready {
+                        return Ok(());
                     }
                 }
                 Ok(ForwardOutcome::AbandonedResponse { needs_sync }) => {
@@ -246,13 +279,17 @@ async fn checkout_backend(
 async fn next_client_cycle(
     client: &mut TcpStream,
     client_buffer: &mut BytesMut,
-) -> anyhow::Result<Option<Vec<FrontendFrame>>> {
+) -> anyhow::Result<Option<ClientCycle>> {
     let Some(first) = parse_frontend_frame(client_buffer)? else {
         return Ok(None);
     };
 
+    if first.tag == b'X' {
+        return Ok(Some(ClientCycle::Terminate));
+    }
+
     if first.tag == b'Q' {
-        return Ok(Some(vec![first]));
+        return Ok(Some(ClientCycle::Frames(vec![first])));
     }
 
     let mut frames = vec![first];
@@ -272,32 +309,78 @@ async fn next_client_cycle(
         }
     }
 
-    Ok(Some(frames))
+    Ok(Some(ClientCycle::Frames(frames)))
 }
 
-async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> anyhow::Result<()> {
-    let mut client_buffer = BytesMut::with_capacity(8192);
+#[derive(Debug)]
+enum ClientCycle {
+    Frames(Vec<FrontendFrame>),
+    Terminate,
+}
+
+async fn read_startup_packet(client: &mut TcpStream) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
     loop {
-        buffer.clear();
-        client.read_buf(&mut buffer).await.context("read startup")?;
+        while let Some(packet) = next_startup_packet(&mut buffer)? {
+            match parse_startup_packet(&packet) {
+                Ok(StartupPacket::SslRequest | StartupPacket::GssEncRequest) => {
+                    reject_startup_encryption_request(client).await?;
+                    continue;
+                }
+                Ok(StartupPacket::CancelRequest { .. }) => {
+                    anyhow::bail!("cancel requests are not supported during startup");
+                }
+                Ok(StartupPacket::Startup { .. }) => return Ok(StartupRead::Packet(packet)),
+                Err(error) => return Err(error).context("parse startup packet"),
+            }
+        }
 
-        match parse_startup_packet(&buffer) {
-            Ok(StartupPacket::SslRequest) => {
-                client
-                    .write_all(b"N")
-                    .await
-                    .context("reject startup ssl request")?;
-                continue;
-            }
-            Ok(StartupPacket::CancelRequest { .. }) => {
-                anyhow::bail!("cancel requests are not supported during startup");
-            }
-            Ok(StartupPacket::Startup { .. }) => break,
-            Err(error) => return Err(error).context("parse startup packet"),
+        if client.read_buf(&mut buffer).await.context("read startup")? == 0 {
+            return Ok(StartupRead::ClientClosed);
         }
     }
+}
 
+fn next_startup_packet(buffer: &mut BytesMut) -> anyhow::Result<Option<BytesMut>> {
+    if buffer.len() < 4 {
+        return Ok(None);
+    }
+
+    let len = i32::from_be_bytes(
+        buffer[..4]
+            .try_into()
+            .expect("four startup length bytes are present"),
+    );
+    if len < 8 {
+        return Err(WireError::InvalidStartupLength(len)).context("parse startup packet");
+    }
+
+    let len = len as usize;
+    if buffer.len() < len {
+        return Ok(None);
+    }
+
+    Ok(Some(buffer.split_to(len)))
+}
+
+async fn reject_startup_encryption_request(client: &mut TcpStream) -> anyhow::Result<()> {
+    client
+        .write_all(b"N")
+        .await
+        .context("reject startup encryption request")
+}
+
+#[derive(Debug)]
+enum StartupRead {
+    Packet(BytesMut),
+    ClientClosed,
+}
+
+async fn proxy_startup(
+    client: &mut TcpStream,
+    backend: &mut PooledBackend,
+    startup_packet: &[u8],
+) -> anyhow::Result<()> {
     if !backend.requires_startup() {
         client
             .write_all(&synthetic_startup_ready())
@@ -309,10 +392,11 @@ async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> a
     backend
         .backend_mut()
         .stream_mut()
-        .write_all(&buffer)
+        .write_all(startup_packet)
         .await
         .context("forward startup")?;
 
+    let mut client_buffer = BytesMut::with_capacity(8192);
     let mut backend_buffer = BytesMut::with_capacity(8192);
     loop {
         backend
@@ -434,14 +518,12 @@ async fn forward_message_cycle(
             }
         }
 
-        if !forward.is_empty() {
-            if let Err(error) = client.write_all(&forward).await {
-                if ready.is_some() {
-                    return Err(error).context("write backend frames to client");
-                }
-
-                return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
+        if !forward.is_empty() && client.write_all(&forward).await.is_err() {
+            if let Some(status) = ready {
+                return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
             }
+
+            return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
         }
 
         if let Some(status) = ready {
@@ -539,6 +621,7 @@ impl PreparedForwardPlan {
 #[derive(Debug)]
 enum ForwardOutcome {
     Ready(ReadyStatus),
+    ClientDisconnectedAfterReady(ReadyStatus),
     AbandonedResponse { needs_sync: bool },
 }
 

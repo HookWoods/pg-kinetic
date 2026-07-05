@@ -4,6 +4,7 @@ use crate::wire::error::WireError;
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
+const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 const MIN_STARTUP_LEN: i32 = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,7 @@ pub enum StartupPacket {
         parameters: Vec<(String, String)>,
     },
     SslRequest,
+    GssEncRequest,
     CancelRequest {
         process_id: i32,
         secret_key: i32,
@@ -38,6 +40,7 @@ pub fn parse_startup_packet(packet: &[u8]) -> Result<StartupPacket, WireError> {
     let code = cursor.get_i32();
     match code {
         SSL_REQUEST_CODE => Ok(StartupPacket::SslRequest),
+        GSSENC_REQUEST_CODE => Ok(StartupPacket::GssEncRequest),
         CANCEL_REQUEST_CODE => {
             if cursor.remaining() != 8 {
                 return Err(WireError::InvalidStartupLength(len));
