@@ -22,7 +22,7 @@ use crate::{
     metrics,
     pin::PinnedBackend,
     pool::{BackendPool, PooledBackend},
-    prepare::PreparedCatalog,
+    prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     sql::classify,
     virtual_session::{PinReason, VirtualSession},
@@ -389,6 +389,18 @@ async fn forward_message_cycle(
         let mut forward = BytesMut::new();
         let mut ready = None;
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            if let Some(sqlstate) = frame.sqlstate() {
+                metrics::increment_sqlstate(sqlstate);
+                let scope = prepared.invalidate_for_sqlstate(sqlstate, backend.backend_id());
+                if scope != InvalidationScope::None {
+                    metrics::increment_prepared_event("invalidate");
+                }
+            }
+
+            if frame.tag == b'E' && matches!(session.pin_reason(), Some(PinReason::OpenTransaction)) {
+                session.mark_failed_transaction();
+            }
+
             forward.extend_from_slice(&encode_backend_frame(&frame));
             if let Some(status) = frame.ready_status() {
                 ready = Some(status);
