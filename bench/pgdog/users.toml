@@ -1,0 +1,4 @@
+[[users]]
+name = "postgres"
+database = "pgkinetic"
+password = "postgres"

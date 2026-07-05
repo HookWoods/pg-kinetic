@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: pgkinetic
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgkinetic"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "56432:5432"
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+
+  pgdog:
+    image: ghcr.io/pgdogdev/pgdog:v0.1.46
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "57432:6432"
+    volumes:
+      - ./pgdog/pgdog.toml:/pgdog/pgdog.toml:ro
+      - ./pgdog/users.toml:/pgdog/users.toml:ro
+    environment:
+      RUST_LOG: info
+
+  pg-kinetic:
+    build:
+      context: ..
+      dockerfile_inline: |
+        FROM rust:1.88-bookworm AS builder
+        WORKDIR /src
+        COPY . .
+        RUN cargo build --release -p pg-kinetic
+        FROM debian:bookworm-slim
+        COPY --from=builder /src/target/release/pg-kinetic /usr/local/bin/pg-kinetic
+        EXPOSE 6543
+        ENTRYPOINT ["/usr/local/bin/pg-kinetic"]
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        backend_ip="$$(getent hosts postgres | awk 'NR==1 { print $1 }')"
+        exec /usr/local/bin/pg-kinetic \
+          --listen-addr "$${PG_KINETIC_LISTEN_ADDR:-0.0.0.0:6543}" \
+          --backend-addr "$${backend_ip}:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "58432:6543"
+    environment:
+      PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
+      PG_KINETIC_BACKEND_ADDR: "postgres:5432"
+      RUST_LOG: info
