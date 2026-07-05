@@ -89,7 +89,7 @@ fn qos_metric_labels_are_stable() {
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_route_waiting",
-        &[("route", route_label.as_str()), ("scope", "global")]
+        &[("route", route_label.as_str()), ("scope", "route")]
     ));
     assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "idle_timeout")]));
     assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "query_timeout")]));

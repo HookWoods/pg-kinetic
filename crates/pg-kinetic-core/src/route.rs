@@ -40,6 +40,7 @@ impl PartialEq for RouteKey {
         self.database == other.database
             && self.user == other.user
             && self.application_name == other.application_name
+            && self.client_addr == other.client_addr
             && self.query_class == other.query_class
     }
 }
@@ -51,6 +52,7 @@ impl Hash for RouteKey {
         self.database.hash(state);
         self.user.hash(state);
         self.application_name.hash(state);
+        self.client_addr.hash(state);
         self.query_class.hash(state);
     }
 }

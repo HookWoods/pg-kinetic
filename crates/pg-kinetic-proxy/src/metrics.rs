@@ -115,7 +115,7 @@ pub fn record_route_waiting(route: &RouteKey, waiting: usize) {
     metrics_crate::gauge!(
         MetricName::RouteWaiting.as_str(),
         "route" => route.metric_label(),
-        "scope" => QueueScope::Global.as_str()
+        "scope" => QueueScope::Route.as_str()
     )
     .set(waiting as f64);
 }
@@ -191,14 +191,12 @@ fn describe_metrics() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueScope {
     Route,
-    Global,
 }
 
 impl QueueScope {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Route => "route",
-            Self::Global => "global",
         }
     }
 }
