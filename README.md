@@ -67,3 +67,45 @@ The smoke clients exercise prepared queries through:
 - Go `pgx`
 - Node.js `pg`
 - Python `psycopg`
+
+## Virtual Sessions
+
+pg-kinetic tracks lightweight PostgreSQL session state so transaction pooling remains safe.
+
+The proxy returns a backend to the pool when the session is idle and replayable. It keeps, recovers, drains, resets, or discards a backend when the client uses stateful PostgreSQL features or disconnects before a backend is ready for reuse.
+
+Pinned backend reasons:
+
+- open transaction
+- failed transaction
+- unsafe session state
+- temporary table
+- advisory lock
+- `COPY`
+- `LISTEN/NOTIFY`
+- unknown protocol state
+
+Replayable settings:
+
+- `application_name`
+- `timezone`
+- `datestyle`
+- `search_path`
+- `extra_float_digits`
+
+`DISCARD ALL` clears tracked virtual session state. `DISCARD TEMP` clears temporary table pinning. Unknown or unsafe session state is handled conservatively.
+
+Recovery modes:
+
+- `recover`: roll back abandoned transactions and drain abandoned responses when possible.
+- `rollback_only`: roll back abandoned transactions but discard backends abandoned mid-response.
+- `drop`: discard backends on recovery triggers.
+
+Recovery is bounded by `recovery_timeout_ms`. If recovery times out or the protocol state remains uncertain, pg-kinetic discards the backend rather than returning it to the pool.
+
+Metrics:
+
+- `pg_kinetic_backend_pin_total`
+- `pg_kinetic_backend_cleanup_total`
+- `pg_kinetic_backend_recovery_total`
+- `pg_kinetic_backend_sqlstate_total`
