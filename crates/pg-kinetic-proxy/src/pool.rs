@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
 use crate::backend::Backend;
@@ -22,6 +22,7 @@ pub struct BackendPool {
     gate: BackpressureGate,
     route_gates: Mutex<HashMap<RouteKey, BackpressureGate>>,
     idle: Mutex<VecDeque<Backend>>,
+    backend_available: Notify,
     max_backends: usize,
     max_waiters: usize,
     route_max_in_flight: usize,
@@ -63,6 +64,7 @@ impl BackendPool {
             gate: BackpressureGate::new(max_backends, max_waiters),
             route_gates: Mutex::new(HashMap::new()),
             idle: Mutex::new(VecDeque::new()),
+            backend_available: Notify::new(),
             max_backends,
             max_waiters,
             route_max_in_flight,
@@ -72,6 +74,23 @@ impl BackendPool {
     }
 
     pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
+        self.checkout_with_mode(route, CheckoutMode::AllowConnect)
+            .await
+    }
+
+    pub async fn checkout_reusable(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.checkout_with_mode(route, CheckoutMode::ReuseOnly)
+            .await
+    }
+
+    async fn checkout_with_mode(
+        self: &Arc<Self>,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
         let route_gate = self.route_gate(&route).await;
         let started = Instant::now();
         let checkout = async {
@@ -104,7 +123,7 @@ impl BackendPool {
             metrics::record_route_in_flight(&route, route_gate.in_flight());
             metrics::record_route_waiting(&route, route_gate.waiting());
 
-            if let Some(backend) = self.idle.lock().await.pop_front() {
+            if let Some(backend) = self.checkout_idle_backend(mode).await {
                 return Ok(PooledBackend {
                     backend: Some(backend),
                     pool: self.clone(),
@@ -136,6 +155,19 @@ impl BackendPool {
                 );
                 Err(PoolError::Backpressure(BackpressureError::Timeout))
             }
+        }
+    }
+
+    async fn checkout_idle_backend(&self, mode: CheckoutMode) -> Option<Backend> {
+        loop {
+            let notified = self.backend_available.notified();
+            if let Some(backend) = self.idle.lock().await.pop_front() {
+                return Some(backend);
+            }
+            if mode == CheckoutMode::AllowConnect {
+                return None;
+            }
+            notified.await;
         }
     }
 
@@ -176,7 +208,14 @@ impl BackendPool {
 
     async fn return_backend(&self, backend: Backend) {
         self.idle.lock().await.push_back(backend);
+        self.backend_available.notify_one();
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutMode {
+    AllowConnect,
+    ReuseOnly,
 }
 
 fn backpressure_outcome(error: BackpressureError) -> &'static str {

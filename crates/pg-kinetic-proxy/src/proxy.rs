@@ -161,6 +161,7 @@ async fn handle_client(
             client_addr,
         ),
         "checkout backend for startup",
+        CheckoutMode::AllowConnect,
     )
     .await
     {
@@ -240,6 +241,7 @@ async fn handle_client(
                             client_addr,
                         ),
                         "checkout backend for cycle",
+                        CheckoutMode::ReuseOnly,
                     )
                     .await
                     {
@@ -455,9 +457,14 @@ async fn checkout_backend(
     pool: &Arc<BackendPool>,
     route: RouteKey,
     context: &'static str,
+    mode: CheckoutMode,
 ) -> Result<PooledBackend, CheckoutFailure> {
     let started = Instant::now();
-    let backend = match pool.checkout(route).await {
+    let backend_result = match mode {
+        CheckoutMode::AllowConnect => pool.checkout(route).await,
+        CheckoutMode::ReuseOnly => pool.checkout_reusable(route).await,
+    };
+    let backend = match backend_result {
         Ok(backend) => backend,
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
@@ -474,6 +481,12 @@ async fn checkout_backend(
     };
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
     Ok(backend)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutMode {
+    AllowConnect,
+    ReuseOnly,
 }
 
 #[derive(Debug)]
