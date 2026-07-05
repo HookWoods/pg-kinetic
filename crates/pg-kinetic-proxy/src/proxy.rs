@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -25,9 +25,9 @@ use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::PreparedEvent,
     pin::PinnedBackend,
-    route::{QueryClass, RouteKey},
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
+    route::{QueryClass, RouteKey},
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
@@ -45,6 +45,7 @@ use pg_kinetic_wire::{
         rewrite_close_statement_name, rewrite_describe_statement_name,
         rewrite_parse_statement_name,
     },
+    sqlstate::SqlState,
     startup::{parse_startup_packet, StartupPacket},
 };
 
@@ -120,13 +121,24 @@ async fn handle_client(
     let mut pinned_backend = PinnedBackend::default();
     let mut prepared = PreparedCatalog::new(session_id);
     let mut held_backend: Option<PooledBackend> = None;
+    let mut wait_for_client_activity_after_timeout = false;
 
-    let startup_packet = match read_startup_packet(&mut client)
+    let startup_packet = match read_startup_packet(&mut client, qos.idle_client_timeout())
         .await
         .with_context(|| format!("proxy client {client_addr}"))?
     {
         StartupRead::Packet(packet) => packet,
         StartupRead::ClientClosed => return Ok(()),
+        StartupRead::TimedOut => {
+            error_response_and_ready_with_state(
+                &mut client,
+                SqlState::OperatorIntervention.as_str(),
+                "startup timed out",
+                ReadyStatus::Idle,
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     let (route_database, route_user, mut route_application_name) =
@@ -161,28 +173,196 @@ async fn handle_client(
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
 
     loop {
-        if client
-            .read_buf(&mut client_buffer)
-            .await
-            .context("read client")?
-            == 0
-        {
-            if let Some(backend) = held_backend.take() {
-                finalize_backend_on_disconnect(
-                    backend,
-                    &pool,
-                    &performance,
-                    &mut session,
-                    &mut pinned_backend,
+        let idle_timeout_kind = if matches!(
+            session.pin_reason(),
+            Some(PinReason::OpenTransaction) | Some(PinReason::FailedTransaction)
+        ) {
+            IdleTimeoutKind::Transaction
+        } else {
+            IdleTimeoutKind::Client
+        };
+        let idle_timeout = if idle_timeout_kind == IdleTimeoutKind::Transaction {
+            qos.idle_transaction_timeout()
+        } else {
+            qos.idle_client_timeout()
+        };
+        let cycle_timeout = if wait_for_client_activity_after_timeout {
+            None
+        } else {
+            Some(idle_timeout)
+        };
+
+        let Some(cycle) = next_client_cycle(
+            &mut client,
+            &mut client_buffer,
+            cycle_timeout,
+            idle_timeout_kind,
+        )
+        .await?
+        else {
+            continue;
+        };
+
+        wait_for_client_activity_after_timeout = false;
+        match cycle {
+            ClientCycle::Frames(frames) => {
+                let mut backend = if let Some(backend) = held_backend.take() {
+                    backend
+                } else {
+                    match checkout_backend(
+                        &pool,
+                        route_key(
+                            &route_database,
+                            &route_user,
+                            route_application_name.as_deref(),
+                            client_addr,
+                        ),
+                        "checkout backend for cycle",
+                    )
+                    .await
+                    {
+                        Ok(backend) => backend,
+                        Err(CheckoutFailure::Overload(message)) => {
+                            error_response_and_ready(&mut client, &qos, message).await?;
+                            return Ok(());
+                        }
+                        Err(CheckoutFailure::Close) => {
+                            return Ok(());
+                        }
+                        Err(CheckoutFailure::Fatal(error)) => return Err(error),
+                    }
+                };
+
+                if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
+                    let replay = replay_frames(&session);
+                    let status = execute_backend_batch(&mut backend, &replay)
+                        .await
+                        .context("replay virtual session")?;
+                    anyhow::ensure!(
+                        status == ReadyStatus::Idle,
+                        "unexpected replay status: {status:?}"
+                    );
+                }
+
+                let mut progress = QueryProgress::default();
+                let result = timeout(
+                    qos.query_timeout(),
+                    forward_message_cycle(
+                        &mut client,
+                        &mut backend,
+                        &mut session,
+                        &mut prepared,
+                        frames,
+                        &mut route_application_name,
+                        &mut progress,
+                    ),
                 )
-                .await?;
+                .await;
+
+                let client_disconnected_after_ready = matches!(
+                    &result,
+                    Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)))
+                );
+
+                match result {
+                    Ok(Ok(ForwardOutcome::Ready(status)))
+                    | Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(status))) => {
+                        session.mark_ready_after_copy();
+                        let action = cleanup_action(&session, status);
+                        metrics::increment_cleanup(action);
+
+                        match action {
+                            CleanupAction::Reuse => {
+                                pinned_backend.clear();
+                                backend.release().await;
+                            }
+                            CleanupAction::ResetThenReuse => {
+                                execute_simple_query(&mut backend, pool.reset_query())
+                                    .await
+                                    .context("reset backend before reuse")?;
+                                pinned_backend.clear();
+                                backend.release().await;
+                            }
+                            CleanupAction::KeepPinned => {
+                                if let Some(reason) = session.pin_reason() {
+                                    metrics::increment_pin(reason);
+                                }
+                                pinned_backend.mark_pinned(backend.backend_id());
+                                held_backend = Some(backend);
+                            }
+                            CleanupAction::RollbackThenReuse => {
+                                execute_simple_query(&mut backend, "ROLLBACK")
+                                    .await
+                                    .context("rollback failed transaction")?;
+                                session.apply_sql(classify("rollback"));
+                                pinned_backend.clear();
+                                backend.release().await;
+                            }
+                            CleanupAction::Discard => {
+                                pinned_backend.clear();
+                                backend.discard();
+                            }
+                        }
+
+                        if client_disconnected_after_ready {
+                            return Ok(());
+                        }
+                    }
+                    Ok(Ok(ForwardOutcome::AbandonedResponse { needs_sync })) => {
+                        let reused = recover_backend(
+                            &mut backend,
+                            RecoveryTrigger::AbandonedResponse,
+                            &performance,
+                            needs_sync,
+                            &mut session,
+                        )
+                        .await
+                        .context("recover abandoned response")?;
+                        pinned_backend.clear();
+                        if reused {
+                            backend.release().await;
+                        } else {
+                            backend.discard();
+                        }
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => {
+                        backend.discard();
+                        return Err(error).with_context(|| format!("proxy client {client_addr}"));
+                    }
+                    Err(_) => {
+                        let continue_client = handle_query_timeout(
+                            &mut client,
+                            &performance,
+                            backend,
+                            &mut session,
+                            &mut pinned_backend,
+                            progress,
+                        )
+                        .await?;
+
+                        if !continue_client {
+                            return Ok(());
+                        }
+
+                        wait_for_client_activity_after_timeout = true;
+                    }
+                }
             }
-
-            return Ok(());
-        }
-
-        while let Some(cycle) = next_client_cycle(&mut client, &mut client_buffer).await? {
-            let ClientCycle::Frames(frames) = cycle else {
+            ClientCycle::Terminate => {
+                if let Some(backend) = held_backend.take() {
+                    finalize_backend_on_disconnect(
+                        backend,
+                        &pool,
+                        &performance,
+                        &mut session,
+                        &mut pinned_backend,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            ClientCycle::IdleTimeout(kind) => {
                 if let Some(backend) = held_backend.take() {
                     finalize_backend_on_disconnect(
                         backend,
@@ -194,126 +374,13 @@ async fn handle_client(
                     .await?;
                 }
 
-                return Ok(());
-            };
-
-            let mut backend = if let Some(backend) = held_backend.take() {
-                backend
-            } else {
-                match checkout_backend(
-                    &pool,
-                    route_key(
-                        &route_database,
-                        &route_user,
-                        route_application_name.as_deref(),
-                        client_addr,
-                    ),
-                    "checkout backend for cycle",
-                )
-                .await
-                {
-                    Ok(backend) => backend,
-                    Err(CheckoutFailure::Overload(message)) => {
-                        error_response_and_ready(&mut client, &qos, message).await?;
-                        return Ok(());
-                    }
-                    Err(CheckoutFailure::Close) => {
-                        return Ok(());
-                    }
-                    Err(CheckoutFailure::Fatal(error)) => return Err(error),
-                }
-            };
-
-            if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
-                let replay = replay_frames(&session);
-                let status = execute_backend_batch(&mut backend, &replay)
-                    .await
-                    .context("replay virtual session")?;
-                anyhow::ensure!(
-                    status == ReadyStatus::Idle,
-                    "unexpected replay status: {status:?}"
-                );
-            }
-
-            let result = forward_message_cycle(
-                &mut client,
-                &mut backend,
-                &mut session,
-                &mut prepared,
-                frames,
-                &mut route_application_name,
-            )
-            .await;
-
-            let client_disconnected_after_ready =
-                matches!(&result, Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)));
-
-            match result {
-                Ok(ForwardOutcome::Ready(status))
-                | Ok(ForwardOutcome::ClientDisconnectedAfterReady(status)) => {
-                    session.mark_ready_after_copy();
-                    let action = cleanup_action(&session, status);
-                    metrics::increment_cleanup(action);
-
-                    match action {
-                        CleanupAction::Reuse => {
-                            pinned_backend.clear();
-                            backend.release().await;
-                        }
-                        CleanupAction::ResetThenReuse => {
-                            execute_simple_query(&mut backend, pool.reset_query())
-                                .await
-                                .context("reset backend before reuse")?;
-                            pinned_backend.clear();
-                            backend.release().await;
-                        }
-                        CleanupAction::KeepPinned => {
-                            if let Some(reason) = session.pin_reason() {
-                                metrics::increment_pin(reason);
-                            }
-                            pinned_backend.mark_pinned(backend.backend_id());
-                            held_backend = Some(backend);
-                        }
-                        CleanupAction::RollbackThenReuse => {
-                            execute_simple_query(&mut backend, "ROLLBACK")
-                                .await
-                                .context("rollback failed transaction")?;
-                            session.apply_sql(classify("rollback"));
-                            pinned_backend.clear();
-                            backend.release().await;
-                        }
-                        CleanupAction::Discard => {
-                            pinned_backend.clear();
-                            backend.discard();
-                        }
-                    }
-
-                    if client_disconnected_after_ready {
-                        return Ok(());
-                    }
-                }
-                Ok(ForwardOutcome::AbandonedResponse { needs_sync }) => {
-                    let reused = recover_backend(
-                        &mut backend,
-                        RecoveryTrigger::AbandonedResponse,
-                        &performance,
-                        needs_sync,
-                        &mut session,
-                    )
-                    .await
-                    .context("recover abandoned response")?;
-                    pinned_backend.clear();
-                    if reused {
-                        backend.release().await;
-                    } else {
-                        backend.discard();
-                    }
+                client_buffer.clear();
+                handle_idle_timeout(&mut client, kind).await?;
+                if kind == IdleTimeoutKind::Transaction {
                     return Ok(());
                 }
-                Err(error) => {
-                    backend.discard();
-                    return Err(error).with_context(|| format!("proxy client {client_addr}"));
-                }
+
+                wait_for_client_activity_after_timeout = true;
             }
         }
     }
@@ -393,9 +460,32 @@ fn route_key(
 async fn next_client_cycle(
     client: &mut TcpStream,
     client_buffer: &mut BytesMut,
+    idle_timeout: Option<Duration>,
+    idle_timeout_kind: IdleTimeoutKind,
 ) -> anyhow::Result<Option<ClientCycle>> {
-    let Some(first) = parse_frontend_frame(client_buffer)? else {
-        return Ok(None);
+    let first = loop {
+        if let Some(frame) = parse_frontend_frame(client_buffer)? {
+            break frame;
+        }
+
+        match idle_timeout {
+            Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
+                Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => return Err(error).context("read client"),
+                Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
+            },
+            None => {
+                if client
+                    .read_buf(client_buffer)
+                    .await
+                    .context("read client")?
+                    == 0
+                {
+                    return Ok(Some(ClientCycle::Terminate));
+                }
+            }
+        }
     };
 
     if first.tag == u8::from(FrontendTag::Terminate) {
@@ -416,13 +506,23 @@ async fn next_client_cycle(
             continue;
         }
 
-        if client
-            .read_buf(client_buffer)
-            .await
-            .context("read extended query frame")?
-            == 0
-        {
-            anyhow::bail!("client disconnected during extended query cycle");
+        match idle_timeout {
+            Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
+                Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => return Err(error).context("read extended query frame"),
+                Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
+            },
+            None => {
+                if client
+                    .read_buf(client_buffer)
+                    .await
+                    .context("read extended query frame")?
+                    == 0
+                {
+                    return Ok(Some(ClientCycle::Terminate));
+                }
+            }
         }
     }
 
@@ -433,9 +533,24 @@ async fn next_client_cycle(
 enum ClientCycle {
     Frames(Vec<FrontendFrame>),
     Terminate,
+    IdleTimeout(IdleTimeoutKind),
 }
 
-async fn read_startup_packet(client: &mut TcpStream) -> anyhow::Result<StartupRead> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleTimeoutKind {
+    Client,
+    Transaction,
+}
+
+#[derive(Default)]
+struct QueryProgress {
+    response_started: bool,
+}
+
+async fn read_startup_packet(
+    client: &mut TcpStream,
+    idle_timeout: Duration,
+) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
     loop {
         while let Some(packet) = next_startup_packet(&mut buffer)? {
@@ -452,8 +567,11 @@ async fn read_startup_packet(client: &mut TcpStream) -> anyhow::Result<StartupRe
             }
         }
 
-        if client.read_buf(&mut buffer).await.context("read startup")? == 0 {
-            return Ok(StartupRead::ClientClosed);
+        match timeout(idle_timeout, client.read_buf(&mut buffer)).await {
+            Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
+            Ok(Ok(_)) => continue,
+            Ok(Err(error)) => return Err(error).context("read startup"),
+            Err(_) => return Ok(StartupRead::TimedOut),
         }
     }
 }
@@ -491,6 +609,7 @@ async fn reject_startup_encryption_request(client: &mut TcpStream) -> anyhow::Re
 enum StartupRead {
     Packet(BytesMut),
     ClientClosed,
+    TimedOut,
 }
 
 async fn proxy_startup(
@@ -571,10 +690,18 @@ fn synthetic_startup_ready() -> BytesMut {
 }
 
 fn ready_for_query_idle() -> BytesMut {
+    ready_for_query(ReadyStatus::Idle)
+}
+
+fn ready_for_query(status: ReadyStatus) -> BytesMut {
     let mut bytes = BytesMut::new();
     bytes.put_u8(u8::from(BackendTag::ReadyForQuery));
     bytes.put_i32(5);
-    bytes.put_u8(u8::from(ReadyStatusByte::Idle));
+    bytes.put_u8(match status {
+        ReadyStatus::Idle => u8::from(ReadyStatusByte::Idle),
+        ReadyStatus::InTransaction => u8::from(ReadyStatusByte::InTransaction),
+        ReadyStatus::FailedTransaction => u8::from(ReadyStatusByte::FailedTransaction),
+    });
     bytes
 }
 
@@ -591,6 +718,7 @@ async fn forward_message_cycle(
     prepared: &mut PreparedCatalog,
     frames: Vec<FrontendFrame>,
     route_application_name: &mut Option<String>,
+    progress: &mut QueryProgress,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let mut outbound = BytesMut::new();
@@ -626,6 +754,7 @@ async fn forward_message_cycle(
         let mut forward = BytesMut::new();
         let mut ready = None;
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            progress.response_started = true;
             if let Some(sqlstate) = frame.sqlstate() {
                 metrics::increment_sqlstate(sqlstate);
                 let scope = prepared.invalidate_for_sqlstate(sqlstate, backend.backend_id());
@@ -949,16 +1078,118 @@ async fn error_response_and_ready(
     qos: &crate::config::QosConfig,
     message: &'static str,
 ) -> anyhow::Result<()> {
-    let error = build_error_response(&qos.overload_error_code, message);
+    error_response_and_ready_with_state(
+        client,
+        &qos.overload_error_code,
+        message,
+        ReadyStatus::Idle,
+    )
+    .await
+}
+
+async fn error_response_and_ready_with_state(
+    client: &mut TcpStream,
+    sqlstate: &str,
+    message: &str,
+    ready_status: ReadyStatus,
+) -> anyhow::Result<()> {
+    let error = build_error_response(sqlstate, message);
     client
         .write_all(&error)
         .await
-        .context("write overload error response")?;
-    let ready = ready_for_query_idle();
+        .context("write error response")?;
+    let ready = ready_for_query(ready_status);
     client
         .write_all(&ready)
         .await
-        .context("write ready after overload")
+        .context("write ready after error")
+}
+
+async fn error_response_only(
+    client: &mut TcpStream,
+    sqlstate: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let error = build_error_response(sqlstate, message);
+    client
+        .write_all(&error)
+        .await
+        .context("write timeout error response")
+}
+
+async fn handle_query_timeout(
+    client: &mut TcpStream,
+    performance: &crate::config::PerformanceConfig,
+    mut backend: PooledBackend,
+    session: &mut VirtualSession,
+    pinned_backend: &mut PinnedBackend,
+    progress: QueryProgress,
+) -> anyhow::Result<bool> {
+    metrics_crate::counter!(
+        pg_kinetic_core::constants::MetricName::TimeoutTotal.as_str(),
+        "kind" => "query"
+    )
+    .increment(1);
+
+    let recovery_trigger = match session.pin_reason() {
+        Some(PinReason::OpenTransaction) | Some(PinReason::FailedTransaction) => {
+            RecoveryTrigger::AbandonedTransaction
+        }
+        _ => RecoveryTrigger::AbandonedResponse,
+    };
+
+    if !progress.response_started {
+        error_response_and_ready_with_state(
+            client,
+            SqlState::QueryCanceled.as_str(),
+            "query timed out",
+            ReadyStatus::Idle,
+        )
+        .await?;
+    }
+
+    let reused = recover_backend(&mut backend, recovery_trigger, performance, false, session)
+        .await
+        .unwrap_or(false);
+    pinned_backend.clear();
+    if reused {
+        backend.release().await;
+    } else {
+        backend.discard();
+    }
+
+    Ok(!progress.response_started)
+}
+
+async fn handle_idle_timeout(client: &mut TcpStream, kind: IdleTimeoutKind) -> anyhow::Result<()> {
+    metrics_crate::counter!(
+        pg_kinetic_core::constants::MetricName::TimeoutTotal.as_str(),
+        "kind" => match kind {
+            IdleTimeoutKind::Client => "idle_client",
+            IdleTimeoutKind::Transaction => "idle_transaction",
+        }
+    )
+    .increment(1);
+
+    match kind {
+        IdleTimeoutKind::Client => {
+            error_response_and_ready_with_state(
+                client,
+                SqlState::OperatorIntervention.as_str(),
+                "idle client timed out",
+                ReadyStatus::Idle,
+            )
+            .await
+        }
+        IdleTimeoutKind::Transaction => {
+            error_response_only(
+                client,
+                SqlState::OperatorIntervention.as_str(),
+                "idle transaction timed out",
+            )
+            .await
+        }
+    }
 }
 
 async fn finalize_backend_on_disconnect(

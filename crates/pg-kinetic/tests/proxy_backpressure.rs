@@ -1,20 +1,28 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
+    backpressure::BackpressureError,
     config::{
         CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
     },
-    backpressure::BackpressureError,
     pool::{BackendPool, PoolError},
     proxy::Proxy,
-    route::{QueryClass, RouteKey},
     recovery::RecoveryMode,
+    route::{QueryClass, RouteKey},
     wire::{
-        backend::{build_error_response, parse_backend_frame, BackendFrame},
+        backend::{build_error_response, parse_backend_frame, BackendFrame, ReadyStatus},
         frame::parse_frontend_frame,
         message::parse_simple_query,
         protocol::{FrontendTag, ProtocolVersion},
+        sqlstate::SqlState,
         startup::{parse_startup_packet, StartupPacket},
     },
 };
@@ -29,18 +37,14 @@ use tokio::{
 async fn startup_route_components_are_forwarded_to_the_backend() {
     let (proxy_addr, mut seen, _) = spawn_proxy_with_backend(HoldRule::Never).await;
 
-    let mut client = open_client(
-        proxy_addr,
-        "pgkinetic",
-        "postgres",
-        Some("api"),
-    )
-    .await;
+    let mut client = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
     send_query(&mut client, "select 1").await;
     read_response(&mut client).await;
 
     let events = collect_events(&mut seen).await;
-    assert!(events.iter().any(|event| event.contains("startup db=pgkinetic user=postgres app=api")));
+    assert!(events
+        .iter()
+        .any(|event| event.contains("startup db=pgkinetic user=postgres app=api")));
 }
 
 #[test]
@@ -81,7 +85,10 @@ async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
         Duration::from_millis(5),
         "DISCARD ALL",
     );
-    let queue_full_error = queue_full.checkout(route.clone()).await.expect_err("queue full");
+    let queue_full_error = queue_full
+        .checkout(route.clone())
+        .await
+        .expect_err("queue full");
     assert!(matches!(
         queue_full_error,
         PoolError::Backpressure(BackpressureError::QueueFull)
@@ -123,7 +130,9 @@ async fn database_startup_value_participates_in_route_selection() {
     assert!(hold_event.contains("user=postgres"));
 
     let events = collect_events(&mut seen).await;
-    assert!(events.iter().any(|event| event.contains("startup db=pgkinetic-b user=postgres")));
+    assert!(events
+        .iter()
+        .any(|event| event.contains("startup db=pgkinetic-b user=postgres")));
 }
 
 #[tokio::test]
@@ -146,20 +155,16 @@ async fn user_startup_value_participates_in_route_selection() {
     assert!(hold_event.contains("user=alice"));
 
     let events = collect_events(&mut seen).await;
-    assert!(events.iter().any(|event| event.contains("startup db=pgkinetic user=bob")));
+    assert!(events
+        .iter()
+        .any(|event| event.contains("startup db=pgkinetic user=bob")));
 }
 
 #[tokio::test]
 async fn application_name_change_is_forwarded_before_the_next_query() {
     let (proxy_addr, mut seen, _) = spawn_proxy_with_backend(HoldRule::Never).await;
 
-    let mut client = open_client(
-        proxy_addr,
-        "pgkinetic",
-        "postgres",
-        Some("api-a"),
-    )
-    .await;
+    let mut client = open_client(proxy_addr, "pgkinetic", "postgres", Some("api-a")).await;
 
     send_query(&mut client, "set application_name = 'api-b'").await;
     read_response(&mut client).await;
@@ -178,6 +183,279 @@ async fn application_name_change_is_forwarded_before_the_next_query() {
         .expect("select query recorded");
 
     assert!(set_index < select_index);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutScenario {
+    Normal,
+    QueryTimeoutThenNormal,
+    IdleTransactionThenNormal,
+}
+
+async fn spawn_timeout_proxy(scenario: TimeoutScenario) -> (SocketAddr, mpsc::Receiver<String>) {
+    let (sender, receiver) = mpsc::channel(128);
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+    let connection_ids = Arc::new(AtomicU64::new(0));
+
+    tokio::spawn({
+        let connection_ids = connection_ids.clone();
+        async move {
+            loop {
+                let (mut stream, _) = backend.accept().await.expect("accept backend");
+                let sender = sender.clone();
+                let connection_ids = connection_ids.clone();
+                tokio::spawn(async move {
+                    let connection_id = connection_ids.fetch_add(1, Ordering::Relaxed) + 1;
+                    sender
+                        .send(format!("conn={connection_id} open"))
+                        .await
+                        .expect("record connection open");
+
+                    let mut startup = [0_u8; 2048];
+                    let read = stream.read(&mut startup).await.expect("read startup");
+                    if read == 0 {
+                        sender
+                            .send(format!("conn={connection_id} closed before startup"))
+                            .await
+                            .expect("record startup close");
+                        return;
+                    }
+
+                    let startup_packet =
+                        parse_startup_packet(&startup[..read]).expect("parse startup");
+                    let (database, user, application_name) = startup_fields(&startup_packet);
+                    sender
+                        .send(format!(
+                            "startup db={database} user={user} app={}",
+                            application_name.as_deref().unwrap_or("<none>")
+                        ))
+                        .await
+                        .expect("record startup");
+
+                    stream
+                        .write_all(&auth_ok_ready())
+                        .await
+                        .expect("auth ready");
+
+                    let mut buffer = BytesMut::with_capacity(4096);
+                    let mut hung = false;
+                    loop {
+                        let read = stream.read_buf(&mut buffer).await.expect("read frontend");
+                        if read == 0 {
+                            sender
+                                .send(format!("conn={connection_id} closed"))
+                                .await
+                                .expect("record close");
+                            return;
+                        }
+
+                        while let Some(frame) =
+                            parse_frontend_frame(&mut buffer).expect("parse frontend frame")
+                        {
+                            if hung {
+                                continue;
+                            }
+
+                            if let Some(query) = parse_simple_query(&frame).expect("parse query") {
+                                sender
+                                    .send(format!("conn={connection_id} query={query}"))
+                                    .await
+                                    .expect("record query");
+
+                                match scenario {
+                                    TimeoutScenario::Normal => {
+                                        if query == "begin" {
+                                            stream
+                                                .write_all(&ready_in_transaction())
+                                                .await
+                                                .expect("write begin ready");
+                                        } else {
+                                            stream
+                                                .write_all(&ready_idle())
+                                                .await
+                                                .expect("write ready");
+                                        }
+                                    }
+                                    TimeoutScenario::QueryTimeoutThenNormal => {
+                                        if connection_id == 1 {
+                                            hung = true;
+                                        } else if query == "begin" {
+                                            stream
+                                                .write_all(&ready_in_transaction())
+                                                .await
+                                                .expect("write begin ready");
+                                        } else {
+                                            stream
+                                                .write_all(&ready_idle())
+                                                .await
+                                                .expect("write ready");
+                                        }
+                                    }
+                                    TimeoutScenario::IdleTransactionThenNormal => {
+                                        if connection_id == 1 && query == "begin" {
+                                            stream
+                                                .write_all(&ready_in_transaction())
+                                                .await
+                                                .expect("write begin ready");
+                                            hung = true;
+                                        } else if connection_id == 1 {
+                                            hung = true;
+                                        } else if query == "begin" {
+                                            stream
+                                                .write_all(&ready_in_transaction())
+                                                .await
+                                                .expect("write begin ready");
+                                        } else {
+                                            stream
+                                                .write_all(&ready_idle())
+                                                .await
+                                                .expect("write ready");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let listen = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+    let listen_addr = listen.local_addr().expect("listen addr");
+    drop(listen);
+
+    let config = Config {
+        connection: ConnectionConfig {
+            listen_addr,
+            backend_addr,
+        },
+        capacity: CapacityConfig {
+            max_clients: 10,
+            max_backends: 2,
+            max_checkout_waiters: 4,
+        },
+        performance: PerformanceConfig {
+            checkout_timeout_ms: 100,
+            recovery_mode: RecoveryMode::Recover,
+            recovery_timeout_ms: 50,
+            backend_reset_query: "DISCARD ALL".to_string(),
+        },
+        qos: QosConfig {
+            max_route_in_flight: 1,
+            max_route_waiters: 1,
+            query_timeout_ms: 50,
+            idle_client_timeout_ms: 50,
+            idle_transaction_timeout_ms: 50,
+            max_client_buffer_bytes: 1_048_576,
+            max_backend_buffer_bytes: 4_194_304,
+            overload_error_code: "53300".to_string(),
+        },
+        observability: ObservabilityConfig { metrics_addr: None },
+    };
+
+    tokio::spawn(async move {
+        let _ = Proxy::new(config).run().await;
+    });
+    time::sleep(Duration::from_millis(50)).await;
+
+    (listen_addr, receiver)
+}
+
+#[tokio::test]
+async fn query_timeout_returns_error_and_discards_uncertain_backend() {
+    let (proxy_addr, mut seen) = spawn_timeout_proxy(TimeoutScenario::QueryTimeoutThenNormal).await;
+
+    let mut client = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
+    send_query(&mut client, "select slow").await;
+
+    let timeout_frames = read_frames(&mut client).await;
+    assert!(!timeout_frames.is_empty());
+    assert_eq!(timeout_frames[0].tag, b'E');
+    assert_eq!(timeout_frames[0].sqlstate(), Some(SqlState::QueryCanceled));
+    assert_error_field(&timeout_frames[0], b'M', "query timed out");
+    assert!(timeout_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
+
+    let mut second = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
+    send_query(&mut second, "select 1").await;
+    let second_frames = read_frames(&mut second).await;
+    assert!(second_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.iter().any(|event| event.contains("conn=1")));
+    assert!(events.iter().any(|event| event.contains("conn=2")));
+}
+
+#[tokio::test]
+async fn idle_client_timeout_can_continue_with_the_same_connection() {
+    let (proxy_addr, _seen) = spawn_timeout_proxy(TimeoutScenario::Normal).await;
+
+    let mut client = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
+
+    let timeout_frames = read_frames(&mut client).await;
+    assert!(!timeout_frames.is_empty());
+    assert_eq!(timeout_frames[0].tag, b'E');
+    assert_eq!(
+        timeout_frames[0].sqlstate(),
+        Some(SqlState::OperatorIntervention)
+    );
+    assert_error_field(&timeout_frames[0], b'M', "idle client timed out");
+    assert!(timeout_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
+
+    send_query(&mut client, "select 1").await;
+    let recovery_frames = read_frames(&mut client).await;
+    assert!(recovery_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
+}
+
+#[tokio::test]
+async fn idle_transaction_timeout_closes_the_client_and_discards_the_backend() {
+    let (proxy_addr, mut seen) =
+        spawn_timeout_proxy(TimeoutScenario::IdleTransactionThenNormal).await;
+
+    let mut client = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
+    send_query(&mut client, "begin").await;
+    let begin_frames = read_until_ready(&mut client).await;
+    assert!(begin_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::InTransaction)));
+
+    let timeout_frames = read_frames(&mut client).await;
+    assert!(!timeout_frames.is_empty());
+    assert_eq!(timeout_frames[0].tag, b'E');
+    assert_eq!(
+        timeout_frames[0].sqlstate(),
+        Some(SqlState::OperatorIntervention)
+    );
+    assert_error_field(&timeout_frames[0], b'M', "idle transaction timed out");
+
+    let mut eof_probe = [0_u8; 1];
+    let read = time::timeout(Duration::from_millis(200), client.read(&mut eof_probe))
+        .await
+        .expect("wait for timeout close")
+        .expect("read after timeout");
+    assert_eq!(read, 0);
+
+    let mut second = open_client(proxy_addr, "pgkinetic", "postgres", Some("api")).await;
+    send_query(&mut second, "select 1").await;
+    let second_frames = read_frames(&mut second).await;
+    assert!(second_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
+
+    let events = collect_events(&mut seen).await;
+    assert!(events.iter().any(|event| event.contains("conn=1")));
+    assert!(events.iter().any(|event| event.contains("conn=2")));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,7 +519,8 @@ async fn spawn_proxy_with_backend_and_qos(
                         return;
                     }
 
-                    let startup_packet = parse_startup_packet(&startup[..read]).expect("parse startup");
+                    let startup_packet =
+                        parse_startup_packet(&startup[..read]).expect("parse startup");
                     let (database, user, application_name) = startup_fields(&startup_packet);
                     sender
                         .send(format!(
@@ -262,7 +541,10 @@ async fn spawn_proxy_with_backend_and_qos(
                     loop {
                         let read = stream.read_buf(&mut buffer).await.expect("read frontend");
                         if read == 0 {
-                            sender.send("closed".to_string()).await.expect("record close");
+                            sender
+                                .send("closed".to_string())
+                                .await
+                                .expect("record close");
                             return;
                         }
 
@@ -290,10 +572,7 @@ async fn spawn_proxy_with_backend_and_qos(
                                     release_hold.notified().await;
                                 }
 
-                                stream
-                                    .write_all(&ready_idle())
-                                    .await
-                                    .expect("write ready");
+                                stream.write_all(&ready_idle()).await.expect("write ready");
                             }
                         }
                     }
@@ -341,13 +620,15 @@ async fn open_client(
     application_name: Option<&str>,
 ) -> TcpStream {
     let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
-    stream.write_all(&startup_packet(database, user, application_name)).await.expect("startup");
-
-    let mut startup_response = [0_u8; 128];
-    let _ = stream
-        .read(&mut startup_response)
+    stream
+        .write_all(&startup_packet(database, user, application_name))
         .await
-        .expect("startup response");
+        .expect("startup");
+
+    let startup_frames = read_until_ready(&mut stream).await;
+    assert!(startup_frames
+        .iter()
+        .any(|frame| frame.ready_status() == Some(ReadyStatus::Idle)));
 
     stream
 }
@@ -359,6 +640,51 @@ async fn send_query(stream: &mut TcpStream, query: &str) {
 async fn read_response(stream: &mut TcpStream) {
     let mut response = [0_u8; 256];
     let _ = stream.read(&mut response).await.expect("response");
+}
+
+async fn read_frames(stream: &mut TcpStream) -> Vec<BackendFrame> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        match time::timeout(Duration::from_millis(250), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => bytes.extend_from_slice(&buffer[..read]),
+            Ok(Err(error)) => panic!("read response: {error}"),
+            Err(_) => break,
+        }
+    }
+
+    let mut buffer = BytesMut::from(bytes.as_slice());
+    let mut frames = Vec::new();
+    while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
+        frames.push(frame);
+    }
+
+    frames
+}
+
+async fn read_until_ready(stream: &mut TcpStream) -> Vec<BackendFrame> {
+    let mut bytes = BytesMut::new();
+    let mut frames = Vec::new();
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        let read = time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+            .await
+            .expect("timed out waiting for ready")
+            .expect("read response");
+        assert!(read > 0, "connection closed before ready");
+
+        bytes.extend_from_slice(&buffer[..read]);
+        while let Some(frame) = parse_backend_frame(&mut bytes).expect("parse backend frame") {
+            let ready = frame.ready_status().is_some();
+            frames.push(frame);
+            if ready {
+                return frames;
+            }
+        }
+    }
 }
 
 fn parse_error_frame(bytes: &[u8]) -> BackendFrame {
@@ -379,7 +705,10 @@ fn assert_error_field(frame: &BackendFrame, kind: u8, expected: &str) {
         }
 
         let remaining = &frame.payload[offset..];
-        let terminator = remaining.iter().position(|byte| *byte == 0).expect("terminated");
+        let terminator = remaining
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("terminated");
         let value = std::str::from_utf8(&remaining[..terminator]).expect("utf8");
         if field_kind == kind {
             assert_eq!(value, expected);
@@ -415,8 +744,12 @@ fn startup_fields(startup: &StartupPacket) -> (String, String, Option<String>) {
         panic!("expected startup packet");
     };
 
-    let database = startup_parameter(parameters, "database").expect("database").to_string();
-    let user = startup_parameter(parameters, "user").expect("user").to_string();
+    let database = startup_parameter(parameters, "database")
+        .expect("database")
+        .to_string();
+    let user = startup_parameter(parameters, "user")
+        .expect("user")
+        .to_string();
     let application_name = startup_parameter(parameters, "application_name").map(str::to_string);
 
     (database, user, application_name)
@@ -481,5 +814,16 @@ fn ready_idle() -> Vec<u8> {
     bytes.put_u8(b'Z');
     bytes.put_i32(5);
     bytes.put_u8(b'I');
+    bytes.to_vec()
+}
+
+fn ready_in_transaction() -> Vec<u8> {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'C');
+    bytes.put_i32(10);
+    bytes.extend_from_slice(b"BEGIN\0");
+    bytes.put_u8(b'Z');
+    bytes.put_i32(5);
+    bytes.put_u8(b'T');
     bytes.to_vec()
 }
