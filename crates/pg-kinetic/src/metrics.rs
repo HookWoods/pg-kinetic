@@ -46,8 +46,7 @@ pub fn increment_pin(reason: PinReason) {
 }
 
 pub fn increment_cleanup(action: &'static str) {
-    metrics_crate::counter!("pg_kinetic_backend_cleanup_total", "action" => action)
-        .increment(1);
+    metrics_crate::counter!("pg_kinetic_backend_cleanup_total", "action" => action).increment(1);
 }
 
 pub fn increment_recovery(trigger: RecoveryTrigger, action: RecoveryAction, outcome: &'static str) {
