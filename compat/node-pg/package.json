@@ -1,0 +1,12 @@
+{
+  "name": "pg-kinetic-node-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node smoke.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}
