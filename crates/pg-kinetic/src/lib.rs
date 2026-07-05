@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod backpressure;
+pub mod cleanup;
 pub mod config;
 pub mod metrics;
 pub mod pool;
