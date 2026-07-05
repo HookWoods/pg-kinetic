@@ -20,4 +20,7 @@ pub enum WireError {
 
     #[error("frontend frame is incomplete")]
     IncompleteFrame,
+
+    #[error("backend frame length is invalid: {0}")]
+    InvalidBackendFrameLength(i32),
 }
