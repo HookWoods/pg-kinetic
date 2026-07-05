@@ -2,6 +2,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
+use crate::recovery::RecoveryMode;
+
 #[derive(Clone, Debug, Parser)]
 #[command(name = "pg-kinetic")]
 #[command(about = "Low-overhead PostgreSQL wire proxy")]
@@ -51,6 +53,17 @@ pub struct PerformanceConfig {
 
     #[arg(
         long,
+        env = "PG_KINETIC_RECOVERY_MODE",
+        value_enum,
+        default_value_t = RecoveryMode::Recover
+    )]
+    pub recovery_mode: RecoveryMode,
+
+    #[arg(long, env = "PG_KINETIC_RECOVERY_TIMEOUT_MS", default_value_t = 5_000)]
+    pub recovery_timeout_ms: u64,
+
+    #[arg(
+        long,
         env = "PG_KINETIC_BACKEND_RESET_QUERY",
         default_value = "DISCARD ALL"
     )]
@@ -74,6 +87,11 @@ impl PerformanceConfig {
     #[must_use]
     pub const fn checkout_timeout(&self) -> Duration {
         Duration::from_millis(self.checkout_timeout_ms)
+    }
+
+    #[must_use]
+    pub const fn recovery_timeout(&self) -> Duration {
+        Duration::from_millis(self.recovery_timeout_ms)
     }
 }
 
@@ -106,6 +124,14 @@ mod tests {
             config.performance.checkout_timeout(),
             Duration::from_secs(1)
         );
+        assert_eq!(
+            config.performance.recovery_mode,
+            crate::recovery::RecoveryMode::Recover
+        );
+        assert_eq!(
+            config.performance.recovery_timeout(),
+            Duration::from_secs(5)
+        );
         assert_eq!(config.performance.backend_reset_query, "DISCARD ALL");
         assert_eq!(config.observability.metrics_addr, None);
     }
@@ -126,6 +152,10 @@ mod tests {
             "12",
             "--checkout-timeout-ms",
             "250",
+            "--recovery-mode",
+            "drop",
+            "--recovery-timeout-ms",
+            "7500",
             "--backend-reset-query",
             "DISCARD TEMP",
         ])
@@ -147,6 +177,14 @@ mod tests {
         assert_eq!(
             config.performance.checkout_timeout(),
             Duration::from_millis(250)
+        );
+        assert_eq!(
+            config.performance.recovery_mode,
+            crate::recovery::RecoveryMode::Drop
+        );
+        assert_eq!(
+            config.performance.recovery_timeout(),
+            Duration::from_millis(7_500)
         );
         assert_eq!(config.performance.backend_reset_query, "DISCARD TEMP");
     }

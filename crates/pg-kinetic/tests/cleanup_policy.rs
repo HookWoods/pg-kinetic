@@ -1,5 +1,5 @@
 use pg_kinetic::{
-    cleanup::{CleanupAction, cleanup_action},
+    cleanup::{cleanup_action, CleanupAction},
     sql::classify,
     virtual_session::VirtualSession,
     wire::backend::ReadyStatus,
@@ -9,7 +9,10 @@ use pg_kinetic::{
 fn idle_unpinned_backend_can_be_reused() {
     let session = VirtualSession::default();
 
-    assert_eq!(cleanup_action(&session, ReadyStatus::Idle), CleanupAction::Reuse);
+    assert_eq!(
+        cleanup_action(&session, ReadyStatus::Idle),
+        CleanupAction::Reuse
+    );
 }
 
 #[test]
@@ -51,5 +54,8 @@ fn unknown_protocol_state_discards_backend() {
     let mut session = VirtualSession::default();
     session.mark_unknown_protocol_state();
 
-    assert_eq!(cleanup_action(&session, ReadyStatus::Idle), CleanupAction::Discard);
+    assert_eq!(
+        cleanup_action(&session, ReadyStatus::Idle),
+        CleanupAction::Discard
+    );
 }
