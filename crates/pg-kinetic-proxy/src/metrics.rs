@@ -4,6 +4,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
+    route::RouteKey,
 };
 use pg_kinetic_core::{
     recovery::{RecoveryAction, RecoveryTrigger},
@@ -83,6 +84,58 @@ pub fn increment_sqlstate(sqlstate: SqlState) {
     .increment(1);
 }
 
+pub fn increment_backpressure_event(route: &RouteKey, outcome: &'static str) {
+    metrics_crate::counter!(
+        MetricName::BackpressureEvents.as_str(),
+        "route" => route.metric_label(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+pub fn record_route_wait(route: &RouteKey, wait_ms: f64, outcome: &'static str) {
+    metrics_crate::histogram!(
+        MetricName::RouteCheckoutWaitMs.as_str(),
+        "route" => route.metric_label(),
+        "outcome" => outcome
+    )
+    .record(wait_ms);
+}
+
+pub fn record_route_in_flight(route: &RouteKey, in_flight: usize) {
+    metrics_crate::gauge!(
+        MetricName::RouteInFlight.as_str(),
+        "route" => route.metric_label(),
+        "scope" => QueueScope::Route.as_str()
+    )
+    .set(in_flight as f64);
+}
+
+pub fn record_route_waiting(route: &RouteKey, waiting: usize) {
+    metrics_crate::gauge!(
+        MetricName::RouteWaiting.as_str(),
+        "route" => route.metric_label(),
+        "scope" => QueueScope::Global.as_str()
+    )
+    .set(waiting as f64);
+}
+
+pub fn increment_timeout(kind: &'static str) {
+    metrics_crate::counter!(
+        MetricName::TimeoutTotal.as_str(),
+        "kind" => kind
+    )
+    .increment(1);
+}
+
+pub fn increment_buffer_limit(kind: &'static str) {
+    metrics_crate::counter!(
+        MetricName::BufferLimitTotal.as_str(),
+        "kind" => kind
+    )
+    .increment(1);
+}
+
 fn describe_metrics() {
     metrics_crate::describe_counter!(
         MetricName::ClientConnectionsTotal.as_str(),
@@ -112,4 +165,43 @@ fn describe_metrics() {
         MetricName::BackendSqlstateTotal.as_str(),
         "Backend ErrorResponse counts by SQLSTATE"
     );
+    metrics_crate::describe_counter!(
+        MetricName::BackpressureEvents.as_str(),
+        "Backpressure outcomes by route"
+    );
+    metrics_crate::describe_histogram!(
+        MetricName::RouteCheckoutWaitMs.as_str(),
+        "Route checkout wait time in milliseconds"
+    );
+    metrics_crate::describe_gauge!(
+        MetricName::RouteInFlight.as_str(),
+        "Route in-flight checkout count"
+    );
+    metrics_crate::describe_gauge!(
+        MetricName::RouteWaiting.as_str(),
+        "Route waiting checkout count"
+    );
+    metrics_crate::describe_counter!(
+        MetricName::TimeoutTotal.as_str(),
+        "Timeouts by kind"
+    );
+    metrics_crate::describe_counter!(
+        MetricName::BufferLimitTotal.as_str(),
+        "Buffer limit breaches by kind"
+    );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueScope {
+    Route,
+    Global,
+}
+
+impl QueueScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Route => "route",
+            Self::Global => "global",
+        }
+    }
 }
