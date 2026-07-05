@@ -1,0 +1,11 @@
+/target/
+/.env
+/.env.*
+!/env.example
+*.log
+*.prof
+*.heap
+*.tmp
+.DS_Store
+Thumbs.db
+bench/results/

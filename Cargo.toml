@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/pg-kinetic"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
