@@ -32,7 +32,7 @@ use pg_kinetic_core::{
     virtual_session::{PinReason, VirtualSession},
 };
 use pg_kinetic_wire::{
-    backend::{parse_backend_frame, BackendFrame, ReadyStatus},
+    backend::{build_error_response, parse_backend_frame, BackendFrame, ReadyStatus},
     error::WireError,
     frame::{parse_frontend_frame, FrontendFrame},
     message::{
@@ -93,9 +93,10 @@ impl Proxy {
             let permit = self.client_slots.clone().acquire_owned().await?;
             let pool = self.pool.clone();
             let performance = self.config.performance.clone();
+            let qos = self.config.qos.clone();
 
             tokio::spawn(async move {
-                let result = handle_client(client, client_addr, pool, performance).await;
+                let result = handle_client(client, client_addr, pool, performance, qos).await;
                 drop(permit);
 
                 if let Err(error) = result {
@@ -112,6 +113,7 @@ async fn handle_client(
     client_addr: SocketAddr,
     pool: Arc<BackendPool>,
     performance: crate::config::PerformanceConfig,
+    qos: crate::config::QosConfig,
 ) -> anyhow::Result<()> {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let mut session = VirtualSession::default();
@@ -130,7 +132,7 @@ async fn handle_client(
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
 
-    let mut backend = checkout_backend(
+    let mut backend = match checkout_backend(
         &pool,
         route_key(
             &route_database,
@@ -140,7 +142,16 @@ async fn handle_client(
         ),
         "checkout backend for startup",
     )
-    .await?;
+    .await
+    {
+        Ok(backend) => backend,
+        Err(CheckoutFailure::Overload(message)) => {
+            error_response_and_ready(&mut client, &qos, message).await?;
+            return Ok(());
+        }
+        Err(CheckoutFailure::Close) => return Ok(()),
+        Err(CheckoutFailure::Fatal(error)) => return Err(error),
+    };
     if let Err(error) = proxy_startup(&mut client, &mut backend, &startup_packet).await {
         backend.discard();
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
@@ -189,7 +200,7 @@ async fn handle_client(
             let mut backend = if let Some(backend) = held_backend.take() {
                 backend
             } else {
-                checkout_backend(
+                match checkout_backend(
                     &pool,
                     route_key(
                         &route_database,
@@ -199,7 +210,18 @@ async fn handle_client(
                     ),
                     "checkout backend for cycle",
                 )
-                .await?
+                .await
+                {
+                    Ok(backend) => backend,
+                    Err(CheckoutFailure::Overload(message)) => {
+                        error_response_and_ready(&mut client, &qos, message).await?;
+                        return Ok(());
+                    }
+                    Err(CheckoutFailure::Close) => {
+                        return Ok(());
+                    }
+                    Err(CheckoutFailure::Fatal(error)) => return Err(error),
+                }
             };
 
             if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
@@ -301,11 +323,32 @@ async fn checkout_backend(
     pool: &Arc<BackendPool>,
     route: RouteKey,
     context: &'static str,
-) -> anyhow::Result<PooledBackend> {
+) -> Result<PooledBackend, CheckoutFailure> {
     let started = Instant::now();
-    let backend = pool.checkout(route).await.context(context)?;
+    let backend = match pool.checkout(route).await {
+        Ok(backend) => backend,
+        Err(crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::QueueFull,
+        )) => return Err(CheckoutFailure::Overload("backend checkout queue is full")),
+        Err(crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Timeout,
+        )) => return Err(CheckoutFailure::Overload("backend checkout timed out")),
+        Err(crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Closed,
+        )) => return Err(CheckoutFailure::Close),
+        Err(crate::pool::PoolError::Connect(error)) => {
+            return Err(CheckoutFailure::Fatal(error.context(context)));
+        }
+    };
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
     Ok(backend)
+}
+
+#[derive(Debug)]
+enum CheckoutFailure {
+    Overload(&'static str),
+    Close,
+    Fatal(anyhow::Error),
 }
 
 fn startup_route_key(startup_packet: &[u8]) -> anyhow::Result<(String, String, Option<String>)> {
@@ -518,10 +561,17 @@ fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
 }
 
 fn synthetic_startup_ready() -> BytesMut {
+    let ready = ready_for_query_idle();
     let mut bytes = BytesMut::new();
     bytes.put_u8(u8::from(BackendTag::Authentication));
     bytes.put_i32(8);
     bytes.put_i32(0);
+    bytes.extend_from_slice(&ready);
+    bytes
+}
+
+fn ready_for_query_idle() -> BytesMut {
+    let mut bytes = BytesMut::new();
     bytes.put_u8(u8::from(BackendTag::ReadyForQuery));
     bytes.put_i32(5);
     bytes.put_u8(u8::from(ReadyStatusByte::Idle));
@@ -892,6 +942,23 @@ async fn recover_backend(
             Ok(false)
         }
     }
+}
+
+async fn error_response_and_ready(
+    client: &mut TcpStream,
+    qos: &crate::config::QosConfig,
+    message: &'static str,
+) -> anyhow::Result<()> {
+    let error = build_error_response(&qos.overload_error_code, message);
+    client
+        .write_all(&error)
+        .await
+        .context("write overload error response")?;
+    let ready = ready_for_query_idle();
+    client
+        .write_all(&ready)
+        .await
+        .context("write ready after overload")
 }
 
 async fn finalize_backend_on_disconnect(

@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
     error::WireError,
@@ -7,6 +7,8 @@ use crate::{
 };
 
 const SQLSTATE_FIELD_KIND: u8 = b'C';
+const SEVERITY_FIELD_KIND: u8 = b'S';
+const MESSAGE_FIELD_KIND: u8 = b'M';
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadyStatus {
@@ -19,6 +21,26 @@ pub enum ReadyStatus {
 pub struct BackendFrame {
     pub tag: u8,
     pub payload: Bytes,
+}
+
+#[must_use]
+pub fn build_error_response(sqlstate: &str, message: &str) -> Bytes {
+    let mut payload = BytesMut::new();
+    payload.put_u8(SEVERITY_FIELD_KIND);
+    payload.extend_from_slice(b"ERROR\0");
+    payload.put_u8(SQLSTATE_FIELD_KIND);
+    payload.extend_from_slice(sqlstate.as_bytes());
+    payload.put_u8(0);
+    payload.put_u8(MESSAGE_FIELD_KIND);
+    payload.extend_from_slice(message.as_bytes());
+    payload.put_u8(0);
+    payload.put_u8(0);
+
+    let mut frame = BytesMut::with_capacity(payload.len() + 5);
+    frame.put_u8(u8::from(BackendTag::ErrorResponse));
+    frame.put_i32((payload.len() + 4) as i32);
+    frame.extend_from_slice(&payload);
+    frame.freeze()
 }
 
 impl BackendFrame {

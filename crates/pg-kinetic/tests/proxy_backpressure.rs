@@ -5,9 +5,13 @@ use pg_kinetic::{
     config::{
         CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
     },
+    backpressure::BackpressureError,
+    pool::{BackendPool, PoolError},
     proxy::Proxy,
+    route::{QueryClass, RouteKey},
     recovery::RecoveryMode,
     wire::{
+        backend::{build_error_response, parse_backend_frame, BackendFrame},
         frame::parse_frontend_frame,
         message::parse_simple_query,
         protocol::{FrontendTag, ProtocolVersion},
@@ -37,6 +41,66 @@ async fn startup_route_components_are_forwarded_to_the_backend() {
 
     let events = collect_events(&mut seen).await;
     assert!(events.iter().any(|event| event.contains("startup db=pgkinetic user=postgres app=api")));
+}
+
+#[test]
+fn overload_error_responses_include_clear_fields() {
+    let cases = [
+        ("53301", "backend checkout queue is full"),
+        ("53301", "backend checkout timed out"),
+        ("57014", "query timed out"),
+        ("57000", "idle client timed out"),
+        ("57000", "backend response buffer limit exceeded"),
+    ];
+
+    for (sqlstate, message) in cases {
+        let frame = parse_error_frame(&build_error_response(sqlstate, message));
+        assert_eq!(frame.tag, b'E');
+        assert_error_field(&frame, b'S', "ERROR");
+        assert_error_field(&frame, b'C', sqlstate);
+        assert_error_field(&frame, b'M', message);
+    }
+}
+
+#[tokio::test]
+async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
+    let route = RouteKey::new(
+        "pgkinetic",
+        "postgres",
+        Some("api"),
+        None,
+        QueryClass::Default,
+    );
+
+    let queue_full = BackendPool::new(
+        "127.0.0.1:1".parse().expect("backend addr"),
+        1,
+        1,
+        0,
+        0,
+        Duration::from_millis(5),
+        "DISCARD ALL",
+    );
+    let queue_full_error = queue_full.checkout(route.clone()).await.expect_err("queue full");
+    assert!(matches!(
+        queue_full_error,
+        PoolError::Backpressure(BackpressureError::QueueFull)
+    ));
+
+    let timeout = BackendPool::new(
+        "127.0.0.1:1".parse().expect("backend addr"),
+        1,
+        1,
+        0,
+        1,
+        Duration::from_millis(5),
+        "DISCARD ALL",
+    );
+    let timeout_error = timeout.checkout(route).await.expect_err("timeout");
+    assert!(matches!(
+        timeout_error,
+        PoolError::Backpressure(BackpressureError::Timeout)
+    ));
 }
 
 #[tokio::test]
@@ -135,6 +199,26 @@ impl HoldRule {
 
 async fn spawn_proxy_with_backend(
     hold_rule: HoldRule,
+) -> (SocketAddr, mpsc::Receiver<String>, Arc<Notify>) {
+    spawn_proxy_with_backend_and_qos(
+        hold_rule,
+        QosConfig {
+            max_route_in_flight: 1,
+            max_route_waiters: 1,
+            query_timeout_ms: 30_000,
+            idle_client_timeout_ms: 300_000,
+            idle_transaction_timeout_ms: 60_000,
+            max_client_buffer_bytes: 1_048_576,
+            max_backend_buffer_bytes: 4_194_304,
+            overload_error_code: "53300".to_string(),
+        },
+    )
+    .await
+}
+
+async fn spawn_proxy_with_backend_and_qos(
+    hold_rule: HoldRule,
+    qos: QosConfig,
 ) -> (SocketAddr, mpsc::Receiver<String>, Arc<Notify>) {
     let (sender, receiver) = mpsc::channel(128);
     let release_hold = Arc::new(Notify::new());
@@ -238,16 +322,7 @@ async fn spawn_proxy_with_backend(
             recovery_timeout_ms: 1_000,
             backend_reset_query: "DISCARD ALL".to_string(),
         },
-        qos: QosConfig {
-            max_route_in_flight: 1,
-            max_route_waiters: 1,
-            query_timeout_ms: 30_000,
-            idle_client_timeout_ms: 300_000,
-            idle_transaction_timeout_ms: 60_000,
-            max_client_buffer_bytes: 1_048_576,
-            max_backend_buffer_bytes: 4_194_304,
-            overload_error_code: "53300".to_string(),
-        },
+        qos,
         observability: ObservabilityConfig { metrics_addr: None },
     };
 
@@ -284,6 +359,37 @@ async fn send_query(stream: &mut TcpStream, query: &str) {
 async fn read_response(stream: &mut TcpStream) {
     let mut response = [0_u8; 256];
     let _ = stream.read(&mut response).await.expect("response");
+}
+
+fn parse_error_frame(bytes: &[u8]) -> BackendFrame {
+    let mut buffer = BytesMut::from(bytes);
+    parse_backend_frame(&mut buffer)
+        .expect("parse backend frame")
+        .expect("backend frame")
+}
+
+fn assert_error_field(frame: &BackendFrame, kind: u8, expected: &str) {
+    let mut offset = 0;
+    while offset < frame.payload.len() {
+        let field_kind = frame.payload[offset];
+        offset += 1;
+
+        if field_kind == 0 {
+            break;
+        }
+
+        let remaining = &frame.payload[offset..];
+        let terminator = remaining.iter().position(|byte| *byte == 0).expect("terminated");
+        let value = std::str::from_utf8(&remaining[..terminator]).expect("utf8");
+        if field_kind == kind {
+            assert_eq!(value, expected);
+            return;
+        }
+
+        offset += terminator + 1;
+    }
+
+    panic!("missing error field {kind}");
 }
 
 async fn wait_for_event(receiver: &mut mpsc::Receiver<String>, expected: &str) -> String {
