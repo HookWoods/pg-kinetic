@@ -2,7 +2,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
-    config::{CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig},
+    config::{
+        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
+    },
     proxy::Proxy,
     recovery::RecoveryMode,
     wire::{
@@ -275,6 +277,16 @@ async fn spawn_proxy_with_backend(
             recovery_mode,
             recovery_timeout_ms,
             backend_reset_query: "DISCARD ALL".to_string(),
+        },
+        qos: QosConfig {
+            max_route_in_flight: 100,
+            max_route_waiters: 1_000,
+            query_timeout_ms: 30_000,
+            idle_client_timeout_ms: 300_000,
+            idle_transaction_timeout_ms: 60_000,
+            max_client_buffer_bytes: 1_048_576,
+            max_backend_buffer_bytes: 4_194_304,
+            overload_error_code: "53300".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },
     };

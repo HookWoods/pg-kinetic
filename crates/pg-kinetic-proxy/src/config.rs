@@ -2,6 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
+use pg_kinetic_core::constants::{BufferDefaults, QosDefaults, TimeoutDefaults};
 use pg_kinetic_core::recovery::RecoveryMode;
 
 #[derive(Clone, Debug, Parser)]
@@ -16,6 +17,9 @@ pub struct Config {
 
     #[command(flatten)]
     pub performance: PerformanceConfig,
+
+    #[command(flatten)]
+    pub qos: QosConfig,
 
     #[command(flatten)]
     pub observability: ObservabilityConfig,
@@ -71,6 +75,61 @@ pub struct PerformanceConfig {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct QosConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_MAX_ROUTE_IN_FLIGHT",
+        default_value_t = QosDefaults::MAX_ROUTE_IN_FLIGHT
+    )]
+    pub max_route_in_flight: usize,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_MAX_ROUTE_WAITERS",
+        default_value_t = QosDefaults::MAX_ROUTE_WAITERS
+    )]
+    pub max_route_waiters: usize,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_QUERY_TIMEOUT_MS",
+        default_value_t = TimeoutDefaults::QUERY_TIMEOUT_MS
+    )]
+    pub query_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_IDLE_CLIENT_TIMEOUT_MS",
+        default_value_t = TimeoutDefaults::IDLE_CLIENT_TIMEOUT_MS
+    )]
+    pub idle_client_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_IDLE_TRANSACTION_TIMEOUT_MS",
+        default_value_t = TimeoutDefaults::IDLE_TRANSACTION_TIMEOUT_MS
+    )]
+    pub idle_transaction_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_MAX_CLIENT_BUFFER_BYTES",
+        default_value_t = BufferDefaults::MAX_CLIENT_BUFFER_BYTES
+    )]
+    pub max_client_buffer_bytes: usize,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_MAX_BACKEND_BUFFER_BYTES",
+        default_value_t = BufferDefaults::MAX_BACKEND_BUFFER_BYTES
+    )]
+    pub max_backend_buffer_bytes: usize,
+
+    #[arg(long, env = "PG_KINETIC_OVERLOAD_ERROR_CODE", default_value = "53300")]
+    pub overload_error_code: String,
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
@@ -95,6 +154,23 @@ impl PerformanceConfig {
     }
 }
 
+impl QosConfig {
+    #[must_use]
+    pub const fn query_timeout(&self) -> Duration {
+        Duration::from_millis(self.query_timeout_ms)
+    }
+
+    #[must_use]
+    pub const fn idle_client_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_client_timeout_ms)
+    }
+
+    #[must_use]
+    pub const fn idle_transaction_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_transaction_timeout_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
@@ -102,7 +178,7 @@ mod tests {
     use std::{net::SocketAddr, time::Duration};
 
     #[test]
-    fn parses_defaults() {
+    fn config_parses_defaults() {
         let config = Config::try_parse_from(["pg-kinetic"]).expect("defaults parse");
 
         assert_eq!(
@@ -133,11 +209,22 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(config.performance.backend_reset_query, "DISCARD ALL");
+        assert_eq!(config.qos.max_route_in_flight, 100);
+        assert_eq!(config.qos.max_route_waiters, 1_000);
+        assert_eq!(config.qos.query_timeout(), Duration::from_secs(30));
+        assert_eq!(config.qos.idle_client_timeout(), Duration::from_secs(300));
+        assert_eq!(
+            config.qos.idle_transaction_timeout(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.qos.max_client_buffer_bytes, 1_048_576);
+        assert_eq!(config.qos.max_backend_buffer_bytes, 4_194_304);
+        assert_eq!(config.qos.overload_error_code, "53300");
         assert_eq!(config.observability.metrics_addr, None);
     }
 
     #[test]
-    fn parses_explicit_flags() {
+    fn config_parses_explicit_flags() {
         let config = Config::try_parse_from([
             "pg-kinetic",
             "--listen-addr",
@@ -158,6 +245,22 @@ mod tests {
             "7500",
             "--backend-reset-query",
             "DISCARD TEMP",
+            "--max-route-in-flight",
+            "7",
+            "--max-route-waiters",
+            "9",
+            "--query-timeout-ms",
+            "1234",
+            "--idle-client-timeout-ms",
+            "5678",
+            "--idle-transaction-timeout-ms",
+            "9012",
+            "--max-client-buffer-bytes",
+            "111",
+            "--max-backend-buffer-bytes",
+            "222",
+            "--overload-error-code",
+            "53301",
         ])
         .expect("flags parse");
 
@@ -187,10 +290,24 @@ mod tests {
             Duration::from_millis(7_500)
         );
         assert_eq!(config.performance.backend_reset_query, "DISCARD TEMP");
+        assert_eq!(config.qos.max_route_in_flight, 7);
+        assert_eq!(config.qos.max_route_waiters, 9);
+        assert_eq!(config.qos.query_timeout(), Duration::from_millis(1_234));
+        assert_eq!(
+            config.qos.idle_client_timeout(),
+            Duration::from_millis(5_678)
+        );
+        assert_eq!(
+            config.qos.idle_transaction_timeout(),
+            Duration::from_millis(9_012)
+        );
+        assert_eq!(config.qos.max_client_buffer_bytes, 111);
+        assert_eq!(config.qos.max_backend_buffer_bytes, 222);
+        assert_eq!(config.qos.overload_error_code, "53301");
     }
 
     #[test]
-    fn parses_pool_and_metrics_flags() {
+    fn config_parses_pool_and_metrics_flags() {
         let config = Config::try_parse_from([
             "pg-kinetic",
             "--max-backends",
@@ -207,6 +324,8 @@ mod tests {
         assert_eq!(config.capacity.max_backends, 8);
         assert_eq!(config.capacity.max_checkout_waiters, 16);
         assert_eq!(config.performance.backend_reset_query, "DISCARD ALL");
+        assert_eq!(config.qos.max_route_in_flight, 100);
+        assert_eq!(config.qos.max_route_waiters, 1_000);
         assert_eq!(
             config.observability.metrics_addr,
             Some("127.0.0.1:9099".parse().expect("valid socket"))
@@ -214,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn disables_metrics_by_default() {
+    fn config_disables_metrics_by_default() {
         let config = Config::try_parse_from(["pg-kinetic"]).expect("defaults parse");
 
         assert_eq!(config.observability.metrics_addr, None);

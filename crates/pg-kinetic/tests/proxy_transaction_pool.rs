@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
-    config::{CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig},
+    config::{
+        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
+    },
     proxy::Proxy,
     wire::protocol::{FrontendTag, ProtocolVersion},
 };
@@ -66,6 +68,16 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 5_000,
             backend_reset_query: "DISCARD ALL".to_string(),
+        },
+        qos: QosConfig {
+            max_route_in_flight: 100,
+            max_route_waiters: 1_000,
+            query_timeout_ms: 30_000,
+            idle_client_timeout_ms: 300_000,
+            idle_transaction_timeout_ms: 60_000,
+            max_client_buffer_bytes: 1_048_576,
+            max_backend_buffer_bytes: 4_194_304,
+            overload_error_code: "53300".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },
     };
