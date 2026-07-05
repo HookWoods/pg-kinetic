@@ -35,6 +35,7 @@ impl Proxy {
         loop {
             let (client, client_addr) = listener.accept().await.context("accept client")?;
             let backend_addr = self.config.connection.backend_addr;
+            crate::metrics::increment_client_connections();
             let permit = self.client_slots.clone().acquire_owned().await?;
 
             tokio::spawn(async move {
