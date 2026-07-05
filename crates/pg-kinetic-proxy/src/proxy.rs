@@ -23,7 +23,7 @@ use crate::{
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
-    constants::PreparedEvent,
+    constants::{MetricName, PreparedEvent},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
@@ -123,9 +123,13 @@ async fn handle_client(
     let mut held_backend: Option<PooledBackend> = None;
     let mut wait_for_client_activity_after_timeout = false;
 
-    let startup_packet = match read_startup_packet(&mut client, qos.idle_client_timeout())
-        .await
-        .with_context(|| format!("proxy client {client_addr}"))?
+    let startup_packet = match read_startup_packet(
+        &mut client,
+        qos.idle_client_timeout(),
+        qos.max_client_buffer_bytes,
+    )
+    .await
+    .with_context(|| format!("proxy client {client_addr}"))?
     {
         StartupRead::Packet(packet) => packet,
         StartupRead::ClientClosed => return Ok(()),
@@ -137,6 +141,10 @@ async fn handle_client(
                 ReadyStatus::Idle,
             )
             .await?;
+            return Ok(());
+        }
+        StartupRead::BufferLimitExceeded => {
+            record_buffer_limit(BufferBudgetKind::Client);
             return Ok(());
         }
     };
@@ -164,7 +172,20 @@ async fn handle_client(
         Err(CheckoutFailure::Close) => return Ok(()),
         Err(CheckoutFailure::Fatal(error)) => return Err(error),
     };
-    if let Err(error) = proxy_startup(&mut client, &mut backend, &startup_packet).await {
+    if let Err(error) = proxy_startup(
+        &mut client,
+        &mut backend,
+        &startup_packet,
+        qos.max_client_buffer_bytes,
+        qos.max_backend_buffer_bytes,
+    )
+    .await
+    {
+        if buffer_limit_kind(&error).is_some() {
+            backend.discard();
+            return Ok(());
+        }
+
         backend.discard();
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
     }
@@ -197,6 +218,7 @@ async fn handle_client(
             &mut client_buffer,
             cycle_timeout,
             idle_timeout_kind,
+            qos.max_client_buffer_bytes,
         )
         .await?
         else {
@@ -235,9 +257,10 @@ async fn handle_client(
 
                 if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
                     let replay = replay_frames(&session);
-                    let status = execute_backend_batch(&mut backend, &replay)
-                        .await
-                        .context("replay virtual session")?;
+                    let status =
+                        execute_backend_batch(&mut backend, &replay, qos.max_backend_buffer_bytes)
+                            .await
+                            .context("replay virtual session")?;
                     anyhow::ensure!(
                         status == ReadyStatus::Idle,
                         "unexpected replay status: {status:?}"
@@ -255,6 +278,7 @@ async fn handle_client(
                         frames,
                         &mut route_application_name,
                         &mut progress,
+                        qos.max_backend_buffer_bytes,
                     ),
                 )
                 .await;
@@ -277,9 +301,13 @@ async fn handle_client(
                                 backend.release().await;
                             }
                             CleanupAction::ResetThenReuse => {
-                                execute_simple_query(&mut backend, pool.reset_query())
-                                    .await
-                                    .context("reset backend before reuse")?;
+                                execute_simple_query(
+                                    &mut backend,
+                                    pool.reset_query(),
+                                    qos.max_backend_buffer_bytes,
+                                )
+                                .await
+                                .context("reset backend before reuse")?;
                                 pinned_backend.clear();
                                 backend.release().await;
                             }
@@ -291,9 +319,13 @@ async fn handle_client(
                                 held_backend = Some(backend);
                             }
                             CleanupAction::RollbackThenReuse => {
-                                execute_simple_query(&mut backend, "ROLLBACK")
-                                    .await
-                                    .context("rollback failed transaction")?;
+                                execute_simple_query(
+                                    &mut backend,
+                                    "ROLLBACK",
+                                    qos.max_backend_buffer_bytes,
+                                )
+                                .await
+                                .context("rollback failed transaction")?;
                                 session.apply_sql(classify("rollback"));
                                 pinned_backend.clear();
                                 backend.release().await;
@@ -315,6 +347,7 @@ async fn handle_client(
                             &performance,
                             needs_sync,
                             &mut session,
+                            qos.max_backend_buffer_bytes,
                         )
                         .await
                         .context("recover abandoned response")?;
@@ -326,7 +359,17 @@ async fn handle_client(
                         }
                         return Ok(());
                     }
+                    Ok(Ok(ForwardOutcome::BufferLimitExceeded)) => {
+                        backend.discard();
+                        return Ok(());
+                    }
                     Ok(Err(error)) => {
+                        if let Some(kind) = buffer_limit_kind(&error) {
+                            record_buffer_limit(kind);
+                            backend.discard();
+                            return Ok(());
+                        }
+
                         backend.discard();
                         return Err(error).with_context(|| format!("proxy client {client_addr}"));
                     }
@@ -338,6 +381,7 @@ async fn handle_client(
                             &mut session,
                             &mut pinned_backend,
                             progress,
+                            qos.max_backend_buffer_bytes,
                         )
                         .await?;
 
@@ -357,6 +401,7 @@ async fn handle_client(
                         &performance,
                         &mut session,
                         &mut pinned_backend,
+                        &qos,
                     )
                     .await?;
                 }
@@ -370,6 +415,7 @@ async fn handle_client(
                         &performance,
                         &mut session,
                         &mut pinned_backend,
+                        &qos,
                     )
                     .await?;
                 }
@@ -381,6 +427,22 @@ async fn handle_client(
                 }
 
                 wait_for_client_activity_after_timeout = true;
+            }
+            ClientCycle::BufferLimitExceeded => {
+                record_buffer_limit(BufferBudgetKind::Client);
+                if let Some(backend) = held_backend.take() {
+                    finalize_backend_on_disconnect(
+                        backend,
+                        &pool,
+                        &performance,
+                        &mut session,
+                        &mut pinned_backend,
+                        &qos,
+                    )
+                    .await?;
+                }
+
+                return Ok(());
             }
         }
     }
@@ -462,16 +524,26 @@ async fn next_client_cycle(
     client_buffer: &mut BytesMut,
     idle_timeout: Option<Duration>,
     idle_timeout_kind: IdleTimeoutKind,
+    max_client_buffer_bytes: usize,
 ) -> anyhow::Result<Option<ClientCycle>> {
     let first = loop {
         if let Some(frame) = parse_frontend_frame(client_buffer)? {
             break frame;
         }
 
+        if client_buffer.len() >= max_client_buffer_bytes {
+            return Ok(Some(ClientCycle::BufferLimitExceeded));
+        }
+
         match idle_timeout {
             Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
                 Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
-                Ok(Ok(_)) => continue,
+                Ok(Ok(_)) => {
+                    if client_buffer.len() > max_client_buffer_bytes {
+                        return Ok(Some(ClientCycle::BufferLimitExceeded));
+                    }
+                    continue;
+                }
                 Ok(Err(error)) => return Err(error).context("read client"),
                 Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
             },
@@ -483,6 +555,10 @@ async fn next_client_cycle(
                     == 0
                 {
                     return Ok(Some(ClientCycle::Terminate));
+                }
+
+                if client_buffer.len() > max_client_buffer_bytes {
+                    return Ok(Some(ClientCycle::BufferLimitExceeded));
                 }
             }
         }
@@ -506,10 +582,19 @@ async fn next_client_cycle(
             continue;
         }
 
+        if client_buffer.len() >= max_client_buffer_bytes {
+            return Ok(Some(ClientCycle::BufferLimitExceeded));
+        }
+
         match idle_timeout {
             Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
                 Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
-                Ok(Ok(_)) => continue,
+                Ok(Ok(_)) => {
+                    if client_buffer.len() > max_client_buffer_bytes {
+                        return Ok(Some(ClientCycle::BufferLimitExceeded));
+                    }
+                    continue;
+                }
                 Ok(Err(error)) => return Err(error).context("read extended query frame"),
                 Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
             },
@@ -521,6 +606,10 @@ async fn next_client_cycle(
                     == 0
                 {
                     return Ok(Some(ClientCycle::Terminate));
+                }
+
+                if client_buffer.len() > max_client_buffer_bytes {
+                    return Ok(Some(ClientCycle::BufferLimitExceeded));
                 }
             }
         }
@@ -534,6 +623,7 @@ enum ClientCycle {
     Frames(Vec<FrontendFrame>),
     Terminate,
     IdleTimeout(IdleTimeoutKind),
+    BufferLimitExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,6 +640,7 @@ struct QueryProgress {
 async fn read_startup_packet(
     client: &mut TcpStream,
     idle_timeout: Duration,
+    max_client_buffer_bytes: usize,
 ) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
     loop {
@@ -567,9 +658,18 @@ async fn read_startup_packet(
             }
         }
 
+        if buffer.len() >= max_client_buffer_bytes {
+            return Ok(StartupRead::BufferLimitExceeded);
+        }
+
         match timeout(idle_timeout, client.read_buf(&mut buffer)).await {
             Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
-            Ok(Ok(_)) => continue,
+            Ok(Ok(_)) => {
+                if buffer.len() > max_client_buffer_bytes {
+                    return Ok(StartupRead::BufferLimitExceeded);
+                }
+                continue;
+            }
             Ok(Err(error)) => return Err(error).context("read startup"),
             Err(_) => return Ok(StartupRead::TimedOut),
         }
@@ -610,12 +710,15 @@ enum StartupRead {
     Packet(BytesMut),
     ClientClosed,
     TimedOut,
+    BufferLimitExceeded,
 }
 
 async fn proxy_startup(
     client: &mut TcpStream,
     backend: &mut PooledBackend,
     startup_packet: &[u8],
+    max_client_buffer_bytes: usize,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
         client
@@ -635,12 +738,20 @@ async fn proxy_startup(
     let mut client_buffer = BytesMut::with_capacity(8192);
     let mut backend_buffer = BytesMut::with_capacity(8192);
     loop {
+        if backend_buffer.len() >= max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
         backend
             .backend_mut()
             .stream_mut()
             .read_buf(&mut backend_buffer)
             .await
             .context("read startup response")?;
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
             client
                 .write_all(&encode_backend_frame(&frame))
@@ -650,12 +761,19 @@ async fn proxy_startup(
             if frame.tag == u8::from(BackendTag::Authentication)
                 && auth_request_expects_client_response(&frame.payload)?
             {
+                if client_buffer.len() >= max_client_buffer_bytes {
+                    return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+                }
+
                 client_buffer.clear();
                 let read = client
                     .read_buf(&mut client_buffer)
                     .await
                     .context("read startup auth response")?;
                 anyhow::ensure!(read > 0, "client disconnected during startup auth");
+                if client_buffer.len() > max_client_buffer_bytes {
+                    return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+                }
                 backend
                     .backend_mut()
                     .stream_mut()
@@ -719,6 +837,7 @@ async fn forward_message_cycle(
     frames: Vec<FrontendFrame>,
     route_application_name: &mut Option<String>,
     progress: &mut QueryProgress,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let mut outbound = BytesMut::new();
@@ -741,6 +860,11 @@ async fn forward_message_cycle(
 
     let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
     loop {
+        if backend_buffer.len() >= max_backend_buffer_bytes {
+            record_buffer_limit(BufferBudgetKind::Backend);
+            return Ok(ForwardOutcome::BufferLimitExceeded);
+        }
+
         let read = backend
             .backend_mut()
             .stream_mut()
@@ -749,6 +873,11 @@ async fn forward_message_cycle(
             .context("read backend frame")?;
         if read == 0 {
             anyhow::bail!("backend disconnected during response cycle");
+        }
+
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            record_buffer_limit(BufferBudgetKind::Backend);
+            return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
         let mut forward = BytesMut::new();
@@ -880,6 +1009,7 @@ enum ForwardOutcome {
     Ready(ReadyStatus),
     ClientDisconnectedAfterReady(ReadyStatus),
     AbandonedResponse { needs_sync: bool },
+    BufferLimitExceeded,
 }
 
 fn should_sync_for_frames(frames: &[FrontendFrame]) -> bool {
@@ -958,6 +1088,7 @@ fn update_virtual_session_from_frame(
 async fn execute_backend_batch(
     backend: &mut PooledBackend,
     frames: &[FrontendFrame],
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ReadyStatus> {
     let mut outbound = BytesMut::new();
     for frame in frames {
@@ -970,13 +1101,21 @@ async fn execute_backend_batch(
         .write_all(&outbound)
         .await
         .context("write backend batch")?;
-    await_ready_status(backend).await
+    await_ready_status(backend, max_backend_buffer_bytes).await
 }
 
-async fn execute_simple_query(backend: &mut PooledBackend, sql: &str) -> anyhow::Result<()> {
-    let status = execute_backend_batch(backend, &[simple_query_frame(sql)])
-        .await
-        .with_context(|| format!("execute backend query {sql}"))?;
+async fn execute_simple_query(
+    backend: &mut PooledBackend,
+    sql: &str,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<()> {
+    let status = execute_backend_batch(
+        backend,
+        &[simple_query_frame(sql)],
+        max_backend_buffer_bytes,
+    )
+    .await
+    .with_context(|| format!("execute backend query {sql}"))?;
     anyhow::ensure!(
         status == ReadyStatus::Idle,
         "unexpected backend status after {sql}: {status:?}"
@@ -984,9 +1123,16 @@ async fn execute_simple_query(backend: &mut PooledBackend, sql: &str) -> anyhow:
     Ok(())
 }
 
-async fn await_ready_status(backend: &mut PooledBackend) -> anyhow::Result<ReadyStatus> {
+async fn await_ready_status(
+    backend: &mut PooledBackend,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<ReadyStatus> {
     let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
     loop {
+        if backend_buffer.len() >= max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
         let read = backend
             .backend_mut()
             .stream_mut()
@@ -995,6 +1141,10 @@ async fn await_ready_status(backend: &mut PooledBackend) -> anyhow::Result<Ready
             .context("read backend response")?;
         if read == 0 {
             anyhow::bail!("backend disconnected during response drain");
+        }
+
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
         let mut ready = None;
@@ -1016,21 +1166,23 @@ async fn recover_backend(
     performance: &crate::config::PerformanceConfig,
     needs_sync: bool,
     session: &mut VirtualSession,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<bool> {
     let action = recovery_action(trigger, performance.recovery_mode);
     let recovered = timeout(performance.recovery_timeout(), async {
         match action {
             RecoveryAction::None => Ok(true),
             RecoveryAction::Rollback => {
-                execute_simple_query(backend, "ROLLBACK").await?;
+                execute_simple_query(backend, "ROLLBACK", max_backend_buffer_bytes).await?;
                 session.apply_sql(classify("rollback"));
                 Ok(true)
             }
             RecoveryAction::DrainAndSync => {
                 let status = if needs_sync {
-                    execute_backend_batch(backend, &[sync_frame()]).await?
+                    execute_backend_batch(backend, &[sync_frame()], max_backend_buffer_bytes)
+                        .await?
                 } else {
-                    await_ready_status(backend).await?
+                    await_ready_status(backend, max_backend_buffer_bytes).await?
                 };
                 anyhow::ensure!(
                     status == ReadyStatus::Idle,
@@ -1040,15 +1192,16 @@ async fn recover_backend(
             }
             RecoveryAction::RollbackAndDrain => {
                 let status = if needs_sync {
-                    execute_backend_batch(backend, &[sync_frame()]).await?
+                    execute_backend_batch(backend, &[sync_frame()], max_backend_buffer_bytes)
+                        .await?
                 } else {
-                    await_ready_status(backend).await?
+                    await_ready_status(backend, max_backend_buffer_bytes).await?
                 };
                 anyhow::ensure!(
                     status == ReadyStatus::Idle,
                     "unexpected recovery status: {status:?}"
                 );
-                execute_simple_query(backend, "ROLLBACK").await?;
+                execute_simple_query(backend, "ROLLBACK", max_backend_buffer_bytes).await?;
                 session.apply_sql(classify("rollback"));
                 Ok(true)
             }
@@ -1063,6 +1216,10 @@ async fn recover_backend(
             Ok(reuse)
         }
         Ok(Err(error)) => {
+            if buffer_limit_kind(&error).is_some() {
+                metrics::increment_recovery(trigger, action, "buffer_limit");
+                return Ok(false);
+            }
             metrics::increment_recovery(trigger, action, "error");
             Err(error)
         }
@@ -1124,9 +1281,10 @@ async fn handle_query_timeout(
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
     progress: QueryProgress,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<bool> {
     metrics_crate::counter!(
-        pg_kinetic_core::constants::MetricName::TimeoutTotal.as_str(),
+        MetricName::TimeoutTotal.as_str(),
         "kind" => "query"
     )
     .increment(1);
@@ -1148,9 +1306,16 @@ async fn handle_query_timeout(
         .await?;
     }
 
-    let reused = recover_backend(&mut backend, recovery_trigger, performance, false, session)
-        .await
-        .unwrap_or(false);
+    let reused = recover_backend(
+        &mut backend,
+        recovery_trigger,
+        performance,
+        false,
+        session,
+        max_backend_buffer_bytes,
+    )
+    .await
+    .unwrap_or(false);
     pinned_backend.clear();
     if reused {
         backend.release().await;
@@ -1163,7 +1328,7 @@ async fn handle_query_timeout(
 
 async fn handle_idle_timeout(client: &mut TcpStream, kind: IdleTimeoutKind) -> anyhow::Result<()> {
     metrics_crate::counter!(
-        pg_kinetic_core::constants::MetricName::TimeoutTotal.as_str(),
+        MetricName::TimeoutTotal.as_str(),
         "kind" => match kind {
             IdleTimeoutKind::Client => "idle_client",
             IdleTimeoutKind::Transaction => "idle_transaction",
@@ -1198,6 +1363,7 @@ async fn finalize_backend_on_disconnect(
     performance: &crate::config::PerformanceConfig,
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
+    qos: &crate::config::QosConfig,
 ) -> anyhow::Result<()> {
     match session.pin_reason() {
         Some(PinReason::OpenTransaction) | Some(PinReason::FailedTransaction) => {
@@ -1207,6 +1373,7 @@ async fn finalize_backend_on_disconnect(
                 performance,
                 false,
                 session,
+                qos.max_backend_buffer_bytes,
             )
             .await
             .context("recover abandoned transaction")?;
@@ -1231,9 +1398,13 @@ async fn finalize_backend_on_disconnect(
         }
         None => {
             if session.has_replayable_settings() {
-                execute_simple_query(&mut backend, pool.reset_query())
-                    .await
-                    .context("reset backend during disconnect cleanup")?;
+                execute_simple_query(
+                    &mut backend,
+                    pool.reset_query(),
+                    qos.max_backend_buffer_bytes,
+                )
+                .await
+                .context("reset backend during disconnect cleanup")?;
             }
             pinned_backend.clear();
             backend.release().await;
@@ -1249,6 +1420,53 @@ fn should_replay_session(
     backend_id: u64,
 ) -> bool {
     session.has_replayable_settings() && pinned_backend.backend_id() != Some(backend_id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferBudgetKind {
+    Client,
+    Backend,
+}
+
+impl BufferBudgetKind {
+    #[must_use]
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+impl std::fmt::Display for BufferBudgetKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.metric_label())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{kind} buffer limit exceeded")]
+struct BufferLimitExceeded {
+    kind: BufferBudgetKind,
+}
+
+fn buffer_limit_exceeded(kind: BufferBudgetKind) -> anyhow::Error {
+    record_buffer_limit(kind);
+    BufferLimitExceeded { kind }.into()
+}
+
+fn buffer_limit_kind(error: &anyhow::Error) -> Option<BufferBudgetKind> {
+    error
+        .downcast_ref::<BufferLimitExceeded>()
+        .map(|error| error.kind)
+}
+
+fn record_buffer_limit(kind: BufferBudgetKind) {
+    metrics_crate::counter!(
+        MetricName::BufferLimitTotal.as_str(),
+        "kind" => kind.metric_label()
+    )
+    .increment(1);
 }
 
 #[cfg(test)]

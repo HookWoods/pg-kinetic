@@ -500,6 +500,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "metrics",
  "pg-kinetic-core",
  "pg-kinetic-proxy",
  "pg-kinetic-wire",
