@@ -268,16 +268,19 @@ async fn handle_client(
                 }
 
                 let mut progress = QueryProgress::default();
+                let mut state = ForwardCycleState {
+                    session: &mut session,
+                    prepared: &mut prepared,
+                    route_application_name: &mut route_application_name,
+                    progress: &mut progress,
+                };
                 let result = timeout(
                     qos.query_timeout(),
                     forward_message_cycle(
                         &mut client,
                         &mut backend,
-                        &mut session,
-                        &mut prepared,
+                        &mut state,
                         frames,
-                        &mut route_application_name,
-                        &mut progress,
                         qos.max_backend_buffer_bytes,
                     ),
                 )
@@ -829,21 +832,29 @@ fn auth_request_expects_client_response(payload: &[u8]) -> anyhow::Result<bool> 
     Ok(matches!(code, 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11))
 }
 
+struct ForwardCycleState<'a> {
+    session: &'a mut VirtualSession,
+    prepared: &'a mut PreparedCatalog,
+    route_application_name: &'a mut Option<String>,
+    progress: &'a mut QueryProgress,
+}
+
 async fn forward_message_cycle(
     client: &mut TcpStream,
     backend: &mut PooledBackend,
-    session: &mut VirtualSession,
-    prepared: &mut PreparedCatalog,
+    state: &mut ForwardCycleState<'_>,
     frames: Vec<FrontendFrame>,
-    route_application_name: &mut Option<String>,
-    progress: &mut QueryProgress,
     max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let mut outbound = BytesMut::new();
     for frame in frames {
-        let plan = prepare_frame_for_backend(backend.backend_id(), prepared, frame)?;
-        update_virtual_session_from_frame(session, &plan.frame, route_application_name)?;
+        let plan = prepare_frame_for_backend(backend.backend_id(), state.prepared, frame)?;
+        update_virtual_session_from_frame(
+            state.session,
+            &plan.frame,
+            state.route_application_name,
+        )?;
 
         for prelude in &plan.prelude {
             outbound.extend_from_slice(&encode_frontend_frame(prelude));
@@ -883,19 +894,21 @@ async fn forward_message_cycle(
         let mut forward = BytesMut::new();
         let mut ready = None;
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
-            progress.response_started = true;
+            state.progress.response_started = true;
             if let Some(sqlstate) = frame.sqlstate() {
                 metrics::increment_sqlstate(sqlstate);
-                let scope = prepared.invalidate_for_sqlstate(sqlstate, backend.backend_id());
+                let scope = state
+                    .prepared
+                    .invalidate_for_sqlstate(sqlstate, backend.backend_id());
                 if scope != InvalidationScope::None {
                     metrics::increment_prepared_event(PreparedEvent::Invalidate);
                 }
             }
 
             if frame.tag == u8::from(BackendTag::ErrorResponse)
-                && matches!(session.pin_reason(), Some(PinReason::OpenTransaction))
+                && matches!(state.session.pin_reason(), Some(PinReason::OpenTransaction))
             {
-                session.mark_failed_transaction();
+                state.session.mark_failed_transaction();
             }
 
             forward.extend_from_slice(&encode_backend_frame(&frame));

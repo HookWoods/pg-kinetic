@@ -26,7 +26,7 @@ impl SqlState {
     }
 
     #[must_use]
-    pub fn from_str(code: &str) -> Option<Self> {
+    pub fn parse(code: &str) -> Option<Self> {
         match code {
             "53300" => Some(Self::TooManyConnections),
             "57014" => Some(Self::QueryCanceled),

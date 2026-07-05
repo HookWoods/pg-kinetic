@@ -2,8 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -109,7 +108,10 @@ impl BackpressureGate {
         ))
     }
 
-    pub async fn checkout(&self, timeout: Duration) -> Result<BackpressurePermit, BackpressureError> {
+    pub async fn checkout(
+        &self,
+        timeout: Duration,
+    ) -> Result<BackpressurePermit, BackpressureError> {
         let deadline = time::Instant::now() + timeout;
         self.checkout_until(deadline).await
     }
@@ -148,7 +150,9 @@ impl BackpressureCoordinator {
         let mut routes = self.routes.lock().expect("route map poisoned");
         routes
             .entry(route.clone())
-            .or_insert_with(|| BackpressureGate::new(self.max_route_in_flight, self.max_route_waiters))
+            .or_insert_with(|| {
+                BackpressureGate::new(self.max_route_in_flight, self.max_route_waiters)
+            })
             .clone()
     }
 

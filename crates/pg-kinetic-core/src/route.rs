@@ -1,4 +1,9 @@
-use std::{fmt, net::SocketAddr, sync::Arc};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum QueryClass {
@@ -21,13 +26,33 @@ impl fmt::Display for QueryClass {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RouteKey {
     database: Arc<str>,
     user: Arc<str>,
     application_name: Option<Arc<str>>,
     client_addr: Option<SocketAddr>,
     query_class: QueryClass,
+}
+
+impl PartialEq for RouteKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.database == other.database
+            && self.user == other.user
+            && self.application_name == other.application_name
+            && self.query_class == other.query_class
+    }
+}
+
+impl Eq for RouteKey {}
+
+impl Hash for RouteKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.database.hash(state);
+        self.user.hash(state);
+        self.application_name.hash(state);
+        self.query_class.hash(state);
+    }
 }
 
 impl RouteKey {

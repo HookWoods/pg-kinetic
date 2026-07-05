@@ -82,7 +82,7 @@ impl BackendFrame {
             let value = std::str::from_utf8(&remaining[..terminator]).ok()?;
 
             if field_type == SQLSTATE_FIELD_KIND {
-                return SqlState::from_str(value);
+                return SqlState::parse(value);
             }
 
             offset += terminator + 1;

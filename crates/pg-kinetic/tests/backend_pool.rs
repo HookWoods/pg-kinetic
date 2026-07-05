@@ -5,13 +5,27 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 fn route_key() -> RouteKey {
-    RouteKey::new("pgkinetic", "postgres", Some("api"), None, QueryClass::Default)
+    RouteKey::new(
+        "pgkinetic",
+        "postgres",
+        Some("api"),
+        None,
+        QueryClass::Default,
+    )
 }
 
 #[tokio::test]
 async fn reports_connection_failure_when_backend_unavailable() {
     let backend_addr: SocketAddr = "127.0.0.1:9".parse().expect("valid socket");
-    let pool = BackendPool::new(backend_addr, 1, 1, 1, 1, Duration::from_secs(1), "DISCARD ALL");
+    let pool = BackendPool::new(
+        backend_addr,
+        1,
+        1,
+        1,
+        1,
+        Duration::from_secs(1),
+        "DISCARD ALL",
+    );
 
     let error = pool
         .checkout(route_key())

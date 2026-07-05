@@ -181,10 +181,7 @@ fn describe_metrics() {
         MetricName::RouteWaiting.as_str(),
         "Route waiting checkout count"
     );
-    metrics_crate::describe_counter!(
-        MetricName::TimeoutTotal.as_str(),
-        "Timeouts by kind"
-    );
+    metrics_crate::describe_counter!(MetricName::TimeoutTotal.as_str(), "Timeouts by kind");
     metrics_crate::describe_counter!(
         MetricName::BufferLimitTotal.as_str(),
         "Buffer limit breaches by kind"

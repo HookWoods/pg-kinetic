@@ -1,3 +1,4 @@
+use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 use pg_kinetic::backpressure::{
     BackpressureCoordinator, BackpressureError, BackpressureGate, RouteBackpressureSnapshot,
 };
@@ -7,7 +8,6 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
 };
-use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
 
@@ -74,7 +74,10 @@ fn qos_metric_labels_are_stable() {
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_backpressure_events_total",
-        &[("route", route_label.as_str()), ("outcome", "query_timeout")]
+        &[
+            ("route", route_label.as_str()),
+            ("outcome", "query_timeout")
+        ]
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_route_checkout_wait_ms",
@@ -88,18 +91,9 @@ fn qos_metric_labels_are_stable() {
         "pg_kinetic_route_waiting",
         &[("route", route_label.as_str()), ("scope", "global")]
     ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_timeout_total",
-        &[("kind", "idle_timeout")]
-    ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_timeout_total",
-        &[("kind", "query_timeout")]
-    ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_buffer_limit_total",
-        &[("kind", "buffer_limit")]
-    ));
+    assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "idle_timeout")]));
+    assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "query_timeout")]));
+    assert!(recorder.has_metric("pg_kinetic_buffer_limit_total", &[("kind", "buffer_limit")]));
 }
 
 #[tokio::test]

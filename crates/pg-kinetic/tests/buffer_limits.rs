@@ -29,12 +29,11 @@ use tokio::{
     time,
 };
 
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
 
 #[tokio::test(flavor = "current_thread")]
 async fn client_buffer_overflow_closes_before_backend_checkout() {
-    let _guard = TEST_LOCK.lock().expect("lock test");
+    let _guard = test_lock().lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
     let (proxy_addr, backend_connections) =
@@ -58,7 +57,7 @@ async fn client_buffer_overflow_closes_before_backend_checkout() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn backend_buffer_overflow_discards_the_backend_mid_query() {
-    let _guard = TEST_LOCK.lock().expect("lock test");
+    let _guard = test_lock().lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
     let (proxy_addr, backend_connections) = spawn_proxy(
@@ -119,6 +118,11 @@ fn install_metrics_recorder() -> Arc<TestRecorder> {
             recorder
         })
         .clone()
+}
+
+fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[derive(Debug, Default)]

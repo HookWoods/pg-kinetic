@@ -1,9 +1,15 @@
-use std::{collections::{HashMap, VecDeque}, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::backend::Backend;
+use crate::metrics;
 use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
     route::RouteKey,
@@ -67,9 +73,36 @@ impl BackendPool {
 
     pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
         let route_gate = self.route_gate(&route).await;
+        let started = Instant::now();
         let checkout = async {
-            let route_permit = route_gate.checkout(self.checkout_timeout).await?;
-            let permit = self.gate.checkout(self.checkout_timeout).await?;
+            let route_permit = match route_gate.checkout(self.checkout_timeout).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    metrics::increment_backpressure_event(&route, backpressure_outcome(error));
+                    metrics::record_route_wait(
+                        &route,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        backpressure_outcome(error),
+                    );
+                    return Err(PoolError::Backpressure(error));
+                }
+            };
+            let permit = match self.gate.checkout(self.checkout_timeout).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    metrics::increment_backpressure_event(&route, backpressure_outcome(error));
+                    metrics::record_route_wait(
+                        &route,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        backpressure_outcome(error),
+                    );
+                    return Err(PoolError::Backpressure(error));
+                }
+            };
+
+            metrics::record_route_wait(&route, started.elapsed().as_secs_f64() * 1000.0, "ok");
+            metrics::record_route_in_flight(&route, route_gate.in_flight());
+            metrics::record_route_waiting(&route, route_gate.waiting());
 
             if let Some(backend) = self.idle.lock().await.pop_front() {
                 return Ok(PooledBackend {
@@ -84,17 +117,25 @@ impl BackendPool {
                 .await
                 .map_err(PoolError::Connect)?;
 
-            return Ok(PooledBackend {
+            Ok(PooledBackend {
                 backend: Some(backend),
                 pool: self.clone(),
                 _permit: BackpressurePermit::join(route_permit, permit),
                 requires_startup: true,
-            });
+            })
         };
 
         match timeout(self.checkout_timeout, checkout).await {
             Ok(result) => result,
-            Err(_) => Err(PoolError::Backpressure(BackpressureError::Timeout)),
+            Err(_) => {
+                metrics::increment_backpressure_event(&route, "timeout");
+                metrics::record_route_wait(
+                    &route,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    "timeout",
+                );
+                Err(PoolError::Backpressure(BackpressureError::Timeout))
+            }
         }
     }
 
@@ -127,12 +168,22 @@ impl BackendPool {
         let mut route_gates = self.route_gates.lock().await;
         route_gates
             .entry(route.clone())
-            .or_insert_with(|| BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters))
+            .or_insert_with(|| {
+                BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters)
+            })
             .clone()
     }
 
     async fn return_backend(&self, backend: Backend) {
         self.idle.lock().await.push_back(backend);
+    }
+}
+
+fn backpressure_outcome(error: BackpressureError) -> &'static str {
+    match error {
+        BackpressureError::QueueFull => "queue_full",
+        BackpressureError::Timeout => "timeout",
+        BackpressureError::Closed => "closed",
     }
 }
 
