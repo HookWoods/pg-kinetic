@@ -29,6 +29,35 @@ impl BackendFrame {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<&str> {
+        if self.tag != b'E' {
+            return None;
+        }
+
+        let mut offset = 0;
+        while offset < self.payload.len() {
+            let field_type = self.payload[offset];
+            offset += 1;
+
+            if field_type == 0 {
+                return None;
+            }
+
+            let remaining = self.payload.get(offset..)?;
+            let terminator = remaining.iter().position(|byte| *byte == 0)?;
+            let value = std::str::from_utf8(&remaining[..terminator]).ok()?;
+
+            if field_type == b'C' {
+                return Some(value);
+            }
+
+            offset += terminator + 1;
+        }
+
+        None
+    }
 }
 
 pub fn parse_backend_frame(buffer: &mut BytesMut) -> Result<Option<BackendFrame>, WireError> {
