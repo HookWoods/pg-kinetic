@@ -1,5 +1,7 @@
+pub mod backend;
 pub mod backpressure;
 pub mod config;
+pub mod pool;
 pub mod prepare;
 pub mod proxy;
 pub mod session;
