@@ -7,6 +7,7 @@ pub mod prepare;
 pub mod proxy;
 pub mod session;
 pub mod sql;
+pub mod virtual_session;
 pub mod wire;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
