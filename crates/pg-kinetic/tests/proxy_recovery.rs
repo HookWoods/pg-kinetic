@@ -185,20 +185,18 @@ async fn spawn_proxy_with_backend(
                                     pending_stream = true;
                                 }
                             }
-                            b'S' => {
-                                if pending_stream {
-                                    pending_stream = false;
-                                    stream
-                                        .write_all(&data_row("row-1"))
-                                        .await
-                                        .expect("write row 1");
-                                    time::sleep(Duration::from_millis(25)).await;
-                                    stream
-                                        .write_all(&data_row("row-2"))
-                                        .await
-                                        .expect("write row 2");
-                                    awaiting_recovery_sync = true;
-                                }
+                            b'S' if pending_stream => {
+                                pending_stream = false;
+                                stream
+                                    .write_all(&data_row("row-1"))
+                                    .await
+                                    .expect("write row 1");
+                                time::sleep(Duration::from_millis(25)).await;
+                                stream
+                                    .write_all(&data_row("row-2"))
+                                    .await
+                                    .expect("write row 2");
+                                awaiting_recovery_sync = true;
                             }
                             _ => {}
                         }

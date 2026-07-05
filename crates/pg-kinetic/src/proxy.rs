@@ -298,6 +298,14 @@ async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> a
         }
     }
 
+    if !backend.requires_startup() {
+        client
+            .write_all(&synthetic_startup_ready())
+            .await
+            .context("write synthetic startup response")?;
+        return Ok(());
+    }
+
     backend
         .backend_mut()
         .stream_mut()
@@ -319,12 +327,13 @@ async fn proxy_startup(client: &mut TcpStream, backend: &mut PooledBackend) -> a
                 .await
                 .context("forward startup response")?;
 
-            if frame.tag == b'R' && !frame.payload.starts_with(&[0, 0, 0, 0]) {
+            if frame.tag == b'R' && auth_request_expects_client_response(&frame.payload)? {
                 client_buffer.clear();
-                client
+                let read = client
                     .read_buf(&mut client_buffer)
                     .await
                     .context("read startup auth response")?;
+                anyhow::ensure!(read > 0, "client disconnected during startup auth");
                 backend
                     .backend_mut()
                     .stream_mut()
@@ -346,6 +355,23 @@ fn encode_backend_frame(frame: &crate::wire::backend::BackendFrame) -> BytesMut 
     encoded.put_i32((frame.payload.len() + 4) as i32);
     encoded.extend_from_slice(&frame.payload);
     encoded
+}
+
+fn synthetic_startup_ready() -> BytesMut {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'R');
+    bytes.put_i32(8);
+    bytes.put_i32(0);
+    bytes.put_u8(b'Z');
+    bytes.put_i32(5);
+    bytes.put_u8(b'I');
+    bytes
+}
+
+fn auth_request_expects_client_response(payload: &[u8]) -> anyhow::Result<bool> {
+    anyhow::ensure!(payload.len() >= 4, "authentication request missing code");
+    let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Ok(matches!(code, 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11))
 }
 
 async fn forward_message_cycle(
@@ -397,7 +423,8 @@ async fn forward_message_cycle(
                 }
             }
 
-            if frame.tag == b'E' && matches!(session.pin_reason(), Some(PinReason::OpenTransaction)) {
+            if frame.tag == b'E' && matches!(session.pin_reason(), Some(PinReason::OpenTransaction))
+            {
                 session.mark_failed_transaction();
             }
 
@@ -742,4 +769,25 @@ fn should_replay_session(
     backend_id: u64,
 ) -> bool {
     session.has_replayable_settings() && pinned_backend.backend_id() != Some(backend_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auth_request_expects_client_response;
+
+    fn auth_payload(code: i32) -> [u8; 4] {
+        code.to_be_bytes()
+    }
+
+    #[test]
+    fn sasl_start_and_continue_expect_client_responses() {
+        assert!(auth_request_expects_client_response(&auth_payload(10)).unwrap());
+        assert!(auth_request_expects_client_response(&auth_payload(11)).unwrap());
+    }
+
+    #[test]
+    fn sasl_final_and_ok_do_not_expect_client_responses() {
+        assert!(!auth_request_expects_client_response(&auth_payload(12)).unwrap());
+        assert!(!auth_request_expects_client_response(&auth_payload(0)).unwrap());
+    }
 }

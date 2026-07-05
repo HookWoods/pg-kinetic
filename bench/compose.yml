@@ -66,7 +66,9 @@ services:
         condition: service_healthy
     ports:
       - "58432:6543"
+      - "19090:9090"
     environment:
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
+      PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"
       RUST_LOG: info

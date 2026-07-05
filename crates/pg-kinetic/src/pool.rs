@@ -23,6 +23,7 @@ pub struct PooledBackend {
     backend: Option<Backend>,
     pool: Arc<BackendPool>,
     _permit: BackpressurePermit,
+    requires_startup: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,7 @@ impl BackendPool {
                 backend: Some(backend),
                 pool: self.clone(),
                 _permit: permit,
+                requires_startup: false,
             });
         }
 
@@ -73,6 +75,7 @@ impl BackendPool {
             backend: Some(backend),
             pool: self.clone(),
             _permit: permit,
+            requires_startup: true,
         })
     }
 
@@ -109,6 +112,11 @@ impl PooledBackend {
         self.backend
             .as_mut()
             .expect("pooled backend exists until release")
+    }
+
+    #[must_use]
+    pub const fn requires_startup(&self) -> bool {
+        self.requires_startup
     }
 
     pub async fn release(mut self) {
