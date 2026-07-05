@@ -3,6 +3,7 @@ use pg_kinetic::{
     cleanup::CleanupAction,
     core,
     pin::PinnedBackend,
+    route::RouteKey,
     pool::PoolError,
     prepare::PreparedCatalog,
     proxy_runtime,
@@ -19,6 +20,7 @@ fn compatibility_reexports_remain_available() {
     let _ = std::mem::size_of::<BackpressureError>();
     let _ = std::mem::size_of::<CleanupAction>();
     let _ = std::mem::size_of::<PinnedBackend>();
+    let _ = std::mem::size_of::<RouteKey>();
     let _ = std::mem::size_of::<PoolError>();
     let _ = std::mem::size_of::<PreparedCatalog>();
     let _ = std::mem::size_of::<RecoveryAction>();

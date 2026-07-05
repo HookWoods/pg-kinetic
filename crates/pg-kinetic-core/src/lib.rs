@@ -4,6 +4,7 @@ pub mod constants;
 pub mod pin;
 pub mod prepare;
 pub mod recovery;
+pub mod route;
 pub mod session;
 pub mod sql;
 pub mod virtual_session;
