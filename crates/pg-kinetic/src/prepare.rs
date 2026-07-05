@@ -1,5 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidationScope {
+    None,
+    Backend,
+    AllBackends,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedStatement {
     pub client_name: String,
@@ -88,5 +95,23 @@ impl PreparedCatalog {
             .entry(backend_id)
             .or_default()
             .insert(statement.backend_name.clone());
+    }
+
+    pub fn invalidate_for_sqlstate(
+        &mut self,
+        sqlstate: &str,
+        backend_id: u64,
+    ) -> InvalidationScope {
+        match sqlstate {
+            "26000" => {
+                self.materialized.remove(&backend_id);
+                InvalidationScope::Backend
+            }
+            "0A000" | "42P01" | "42703" => {
+                self.materialized.clear();
+                InvalidationScope::AllBackends
+            }
+            _ => InvalidationScope::None,
+        }
     }
 }
