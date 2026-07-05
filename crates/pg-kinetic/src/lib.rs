@@ -1,3 +1,4 @@
+pub mod backpressure;
 pub mod config;
 pub mod prepare;
 pub mod proxy;
