@@ -18,7 +18,7 @@ pub struct Proxy {
 impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
-        let client_slots = Arc::new(Semaphore::new(config.max_clients));
+        let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
         Self {
             config,
             client_slots,
@@ -26,15 +26,15 @@ impl Proxy {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(self.config.listen_addr)
+        let listener = TcpListener::bind(self.config.connection.listen_addr)
             .await
-            .with_context(|| format!("bind listener {}", self.config.listen_addr))?;
+            .with_context(|| format!("bind listener {}", self.config.connection.listen_addr))?;
 
-        tracing::info!(listen_addr = %self.config.listen_addr, "listening");
+        tracing::info!(listen_addr = %self.config.connection.listen_addr, "listening");
 
         loop {
             let (client, client_addr) = listener.accept().await.context("accept client")?;
-            let backend_addr = self.config.backend_addr;
+            let backend_addr = self.config.connection.backend_addr;
             let permit = self.client_slots.clone().acquire_owned().await?;
 
             tokio::spawn(async move {
