@@ -1,4 +1,7 @@
-use pg_kinetic::prepare::{InvalidationScope, PreparedCatalog};
+use pg_kinetic::{
+    prepare::{InvalidationScope, PreparedCatalog},
+    wire::sqlstate::SqlState,
+};
 
 #[test]
 fn invalid_statement_name_invalidates_one_backend_materialization() {
@@ -7,7 +10,7 @@ fn invalid_statement_name_invalidates_one_backend_materialization() {
     catalog.mark_materialized(10, &statement);
 
     assert_eq!(
-        catalog.invalidate_for_sqlstate("26000", 10),
+        catalog.invalidate_for_sqlstate(SqlState::InvalidSqlStatementName, 10),
         InvalidationScope::Backend
     );
     assert!(!catalog.is_materialized(10, &statement));
@@ -21,7 +24,7 @@ fn cached_plan_error_invalidates_all_materializations() {
     catalog.mark_materialized(11, &statement);
 
     assert_eq!(
-        catalog.invalidate_for_sqlstate("0A000", 10),
+        catalog.invalidate_for_sqlstate(SqlState::FeatureNotSupported, 10),
         InvalidationScope::AllBackends
     );
     assert!(!catalog.is_materialized(10, &statement));
@@ -35,7 +38,7 @@ fn unrelated_error_keeps_materialization() {
     catalog.mark_materialized(10, &statement);
 
     assert_eq!(
-        catalog.invalidate_for_sqlstate("23505", 10),
+        catalog.invalidate_for_sqlstate(SqlState::UniqueViolation, 10),
         InvalidationScope::None
     );
     assert!(catalog.is_materialized(10, &statement));

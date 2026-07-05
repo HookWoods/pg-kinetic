@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use pg_kinetic_wire::sqlstate::SqlState;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidationScope {
     None,
@@ -99,15 +101,17 @@ impl PreparedCatalog {
 
     pub fn invalidate_for_sqlstate(
         &mut self,
-        sqlstate: &str,
+        sqlstate: SqlState,
         backend_id: u64,
     ) -> InvalidationScope {
         match sqlstate {
-            "26000" => {
+            SqlState::InvalidSqlStatementName => {
                 self.materialized.remove(&backend_id);
                 InvalidationScope::Backend
             }
-            "0A000" | "42P01" | "42703" => {
+            SqlState::FeatureNotSupported
+            | SqlState::UndefinedTable
+            | SqlState::UndefinedColumn => {
                 self.materialized.clear();
                 InvalidationScope::AllBackends
             }

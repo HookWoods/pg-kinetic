@@ -1,4 +1,7 @@
-use crate::{error::WireError, frame::FrontendFrame};
+use crate::{error::WireError, frame::FrontendFrame, protocol::FrontendTag};
+
+const STATEMENT_KIND: u8 = b'S';
+const PORTAL_KIND: u8 = b'P';
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseMessage {
@@ -20,7 +23,7 @@ pub enum CloseTarget {
 }
 
 pub fn parse_simple_query(frame: &FrontendFrame) -> Result<Option<&str>, WireError> {
-    if frame.tag != b'Q' {
+    if frame.tag != u8::from(FrontendTag::Query) {
         return Ok(None);
     }
 
@@ -28,7 +31,7 @@ pub fn parse_simple_query(frame: &FrontendFrame) -> Result<Option<&str>, WireErr
 }
 
 pub fn parse_parse_message(frame: &FrontendFrame) -> Result<Option<ParseMessage>, WireError> {
-    if frame.tag != b'P' {
+    if frame.tag != u8::from(FrontendTag::Parse) {
         return Ok(None);
     }
 
@@ -73,7 +76,7 @@ pub fn parse_parse_message(frame: &FrontendFrame) -> Result<Option<ParseMessage>
 }
 
 pub fn parse_bind_statement_name(frame: &FrontendFrame) -> Result<Option<String>, WireError> {
-    if frame.tag != b'B' {
+    if frame.tag != u8::from(FrontendTag::Bind) {
         return Ok(None);
     }
 
@@ -83,7 +86,7 @@ pub fn parse_bind_statement_name(frame: &FrontendFrame) -> Result<Option<String>
 }
 
 pub fn parse_describe_target(frame: &FrontendFrame) -> Result<Option<DescribeTarget>, WireError> {
-    if frame.tag != b'D' {
+    if frame.tag != u8::from(FrontendTag::Describe) {
         return Ok(None);
     }
 
@@ -95,14 +98,14 @@ pub fn parse_describe_target(frame: &FrontendFrame) -> Result<Option<DescribeTar
     let (target_name, _) = read_cstr(frame.payload.as_ref(), 1)?;
 
     match target_kind {
-        b'S' => Ok(Some(DescribeTarget::Statement(target_name.to_string()))),
-        b'P' => Ok(Some(DescribeTarget::Portal(target_name.to_string()))),
+        STATEMENT_KIND => Ok(Some(DescribeTarget::Statement(target_name.to_string()))),
+        PORTAL_KIND => Ok(Some(DescribeTarget::Portal(target_name.to_string()))),
         _ => Ok(None),
     }
 }
 
 pub fn parse_close_target(frame: &FrontendFrame) -> Result<Option<CloseTarget>, WireError> {
-    if frame.tag != b'C' {
+    if frame.tag != u8::from(FrontendTag::Close) {
         return Ok(None);
     }
 
@@ -114,8 +117,8 @@ pub fn parse_close_target(frame: &FrontendFrame) -> Result<Option<CloseTarget>, 
     let (target_name, _) = read_cstr(frame.payload.as_ref(), 1)?;
 
     match target_kind {
-        b'S' => Ok(Some(CloseTarget::Statement(target_name.to_string()))),
-        b'P' => Ok(Some(CloseTarget::Portal(target_name.to_string()))),
+        STATEMENT_KIND => Ok(Some(CloseTarget::Statement(target_name.to_string()))),
+        PORTAL_KIND => Ok(Some(CloseTarget::Portal(target_name.to_string()))),
         _ => Ok(None),
     }
 }

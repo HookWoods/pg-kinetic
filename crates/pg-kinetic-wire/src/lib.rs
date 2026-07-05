@@ -2,5 +2,7 @@ pub mod backend;
 pub mod error;
 pub mod frame;
 pub mod message;
+pub mod protocol;
 pub mod rewrite;
+pub mod sqlstate;
 pub mod startup;

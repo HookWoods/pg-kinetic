@@ -23,6 +23,7 @@ use crate::{
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
+    constants::PreparedEvent,
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
@@ -37,6 +38,7 @@ use pg_kinetic_wire::{
         parse_bind_statement_name, parse_close_target, parse_describe_target, parse_parse_message,
         parse_simple_query, CloseTarget, DescribeTarget,
     },
+    protocol::{BackendTag, FrontendTag, ReadyStatusByte},
     rewrite::{
         build_parse_frame, encode_frontend_frame, rewrite_bind_statement_name,
         rewrite_close_statement_name, rewrite_describe_statement_name,
@@ -202,7 +204,7 @@ async fn handle_client(
                 | Ok(ForwardOutcome::ClientDisconnectedAfterReady(status)) => {
                     session.mark_ready_after_copy();
                     let action = cleanup_action(&session, status);
-                    metrics::increment_cleanup(cleanup_metric_label(action));
+                    metrics::increment_cleanup(action);
 
                     match action {
                         CleanupAction::Reuse => {
@@ -286,16 +288,19 @@ async fn next_client_cycle(
         return Ok(None);
     };
 
-    if first.tag == b'X' {
+    if first.tag == u8::from(FrontendTag::Terminate) {
         return Ok(Some(ClientCycle::Terminate));
     }
 
-    if first.tag == b'Q' {
+    if first.tag == u8::from(FrontendTag::Query) {
         return Ok(Some(ClientCycle::Frames(vec![first])));
     }
 
     let mut frames = vec![first];
-    while !frames.iter().any(|frame| frame.tag == b'S') {
+    while !frames
+        .iter()
+        .any(|frame| frame.tag == u8::from(FrontendTag::Sync))
+    {
         if let Some(frame) = parse_frontend_frame(client_buffer)? {
             frames.push(frame);
             continue;
@@ -413,7 +418,9 @@ async fn proxy_startup(
                 .await
                 .context("forward startup response")?;
 
-            if frame.tag == b'R' && auth_request_expects_client_response(&frame.payload)? {
+            if frame.tag == u8::from(BackendTag::Authentication)
+                && auth_request_expects_client_response(&frame.payload)?
+            {
                 client_buffer.clear();
                 let read = client
                     .read_buf(&mut client_buffer)
@@ -445,12 +452,12 @@ fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
 
 fn synthetic_startup_ready() -> BytesMut {
     let mut bytes = BytesMut::new();
-    bytes.put_u8(b'R');
+    bytes.put_u8(u8::from(BackendTag::Authentication));
     bytes.put_i32(8);
     bytes.put_i32(0);
-    bytes.put_u8(b'Z');
+    bytes.put_u8(u8::from(BackendTag::ReadyForQuery));
     bytes.put_i32(5);
-    bytes.put_u8(b'I');
+    bytes.put_u8(u8::from(ReadyStatusByte::Idle));
     bytes
 }
 
@@ -505,11 +512,12 @@ async fn forward_message_cycle(
                 metrics::increment_sqlstate(sqlstate);
                 let scope = prepared.invalidate_for_sqlstate(sqlstate, backend.backend_id());
                 if scope != InvalidationScope::None {
-                    metrics::increment_prepared_event("invalidate");
+                    metrics::increment_prepared_event(PreparedEvent::Invalidate);
                 }
             }
 
-            if frame.tag == b'E' && matches!(session.pin_reason(), Some(PinReason::OpenTransaction))
+            if frame.tag == u8::from(BackendTag::ErrorResponse)
+                && matches!(session.pin_reason(), Some(PinReason::OpenTransaction))
             {
                 session.mark_failed_transaction();
             }
@@ -543,7 +551,7 @@ fn prepare_frame_for_backend(
         let statement = prepared
             .upsert(parse.statement_name, parse.query, parse.parameter_type_oids)
             .clone();
-        metrics::increment_prepared_event("parse");
+        metrics::increment_prepared_event(PreparedEvent::Parse);
         prepared.mark_materialized(backend_id, &statement);
         return Ok(PreparedForwardPlan::single(rewrite_parse_statement_name(
             &frame,
@@ -553,7 +561,7 @@ fn prepare_frame_for_backend(
 
     if let Some(statement_name) = parse_bind_statement_name(&frame)? {
         if let Some(statement) = prepared.get(&statement_name).cloned() {
-            metrics::increment_prepared_event("bind");
+            metrics::increment_prepared_event(PreparedEvent::Bind);
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
                 prelude.push(build_parse_frame(
@@ -562,7 +570,7 @@ fn prepare_frame_for_backend(
                     &statement.parameter_type_oids,
                 ));
                 prepared.mark_materialized(backend_id, &statement);
-                metrics::increment_prepared_event("materialize");
+                metrics::increment_prepared_event(PreparedEvent::Materialize);
             }
 
             return Ok(PreparedForwardPlan {
@@ -582,7 +590,7 @@ fn prepare_frame_for_backend(
                     &statement.parameter_type_oids,
                 ));
                 prepared.mark_materialized(backend_id, &statement);
-                metrics::increment_prepared_event("materialize");
+                metrics::increment_prepared_event(PreparedEvent::Materialize);
             }
 
             return Ok(PreparedForwardPlan {
@@ -594,7 +602,7 @@ fn prepare_frame_for_backend(
 
     if let Some(CloseTarget::Statement(statement_name)) = parse_close_target(&frame)? {
         if let Some(statement) = prepared.remove(&statement_name) {
-            metrics::increment_prepared_event("close");
+            metrics::increment_prepared_event(PreparedEvent::Close);
             return Ok(PreparedForwardPlan::single(rewrite_close_statement_name(
                 &frame,
                 &statement.backend_name,
@@ -628,17 +636,9 @@ enum ForwardOutcome {
 }
 
 fn should_sync_for_frames(frames: &[FrontendFrame]) -> bool {
-    frames.iter().any(|frame| frame.tag != b'Q')
-}
-
-fn cleanup_metric_label(action: CleanupAction) -> &'static str {
-    match action {
-        CleanupAction::Reuse => "reuse",
-        CleanupAction::ResetThenReuse => "reset_then_reuse",
-        CleanupAction::KeepPinned => "keep_pinned",
-        CleanupAction::RollbackThenReuse => "rollback_then_reuse",
-        CleanupAction::Discard => "discard",
-    }
+    frames
+        .iter()
+        .any(|frame| frame.tag != u8::from(FrontendTag::Query))
 }
 
 fn simple_query_frame(sql: &str) -> FrontendFrame {
@@ -646,7 +646,7 @@ fn simple_query_frame(sql: &str) -> FrontendFrame {
     payload.extend_from_slice(sql.as_bytes());
     payload.put_u8(0);
     FrontendFrame {
-        tag: b'Q',
+        tag: u8::from(FrontendTag::Query),
         payload: payload.freeze(),
     }
 }
@@ -661,7 +661,7 @@ fn replay_frames(session: &VirtualSession) -> Vec<FrontendFrame> {
 
 fn sync_frame() -> FrontendFrame {
     FrontendFrame {
-        tag: b'S',
+        tag: u8::from(FrontendTag::Sync),
         payload: BytesMut::new().freeze(),
     }
 }
@@ -672,7 +672,17 @@ fn update_virtual_session_from_frame(
 ) -> anyhow::Result<()> {
     if let Some(query) = parse_simple_query(frame)? {
         session.apply_sql(classify(query));
-    } else if matches!(frame.tag, b'P' | b'B' | b'D' | b'E' | b'C' | b'S') {
+    } else if [
+        FrontendTag::Parse,
+        FrontendTag::Bind,
+        FrontendTag::Describe,
+        FrontendTag::Execute,
+        FrontendTag::Close,
+        FrontendTag::Sync,
+    ]
+    .iter()
+    .any(|tag| frame.tag == u8::from(*tag))
+    {
         return Ok(());
     }
 

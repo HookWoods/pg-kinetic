@@ -1,10 +1,9 @@
 use bytes::{Buf, Bytes};
 
-use crate::error::WireError;
-
-const SSL_REQUEST_CODE: i32 = 80_877_103;
-const CANCEL_REQUEST_CODE: i32 = 80_877_102;
-const GSSENC_REQUEST_CODE: i32 = 80_877_104;
+use crate::{
+    error::WireError,
+    protocol::{CANCEL_REQUEST_CODE, GSSENC_REQUEST_CODE, SSL_REQUEST_CODE},
+};
 const MIN_STARTUP_LEN: i32 = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

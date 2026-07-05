@@ -1,10 +1,13 @@
 use bytes::{BufMut, BytesMut};
-use pg_kinetic::wire::startup::{parse_startup_packet, StartupPacket};
+use pg_kinetic::wire::{
+    protocol::{ProtocolVersion, CANCEL_REQUEST_CODE, GSSENC_REQUEST_CODE, SSL_REQUEST_CODE},
+    startup::{parse_startup_packet, StartupPacket},
+};
 use pretty_assertions::assert_eq;
 
 fn startup_bytes() -> BytesMut {
     let mut body = BytesMut::new();
-    body.put_i32(196_608);
+    body.put_i32(ProtocolVersion::V3.to_i32());
     body.extend_from_slice(
         b"user\0postgres\0database\0postgres\0application_name\0pg-kinetic-test\0\0",
     );
@@ -40,7 +43,7 @@ fn parses_startup_packet_parameters() {
 fn parses_ssl_request() {
     let mut packet = BytesMut::new();
     packet.put_i32(8);
-    packet.put_i32(80_877_103);
+    packet.put_i32(SSL_REQUEST_CODE);
 
     assert_eq!(
         parse_startup_packet(&packet).expect("ssl request parses"),
@@ -52,7 +55,7 @@ fn parses_ssl_request() {
 fn parses_gssenc_request() {
     let mut packet = BytesMut::new();
     packet.put_i32(8);
-    packet.put_i32(80_877_104);
+    packet.put_i32(GSSENC_REQUEST_CODE);
 
     assert_eq!(
         parse_startup_packet(&packet).expect("gssenc request parses"),
@@ -64,7 +67,7 @@ fn parses_gssenc_request() {
 fn parses_cancel_request() {
     let mut packet = BytesMut::new();
     packet.put_i32(16);
-    packet.put_i32(80_877_102);
+    packet.put_i32(CANCEL_REQUEST_CODE);
     packet.put_i32(12);
     packet.put_i32(34);
 

@@ -5,6 +5,7 @@ use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig},
     proxy::Proxy,
+    wire::protocol::{FrontendTag, ProtocolVersion},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -104,7 +105,7 @@ async fn run_fake_client(addr: SocketAddr) -> Vec<u8> {
 
 fn startup_packet() -> Vec<u8> {
     let mut body = BytesMut::new();
-    body.put_i32(196_608);
+    body.put_i32(ProtocolVersion::V3.to_i32());
     body.extend_from_slice(b"user\0postgres\0database\0pgkinetic\0\0");
 
     let mut packet = BytesMut::new();
@@ -115,7 +116,7 @@ fn startup_packet() -> Vec<u8> {
 
 fn query_packet(sql: &str) -> Vec<u8> {
     let mut packet = BytesMut::new();
-    packet.put_u8(b'Q');
+    packet.put_u8(u8::from(FrontendTag::Query));
     packet.put_i32((sql.len() + 5) as i32);
     packet.extend_from_slice(sql.as_bytes());
     packet.put_u8(0);

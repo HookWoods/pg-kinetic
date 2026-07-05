@@ -1,6 +1,12 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::error::WireError;
+use crate::{
+    error::WireError,
+    protocol::{BackendTag, ReadyStatusByte},
+    sqlstate::SqlState,
+};
+
+const SQLSTATE_FIELD_KIND: u8 = b'C';
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadyStatus {
@@ -18,21 +24,25 @@ pub struct BackendFrame {
 impl BackendFrame {
     #[must_use]
     pub fn ready_status(&self) -> Option<ReadyStatus> {
-        if self.tag != b'Z' || self.payload.len() != 1 {
+        if self.tag != u8::from(BackendTag::ReadyForQuery) || self.payload.len() != 1 {
             return None;
         }
 
         match self.payload[0] {
-            b'I' => Some(ReadyStatus::Idle),
-            b'T' => Some(ReadyStatus::InTransaction),
-            b'E' => Some(ReadyStatus::FailedTransaction),
+            byte if byte == u8::from(ReadyStatusByte::Idle) => Some(ReadyStatus::Idle),
+            byte if byte == u8::from(ReadyStatusByte::InTransaction) => {
+                Some(ReadyStatus::InTransaction)
+            }
+            byte if byte == u8::from(ReadyStatusByte::FailedTransaction) => {
+                Some(ReadyStatus::FailedTransaction)
+            }
             _ => None,
         }
     }
 
     #[must_use]
-    pub fn sqlstate(&self) -> Option<&str> {
-        if self.tag != b'E' {
+    pub fn sqlstate(&self) -> Option<SqlState> {
+        if self.tag != u8::from(BackendTag::ErrorResponse) {
             return None;
         }
 
@@ -49,8 +59,8 @@ impl BackendFrame {
             let terminator = remaining.iter().position(|byte| *byte == 0)?;
             let value = std::str::from_utf8(&remaining[..terminator]).ok()?;
 
-            if field_type == b'C' {
-                return Some(value);
+            if field_type == SQLSTATE_FIELD_KIND {
+                return SqlState::from_str(value);
             }
 
             offset += terminator + 1;

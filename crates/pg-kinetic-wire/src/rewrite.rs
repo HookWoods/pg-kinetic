@@ -1,12 +1,14 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::{error::WireError, frame::FrontendFrame};
+use crate::{error::WireError, frame::FrontendFrame, protocol::FrontendTag};
+
+const STATEMENT_KIND: u8 = b'S';
 
 pub fn rewrite_parse_statement_name(
     frame: &FrontendFrame,
     backend_name: &str,
 ) -> Result<FrontendFrame, WireError> {
-    if frame.tag != b'P' {
+    if frame.tag != u8::from(FrontendTag::Parse) {
         return Ok(frame.clone());
     }
 
@@ -25,7 +27,7 @@ pub fn rewrite_bind_statement_name(
     frame: &FrontendFrame,
     backend_name: &str,
 ) -> Result<FrontendFrame, WireError> {
-    if frame.tag != b'B' {
+    if frame.tag != u8::from(FrontendTag::Bind) {
         return Ok(frame.clone());
     }
 
@@ -47,14 +49,14 @@ pub fn rewrite_describe_statement_name(
     frame: &FrontendFrame,
     backend_name: &str,
 ) -> Result<FrontendFrame, WireError> {
-    rewrite_statement_target(frame, b'D', backend_name)
+    rewrite_statement_target(frame, u8::from(FrontendTag::Describe), backend_name)
 }
 
 pub fn rewrite_close_statement_name(
     frame: &FrontendFrame,
     backend_name: &str,
 ) -> Result<FrontendFrame, WireError> {
-    rewrite_statement_target(frame, b'C', backend_name)
+    rewrite_statement_target(frame, u8::from(FrontendTag::Close), backend_name)
 }
 
 fn rewrite_statement_target(
@@ -66,12 +68,12 @@ fn rewrite_statement_target(
         return Ok(frame.clone());
     }
 
-    if frame.payload.first() != Some(&b'S') {
+    if frame.payload.first() != Some(&STATEMENT_KIND) {
         return Ok(frame.clone());
     }
 
     let mut payload = BytesMut::new();
-    payload.put_u8(b'S');
+    payload.put_u8(STATEMENT_KIND);
     write_cstr(&mut payload, backend_name);
 
     Ok(FrontendFrame {
@@ -122,7 +124,7 @@ pub fn build_parse_frame(
     }
 
     FrontendFrame {
-        tag: b'P',
+        tag: u8::from(FrontendTag::Parse),
         payload: payload.freeze(),
     }
 }
