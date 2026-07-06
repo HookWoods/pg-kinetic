@@ -6,6 +6,7 @@ pub mod prepare;
 pub mod recovery;
 pub mod route;
 pub mod security;
+pub mod secrets;
 pub mod session;
 pub mod sql;
 pub mod virtual_session;
