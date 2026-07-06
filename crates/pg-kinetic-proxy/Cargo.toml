@@ -7,14 +7,18 @@ readme.workspace = true
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+hmac = "0.12"
 metrics_crate = { package = "metrics", version = "0.24" }
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 pg-kinetic-core = { path = "../pg-kinetic-core" }
 pg-kinetic-wire = { path = "../pg-kinetic-wire" }
+sha2 = "0.10"
 rustls = "0.23"
 rustls-pemfile = "2"
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"

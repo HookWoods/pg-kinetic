@@ -18,6 +18,7 @@ use tokio::{
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 
 use crate::{
+    auth,
     config::Config,
     metrics,
     pool::{BackendPool, PooledBackend},
@@ -30,6 +31,7 @@ use pg_kinetic_core::{
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
+    secrets::UserStore,
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
@@ -54,7 +56,7 @@ use pg_kinetic_wire::{
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-struct ClientConnection {
+pub(crate) struct ClientConnection {
     inner: Option<ClientTransport>,
 }
 
@@ -65,24 +67,24 @@ enum ClientTransport {
 }
 
 impl ClientConnection {
-    fn new(stream: TcpStream) -> Self {
+    pub(crate) fn new(stream: TcpStream) -> Self {
         Self {
             inner: Some(ClientTransport::Plain(stream)),
         }
     }
 
-    fn is_tls(&self) -> bool {
+    pub(crate) fn is_tls(&self) -> bool {
         matches!(self.inner, Some(ClientTransport::Tls(_)))
     }
 
-    fn has_peer_certificates(&self) -> bool {
+    pub(crate) fn has_peer_certificates(&self) -> bool {
         match self.inner.as_ref().expect("client stream present") {
             ClientTransport::Plain(_) => false,
             ClientTransport::Tls(stream) => stream.get_ref().1.peer_certificates().is_some(),
         }
     }
 
-    fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+    pub(crate) fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         match self.inner.as_ref().expect("client stream present") {
             ClientTransport::Plain(stream) => stream.set_nodelay(nodelay),
             ClientTransport::Tls(stream) => {
@@ -92,21 +94,21 @@ impl ClientConnection {
         }
     }
 
-    async fn read_buf(&mut self, buffer: &mut BytesMut) -> std::io::Result<usize> {
+    pub(crate) async fn read_buf(&mut self, buffer: &mut BytesMut) -> std::io::Result<usize> {
         match self.inner.as_mut().expect("client stream present") {
             ClientTransport::Plain(stream) => stream.read_buf(buffer).await,
             ClientTransport::Tls(stream) => stream.read_buf(buffer).await,
         }
     }
 
-    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         match self.inner.as_mut().expect("client stream present") {
             ClientTransport::Plain(stream) => stream.write_all(bytes).await,
             ClientTransport::Tls(stream) => stream.write_all(bytes).await,
         }
     }
 
-    async fn start_tls(&mut self, server_config: &Arc<ServerConfig>) -> anyhow::Result<()> {
+    pub(crate) async fn start_tls(&mut self, server_config: &Arc<ServerConfig>) -> anyhow::Result<()> {
         let plain = match self.inner.take().context("client stream missing")? {
             ClientTransport::Plain(stream) => stream,
             ClientTransport::Tls(stream) => {
@@ -151,6 +153,17 @@ impl Proxy {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
+        let auth_users = if matches!(
+            self.config.auth.auth_mode,
+            crate::config::AuthMode::PassThrough
+        ) {
+            None
+        } else {
+            Some(Arc::new(auth::load_user_store(
+                self.config.auth.auth_users_file.as_deref(),
+            )?))
+        };
+
         let listener = TcpListener::bind(self.config.connection.listen_addr)
             .await
             .with_context(|| format!("bind listener {}", self.config.connection.listen_addr))?;
@@ -171,8 +184,10 @@ impl Proxy {
             let pool = self.pool.clone();
             let performance = self.config.performance.clone();
             let qos = self.config.qos.clone();
+            let auth = self.config.auth.clone();
             let client_tls_mode = self.config.tls.client_tls_mode;
             let client_tls_server_config = client_tls_server_config.clone();
+            let auth_users = auth_users.clone();
 
             tokio::spawn(async move {
                 let result = handle_client(
@@ -181,6 +196,8 @@ impl Proxy {
                     pool,
                     performance,
                     qos,
+                    auth,
+                    auth_users,
                     client_tls_mode,
                     client_tls_server_config,
                 )
@@ -202,6 +219,8 @@ async fn handle_client(
     pool: Arc<BackendPool>,
     performance: crate::config::PerformanceConfig,
     qos: crate::config::QosConfig,
+    auth: crate::config::AuthConfig,
+    auth_users: Option<Arc<UserStore>>,
     client_tls_mode: crate::config::ClientTlsMode,
     client_tls_server_config: Option<Arc<ServerConfig>>,
 ) -> anyhow::Result<()> {
@@ -243,6 +262,22 @@ async fn handle_client(
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
 
+    if !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
+        match auth::authenticate_client(
+            &mut client,
+            &route_user,
+            &auth,
+            auth_users.as_deref().context("auth user store unavailable")?,
+            qos.max_client_buffer_bytes,
+        )
+        .await
+        .with_context(|| format!("authenticate client {client_addr}"))?
+        {
+            auth::ClientAuthOutcome::PassThrough | auth::ClientAuthOutcome::Authenticated => {}
+            auth::ClientAuthOutcome::Rejected => return Ok(()),
+        }
+    }
+
     let mut backend = match checkout_backend(
         &pool,
         route_key(
@@ -270,6 +305,8 @@ async fn handle_client(
         &startup_packet,
         qos.max_client_buffer_bytes,
         qos.max_backend_buffer_bytes,
+        matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
+        matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
     )
     .await
     {
@@ -860,10 +897,17 @@ async fn proxy_startup(
     startup_packet: &[u8],
     max_client_buffer_bytes: usize,
     max_backend_buffer_bytes: usize,
+    forward_backend_auth_requests_to_client: bool,
+    emit_auth_ok_when_backend_requires_no_startup: bool,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
+        let startup_response = if emit_auth_ok_when_backend_requires_no_startup {
+            synthetic_startup_ready()
+        } else {
+            ready_for_query_idle()
+        };
         client
-            .write_all(&synthetic_startup_ready())
+            .write_all(&startup_response)
             .await
             .context("write synthetic startup response")?;
         return Ok(());
@@ -894,33 +938,55 @@ async fn proxy_startup(
         }
 
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
-            client
-                .write_all(&encode_backend_frame(&frame))
-                .await
-                .context("forward startup response")?;
-
-            if frame.tag == u8::from(BackendTag::Authentication)
-                && auth_request_expects_client_response(&frame.payload)?
-            {
-                if client_buffer.len() >= max_client_buffer_bytes {
-                    return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+            if frame.tag == u8::from(BackendTag::Authentication) {
+                let code = auth_request_code(&frame.payload)?;
+                if code == 0 {
+                    if forward_backend_auth_requests_to_client {
+                        client
+                            .write_all(&encode_backend_frame(&frame))
+                            .await
+                            .context("forward startup response")?;
+                    }
+                    continue;
                 }
 
-                client_buffer.clear();
-                let read = client
-                    .read_buf(&mut client_buffer)
-                    .await
-                    .context("read startup auth response")?;
-                anyhow::ensure!(read > 0, "client disconnected during startup auth");
-                if client_buffer.len() > max_client_buffer_bytes {
-                    return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+                if forward_backend_auth_requests_to_client {
+                    client
+                        .write_all(&encode_backend_frame(&frame))
+                        .await
+                        .context("forward startup response")?;
+
+                    if auth_request_expects_client_response(&frame.payload)? {
+                        if client_buffer.len() >= max_client_buffer_bytes {
+                            return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+                        }
+
+                        client_buffer.clear();
+                        let read = client
+                            .read_buf(&mut client_buffer)
+                            .await
+                            .context("read startup auth response")?;
+                        anyhow::ensure!(read > 0, "client disconnected during startup auth");
+                        if client_buffer.len() > max_client_buffer_bytes {
+                            return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+                        }
+                        backend
+                            .backend_mut()
+                            .stream_mut()
+                            .write_all(&client_buffer)
+                            .await
+                            .context("forward startup auth response")?;
+                    }
+                } else {
+                    anyhow::bail!(
+                        "backend authentication exchange is not supported after local auth"
+                    );
                 }
-                backend
-                    .backend_mut()
-                    .stream_mut()
-                    .write_all(&client_buffer)
+            } else {
+                client
+                    .write_all(&encode_backend_frame(&frame))
                     .await
-                    .context("forward startup auth response")?;
+                    .context("forward startup response")?;
             }
 
             if frame.ready_status() == Some(ReadyStatus::Idle) {
@@ -928,6 +994,16 @@ async fn proxy_startup(
             }
         }
     }
+}
+
+fn auth_request_code(payload: &[u8]) -> anyhow::Result<i32> {
+    anyhow::ensure!(payload.len() >= 4, "authentication request missing code");
+    Ok(i32::from_be_bytes([
+        payload[0],
+        payload[1],
+        payload[2],
+        payload[3],
+    ]))
 }
 
 fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
@@ -965,8 +1041,7 @@ fn ready_for_query(status: ReadyStatus) -> BytesMut {
 }
 
 fn auth_request_expects_client_response(payload: &[u8]) -> anyhow::Result<bool> {
-    anyhow::ensure!(payload.len() >= 4, "authentication request missing code");
-    let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let code = auth_request_code(payload)?;
     Ok(matches!(code, 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11))
 }
 

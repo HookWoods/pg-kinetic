@@ -651,12 +651,16 @@ name = "pg-kinetic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
+ "hmac",
  "metrics",
  "pg-kinetic-core",
  "pg-kinetic-proxy",
  "pg-kinetic-wire",
  "pretty_assertions",
+ "sha2",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tracing-subscriber",
@@ -684,8 +688,10 @@ name = "pg-kinetic-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
+ "hmac",
  "metrics",
  "metrics-exporter-prometheus",
  "pg-kinetic-core",
@@ -693,6 +699,8 @@ dependencies = [
  "pretty_assertions",
  "rustls",
  "rustls-pemfile",
+ "sha2",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

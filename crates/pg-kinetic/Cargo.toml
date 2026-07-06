@@ -14,9 +14,13 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
+base64 = "0.22"
 bytes = "1"
+hmac = "0.12"
 metrics = "0.24"
 pretty_assertions = "1"
+sha2 = "0.10"
+subtle = "2"
 tokio-rustls = "0.26"
 
 [lints]
