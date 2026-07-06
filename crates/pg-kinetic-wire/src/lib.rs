@@ -6,3 +6,4 @@ pub mod protocol;
 pub mod rewrite;
 pub mod sqlstate;
 pub mod startup;
+pub mod tls;

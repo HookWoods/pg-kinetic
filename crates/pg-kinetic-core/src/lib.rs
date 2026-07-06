@@ -1,11 +1,11 @@
 pub mod backpressure;
 pub mod cleanup;
 pub mod constants;
-pub mod security;
 pub mod pin;
 pub mod prepare;
 pub mod recovery;
 pub mod route;
+pub mod security;
 pub mod session;
 pub mod sql;
 pub mod virtual_session;
