@@ -21,6 +21,7 @@ use crate::{
     auth,
     config::Config,
     drain::{DrainController, DrainOutcome},
+    health,
     metrics,
     pool::{BackendPool, PooledBackend},
     reload, tls,
@@ -174,6 +175,22 @@ impl Proxy {
             effective_config.performance.checkout_timeout(),
             effective_config.performance.backend_reset_query.clone(),
         );
+
+        let _health_handle = if let Some(health_addr) = effective_config.health.health_addr {
+            Some(
+                health::spawn(
+                    health_addr,
+                    Arc::clone(&self.drain),
+                    effective_config.connection.backend_addr,
+                    effective_config.tls.clone(),
+                    effective_config.health.readiness_timeout(),
+                    effective_config.health.readiness_backend_check_interval(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         if effective_config.reload.reload_enabled && effective_config.reload.config_file.is_some() {
             let base_config = self.config.clone();
