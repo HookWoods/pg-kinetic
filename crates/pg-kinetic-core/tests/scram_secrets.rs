@@ -59,10 +59,8 @@ fn generates_nonce_using_url_safe_text() {
 
 #[test]
 fn rejects_invalid_key_lengths() {
-    let error = ScramVerifier::parse(
-        "SCRAM-SHA-256$4096:c2FsdHlzYWx0$YWJjZA==:YWJjZA==",
-    )
-    .expect_err("invalid key lengths");
+    let error = ScramVerifier::parse("SCRAM-SHA-256$4096:c2FsdHlzYWx0$YWJjZA==:YWJjZA==")
+        .expect_err("invalid key lengths");
 
     assert!(matches!(
         error,

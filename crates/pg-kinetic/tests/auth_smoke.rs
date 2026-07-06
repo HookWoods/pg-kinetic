@@ -38,7 +38,10 @@ async fn pass_through_mode_keeps_backend_auth_behavior() {
 
     assert!(frames.iter().any(|frame| frame.tag == b'R'));
     assert!(frames.iter().any(|frame| frame.tag == b'Z'));
-    assert_eq!(collect_events(&mut events).await, vec![String::from("backend_accept")]);
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![String::from("backend_accept")]
+    );
 }
 
 #[tokio::test]
@@ -49,7 +52,10 @@ async fn trust_mode_accepts_configured_user_without_password() {
 
     assert!(frames.iter().any(|frame| frame.tag == b'R'));
     assert!(frames.iter().any(|frame| frame.tag == b'Z'));
-    assert_eq!(collect_events(&mut events).await, vec![String::from("backend_accept")]);
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![String::from("backend_accept")]
+    );
 }
 
 #[tokio::test]
@@ -60,7 +66,10 @@ async fn scram_mode_accepts_valid_credentials() {
 
     assert!(frames.iter().any(|frame| frame.tag == b'R'));
     assert!(frames.iter().any(|frame| frame.tag == b'Z'));
-    assert_eq!(collect_events(&mut events).await, vec![String::from("backend_accept")]);
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![String::from("backend_accept")]
+    );
 }
 
 #[tokio::test]
@@ -70,7 +79,9 @@ async fn scram_mode_rejects_invalid_password() {
     let frames = run_scram_startup_expect_error(proxy_addr, "alice", b"wrong-password").await;
 
     assert!(
-        frames.iter().any(|frame| error_sqlstate(frame) == Some("28P01"))
+        frames
+            .iter()
+            .any(|frame| error_sqlstate(frame) == Some("28P01"))
             || frames.iter().any(|frame| frame.tag == b'E'),
         "SCRAM rejection should return a PostgreSQL error"
     );
@@ -84,7 +95,9 @@ async fn unknown_user_is_rejected_before_backend_checkout() {
     let frames = run_simple_startup(proxy_addr, "charlie").await;
 
     assert!(
-        frames.iter().any(|frame| error_sqlstate(frame) == Some("28P01"))
+        frames
+            .iter()
+            .any(|frame| error_sqlstate(frame) == Some("28P01"))
             || frames.iter().any(|frame| frame.tag == b'E'),
         "unknown user should be rejected with a PostgreSQL auth failure"
     );
@@ -244,14 +257,10 @@ async fn run_scram_startup(addr: SocketAddr, user: &str, password: &[u8]) -> Vec
                                 .expect("write SCRAM initial");
                         }
                         11 => {
-                            let server_first = std::str::from_utf8(&frame.payload[4..])
-                                .expect("server first");
-                            let final_message = scram_final_response(
-                                user,
-                                password,
-                                client_nonce,
-                                server_first,
-                            );
+                            let server_first =
+                                std::str::from_utf8(&frame.payload[4..]).expect("server first");
+                            let final_message =
+                                scram_final_response(user, password, client_nonce, server_first);
                             stream
                                 .write_all(&scram_final_message(&final_message))
                                 .await
@@ -267,9 +276,9 @@ async fn run_scram_startup(addr: SocketAddr, user: &str, password: &[u8]) -> Vec
             }
 
             if sent_final
-                && frames
-                    .iter()
-                    .any(|frame| frame.tag == b'Z' && frame.ready_status() == Some(ReadyStatus::Idle))
+                && frames.iter().any(|frame| {
+                    frame.tag == b'Z' && frame.ready_status() == Some(ReadyStatus::Idle)
+                })
             {
                 return frames;
             }
@@ -317,14 +326,10 @@ async fn run_scram_startup_expect_error(
                             .expect("write SCRAM initial");
                     }
                     11 => {
-                        let server_first = std::str::from_utf8(&frame.payload[4..])
-                            .expect("server first");
-                        let final_message = scram_final_response(
-                            user,
-                            password,
-                            client_nonce,
-                            server_first,
-                        );
+                        let server_first =
+                            std::str::from_utf8(&frame.payload[4..]).expect("server first");
+                        let final_message =
+                            scram_final_response(user, password, client_nonce, server_first);
                         stream
                             .write_all(&scram_final_message(&final_message))
                             .await

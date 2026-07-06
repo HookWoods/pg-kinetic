@@ -33,8 +33,8 @@ fn builds_authentication_sasl_scram_sha_256() {
     assert_eq!(
         authentication_sasl_scram_sha_256().freeze(),
         Bytes::from_static(&[
-            b'R', 0, 0, 0, 23, 0, 0, 0, 10, b'S', b'C', b'R', b'A', b'M', b'-', b'S', b'H',
-            b'A', b'-', b'2', b'5', b'6', 0, 0,
+            b'R', 0, 0, 0, 23, 0, 0, 0, 10, b'S', b'C', b'R', b'A', b'M', b'-', b'S', b'H', b'A',
+            b'-', b'2', b'5', b'6', 0, 0,
         ]),
     );
 }
@@ -52,8 +52,8 @@ fn builds_authentication_sasl_final() {
     assert_eq!(
         authentication_sasl_final(b"v=server-proof").freeze(),
         Bytes::from_static(&[
-            b'R', 0, 0, 0, 22, 0, 0, 0, 12, b'v', b'=', b's', b'e', b'r', b'v', b'e', b'r',
-            b'-', b'p', b'r', b'o', b'o', b'f',
+            b'R', 0, 0, 0, 22, 0, 0, 0, 12, b'v', b'=', b's', b'e', b'r', b'v', b'e', b'r', b'-',
+            b'p', b'r', b'o', b'o', b'f',
         ]),
     );
 }

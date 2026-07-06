@@ -4,14 +4,16 @@ use anyhow::{bail, Context};
 
 use crate::config::{BackendTlsMode, ClientTlsMode, TlsConfig};
 use tokio::net::TcpStream;
+use tokio_rustls::rustls::pki_types::{ServerName, UnixTime};
 use tokio_rustls::rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer},
     server::WebPkiClientVerifier,
     ClientConfig, DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme,
 };
-use tokio_rustls::{client::TlsStream as ClientTlsStream, server::TlsStream, TlsAcceptor, TlsConnector};
-use tokio_rustls::rustls::pki_types::{ServerName, UnixTime};
+use tokio_rustls::{
+    client::TlsStream as ClientTlsStream, server::TlsStream, TlsAcceptor, TlsConnector,
+};
 
 pub fn load_server_config(config: &TlsConfig) -> anyhow::Result<Arc<ServerConfig>> {
     let cert_path = config

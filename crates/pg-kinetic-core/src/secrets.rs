@@ -78,12 +78,16 @@ impl ScramVerifier {
         let salt = STANDARD
             .decode(salt)
             .map_err(|_| SecretError::InvalidBase64 { field: "salt" })?;
-        let stored_key = STANDARD.decode(stored_key).map_err(|_| SecretError::InvalidBase64 {
-            field: "stored_key",
-        })?;
-        let server_key = STANDARD.decode(server_key).map_err(|_| SecretError::InvalidBase64 {
-            field: "server_key",
-        })?;
+        let stored_key = STANDARD
+            .decode(stored_key)
+            .map_err(|_| SecretError::InvalidBase64 {
+                field: "stored_key",
+            })?;
+        let server_key = STANDARD
+            .decode(server_key)
+            .map_err(|_| SecretError::InvalidBase64 {
+                field: "server_key",
+            })?;
 
         validate_scram_key_length("stored_key", &stored_key)?;
         validate_scram_key_length("server_key", &server_key)?;
@@ -216,7 +220,11 @@ fn derive_scram_stored_key(password: &[u8], salt: &[u8], iterations: u32) -> Vec
     Sha256::digest(client_key).to_vec()
 }
 
-fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; SCRAM_SHA_256_KEY_LEN] {
+fn pbkdf2_hmac_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; SCRAM_SHA_256_KEY_LEN] {
     let mut block = Vec::with_capacity(salt.len() + 4);
     block.extend_from_slice(salt);
     block.extend_from_slice(&1u32.to_be_bytes());

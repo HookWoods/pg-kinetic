@@ -13,7 +13,10 @@ use crate::{
 };
 use pg_kinetic_core::secrets::{generate_nonce, ScramVerifier, UserSecret, UserStore};
 use pg_kinetic_wire::{
-    auth::{authentication_ok, authentication_sasl_continue, authentication_sasl_final, authentication_sasl_scram_sha_256},
+    auth::{
+        authentication_ok, authentication_sasl_continue, authentication_sasl_final,
+        authentication_sasl_scram_sha_256,
+    },
     backend::build_error_response,
     frame::{parse_frontend_frame, FrontendFrame},
 };
@@ -60,16 +63,14 @@ pub fn load_user_store(path: Option<&Path>) -> anyhow::Result<UserStore> {
         let user_secret = if secret.eq_ignore_ascii_case("trust") {
             UserSecret::Trust
         } else {
-            UserSecret::ScramSha256(
-                ScramVerifier::parse(secret).with_context(|| {
-                    format!(
-                        "parse SCRAM verifier for user {} in {} line {}",
-                        username,
-                        path.display(),
-                        line_number + 1
-                    )
-                })?,
-            )
+            UserSecret::ScramSha256(ScramVerifier::parse(secret).with_context(|| {
+                format!(
+                    "parse SCRAM verifier for user {} in {} line {}",
+                    username,
+                    path.display(),
+                    line_number + 1
+                )
+            })?)
         };
 
         store.insert(username.to_owned(), user_secret);
@@ -110,13 +111,23 @@ async fn authenticate_trust(
             Ok(ClientAuthOutcome::Authenticated)
         }
         Some(UserSecret::ScramSha256(_)) => {
-            reject_authentication(client, auth.auth_failure_message_mode, username, "password required")
-                .await?;
+            reject_authentication(
+                client,
+                auth.auth_failure_message_mode,
+                username,
+                "password required",
+            )
+            .await?;
             Ok(ClientAuthOutcome::Rejected)
         }
         None => {
-            reject_authentication(client, auth.auth_failure_message_mode, username, "unknown user")
-                .await?;
+            reject_authentication(
+                client,
+                auth.auth_failure_message_mode,
+                username,
+                "unknown user",
+            )
+            .await?;
             Ok(ClientAuthOutcome::Rejected)
         }
     }
@@ -130,8 +141,13 @@ async fn authenticate_scram(
     max_client_buffer_bytes: usize,
 ) -> anyhow::Result<ClientAuthOutcome> {
     let Some(UserSecret::ScramSha256(verifier)) = users.get(username) else {
-        reject_authentication(client, auth.auth_failure_message_mode, username, "unknown user")
-            .await?;
+        reject_authentication(
+            client,
+            auth.auth_failure_message_mode,
+            username,
+            "unknown user",
+        )
+        .await?;
         return Ok(ClientAuthOutcome::Rejected);
     };
 
@@ -174,18 +190,21 @@ async fn authenticate_scram(
         .await
         .context("read SCRAM final response")?;
     let final_response = parse_password_frame(&final_response)?;
-    let client_final = std::str::from_utf8(&final_response).context("parse SCRAM final response")?;
+    let client_final =
+        std::str::from_utf8(&final_response).context("parse SCRAM final response")?;
     let (channel_binding, combined_nonce, proof) = parse_scram_client_final(client_final)?;
 
-    anyhow::ensure!(channel_binding == "biws", "unsupported SCRAM channel binding");
+    anyhow::ensure!(
+        channel_binding == "biws",
+        "unsupported SCRAM channel binding"
+    );
     anyhow::ensure!(
         combined_nonce == format!("{client_nonce}{server_nonce}"),
         "SCRAM nonce mismatch"
     );
 
-    let auth_message = format!(
-        "{client_first_bare},{server_first},c={channel_binding},r={combined_nonce}"
-    );
+    let auth_message =
+        format!("{client_first_bare},{server_first},c={channel_binding},r={combined_nonce}");
     if verify_scram_proof(verifier, auth_message.as_bytes(), &proof).is_err() {
         reject_authentication(
             client,
@@ -221,7 +240,9 @@ async fn reject_authentication(
 ) -> anyhow::Result<()> {
     let message = match mode {
         AuthFailureMessageMode::Generic => String::from("password authentication failed"),
-        AuthFailureMessageMode::Detailed => format!("password authentication failed for user {username}: {reason}"),
+        AuthFailureMessageMode::Detailed => {
+            format!("password authentication failed for user {username}: {reason}")
+        }
     };
     let error = build_error_response(AUTH_FAILURE_SQLSTATE, &message);
     client
@@ -281,7 +302,10 @@ fn parse_scram_initial_response(payload: &[u8]) -> anyhow::Result<(&str, &str)> 
 }
 
 fn parse_scram_client_first(message: &str) -> anyhow::Result<(String, String, String)> {
-    anyhow::ensure!(message.starts_with("n,,"), "SCRAM client first message is malformed");
+    anyhow::ensure!(
+        message.starts_with("n,,"),
+        "SCRAM client first message is malformed"
+    );
     let bare = &message[3..];
     let mut username = None;
     let mut nonce = None;
@@ -342,8 +366,10 @@ fn verify_scram_proof(
     let client_signature = hmac_sha256(&verifier.stored_key, auth_message);
     let client_key = xor_bytes(&client_proof, &client_signature);
     let derived_stored_key = Sha256::digest(&client_key);
-    let proof_matches: bool =
-        derived_stored_key.as_slice().ct_eq(verifier.stored_key.as_slice()).into();
+    let proof_matches: bool = derived_stored_key
+        .as_slice()
+        .ct_eq(verifier.stored_key.as_slice())
+        .into();
     anyhow::ensure!(proof_matches, "SCRAM proof verification failed");
     Ok(())
 }

@@ -1,6 +1,6 @@
+use pg_kinetic::config::TlsConfig;
 use pg_kinetic::pool::{BackendPool, PoolError};
 use pg_kinetic::route::{QueryClass, RouteKey};
-use pg_kinetic::config::TlsConfig;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},

@@ -18,8 +18,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::{
-    client::TlsStream as ClientTlsStream, rustls::pki_types::ServerName, TlsAcceptor,
-    TlsConnector,
+    client::TlsStream as ClientTlsStream, rustls::pki_types::ServerName, TlsAcceptor, TlsConnector,
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -429,12 +428,21 @@ async fn backend_tls_disable_connects_without_ssl_request() {
     tokio::spawn(async move {
         let (mut stream, _) = backend.accept().await.expect("accept backend");
         let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await.expect("read startup len");
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("read startup len");
         let len = i32::from_be_bytes(header) as usize;
         assert_ne!(len, 8, "backend should not receive an SSLRequest");
         let mut body = vec![0_u8; len - 4];
-        stream.read_exact(&mut body).await.expect("read startup body");
-        sender.send(String::from("startup")).await.expect("send startup");
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("read startup body");
+        sender
+            .send(String::from("startup"))
+            .await
+            .expect("send startup");
     });
 
     let config = backend_tls_config(BackendTlsMode::Disable, None, None);
@@ -477,12 +485,21 @@ async fn backend_tls_prefer_falls_back_when_backend_denies_tls() {
             .expect("deny tls");
 
         let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await.expect("read startup len");
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("read startup len");
         let len = i32::from_be_bytes(header) as usize;
         assert_ne!(len, 8, "fallback should continue with startup packet");
         let mut body = vec![0_u8; len - 4];
-        stream.read_exact(&mut body).await.expect("read startup body");
-        sender.send(String::from("startup")).await.expect("send startup");
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("read startup body");
+        sender
+            .send(String::from("startup"))
+            .await
+            .expect("send startup");
     });
 
     let config = backend_tls_config(
@@ -611,11 +628,17 @@ async fn backend_tls_verify_full_accepts_tls_with_ca_and_server_name() {
             .await
             .expect("backend tls handshake");
         let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await.expect("read startup len");
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("read startup len");
         let len = i32::from_be_bytes(header) as usize;
         assert_ne!(len, 8, "verify_full should continue with startup packet");
         let mut body = vec![0_u8; len - 4];
-        stream.read_exact(&mut body).await.expect("read startup body");
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("read startup body");
     });
 
     let config = backend_tls_config(

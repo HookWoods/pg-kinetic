@@ -4,7 +4,10 @@ pub mod config;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;
+pub mod reload;
 pub mod tls;
+
+pub use reload::{ReloadDecision, ReloadableConfig};
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
     metrics::install(metrics::MetricsConfig {

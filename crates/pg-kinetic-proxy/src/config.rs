@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, ValueEnum};
+use serde::Deserialize;
 
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
@@ -11,7 +12,8 @@ use pg_kinetic_core::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum ClientTlsMode {
     Disable,
@@ -43,7 +45,8 @@ impl From<ClientTlsMode> for CoreClientTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum BackendTlsMode {
     Disable,
@@ -78,11 +81,13 @@ impl From<BackendTlsMode> for CoreBackendTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum AuthMode {
     PassThrough,
     Trust,
+    #[serde(rename = "scram_sha_256", alias = "scram_sha256")]
     #[value(name = "scram_sha_256", alias = "scram_sha256")]
     ScramSha256,
 }
@@ -108,7 +113,8 @@ impl From<AuthMode> for CoreAuthMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum AuthFailureMessageMode {
     Generic,
@@ -125,7 +131,7 @@ impl AuthFailureMessageMode {
     }
 }
 
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Debug, Eq, PartialEq, Parser)]
 #[command(name = "pg-kinetic")]
 #[command(about = "Low-overhead PostgreSQL wire proxy")]
 pub struct Config {
@@ -163,7 +169,7 @@ pub struct Config {
     pub socket: SocketConfig,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct ConnectionConfig {
     #[arg(long, env = "PG_KINETIC_LISTEN_ADDR", default_value = "127.0.0.1:6543")]
     pub listen_addr: SocketAddr,
@@ -176,7 +182,7 @@ pub struct ConnectionConfig {
     pub backend_addr: SocketAddr,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct CapacityConfig {
     #[arg(long, env = "PG_KINETIC_MAX_CLIENTS", default_value_t = 10_000)]
     pub max_clients: usize,
@@ -188,7 +194,7 @@ pub struct CapacityConfig {
     pub max_checkout_waiters: usize,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct PerformanceConfig {
     #[arg(long, env = "PG_KINETIC_CHECKOUT_TIMEOUT_MS", default_value_t = 1_000)]
     pub checkout_timeout_ms: u64,
@@ -212,7 +218,7 @@ pub struct PerformanceConfig {
     pub backend_reset_query: String,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct QosConfig {
     #[arg(
         long,
@@ -267,13 +273,13 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct TlsConfig {
     #[arg(
         long,
@@ -333,7 +339,7 @@ impl Default for TlsConfig {
     }
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct AuthConfig {
     #[arg(
         long,
@@ -380,7 +386,7 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct ReloadConfig {
     #[arg(long, env = "PG_KINETIC_CONFIG_FILE")]
     pub config_file: Option<PathBuf>,
@@ -413,7 +419,7 @@ impl Default for ReloadConfig {
     }
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DrainConfig {
     #[arg(long, env = "PG_KINETIC_DRAIN_TIMEOUT_MS", default_value_t = 30_000)]
     pub drain_timeout_ms: u64,
@@ -438,7 +444,7 @@ impl Default for DrainConfig {
     }
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct HealthConfig {
     #[arg(long, env = "PG_KINETIC_HEALTH_ADDR")]
     pub health_addr: Option<SocketAddr>,
@@ -476,7 +482,7 @@ impl Default for HealthConfig {
     }
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct SocketConfig {
     #[arg(long, env = "PG_KINETIC_TCP_NODELAY", default_value_t = true)]
     pub tcp_nodelay: bool,
@@ -543,6 +549,59 @@ impl Config {
     #[must_use]
     pub fn parse_args() -> Self {
         Self::parse()
+    }
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:6543".parse().expect("valid default listen addr"),
+            backend_addr: "127.0.0.1:5432"
+                .parse()
+                .expect("valid default backend addr"),
+        }
+    }
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            max_clients: 10_000,
+            max_backends: 100,
+            max_checkout_waiters: 1_000,
+        }
+    }
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            checkout_timeout_ms: 1_000,
+            recovery_mode: RecoveryMode::Recover,
+            recovery_timeout_ms: 5_000,
+            backend_reset_query: String::from("DISCARD ALL"),
+        }
+    }
+}
+
+impl Default for QosConfig {
+    fn default() -> Self {
+        Self {
+            max_route_in_flight: QosDefaults::MAX_ROUTE_IN_FLIGHT,
+            max_route_waiters: QosDefaults::MAX_ROUTE_WAITERS,
+            query_timeout_ms: TimeoutDefaults::QUERY_TIMEOUT_MS,
+            idle_client_timeout_ms: TimeoutDefaults::IDLE_CLIENT_TIMEOUT_MS,
+            idle_transaction_timeout_ms: TimeoutDefaults::IDLE_TRANSACTION_TIMEOUT_MS,
+            max_client_buffer_bytes: BufferDefaults::MAX_CLIENT_BUFFER_BYTES,
+            max_backend_buffer_bytes: BufferDefaults::MAX_BACKEND_BUFFER_BYTES,
+            overload_error_code: String::from("53300"),
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self { metrics_addr: None }
     }
 }
 

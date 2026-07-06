@@ -1,8 +1,8 @@
 use std::{
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     task::{Context as TaskContext, Poll},
 };
 
@@ -11,8 +11,8 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
 };
-use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 
 use crate::{
     config::{BackendTlsMode, TlsConfig},
@@ -187,9 +187,7 @@ async fn negotiate_backend_tls(
         }
         value if value == u8::from(SslResponse::Deny) => match tls_mode {
             BackendTlsMode::Prefer => Ok(BackendConnectStream::Plain(stream)),
-            BackendTlsMode::Require
-            | BackendTlsMode::VerifyCa
-            | BackendTlsMode::VerifyFull => {
+            BackendTlsMode::Require | BackendTlsMode::VerifyCa | BackendTlsMode::VerifyFull => {
                 anyhow::bail!("backend denied TLS negotiation")
             }
             BackendTlsMode::Disable => unreachable!(),

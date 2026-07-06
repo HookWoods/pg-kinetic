@@ -12,7 +12,7 @@ use bytes::{BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{RwLock, Semaphore},
     time::timeout,
 };
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
@@ -22,7 +22,7 @@ use crate::{
     config::Config,
     metrics,
     pool::{BackendPool, PooledBackend},
-    tls,
+    reload, tls,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
@@ -31,7 +31,6 @@ use pg_kinetic_core::{
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
-    secrets::UserStore,
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
@@ -108,7 +107,10 @@ impl ClientConnection {
         }
     }
 
-    pub(crate) async fn start_tls(&mut self, server_config: &Arc<ServerConfig>) -> anyhow::Result<()> {
+    pub(crate) async fn start_tls(
+        &mut self,
+        server_config: &Arc<ServerConfig>,
+    ) -> anyhow::Result<()> {
         let plain = match self.inner.take().context("client stream missing")? {
             ClientTransport::Plain(stream) => stream,
             ClientTransport::Tls(stream) => {
@@ -127,79 +129,76 @@ impl ClientConnection {
 pub struct Proxy {
     config: Config,
     client_slots: Arc<Semaphore>,
-    pool: Arc<BackendPool>,
 }
 
 impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
-        let pool = BackendPool::new(
-            config.connection.backend_addr,
-            config.tls.clone(),
-            config.capacity.max_backends,
-            config.capacity.max_checkout_waiters,
-            config.qos.max_route_in_flight,
-            config.qos.max_route_waiters,
-            config.performance.checkout_timeout(),
-            config.performance.backend_reset_query.clone(),
-        );
 
         Self {
             config,
             client_slots,
-            pool,
         }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let auth_users = if matches!(
-            self.config.auth.auth_mode,
-            crate::config::AuthMode::PassThrough
-        ) {
-            None
-        } else {
-            Some(Arc::new(auth::load_user_store(
-                self.config.auth.auth_users_file.as_deref(),
-            )?))
-        };
+        let effective_config = reload::load_effective_config(&self.config)?;
+        let active_config = Arc::new(RwLock::new(effective_config.clone()));
+        let runtime = Arc::new(RwLock::new(reload::build_reloadable_config(
+            &effective_config,
+        )?));
+        let pool = BackendPool::new(
+            effective_config.connection.backend_addr,
+            effective_config.tls.clone(),
+            effective_config.capacity.max_backends,
+            effective_config.capacity.max_checkout_waiters,
+            effective_config.qos.max_route_in_flight,
+            effective_config.qos.max_route_waiters,
+            effective_config.performance.checkout_timeout(),
+            effective_config.performance.backend_reset_query.clone(),
+        );
 
-        let listener = TcpListener::bind(self.config.connection.listen_addr)
+        if effective_config.reload.reload_enabled && effective_config.reload.config_file.is_some() {
+            let base_config = self.config.clone();
+            let reload_config = effective_config.reload.clone();
+            let active_config = Arc::clone(&active_config);
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                reload::spawn_reload_loop(base_config, reload_config, active_config, runtime).await;
+            });
+        }
+
+        let listener = TcpListener::bind(effective_config.connection.listen_addr)
             .await
-            .with_context(|| format!("bind listener {}", self.config.connection.listen_addr))?;
-        let client_tls_server_config = match self.config.tls.client_tls_mode {
-            crate::config::ClientTlsMode::Disable => None,
-            _ => Some(tls::load_server_config(&self.config.tls)?),
-        };
+            .with_context(|| {
+                format!("bind listener {}", effective_config.connection.listen_addr)
+            })?;
 
-        tracing::info!(listen_addr = %self.config.connection.listen_addr, "listening");
+        tracing::info!(listen_addr = %effective_config.connection.listen_addr, "listening");
 
         loop {
             let (client, client_addr) = listener.accept().await.context("accept client")?;
             let client = ClientConnection::new(client);
-            client.set_nodelay(true).context("set client TCP_NODELAY")?;
+            let runtime_snapshot = runtime.read().await.clone();
+            client
+                .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
+                .context("set client TCP_NODELAY")?;
             metrics::increment_client_connections();
 
             let permit = self.client_slots.clone().acquire_owned().await?;
-            let pool = self.pool.clone();
-            let performance = self.config.performance.clone();
-            let qos = self.config.qos.clone();
-            let auth = self.config.auth.clone();
-            let client_tls_mode = self.config.tls.client_tls_mode;
-            let client_tls_server_config = client_tls_server_config.clone();
-            let auth_users = auth_users.clone();
+            let pool = Arc::clone(&pool);
+            let auth = effective_config.auth.clone();
+            let client_tls_mode = effective_config.tls.client_tls_mode;
 
             tokio::spawn(async move {
                 let result = handle_client(
                     client,
                     client_addr,
                     pool,
-                    performance,
-                    qos,
+                    runtime_snapshot,
                     auth,
-                    auth_users,
                     client_tls_mode,
-                    client_tls_server_config,
                 )
                 .await;
                 drop(permit);
@@ -217,13 +216,18 @@ async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,
     pool: Arc<BackendPool>,
-    performance: crate::config::PerformanceConfig,
-    qos: crate::config::QosConfig,
+    runtime: reload::ReloadableConfig,
     auth: crate::config::AuthConfig,
-    auth_users: Option<Arc<UserStore>>,
     client_tls_mode: crate::config::ClientTlsMode,
-    client_tls_server_config: Option<Arc<ServerConfig>>,
 ) -> anyhow::Result<()> {
+    let reload::ReloadableConfig {
+        performance,
+        qos,
+        socket: _,
+        client_tls_server_config,
+        auth_users,
+    } = runtime;
+
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let mut session = VirtualSession::default();
     let mut pinned_backend = PinnedBackend::default();
@@ -267,7 +271,9 @@ async fn handle_client(
             &mut client,
             &route_user,
             &auth,
-            auth_users.as_deref().context("auth user store unavailable")?,
+            auth_users
+                .as_deref()
+                .context("auth user store unavailable")?,
             qos.max_client_buffer_bytes,
         )
         .await
@@ -999,10 +1005,7 @@ async fn proxy_startup(
 fn auth_request_code(payload: &[u8]) -> anyhow::Result<i32> {
     anyhow::ensure!(payload.len() >= 4, "authentication request missing code");
     Ok(i32::from_be_bytes([
-        payload[0],
-        payload[1],
-        payload[2],
-        payload[3],
+        payload[0], payload[1], payload[2], payload[3],
     ]))
 }
 
