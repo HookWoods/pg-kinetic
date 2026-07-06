@@ -52,7 +52,11 @@ impl From<&SocketConfig> for SocketOptions {
 }
 
 impl SocketOptions {
-    pub fn apply_to(self, stream: &TcpStream, socket_kind: &'static str) -> anyhow::Result<SocketOptionReport> {
+    pub fn apply_to(
+        self,
+        stream: &TcpStream,
+        socket_kind: &'static str,
+    ) -> anyhow::Result<SocketOptionReport> {
         apply_socket_options(stream, &self, socket_kind)
     }
 }
@@ -73,12 +77,7 @@ pub fn apply_socket_options(
         || socket.set_tcp_nodelay(options.tcp_nodelay),
         &mut strict_error,
     );
-    report.tcp_keepalive = apply_keepalive_option(
-        &socket,
-        options,
-        socket_kind,
-        &mut strict_error,
-    );
+    report.tcp_keepalive = apply_keepalive_option(&socket, options, socket_kind, &mut strict_error);
     report.tcp_user_timeout = apply_user_timeout_option(
         &socket,
         options.tcp_user_timeout,
@@ -138,17 +137,25 @@ fn apply_keepalive_option(
         match socket.set_tcp_keepalive(&keepalive) {
             Ok(()) if unsupported => SocketOptionOutcome::Unsupported,
             Ok(()) => SocketOptionOutcome::Applied,
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                handle_unsupported(socket_kind, "tcp_keepalive", options.strict_socket_option_mode, strict_error, error)
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => handle_unsupported(
+                socket_kind,
+                "tcp_keepalive",
+                options.strict_socket_option_mode,
+                strict_error,
+                error,
+            ),
             Err(error) => handle_failed(socket_kind, "tcp_keepalive", strict_error, error),
         }
     } else {
         match socket.set_keepalive(false) {
             Ok(()) => SocketOptionOutcome::Applied,
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                handle_unsupported(socket_kind, "tcp_keepalive", options.strict_socket_option_mode, strict_error, error)
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => handle_unsupported(
+                socket_kind,
+                "tcp_keepalive",
+                options.strict_socket_option_mode,
+                strict_error,
+                error,
+            ),
             Err(error) => handle_failed(socket_kind, "tcp_keepalive", strict_error, error),
         }
     };
@@ -180,7 +187,12 @@ fn apply_user_timeout(
     socket_kind: &'static str,
     strict_error: &mut Option<anyhow::Error>,
 ) -> SocketOptionOutcome {
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux", target_os = "cygwin"))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "cygwin"
+    ))]
     {
         match socket.set_tcp_user_timeout(Some(timeout)) {
             Ok(()) => SocketOptionOutcome::Applied,
@@ -191,7 +203,12 @@ fn apply_user_timeout(
         }
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux", target_os = "cygwin")))]
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "cygwin"
+    )))]
     {
         let _ = socket;
         let _ = timeout;
@@ -200,7 +217,10 @@ fn apply_user_timeout(
             "tcp_user_timeout",
             strict,
             strict_error,
-            std::io::Error::new(std::io::ErrorKind::Unsupported, "tcp user timeout unsupported"),
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "tcp user timeout unsupported",
+            ),
         )
     }
 }

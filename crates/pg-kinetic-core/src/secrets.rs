@@ -54,7 +54,6 @@ pub enum SecretError {
 }
 
 impl ScramVerifier {
-    #[must_use]
     pub fn parse(verifier: &str) -> Result<Self, SecretError> {
         let (prefix, rest) = verifier.split_once('$').ok_or(SecretError::MissingField)?;
         if prefix != SCRAM_SHA_256_PREFIX {
@@ -206,7 +205,6 @@ fn validate_scram_key_length(field: &'static str, value: &[u8]) -> Result<(), Se
     }
 }
 
-#[must_use]
 pub fn generate_nonce() -> Result<String, SecretError> {
     let mut bytes = [0u8; DEFAULT_NONCE_LEN];
     getrandom(&mut bytes).map_err(|_| SecretError::NonceGeneration)?;

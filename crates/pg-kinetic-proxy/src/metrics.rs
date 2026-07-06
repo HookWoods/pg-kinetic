@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
@@ -12,7 +13,6 @@ use pg_kinetic_core::{
     virtual_session::PinReason,
 };
 use pg_kinetic_wire::sqlstate::SqlState;
-use crate::socket::SocketOptionOutcome;
 
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
@@ -147,11 +147,7 @@ pub fn record_tls_handshake<M: MetricLabel>(scope: TlsScope, mode: M) {
     .increment(1);
 }
 
-pub fn record_tls_failure<M: MetricLabel>(
-    scope: TlsScope,
-    mode: M,
-    reason: TlsFailureReason,
-) {
+pub fn record_tls_failure<M: MetricLabel>(scope: TlsScope, mode: M, reason: TlsFailureReason) {
     metrics_crate::counter!(
         OperationalMetricName::TlsFailuresTotal.as_str(),
         "scope" => scope.metric_label(),
@@ -187,7 +183,11 @@ pub fn record_config_reload(outcome: ReloadOutcome) {
 }
 
 pub fn record_drain_state(state: DrainState) {
-    for candidate in [DrainState::Accepting, DrainState::Draining, DrainState::Drained] {
+    for candidate in [
+        DrainState::Accepting,
+        DrainState::Draining,
+        DrainState::Drained,
+    ] {
         metrics_crate::gauge!(
             OperationalMetricName::DrainState.as_str(),
             "state" => candidate.metric_label()

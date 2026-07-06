@@ -16,8 +16,7 @@ use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 
 use crate::{
     config::{BackendTlsMode, SocketConfig, TlsConfig},
-    socket,
-    tls,
+    socket, tls,
 };
 use pg_kinetic_wire::tls::{ssl_request_packet, SslResponse};
 
@@ -114,12 +113,14 @@ impl Backend {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum BackendConnectStream {
     Plain(TcpStream),
     Tls(ClientTlsStream<TcpStream>),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum BackendStream {
     Plain(TcpStream),

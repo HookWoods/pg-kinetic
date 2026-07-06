@@ -5,7 +5,9 @@ use pg_kinetic::{
 use tokio::net::{TcpListener, TcpStream};
 
 async fn connected_stream() -> TcpStream {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener addr");
 
     tokio::spawn(async move {
@@ -36,8 +38,7 @@ async fn applies_supported_socket_options() {
     let stream = connected_stream().await;
     let options = SocketOptions::from(&basic_socket_config());
 
-    let report = apply_socket_options(&stream, &options, "test")
-        .expect("socket options apply");
+    let report = apply_socket_options(&stream, &options, "test").expect("socket options apply");
 
     assert_eq!(report.tcp_nodelay, SocketOptionOutcome::Applied);
     assert_eq!(report.tcp_keepalive, SocketOptionOutcome::Applied);

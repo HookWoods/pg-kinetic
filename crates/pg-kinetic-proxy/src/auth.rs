@@ -161,14 +161,14 @@ async fn authenticate_scram(
         .await
         .context("read SCRAM initial response")?;
     let initial = parse_password_frame(&initial)?;
-    let (mechanism, client_first) = parse_scram_initial_response(&initial)?;
+    let (mechanism, client_first) = parse_scram_initial_response(initial)?;
     anyhow::ensure!(
         mechanism == SCRAM_MECHANISM,
         "unsupported SCRAM mechanism {mechanism}"
     );
 
     let (client_first_bare, client_first_username, client_nonce) =
-        parse_scram_client_first(&client_first)?;
+        parse_scram_client_first(client_first)?;
     anyhow::ensure!(
         client_first_username == username,
         "SCRAM client username does not match startup user"
@@ -190,8 +190,7 @@ async fn authenticate_scram(
         .await
         .context("read SCRAM final response")?;
     let final_response = parse_password_frame(&final_response)?;
-    let client_final =
-        std::str::from_utf8(&final_response).context("parse SCRAM final response")?;
+    let client_final = std::str::from_utf8(final_response).context("parse SCRAM final response")?;
     let (channel_binding, combined_nonce, proof) = parse_scram_client_final(client_final)?;
 
     anyhow::ensure!(
@@ -365,7 +364,7 @@ fn verify_scram_proof(
 
     let client_signature = hmac_sha256(&verifier.stored_key, auth_message);
     let client_key = xor_bytes(&client_proof, &client_signature);
-    let derived_stored_key = Sha256::digest(&client_key);
+    let derived_stored_key = Sha256::digest(client_key);
     let proof_matches: bool = derived_stored_key
         .as_slice()
         .ct_eq(verifier.stored_key.as_slice())

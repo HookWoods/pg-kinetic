@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -45,7 +45,7 @@ fn copy_fixture(prefix: &str, name: &str) -> PathBuf {
     path
 }
 
-fn toml_path(path: &PathBuf) -> String {
+fn toml_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -65,13 +65,14 @@ fn base_config() -> Config {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file_config(
     listen_addr: SocketAddr,
     backend_addr: SocketAddr,
-    auth_users_file: &PathBuf,
-    client_cert_path: &PathBuf,
-    client_key_path: &PathBuf,
-    client_ca_path: &PathBuf,
+    auth_users_file: &Path,
+    client_cert_path: &Path,
+    client_key_path: &Path,
+    client_ca_path: &Path,
     socket_nodelay: bool,
     query_timeout_ms: u64,
     reload_enabled: bool,
@@ -191,7 +192,7 @@ fn loads_config_from_toml_file() {
     assert_eq!(effective.auth.auth_mode, AuthMode::Trust);
     assert_eq!(effective.reload.config_reload_interval_ms, 7_500);
     assert!(effective.reload.reload_enabled);
-    assert_eq!(effective.socket.tcp_nodelay, false);
+    assert!(!effective.socket.tcp_nodelay);
 }
 
 #[test]

@@ -144,7 +144,8 @@ impl BackendHealthProbe {
             }
         };
 
-        self.status.store(Self::status_to_u8(status), Ordering::Release);
+        self.status
+            .store(Self::status_to_u8(status), Ordering::Release);
     }
 
     const fn status_to_u8(status: HealthStatus) -> u8 {

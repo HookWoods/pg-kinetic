@@ -23,16 +23,18 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     time,
 };
 
 type HmacSha256 = Hmac<Sha256>;
 
 const SCRAM_VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHlzYWx0$RdRL9M4hIQ6KSGRy8YdcY/rWTt9c53a35goFQzcrGXw=:lNY6toUrz5jlkvLtdJbAj5bXIomZuncUbgsZq5rYF5M=";
+static AUTH_SMOKE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
 async fn pass_through_mode_keeps_backend_auth_behavior() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::PassThrough, None).await;
     let frames = run_simple_startup(proxy_addr, "postgres").await;
 
@@ -46,6 +48,7 @@ async fn pass_through_mode_keeps_backend_auth_behavior() {
 
 #[tokio::test]
 async fn trust_mode_accepts_configured_user_without_password() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let auth_users_file = write_auth_users_file("alice = trust\n");
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::Trust, Some(auth_users_file)).await;
     let frames = run_simple_startup(proxy_addr, "alice").await;
@@ -60,6 +63,7 @@ async fn trust_mode_accepts_configured_user_without_password() {
 
 #[tokio::test]
 async fn scram_mode_accepts_valid_credentials() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let auth_users_file = write_auth_users_file(&format!("alice = {SCRAM_VERIFIER}\n"));
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::ScramSha256, Some(auth_users_file)).await;
     let frames = run_scram_startup(proxy_addr, "alice", b"pencil").await;
@@ -74,6 +78,7 @@ async fn scram_mode_accepts_valid_credentials() {
 
 #[tokio::test]
 async fn scram_mode_rejects_invalid_password() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let auth_users_file = write_auth_users_file(&format!("alice = {SCRAM_VERIFIER}\n"));
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::ScramSha256, Some(auth_users_file)).await;
     let frames = run_scram_startup_expect_error(proxy_addr, "alice", b"wrong-password").await;
@@ -90,6 +95,7 @@ async fn scram_mode_rejects_invalid_password() {
 
 #[tokio::test]
 async fn unknown_user_is_rejected_before_backend_checkout() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let auth_users_file = write_auth_users_file("alice = trust\n");
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::Trust, Some(auth_users_file)).await;
     let frames = run_simple_startup(proxy_addr, "charlie").await;
@@ -106,6 +112,7 @@ async fn unknown_user_is_rejected_before_backend_checkout() {
 
 #[tokio::test]
 async fn auth_failure_does_not_checkout_a_backend() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
     let auth_users_file = write_auth_users_file(&format!("alice = {SCRAM_VERIFIER}\n"));
     let (proxy_addr, mut events) = spawn_proxy(AuthMode::ScramSha256, Some(auth_users_file)).await;
     let _ = run_scram_startup_expect_error(proxy_addr, "alice", b"bad-password").await;
@@ -245,34 +252,31 @@ async fn run_scram_startup(addr: SocketAddr, user: &str, password: &[u8]) -> Vec
     loop {
         while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
             frames.push(frame.clone());
-            match frame.tag {
-                b'R' => {
-                    let code = auth_code(&frame);
-                    match code {
-                        10 => {
-                            let initial = scram_initial_message(user, client_nonce);
-                            stream
-                                .write_all(&initial)
-                                .await
-                                .expect("write SCRAM initial");
-                        }
-                        11 => {
-                            let server_first =
-                                std::str::from_utf8(&frame.payload[4..]).expect("server first");
-                            let final_message =
-                                scram_final_response(user, password, client_nonce, server_first);
-                            stream
-                                .write_all(&scram_final_message(&final_message))
-                                .await
-                                .expect("write SCRAM final");
-                            sent_final = true;
-                        }
-                        12 => {}
-                        0 => {}
-                        other => panic!("unexpected auth code {other}"),
+            if frame.tag == b'R' {
+                let code = auth_code(&frame);
+                match code {
+                    10 => {
+                        let initial = scram_initial_message(user, client_nonce);
+                        stream
+                            .write_all(&initial)
+                            .await
+                            .expect("write SCRAM initial");
                     }
+                    11 => {
+                        let server_first =
+                            std::str::from_utf8(&frame.payload[4..]).expect("server first");
+                        let final_message =
+                            scram_final_response(user, password, client_nonce, server_first);
+                        stream
+                            .write_all(&scram_final_message(&final_message))
+                            .await
+                            .expect("write SCRAM final");
+                        sent_final = true;
+                    }
+                    12 => {}
+                    0 => {}
+                    other => panic!("unexpected auth code {other}"),
                 }
-                _ => {}
             }
 
             if sent_final
@@ -316,8 +320,8 @@ async fn run_scram_startup_expect_error(
     loop {
         while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
             frames.push(frame.clone());
-            match frame.tag {
-                b'R' => match auth_code(&frame) {
+            if frame.tag == b'R' {
+                match auth_code(&frame) {
                     10 => {
                         let initial = scram_initial_message(user, client_nonce);
                         stream
@@ -338,8 +342,7 @@ async fn run_scram_startup_expect_error(
                     12 => {}
                     0 => {}
                     other => panic!("unexpected auth code {other}"),
-                },
-                _ => {}
+                }
             }
         }
 

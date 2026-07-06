@@ -21,11 +21,9 @@ use crate::{
     auth,
     config::Config,
     drain::{DrainController, DrainOutcome},
-    health,
-    metrics,
+    health, metrics,
     pool::{BackendPool, PooledBackend},
-    socket,
-    reload, tls,
+    reload, socket, tls,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
@@ -62,6 +60,7 @@ pub(crate) struct ClientConnection {
     inner: Option<ClientTransport>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ClientTransport {
     Plain(TcpStream),

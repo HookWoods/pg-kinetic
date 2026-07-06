@@ -52,6 +52,7 @@ pub enum PoolError {
 
 impl BackendPool {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_addr: SocketAddr,
         tls: TlsConfig,
@@ -76,6 +77,7 @@ impl BackendPool {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_socket(
         backend_addr: SocketAddr,
         tls: TlsConfig,

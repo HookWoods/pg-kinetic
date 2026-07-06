@@ -273,7 +273,7 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Args)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
@@ -596,12 +596,6 @@ impl Default for QosConfig {
             max_backend_buffer_bytes: BufferDefaults::MAX_BACKEND_BUFFER_BYTES,
             overload_error_code: String::from("53300"),
         }
-    }
-}
-
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self { metrics_addr: None }
     }
 }
 

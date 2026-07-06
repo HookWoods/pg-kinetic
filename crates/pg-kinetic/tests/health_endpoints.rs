@@ -218,9 +218,7 @@ struct HttpResponse {
 
 async fn http_get(addr: SocketAddr, path: &str) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect health");
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -244,7 +242,10 @@ async fn poll_ready(addr: SocketAddr, path: &str, expected_status: u16) -> HttpR
         }
 
         attempts += 1;
-        assert!(attempts < 40, "timed out waiting for {path} to return {expected_status}");
+        assert!(
+            attempts < 40,
+            "timed out waiting for {path} to return {expected_status}"
+        );
         time::sleep(Duration::from_millis(25)).await;
     }
 }
