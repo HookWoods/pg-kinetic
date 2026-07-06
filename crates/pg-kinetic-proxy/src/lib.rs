@@ -3,6 +3,7 @@ pub mod config;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;
+pub mod tls;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
     metrics::install(metrics::MetricsConfig {
