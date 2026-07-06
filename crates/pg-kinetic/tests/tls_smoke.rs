@@ -9,6 +9,7 @@ use pg_kinetic::{
     proxy::Proxy,
     wire::protocol::ProtocolVersion,
 };
+use pg_kinetic_proxy::backend::Backend;
 use pg_kinetic_proxy::tls::{load_backend_client_config, load_server_config};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -17,7 +18,8 @@ use tokio::{
     time,
 };
 use tokio_rustls::{
-    client::TlsStream as ClientTlsStream, rustls::pki_types::ServerName, TlsConnector,
+    client::TlsStream as ClientTlsStream, rustls::pki_types::ServerName, TlsAcceptor,
+    TlsConnector,
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -53,6 +55,22 @@ fn client_tls_config() -> TlsConfig {
         backend_tls_mode: BackendTlsMode::Disable,
         backend_ca_path: Some(fixture_path("ca.pem")),
         backend_server_name: Some(String::from("localhost")),
+    }
+}
+
+fn backend_tls_config(
+    backend_tls_mode: BackendTlsMode,
+    backend_ca_path: Option<PathBuf>,
+    backend_server_name: Option<String>,
+) -> TlsConfig {
+    TlsConfig {
+        client_tls_mode: ClientTlsMode::Disable,
+        client_cert_path: None,
+        client_key_path: None,
+        client_ca_path: None,
+        backend_tls_mode,
+        backend_ca_path,
+        backend_server_name,
     }
 }
 
@@ -226,6 +244,10 @@ async fn run_tls_startup(addr: SocketAddr) -> Vec<u8> {
     response[..read].to_vec()
 }
 
+fn backend_server_config() -> Arc<tokio_rustls::rustls::ServerConfig> {
+    load_server_config(&proxy_tls_config(ClientTlsMode::Allow)).expect("server config")
+}
+
 #[tokio::test]
 async fn server_config_loads_certificate_chain_and_key() {
     let config = proxy_tls_config(ClientTlsMode::Allow);
@@ -394,4 +416,219 @@ async fn client_tls_verify_client_rejects_clients_without_cert() {
 
     let events = collect_events(&mut events).await;
     assert!(events.is_empty(), "backend should not be touched");
+}
+
+#[tokio::test]
+async fn backend_tls_disable_connects_without_ssl_request() {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await.expect("accept backend");
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await.expect("read startup len");
+        let len = i32::from_be_bytes(header) as usize;
+        assert_ne!(len, 8, "backend should not receive an SSLRequest");
+        let mut body = vec![0_u8; len - 4];
+        stream.read_exact(&mut body).await.expect("read startup body");
+        sender.send(String::from("startup")).await.expect("send startup");
+    });
+
+    let config = backend_tls_config(BackendTlsMode::Disable, None, None);
+    let mut backend = Backend::connect(backend_addr, &config)
+        .await
+        .expect("backend connect");
+    backend
+        .stream_mut()
+        .write_all(&startup_packet())
+        .await
+        .expect("write startup");
+
+    let events = collect_events(&mut receiver).await;
+    assert_eq!(events, vec![String::from("startup")]);
+}
+
+#[tokio::test]
+async fn backend_tls_prefer_falls_back_when_backend_denies_tls() {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await.expect("accept backend");
+        let mut ssl_request = [0_u8; 8];
+        stream
+            .read_exact(&mut ssl_request)
+            .await
+            .expect("read ssl request");
+        assert_eq!(ssl_request.to_vec(), ssl_request_packet());
+        sender
+            .send(String::from("ssl_request"))
+            .await
+            .expect("send ssl request");
+        stream
+            .write_all(&[u8::from(pg_kinetic_wire::tls::SslResponse::Deny)])
+            .await
+            .expect("deny tls");
+
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await.expect("read startup len");
+        let len = i32::from_be_bytes(header) as usize;
+        assert_ne!(len, 8, "fallback should continue with startup packet");
+        let mut body = vec![0_u8; len - 4];
+        stream.read_exact(&mut body).await.expect("read startup body");
+        sender.send(String::from("startup")).await.expect("send startup");
+    });
+
+    let config = backend_tls_config(
+        BackendTlsMode::Prefer,
+        None,
+        Some(String::from("localhost")),
+    );
+    let mut backend = Backend::connect(backend_addr, &config)
+        .await
+        .expect("backend connect");
+    backend
+        .stream_mut()
+        .write_all(&startup_packet())
+        .await
+        .expect("write startup");
+
+    let events = collect_events(&mut receiver).await;
+    assert_eq!(
+        events,
+        vec![String::from("ssl_request"), String::from("startup")]
+    );
+}
+
+#[tokio::test]
+async fn backend_tls_require_fails_when_backend_denies_tls() {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await.expect("accept backend");
+        let mut ssl_request = [0_u8; 8];
+        stream
+            .read_exact(&mut ssl_request)
+            .await
+            .expect("read ssl request");
+        assert_eq!(ssl_request.to_vec(), ssl_request_packet());
+        sender
+            .send(String::from("ssl_request"))
+            .await
+            .expect("send ssl request");
+        stream
+            .write_all(&[u8::from(pg_kinetic_wire::tls::SslResponse::Deny)])
+            .await
+            .expect("deny tls");
+    });
+
+    let config = backend_tls_config(
+        BackendTlsMode::Require,
+        None,
+        Some(String::from("localhost")),
+    );
+    let error = Backend::connect(backend_addr, &config)
+        .await
+        .expect_err("backend tls require should fail");
+    assert!(
+        error.to_string().contains("backend denied TLS negotiation"),
+        "unexpected error: {error}"
+    );
+
+    let events = collect_events(&mut receiver).await;
+    assert_eq!(events, vec![String::from("ssl_request")]);
+}
+
+#[tokio::test]
+async fn backend_tls_verify_ca_requires_ca_configuration() {
+    let config = backend_tls_config(
+        BackendTlsMode::VerifyCa,
+        None,
+        Some(String::from("localhost")),
+    );
+    let error = Backend::connect("127.0.0.1:5432".parse().expect("backend addr"), &config)
+        .await
+        .expect_err("verify_ca without CA should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("backend TLS CA path is required for backend TLS verification"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn backend_tls_verify_full_requires_server_name() {
+    let config = backend_tls_config(
+        BackendTlsMode::VerifyFull,
+        Some(fixture_path("ca.pem")),
+        None,
+    );
+    let error = Backend::connect("127.0.0.1:5432".parse().expect("backend addr"), &config)
+        .await
+        .expect_err("verify_full without server name should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("backend TLS server name is required for backend TLS verify_full"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn backend_tls_verify_full_accepts_tls_with_ca_and_server_name() {
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+    let server_config = backend_server_config();
+
+    tokio::spawn(async move {
+        let (stream, _) = backend.accept().await.expect("accept backend");
+        let mut stream = stream;
+        let mut ssl_request = [0_u8; 8];
+        stream
+            .read_exact(&mut ssl_request)
+            .await
+            .expect("read ssl request");
+        assert_eq!(ssl_request.to_vec(), ssl_request_packet());
+        stream
+            .write_all(&[u8::from(pg_kinetic_wire::tls::SslResponse::Accept)])
+            .await
+            .expect("accept tls");
+        let mut stream = TlsAcceptor::from(server_config)
+            .accept(stream)
+            .await
+            .expect("backend tls handshake");
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await.expect("read startup len");
+        let len = i32::from_be_bytes(header) as usize;
+        assert_ne!(len, 8, "verify_full should continue with startup packet");
+        let mut body = vec![0_u8; len - 4];
+        stream.read_exact(&mut body).await.expect("read startup body");
+    });
+
+    let config = backend_tls_config(
+        BackendTlsMode::VerifyFull,
+        Some(fixture_path("ca.pem")),
+        Some(String::from("localhost")),
+    );
+    let mut backend = Backend::connect(backend_addr, &config)
+        .await
+        .expect("backend connect");
+    backend
+        .stream_mut()
+        .write_all(&startup_packet())
+        .await
+        .expect("write startup");
 }

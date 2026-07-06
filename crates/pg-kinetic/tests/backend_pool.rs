@@ -1,5 +1,6 @@
 use pg_kinetic::pool::{BackendPool, PoolError};
 use pg_kinetic::route::{QueryClass, RouteKey};
+use pg_kinetic::config::TlsConfig;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -23,6 +24,7 @@ async fn reports_connection_failure_when_backend_unavailable() {
     let backend_addr: SocketAddr = "127.0.0.1:9".parse().expect("valid socket");
     let pool = BackendPool::new(
         backend_addr,
+        TlsConfig::default(),
         1,
         1,
         1,
@@ -47,6 +49,7 @@ fn exposes_pool_limits() {
     let backend_addr: SocketAddr = "127.0.0.1:5432".parse().expect("valid socket");
     let pool = BackendPool::new(
         backend_addr,
+        TlsConfig::default(),
         4,
         8,
         4,
@@ -74,6 +77,7 @@ async fn marks_only_new_backend_connections_for_startup() {
 
     let pool = BackendPool::new(
         backend_addr,
+        TlsConfig::default(),
         1,
         1,
         1,
@@ -112,6 +116,7 @@ async fn reusable_checkout_waits_for_started_backend_instead_of_connecting() {
 
     let pool = BackendPool::new(
         backend_addr,
+        TlsConfig::default(),
         2,
         2,
         2,

@@ -11,7 +11,8 @@ use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     backpressure::BackpressureError,
     config::{
-        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
+        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig,
+        QosConfig, TlsConfig,
     },
     pool::{BackendPool, PoolError},
     proxy::Proxy,
@@ -78,6 +79,7 @@ async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
 
     let queue_full = BackendPool::new(
         "127.0.0.1:1".parse().expect("backend addr"),
+        TlsConfig::default(),
         1,
         1,
         0,
@@ -96,6 +98,7 @@ async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
 
     let timeout = BackendPool::new(
         "127.0.0.1:1".parse().expect("backend addr"),
+        TlsConfig::default(),
         1,
         1,
         0,

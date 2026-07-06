@@ -134,6 +134,7 @@ impl Proxy {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
         let pool = BackendPool::new(
             config.connection.backend_addr,
+            config.tls.clone(),
             config.capacity.max_backends,
             config.capacity.max_checkout_waiters,
             config.qos.max_route_in_flight,
