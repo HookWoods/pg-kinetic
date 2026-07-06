@@ -140,3 +140,104 @@ Metrics:
 - `pg_kinetic_backend_cleanup_total`
 - `pg_kinetic_backend_recovery_total`
 - `pg_kinetic_backend_sqlstate_total`
+
+## Production Security And Operations
+
+### TLS
+
+Client TLS modes:
+
+- `disable`: accept plaintext startup only.
+- `allow`: accept either plaintext startup or PostgreSQL `SSLRequest`.
+- `require`: reject plaintext startup and require TLS.
+- `verify_client`: require TLS and verify the client certificate chain.
+
+Backend TLS modes:
+
+- `disable`: connect to PostgreSQL without TLS.
+- `prefer`: try TLS first and fall back to plaintext if the backend refuses TLS.
+- `require`: fail closed if the backend refuses TLS.
+- `verify_ca`: require TLS and verify the backend certificate chain.
+- `verify_full`: require TLS, verify the backend CA, and match `backend_server_name`.
+
+`verify_client` needs `client_cert_path`, `client_key_path`, and `client_ca_path`. Backend verification modes need `backend_ca_path`, and `verify_full` also needs `backend_server_name`.
+
+### Authentication
+
+`auth_mode` controls the client auth path:
+
+- `pass_through`: preserve the backend's normal authentication flow.
+- `trust`: authenticate locally with the configured user store.
+- `scram_sha_256`: run local SCRAM-SHA-256 authentication before backend checkout.
+
+`auth_failure_message_mode` controls whether failures stay generic or include the user and reason. `backend_user` and `backend_password_env_var_name` are used when the proxy needs its own backend credentials.
+
+The local user store file accepts one entry per line:
+
+```text
+# comments and blank lines are ignored
+alice=trust
+bob=SCRAM-SHA-256$4096:base64salt:base64storedkey:base64serverkey
+```
+
+Usernames are case-sensitive by default.
+
+### Reload And Drain
+
+Set `config_file` to load a TOML config, and enable `reload_enabled` to keep checking it every `config_reload_interval_ms`.
+
+Safe reloads apply QoS, timeout, socket, TLS certificate material, and user-store updates. Listener addresses, backend addresses, and auth mode changes are rejected and leave the active config in place.
+
+Shutdown uses graceful drain: the proxy stops accepting new clients, lets active clients finish within `drain_timeout_ms`, and then closes out any remaining work.
+
+### Health
+
+Bind `health_addr` to expose:
+
+- `GET /healthz`
+- `GET /readyz`
+- `GET /state`
+
+`/readyz` returns `503` while draining or when backend readiness is failing. `/state` only exposes non-secret process and backend state.
+
+### Socket Tuning
+
+`tcp_nodelay` is on by default. Optional socket tuning includes keepalive, keepalive idle/interval/retries, `TCP_USER_TIMEOUT`, send and receive buffer sizes, and `strict_socket_option_mode` for fail-closed startup on unsupported options.
+
+### Production Metrics
+
+The production metric set now includes:
+
+- `pg_kinetic_tls_handshakes_total`
+- `pg_kinetic_tls_failures_total`
+- `pg_kinetic_auth_attempts_total`
+- `pg_kinetic_auth_failures_total`
+- `pg_kinetic_config_reload_total`
+- `pg_kinetic_drain_state`
+- `pg_kinetic_health_status`
+- `pg_kinetic_socket_option_total`
+
+The existing QoS and backend metrics remain available alongside them.
+
+### Smoke Commands
+
+Useful production checks:
+
+```bash
+cargo test --workspace
+cargo test -p pg-kinetic --test tls_smoke
+cargo test -p pg-kinetic --test auth_smoke
+cargo test -p pg-kinetic --test reload_config
+cargo test -p pg-kinetic --test graceful_drain
+cargo test -p pg-kinetic --test health_endpoints
+cargo test -p pg-kinetic --test socket_options
+```
+
+For a local stack:
+
+```bash
+docker compose -f bench/compose.yml up -d --build postgres pgbouncer pgdog pg-kinetic
+PGPASSWORD=postgres psql -h 127.0.0.1 -p 58432 -U postgres -d pgkinetic -c "select count(*) from accounts;"
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\psql.ps1 -Port 58432
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
+```

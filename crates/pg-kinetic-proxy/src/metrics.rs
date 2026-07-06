@@ -5,12 +5,14 @@ use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
     route::RouteKey,
+    security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
 };
 use pg_kinetic_core::{
     recovery::{RecoveryAction, RecoveryTrigger},
     virtual_session::PinReason,
 };
 use pg_kinetic_wire::sqlstate::SqlState;
+use crate::socket::SocketOptionOutcome;
 
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
@@ -136,6 +138,94 @@ pub fn increment_buffer_limit(kind: &'static str) {
     .increment(1);
 }
 
+pub fn record_tls_handshake<M: MetricLabel>(scope: TlsScope, mode: M) {
+    metrics_crate::counter!(
+        OperationalMetricName::TlsHandshakesTotal.as_str(),
+        "scope" => scope.metric_label(),
+        "mode" => mode.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn record_tls_failure<M: MetricLabel>(
+    scope: TlsScope,
+    mode: M,
+    reason: TlsFailureReason,
+) {
+    metrics_crate::counter!(
+        OperationalMetricName::TlsFailuresTotal.as_str(),
+        "scope" => scope.metric_label(),
+        "mode" => mode.metric_label(),
+        "reason" => reason.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn record_auth_attempt(mode: AuthMode) {
+    metrics_crate::counter!(
+        OperationalMetricName::AuthAttemptsTotal.as_str(),
+        "mode" => mode.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn record_auth_failure(mode: AuthMode, reason: AuthFailureReason) {
+    metrics_crate::counter!(
+        OperationalMetricName::AuthFailuresTotal.as_str(),
+        "mode" => mode.metric_label(),
+        "reason" => reason.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn record_config_reload(outcome: ReloadOutcome) {
+    metrics_crate::counter!(
+        OperationalMetricName::ConfigReloadTotal.as_str(),
+        "outcome" => outcome.metric_label()
+    )
+    .increment(1);
+}
+
+pub fn record_drain_state(state: DrainState) {
+    for candidate in [DrainState::Accepting, DrainState::Draining, DrainState::Drained] {
+        metrics_crate::gauge!(
+            OperationalMetricName::DrainState.as_str(),
+            "state" => candidate.metric_label()
+        )
+        .set(if candidate == state { 1.0 } else { 0.0 });
+    }
+}
+
+pub fn record_health_status(kind: HealthKind, status: HealthStatus) {
+    for candidate in [
+        HealthStatus::Ready,
+        HealthStatus::NotReady,
+        HealthStatus::Live,
+        HealthStatus::Degraded,
+    ] {
+        metrics_crate::gauge!(
+            OperationalMetricName::HealthStatus.as_str(),
+            "kind" => kind.metric_label(),
+            "status" => candidate.metric_label()
+        )
+        .set(if candidate == status { 1.0 } else { 0.0 });
+    }
+}
+
+pub fn record_socket_option<S: MetricLabel, O: MetricLabel>(
+    socket_kind: S,
+    option: O,
+    outcome: SocketOptionOutcome,
+) {
+    metrics_crate::counter!(
+        OperationalMetricName::SocketOptionTotal.as_str(),
+        "socket" => socket_kind.metric_label(),
+        "option" => option.metric_label(),
+        "outcome" => outcome.metric_label()
+    )
+    .increment(1);
+}
+
 fn describe_metrics() {
     metrics_crate::describe_counter!(
         MetricName::ClientConnectionsTotal.as_str(),
@@ -186,6 +276,38 @@ fn describe_metrics() {
         MetricName::BufferLimitTotal.as_str(),
         "Buffer limit breaches by kind"
     );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::TlsHandshakesTotal.as_str(),
+        "Successful PostgreSQL TLS handshakes by scope and mode"
+    );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::TlsFailuresTotal.as_str(),
+        "Failed PostgreSQL TLS handshakes by scope, mode, and reason"
+    );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::AuthAttemptsTotal.as_str(),
+        "Authentication attempts by auth mode"
+    );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::AuthFailuresTotal.as_str(),
+        "Authentication failures by auth mode and reason"
+    );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::ConfigReloadTotal.as_str(),
+        "Config reload decisions by outcome"
+    );
+    metrics_crate::describe_gauge!(
+        OperationalMetricName::DrainState.as_str(),
+        "Current drain state series (1.0 for the active state, 0.0 otherwise)"
+    );
+    metrics_crate::describe_gauge!(
+        OperationalMetricName::HealthStatus.as_str(),
+        "Current health state by kind and status series (1.0 for the active state, 0.0 otherwise)"
+    );
+    metrics_crate::describe_counter!(
+        OperationalMetricName::SocketOptionTotal.as_str(),
+        "Socket option outcomes by socket kind, option, and result"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,4 +321,202 @@ impl QueueScope {
             Self::Route => "route",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalMetricName {
+    TlsHandshakesTotal,
+    TlsFailuresTotal,
+    AuthAttemptsTotal,
+    AuthFailuresTotal,
+    ConfigReloadTotal,
+    DrainState,
+    HealthStatus,
+    SocketOptionTotal,
+}
+
+impl OperationalMetricName {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsHandshakesTotal => "pg_kinetic_tls_handshakes_total",
+            Self::TlsFailuresTotal => "pg_kinetic_tls_failures_total",
+            Self::AuthAttemptsTotal => "pg_kinetic_auth_attempts_total",
+            Self::AuthFailuresTotal => "pg_kinetic_auth_failures_total",
+            Self::ConfigReloadTotal => "pg_kinetic_config_reload_total",
+            Self::DrainState => "pg_kinetic_drain_state",
+            Self::HealthStatus => "pg_kinetic_health_status",
+            Self::SocketOptionTotal => "pg_kinetic_socket_option_total",
+        }
+    }
+}
+
+pub trait MetricLabel {
+    fn metric_label(self) -> &'static str;
+}
+
+impl MetricLabel for TlsScope {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+impl MetricLabel for ClientTlsMode {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabel for BackendTlsMode {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabel for AuthMode {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabel for DrainState {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabel for HealthStatus {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabel for SocketOptionOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Unsupported => "unsupported",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl MetricLabel for TlsFailureReason {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::HandshakeError => "handshake_error",
+            Self::VerificationFailed => "verification_failed",
+            Self::IoError => "io_error",
+        }
+    }
+}
+
+impl MetricLabel for AuthFailureReason {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::UnknownUser => "unknown_user",
+            Self::PasswordRequired => "password_required",
+            Self::InvalidPassword => "invalid_password",
+            Self::ProtocolError => "protocol_error",
+            Self::IoError => "io_error",
+        }
+    }
+}
+
+impl MetricLabel for ReloadOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+            Self::Unchanged => "unchanged",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl MetricLabel for HealthKind {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Ready => "ready",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+impl MetricLabel for SocketKind {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+impl MetricLabel for SocketOption {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::TcpNodelay => "tcp_nodelay",
+            Self::TcpKeepalive => "tcp_keepalive",
+            Self::TcpUserTimeout => "tcp_user_timeout",
+            Self::TcpSendBufferBytes => "tcp_send_buffer_bytes",
+            Self::TcpRecvBufferBytes => "tcp_recv_buffer_bytes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsScope {
+    Client,
+    Backend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsFailureReason {
+    Denied,
+    HandshakeError,
+    VerificationFailed,
+    IoError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthFailureReason {
+    UnknownUser,
+    PasswordRequired,
+    InvalidPassword,
+    ProtocolError,
+    IoError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReloadOutcome {
+    Applied,
+    Rejected,
+    Unchanged,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthKind {
+    Process,
+    Ready,
+    Backend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketKind {
+    Client,
+    Backend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketOption {
+    TcpNodelay,
+    TcpKeepalive,
+    TcpUserTimeout,
+    TcpSendBufferBytes,
+    TcpRecvBufferBytes,
 }
