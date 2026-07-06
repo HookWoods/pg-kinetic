@@ -164,6 +164,12 @@ async fn spawn_proxy_with_recording_backend() -> (SocketAddr, mpsc::Receiver<Str
             overload_error_code: "53300".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },
+        tls: Default::default(),
+        auth: Default::default(),
+        reload: Default::default(),
+        drain: Default::default(),
+        health: Default::default(),
+        socket: Default::default(),
     };
 
     tokio::spawn(async move {

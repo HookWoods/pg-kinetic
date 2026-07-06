@@ -274,6 +274,12 @@ async fn spawn_proxy(backend_mode: BackendMode, qos: QosConfig) -> (SocketAddr, 
         },
         qos,
         observability: ObservabilityConfig { metrics_addr: None },
+        tls: Default::default(),
+        auth: Default::default(),
+        reload: Default::default(),
+        drain: Default::default(),
+        health: Default::default(),
+        socket: Default::default(),
     };
 
     tokio::spawn(async move {

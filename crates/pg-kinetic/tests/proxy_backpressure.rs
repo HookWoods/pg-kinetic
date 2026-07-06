@@ -355,6 +355,12 @@ async fn spawn_timeout_proxy(scenario: TimeoutScenario) -> (SocketAddr, mpsc::Re
             overload_error_code: "53300".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },
+        tls: Default::default(),
+        auth: Default::default(),
+        reload: Default::default(),
+        drain: Default::default(),
+        health: Default::default(),
+        socket: Default::default(),
     };
 
     tokio::spawn(async move {
@@ -603,6 +609,12 @@ async fn spawn_proxy_with_backend_and_qos(
         },
         qos,
         observability: ObservabilityConfig { metrics_addr: None },
+        tls: Default::default(),
+        auth: Default::default(),
+        reload: Default::default(),
+        drain: Default::default(),
+        health: Default::default(),
+        socket: Default::default(),
     };
 
     tokio::spawn(async move {

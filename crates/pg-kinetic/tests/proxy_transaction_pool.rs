@@ -80,6 +80,12 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             overload_error_code: "53300".to_string(),
         },
         observability: ObservabilityConfig { metrics_addr: None },
+        tls: Default::default(),
+        auth: Default::default(),
+        reload: Default::default(),
+        drain: Default::default(),
+        health: Default::default(),
+        socket: Default::default(),
     };
 
     tokio::spawn(async move {
