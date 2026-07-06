@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod drain;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;

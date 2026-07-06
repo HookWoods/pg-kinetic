@@ -20,6 +20,7 @@ use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 use crate::{
     auth,
     config::Config,
+    drain::{DrainController, DrainOutcome},
     metrics,
     pool::{BackendPool, PooledBackend},
     reload, tls,
@@ -107,6 +108,13 @@ impl ClientConnection {
         }
     }
 
+    pub(crate) async fn shutdown(&mut self) -> std::io::Result<()> {
+        match self.inner.as_mut().expect("client stream present") {
+            ClientTransport::Plain(stream) => stream.shutdown().await,
+            ClientTransport::Tls(stream) => stream.shutdown().await,
+        }
+    }
+
     pub(crate) async fn start_tls(
         &mut self,
         server_config: &Arc<ServerConfig>,
@@ -129,17 +137,25 @@ impl ClientConnection {
 pub struct Proxy {
     config: Config,
     client_slots: Arc<Semaphore>,
+    drain: Arc<DrainController>,
 }
 
 impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
+        let drain = Arc::new(DrainController::new());
 
         Self {
             config,
             client_slots,
+            drain,
         }
+    }
+
+    #[must_use]
+    pub fn drain_controller(&self) -> Arc<DrainController> {
+        Arc::clone(&self.drain)
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -177,37 +193,96 @@ impl Proxy {
 
         tracing::info!(listen_addr = %effective_config.connection.listen_addr, "listening");
 
+        let drain_timeout = effective_config.drain.drain_timeout();
+        let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+        let mut drain_start_wait = Box::pin(self.drain.wait_for_drain_start());
+        let mut draining = false;
+
         loop {
-            let (client, client_addr) = listener.accept().await.context("accept client")?;
-            let client = ClientConnection::new(client);
-            let runtime_snapshot = runtime.read().await.clone();
-            client
-                .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
-                .context("set client TCP_NODELAY")?;
-            metrics::increment_client_connections();
-
-            let permit = self.client_slots.clone().acquire_owned().await?;
-            let pool = Arc::clone(&pool);
-            let auth = effective_config.auth.clone();
-            let client_tls_mode = effective_config.tls.client_tls_mode;
-
-            tokio::spawn(async move {
-                let result = handle_client(
-                    client,
-                    client_addr,
-                    pool,
-                    runtime_snapshot,
-                    auth,
-                    client_tls_mode,
-                )
-                .await;
-                drop(permit);
-
-                if let Err(error) = result {
-                    let error_chain = format!("{error:#}");
-                    tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
+            if draining {
+                let mut drain_completion = Box::pin(self.drain.wait_for_completion());
+                loop {
+                    tokio::select! {
+                        biased;
+                        outcome = &mut drain_completion => {
+                            self.drain.finish_drain();
+                            match outcome {
+                                DrainOutcome::Completed => {
+                                    tracing::info!(active_clients = self.drain.active_clients(), "drain completed");
+                                }
+                                DrainOutcome::TimedOut => {
+                                    tracing::warn!(active_clients = self.drain.active_clients(), "drain timed out");
+                                }
+                            }
+                            return Ok(());
+                        }
+                        accept = listener.accept() => {
+                            let (client, client_addr) = accept.context("accept draining client")?;
+                            let mut client = ClientConnection::new(client);
+                            let runtime_snapshot = runtime.read().await.clone();
+                            client
+                                .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
+                                .context("set draining client TCP_NODELAY")?;
+                            metrics::increment_client_connections();
+                            reject_client_during_drain(&mut client).await?;
+                            tracing::info!(%client_addr, "rejected client during drain");
+                        }
+                    }
                 }
-            });
+            }
+
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    if self.drain.begin_drain(drain_timeout) {
+                        tracing::info!("received shutdown signal; beginning drain");
+                    }
+                    draining = true;
+                }
+                _ = &mut drain_start_wait => {
+                    draining = true;
+                }
+                accept = listener.accept() => {
+                    let (client, client_addr) = accept.context("accept client")?;
+                    let client = ClientConnection::new(client);
+                    let runtime_snapshot = runtime.read().await.clone();
+                    client
+                        .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
+                        .context("set client TCP_NODELAY")?;
+                    metrics::increment_client_connections();
+
+                    let Some(client_guard) = self.drain.try_enter_client() else {
+                        let mut client = client;
+                        reject_client_during_drain(&mut client).await?;
+                        tracing::info!(%client_addr, "rejected client during drain");
+                        continue;
+                    };
+
+                    let permit = self.client_slots.clone().acquire_owned().await?;
+                    let pool = Arc::clone(&pool);
+                    let auth = effective_config.auth.clone();
+                    let client_tls_mode = effective_config.tls.client_tls_mode;
+
+                    tokio::spawn(async move {
+                        let _client_guard = client_guard;
+                        let result = handle_client(
+                            client,
+                            client_addr,
+                            pool,
+                            runtime_snapshot,
+                            auth,
+                            client_tls_mode,
+                        )
+                        .await;
+                        drop(permit);
+
+                        if let Err(error) = result {
+                            let error_chain = format!("{error:#}");
+                            tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -1501,6 +1576,16 @@ async fn error_response_only(
         .write_all(&error)
         .await
         .context("write timeout error response")
+}
+
+async fn reject_client_during_drain(client: &mut ClientConnection) -> anyhow::Result<()> {
+    error_response_only(
+        client,
+        SqlState::OperatorIntervention.as_str(),
+        "proxy is draining",
+    )
+    .await?;
+    client.shutdown().await.context("shutdown draining client")
 }
 
 async fn handle_query_timeout(
