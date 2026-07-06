@@ -15,11 +15,13 @@ use tokio::{
     sync::Semaphore,
     time::timeout,
 };
+use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 
 use crate::{
     config::Config,
     metrics,
     pool::{BackendPool, PooledBackend},
+    tls,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
@@ -50,6 +52,74 @@ use pg_kinetic_wire::{
 };
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ClientConnection {
+    inner: Option<ClientTransport>,
+}
+
+#[derive(Debug)]
+enum ClientTransport {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl ClientConnection {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            inner: Some(ClientTransport::Plain(stream)),
+        }
+    }
+
+    fn is_tls(&self) -> bool {
+        matches!(self.inner, Some(ClientTransport::Tls(_)))
+    }
+
+    fn has_peer_certificates(&self) -> bool {
+        match self.inner.as_ref().expect("client stream present") {
+            ClientTransport::Plain(_) => false,
+            ClientTransport::Tls(stream) => stream.get_ref().1.peer_certificates().is_some(),
+        }
+    }
+
+    fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        match self.inner.as_ref().expect("client stream present") {
+            ClientTransport::Plain(stream) => stream.set_nodelay(nodelay),
+            ClientTransport::Tls(stream) => {
+                let (stream, _) = stream.get_ref();
+                stream.set_nodelay(nodelay)
+            }
+        }
+    }
+
+    async fn read_buf(&mut self, buffer: &mut BytesMut) -> std::io::Result<usize> {
+        match self.inner.as_mut().expect("client stream present") {
+            ClientTransport::Plain(stream) => stream.read_buf(buffer).await,
+            ClientTransport::Tls(stream) => stream.read_buf(buffer).await,
+        }
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self.inner.as_mut().expect("client stream present") {
+            ClientTransport::Plain(stream) => stream.write_all(bytes).await,
+            ClientTransport::Tls(stream) => stream.write_all(bytes).await,
+        }
+    }
+
+    async fn start_tls(&mut self, server_config: &Arc<ServerConfig>) -> anyhow::Result<()> {
+        let plain = match self.inner.take().context("client stream missing")? {
+            ClientTransport::Plain(stream) => stream,
+            ClientTransport::Tls(stream) => {
+                self.inner = Some(ClientTransport::Tls(stream));
+                anyhow::bail!("client TLS is already active");
+            }
+        };
+
+        let tls = tls::accept_client_tls(plain, server_config).await?;
+        self.inner = Some(ClientTransport::Tls(tls));
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct Proxy {
@@ -83,11 +153,16 @@ impl Proxy {
         let listener = TcpListener::bind(self.config.connection.listen_addr)
             .await
             .with_context(|| format!("bind listener {}", self.config.connection.listen_addr))?;
+        let client_tls_server_config = match self.config.tls.client_tls_mode {
+            crate::config::ClientTlsMode::Disable => None,
+            _ => Some(tls::load_server_config(&self.config.tls)?),
+        };
 
         tracing::info!(listen_addr = %self.config.connection.listen_addr, "listening");
 
         loop {
             let (client, client_addr) = listener.accept().await.context("accept client")?;
+            let client = ClientConnection::new(client);
             client.set_nodelay(true).context("set client TCP_NODELAY")?;
             metrics::increment_client_connections();
 
@@ -95,9 +170,20 @@ impl Proxy {
             let pool = self.pool.clone();
             let performance = self.config.performance.clone();
             let qos = self.config.qos.clone();
+            let client_tls_mode = self.config.tls.client_tls_mode;
+            let client_tls_server_config = client_tls_server_config.clone();
 
             tokio::spawn(async move {
-                let result = handle_client(client, client_addr, pool, performance, qos).await;
+                let result = handle_client(
+                    client,
+                    client_addr,
+                    pool,
+                    performance,
+                    qos,
+                    client_tls_mode,
+                    client_tls_server_config,
+                )
+                .await;
                 drop(permit);
 
                 if let Err(error) = result {
@@ -110,11 +196,13 @@ impl Proxy {
 }
 
 async fn handle_client(
-    mut client: TcpStream,
+    mut client: ClientConnection,
     client_addr: SocketAddr,
     pool: Arc<BackendPool>,
     performance: crate::config::PerformanceConfig,
     qos: crate::config::QosConfig,
+    client_tls_mode: crate::config::ClientTlsMode,
+    client_tls_server_config: Option<Arc<ServerConfig>>,
 ) -> anyhow::Result<()> {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let mut session = VirtualSession::default();
@@ -125,6 +213,8 @@ async fn handle_client(
 
     let startup_packet = match read_startup_packet(
         &mut client,
+        client_tls_mode,
+        client_tls_server_config.as_ref(),
         qos.idle_client_timeout(),
         qos.max_client_buffer_bytes,
     )
@@ -536,7 +626,7 @@ fn route_key(
 }
 
 async fn next_client_cycle(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     client_buffer: &mut BytesMut,
     idle_timeout: Option<Duration>,
     idle_timeout_kind: IdleTimeoutKind,
@@ -654,17 +744,51 @@ struct QueryProgress {
 }
 
 async fn read_startup_packet(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
+    client_tls_mode: crate::config::ClientTlsMode,
+    client_tls_server_config: Option<&Arc<ServerConfig>>,
     idle_timeout: Duration,
     max_client_buffer_bytes: usize,
 ) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
+    let client_tls_required = matches!(
+        client_tls_mode,
+        crate::config::ClientTlsMode::Require | crate::config::ClientTlsMode::VerifyClient
+    );
     loop {
         while let Some(packet) = next_startup_packet(&mut buffer)? {
             match parse_startup_packet(&packet) {
-                Ok(StartupPacket::SslRequest | StartupPacket::GssEncRequest) => {
+                Ok(StartupPacket::SslRequest) => {
+                    match client_tls_mode {
+                        crate::config::ClientTlsMode::Disable => {
+                            reject_startup_encryption_request(client).await?;
+                        }
+                        crate::config::ClientTlsMode::Allow
+                        | crate::config::ClientTlsMode::Require
+                        | crate::config::ClientTlsMode::VerifyClient => {
+                            client
+                                .write_all(b"S")
+                                .await
+                                .context("accept startup encryption request")?;
+                            let server_config = client_tls_server_config
+                                .context("client TLS server config is unavailable")?;
+                            client.start_tls(server_config).await?;
+                            if matches!(client_tls_mode, crate::config::ClientTlsMode::VerifyClient)
+                                && !client.has_peer_certificates()
+                            {
+                                anyhow::bail!("client certificate is required");
+                            }
+                            buffer.clear();
+                        }
+                    }
+                    continue;
+                }
+                Ok(StartupPacket::GssEncRequest) => {
                     reject_startup_encryption_request(client).await?;
                     continue;
+                }
+                Ok(StartupPacket::Startup { .. }) if client_tls_required && !client.is_tls() => {
+                    anyhow::bail!("client TLS is required");
                 }
                 Ok(StartupPacket::CancelRequest { .. }) => {
                     anyhow::bail!("cancel requests are not supported during startup");
@@ -714,7 +838,7 @@ fn next_startup_packet(buffer: &mut BytesMut) -> anyhow::Result<Option<BytesMut>
     Ok(Some(buffer.split_to(len)))
 }
 
-async fn reject_startup_encryption_request(client: &mut TcpStream) -> anyhow::Result<()> {
+async fn reject_startup_encryption_request(client: &mut ClientConnection) -> anyhow::Result<()> {
     client
         .write_all(b"N")
         .await
@@ -730,7 +854,7 @@ enum StartupRead {
 }
 
 async fn proxy_startup(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     backend: &mut PooledBackend,
     startup_packet: &[u8],
     max_client_buffer_bytes: usize,
@@ -853,7 +977,7 @@ struct ForwardCycleState<'a> {
 }
 
 async fn forward_message_cycle(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     backend: &mut PooledBackend,
     state: &mut ForwardCycleState<'_>,
     frames: Vec<FrontendFrame>,
@@ -1257,7 +1381,7 @@ async fn recover_backend(
 }
 
 async fn error_response_and_ready(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     qos: &crate::config::QosConfig,
     message: &'static str,
 ) -> anyhow::Result<()> {
@@ -1271,7 +1395,7 @@ async fn error_response_and_ready(
 }
 
 async fn error_response_and_ready_with_state(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     sqlstate: &str,
     message: &str,
     ready_status: ReadyStatus,
@@ -1289,7 +1413,7 @@ async fn error_response_and_ready_with_state(
 }
 
 async fn error_response_only(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     sqlstate: &str,
     message: &str,
 ) -> anyhow::Result<()> {
@@ -1301,7 +1425,7 @@ async fn error_response_only(
 }
 
 async fn handle_query_timeout(
-    client: &mut TcpStream,
+    client: &mut ClientConnection,
     performance: &crate::config::PerformanceConfig,
     mut backend: PooledBackend,
     session: &mut VirtualSession,
@@ -1352,7 +1476,10 @@ async fn handle_query_timeout(
     Ok(!progress.response_started)
 }
 
-async fn handle_idle_timeout(client: &mut TcpStream, kind: IdleTimeoutKind) -> anyhow::Result<()> {
+async fn handle_idle_timeout(
+    client: &mut ClientConnection,
+    kind: IdleTimeoutKind,
+) -> anyhow::Result<()> {
     metrics_crate::counter!(
         MetricName::TimeoutTotal.as_str(),
         "kind" => match kind {

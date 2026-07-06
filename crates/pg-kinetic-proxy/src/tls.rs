@@ -3,11 +3,13 @@ use std::{fs, io::Cursor, path::Path, sync::Arc};
 use anyhow::{bail, Context};
 
 use crate::config::{ClientTlsMode, TlsConfig};
+use tokio::net::TcpStream;
 use tokio_rustls::rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     server::WebPkiClientVerifier,
     ClientConfig, RootCertStore, ServerConfig,
 };
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 pub fn load_server_config(config: &TlsConfig) -> anyhow::Result<Arc<ServerConfig>> {
     let cert_path = config
@@ -63,6 +65,16 @@ pub fn load_backend_client_config(config: &TlsConfig) -> anyhow::Result<Arc<Clie
         .with_no_client_auth();
 
     Ok(Arc::new(client_config))
+}
+
+pub async fn accept_client_tls(
+    stream: TcpStream,
+    server_config: &Arc<ServerConfig>,
+) -> anyhow::Result<TlsStream<TcpStream>> {
+    TlsAcceptor::from(Arc::clone(server_config))
+        .accept(stream)
+        .await
+        .context("complete client TLS handshake")
 }
 
 fn load_certificate_chain(

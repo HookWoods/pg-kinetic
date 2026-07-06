@@ -600,6 +600,7 @@ dependencies = [
  "pg-kinetic-wire",
  "pretty_assertions",
  "tokio",
+ "tokio-rustls",
  "tracing-subscriber",
 ]
 

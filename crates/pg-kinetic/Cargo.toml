@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 bytes = "1"
 metrics = "0.24"
 pretty_assertions = "1"
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true
