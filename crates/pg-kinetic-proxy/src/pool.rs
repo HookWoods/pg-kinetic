@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
 use crate::backend::Backend;
-use crate::config::TlsConfig;
+use crate::config::{SocketConfig, TlsConfig};
 use crate::metrics;
 use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
@@ -20,6 +20,7 @@ use pg_kinetic_core::{
 pub struct BackendPool {
     backend_addr: SocketAddr,
     tls: TlsConfig,
+    socket: SocketConfig,
     reset_query: Arc<str>,
     gate: BackpressureGate,
     route_gates: Mutex<HashMap<RouteKey, BackpressureGate>>,
@@ -61,9 +62,35 @@ impl BackendPool {
         checkout_timeout: Duration,
         reset_query: impl Into<Arc<str>>,
     ) -> Arc<Self> {
+        Self::new_with_socket(
+            backend_addr,
+            tls,
+            SocketConfig::default(),
+            max_backends,
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            checkout_timeout,
+            reset_query,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_socket(
+        backend_addr: SocketAddr,
+        tls: TlsConfig,
+        socket: SocketConfig,
+        max_backends: usize,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        reset_query: impl Into<Arc<str>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             backend_addr,
             tls,
+            socket,
             reset_query: reset_query.into(),
             gate: BackpressureGate::new(max_backends, max_waiters),
             route_gates: Mutex::new(HashMap::new()),
@@ -136,7 +163,7 @@ impl BackendPool {
                 });
             }
 
-            let backend = Backend::connect(self.backend_addr, &self.tls)
+            let backend = Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket)
                 .await
                 .map_err(PoolError::Connect)?;
 

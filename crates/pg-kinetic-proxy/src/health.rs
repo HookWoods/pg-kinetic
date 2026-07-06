@@ -14,7 +14,11 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{backend::Backend, config::TlsConfig, drain::DrainController};
+use crate::{
+    backend::Backend,
+    config::{SocketConfig, TlsConfig},
+    drain::DrainController,
+};
 use pg_kinetic_core::security::{DrainState, HealthStatus};
 
 #[derive(Debug)]
@@ -27,6 +31,7 @@ pub struct HealthState {
 pub struct BackendHealthProbe {
     backend_addr: SocketAddr,
     tls_config: TlsConfig,
+    socket_config: SocketConfig,
     readiness_timeout: Duration,
     readiness_backend_check_interval: Duration,
     status: AtomicU8,
@@ -76,12 +81,14 @@ impl BackendHealthProbe {
     pub fn new(
         backend_addr: SocketAddr,
         tls_config: TlsConfig,
+        socket_config: SocketConfig,
         readiness_timeout: Duration,
         readiness_backend_check_interval: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             backend_addr,
             tls_config,
+            socket_config,
             readiness_timeout,
             readiness_backend_check_interval,
             status: AtomicU8::new(Self::status_to_u8(HealthStatus::NotReady)),
@@ -119,7 +126,7 @@ impl BackendHealthProbe {
     async fn refresh_once(&self) {
         let status = match timeout(
             self.readiness_timeout,
-            Backend::connect(self.backend_addr, &self.tls_config),
+            Backend::connect_with_socket(self.backend_addr, &self.tls_config, &self.socket_config),
         )
         .await
         {
@@ -164,6 +171,7 @@ pub async fn spawn(
     drain: Arc<DrainController>,
     backend_addr: SocketAddr,
     tls_config: TlsConfig,
+    socket_config: SocketConfig,
     readiness_timeout: Duration,
     readiness_backend_check_interval: Duration,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -175,6 +183,7 @@ pub async fn spawn(
     let backend = BackendHealthProbe::new(
         backend_addr,
         tls_config,
+        socket_config,
         readiness_timeout,
         readiness_backend_check_interval,
     );

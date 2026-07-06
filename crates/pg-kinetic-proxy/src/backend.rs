@@ -15,7 +15,8 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 
 use crate::{
-    config::{BackendTlsMode, TlsConfig},
+    config::{BackendTlsMode, SocketConfig, TlsConfig},
+    socket,
     tls,
 };
 use pg_kinetic_wire::tls::{ssl_request_packet, SslResponse};
@@ -31,18 +32,27 @@ pub struct Backend {
 
 impl Backend {
     pub async fn connect(addr: SocketAddr, tls_config: &TlsConfig) -> anyhow::Result<Self> {
+        Self::connect_with_socket(addr, tls_config, &SocketConfig::default()).await
+    }
+
+    pub async fn connect_with_socket(
+        addr: SocketAddr,
+        tls_config: &TlsConfig,
+        socket_config: &SocketConfig,
+    ) -> anyhow::Result<Self> {
         let tls_settings = if matches!(tls_config.backend_tls_mode, BackendTlsMode::Disable) {
             None
         } else {
             Some(tls::backend_tls_settings(tls_config)?)
         };
 
+        let socket_options = socket::SocketOptions::from(socket_config);
+
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connect backend {addr}"))?;
-        stream
-            .set_nodelay(true)
-            .context("set backend TCP_NODELAY")?;
+        socket::apply_socket_options(&stream, &socket_options, "backend")
+            .context("apply backend socket options")?;
 
         if matches!(tls_config.backend_tls_mode, BackendTlsMode::Disable) {
             return Ok(Self {

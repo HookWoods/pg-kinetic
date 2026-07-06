@@ -24,6 +24,7 @@ use crate::{
     health,
     metrics,
     pool::{BackendPool, PooledBackend},
+    socket,
     reload, tls,
 };
 use pg_kinetic_core::{
@@ -82,16 +83,6 @@ impl ClientConnection {
         match self.inner.as_ref().expect("client stream present") {
             ClientTransport::Plain(_) => false,
             ClientTransport::Tls(stream) => stream.get_ref().1.peer_certificates().is_some(),
-        }
-    }
-
-    pub(crate) fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
-        match self.inner.as_ref().expect("client stream present") {
-            ClientTransport::Plain(stream) => stream.set_nodelay(nodelay),
-            ClientTransport::Tls(stream) => {
-                let (stream, _) = stream.get_ref();
-                stream.set_nodelay(nodelay)
-            }
         }
     }
 
@@ -165,9 +156,10 @@ impl Proxy {
         let runtime = Arc::new(RwLock::new(reload::build_reloadable_config(
             &effective_config,
         )?));
-        let pool = BackendPool::new(
+        let pool = BackendPool::new_with_socket(
             effective_config.connection.backend_addr,
             effective_config.tls.clone(),
+            effective_config.socket.clone(),
             effective_config.capacity.max_backends,
             effective_config.capacity.max_checkout_waiters,
             effective_config.qos.max_route_in_flight,
@@ -183,6 +175,7 @@ impl Proxy {
                     Arc::clone(&self.drain),
                     effective_config.connection.backend_addr,
                     effective_config.tls.clone(),
+                    effective_config.socket.clone(),
                     effective_config.health.readiness_timeout(),
                     effective_config.health.readiness_backend_check_interval(),
                 )
@@ -235,11 +228,11 @@ impl Proxy {
                         }
                         accept = listener.accept() => {
                             let (client, client_addr) = accept.context("accept draining client")?;
-                            let mut client = ClientConnection::new(client);
                             let runtime_snapshot = runtime.read().await.clone();
-                            client
-                                .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
-                                .context("set draining client TCP_NODELAY")?;
+                            let socket_options = socket::SocketOptions::from(&runtime_snapshot.socket);
+                            socket::apply_socket_options(&client, &socket_options, "client")
+                                .context("apply draining client socket options")?;
+                            let mut client = ClientConnection::new(client);
                             metrics::increment_client_connections();
                             reject_client_during_drain(&mut client).await?;
                             tracing::info!(%client_addr, "rejected client during drain");
@@ -261,11 +254,11 @@ impl Proxy {
                 }
                 accept = listener.accept() => {
                     let (client, client_addr) = accept.context("accept client")?;
-                    let client = ClientConnection::new(client);
                     let runtime_snapshot = runtime.read().await.clone();
-                    client
-                        .set_nodelay(runtime_snapshot.socket.tcp_nodelay)
-                        .context("set client TCP_NODELAY")?;
+                    let socket_options = socket::SocketOptions::from(&runtime_snapshot.socket);
+                    socket::apply_socket_options(&client, &socket_options, "client")
+                        .context("apply client socket options")?;
+                    let client = ClientConnection::new(client);
                     metrics::increment_client_connections();
 
                     let Some(client_guard) = self.drain.try_enter_client() else {
