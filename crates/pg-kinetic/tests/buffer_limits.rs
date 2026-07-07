@@ -274,7 +274,10 @@ async fn spawn_proxy(backend_mode: BackendMode, qos: QosConfig) -> (SocketAddr, 
         },
         qos,
         admin: Default::default(),
-        observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
+        observability: ObservabilityConfig {
+            metrics_addr: None,
+            ..Default::default()
+        },
         tls: Default::default(),
         auth: Default::default(),
         reload: Default::default(),

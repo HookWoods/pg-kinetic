@@ -10,12 +10,10 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
     let mut parts = normalized_sql.split_whitespace();
 
     match (parts.next(), parts.next(), parts.next()) {
-        (Some(command), Some(view), None) if command == "show" => {
-            match parse_admin_view(view) {
-                Some(view) => AdminCommand::Show(view),
-                None => AdminCommand::Unknown(normalized_sql),
-            }
-        }
+        (Some("show"), Some(view), None) => match parse_admin_view(view) {
+            Some(view) => AdminCommand::Show(view),
+            None => AdminCommand::Unknown(normalized_sql),
+        },
         _ => AdminCommand::Unknown(normalized_sql),
     }
 }

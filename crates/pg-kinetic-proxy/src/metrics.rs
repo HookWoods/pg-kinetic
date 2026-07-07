@@ -1,15 +1,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::socket::SocketOptionOutcome;
 use crate::snapshot::{PoolSnapshot, ServerSnapshot, SnapshotStore};
+use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
     observability::{
-        metric_catalog, MetricDescriptor, MetricKind,
-        MetricName as ObservabilityMetricName, MetricOutcome, ProtocolPhase,
+        metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
+        MetricOutcome, ProtocolPhase,
     },
     route::RouteKey,
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},

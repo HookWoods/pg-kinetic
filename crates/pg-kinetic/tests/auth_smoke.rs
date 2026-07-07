@@ -197,7 +197,10 @@ async fn spawn_proxy(
             overload_error_code: String::from("53300"),
         },
         admin: Default::default(),
-        observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
+        observability: ObservabilityConfig {
+            metrics_addr: None,
+            ..Default::default()
+        },
         tls: TlsConfig {
             client_tls_mode: pg_kinetic::config::ClientTlsMode::Disable,
             client_cert_path: None,

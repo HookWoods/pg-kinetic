@@ -235,11 +235,8 @@ const TRIGGER_ACTION_OUTCOME_LABELS: &[MetricLabel] = &[
 const KIND_LABELS: &[MetricLabel] = &[MetricLabel::Kind];
 const PHASE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Phase, MetricLabel::Outcome];
 const SCOPE_MODE_LABELS: &[MetricLabel] = &[MetricLabel::Scope, MetricLabel::Mode];
-const SCOPE_MODE_REASON_LABELS: &[MetricLabel] = &[
-    MetricLabel::Scope,
-    MetricLabel::Mode,
-    MetricLabel::Reason,
-];
+const SCOPE_MODE_REASON_LABELS: &[MetricLabel] =
+    &[MetricLabel::Scope, MetricLabel::Mode, MetricLabel::Reason];
 const MODE_LABELS: &[MetricLabel] = &[MetricLabel::Mode];
 const MODE_REASON_LABELS: &[MetricLabel] = &[MetricLabel::Mode, MetricLabel::Reason];
 const OUTCOME_ONLY_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];

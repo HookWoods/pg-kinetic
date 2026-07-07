@@ -7,14 +7,13 @@ use std::{
 
 use pg_kinetic_core::{
     observability::MetricOutcome,
+    prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     session::PinReason,
 };
 
-use crate::config::{
-    AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config,
-};
+use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -88,15 +87,23 @@ impl ServerSnapshot {
 pub struct PreparedSnapshot {
     pub statement_count: usize,
     pub materialization_count: usize,
+    pub statements: Vec<PreparedStatementSnapshot>,
 }
 
 impl PreparedSnapshot {
     #[must_use]
-    pub const fn new(statement_count: usize, materialization_count: usize) -> Self {
+    pub fn new(statement_count: usize, materialization_count: usize) -> Self {
         Self {
             statement_count,
             materialization_count,
+            statements: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_statements(mut self, statements: Vec<PreparedStatementSnapshot>) -> Self {
+        self.statements = statements;
+        self
     }
 }
 
@@ -516,15 +523,11 @@ impl SnapshotStore {
         outcome: MetricOutcome,
     ) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if let Some(snapshot) = inner
-            .recoveries
-            .iter_mut()
-            .find(|candidate| {
-                candidate.trigger == trigger
-                    && candidate.action == action
-                    && candidate.outcome == outcome
-            })
-        {
+        if let Some(snapshot) = inner.recoveries.iter_mut().find(|candidate| {
+            candidate.trigger == trigger
+                && candidate.action == action
+                && candidate.outcome == outcome
+        }) {
             snapshot.count += 1;
         } else {
             let mut snapshot = RecoverySnapshot::new(trigger, action, outcome);
@@ -541,15 +544,11 @@ impl SnapshotStore {
         error: impl Into<String>,
     ) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if let Some(snapshot) = inner
-            .recoveries
-            .iter_mut()
-            .find(|candidate| {
-                candidate.trigger == trigger
-                    && candidate.action == action
-                    && candidate.outcome == outcome
-            })
-        {
+        if let Some(snapshot) = inner.recoveries.iter_mut().find(|candidate| {
+            candidate.trigger == trigger
+                && candidate.action == action
+                && candidate.outcome == outcome
+        }) {
             snapshot.last_error = Some(error.into());
         }
     }
@@ -579,12 +578,7 @@ impl SnapshotStore {
             .insert(snapshot.route_key.clone(), snapshot);
     }
 
-    pub fn set_backpressure_route(
-        &self,
-        route_key: RouteKey,
-        waiting: usize,
-        in_flight: usize,
-    ) {
+    pub fn set_backpressure_route(&self, route_key: RouteKey, waiting: usize, in_flight: usize) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
         let snapshot = inner
             .backpressure
@@ -663,10 +657,7 @@ impl SnapshotStore {
     }
 
     pub fn set_limits_snapshot(&self, snapshot: LimitsSnapshot) {
-        self.inner
-            .write()
-            .expect("snapshot store poisoned")
-            .limits = snapshot;
+        self.inner.write().expect("snapshot store poisoned").limits = snapshot;
     }
 
     #[must_use]
@@ -769,6 +760,14 @@ impl PreparedSnapshotHandle {
             .prepared
             .materialization_count += 1;
     }
+
+    pub fn set_statements(&self, statements: Vec<PreparedStatementSnapshot>) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .prepared
+            .statements = statements;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -781,22 +780,13 @@ impl RecoverySnapshotHandle {
         Self { inner }
     }
 
-    pub fn record(
-        &self,
-        trigger: RecoveryTrigger,
-        action: RecoveryAction,
-        outcome: MetricOutcome,
-    ) {
+    pub fn record(&self, trigger: RecoveryTrigger, action: RecoveryAction, outcome: MetricOutcome) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if let Some(snapshot) = inner
-            .recoveries
-            .iter_mut()
-            .find(|candidate| {
-                candidate.trigger == trigger
-                    && candidate.action == action
-                    && candidate.outcome == outcome
-            })
-        {
+        if let Some(snapshot) = inner.recoveries.iter_mut().find(|candidate| {
+            candidate.trigger == trigger
+                && candidate.action == action
+                && candidate.outcome == outcome
+        }) {
             snapshot.count += 1;
         } else {
             let mut snapshot = RecoverySnapshot::new(trigger, action, outcome);
@@ -813,15 +803,11 @@ impl RecoverySnapshotHandle {
         error: impl Into<String>,
     ) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if let Some(snapshot) = inner
-            .recoveries
-            .iter_mut()
-            .find(|candidate| {
-                candidate.trigger == trigger
-                    && candidate.action == action
-                    && candidate.outcome == outcome
-            })
-        {
+        if let Some(snapshot) = inner.recoveries.iter_mut().find(|candidate| {
+            candidate.trigger == trigger
+                && candidate.action == action
+                && candidate.outcome == outcome
+        }) {
             snapshot.last_error = Some(error.into());
         }
     }

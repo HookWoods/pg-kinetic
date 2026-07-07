@@ -18,8 +18,8 @@ use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 use crate::{
     config::{BackendTlsMode, SocketConfig, TlsConfig},
     metrics,
-    socket, tls,
     snapshot::{ServerSnapshot, SnapshotStore},
+    socket, tls,
 };
 use pg_kinetic_core::route::RouteKey;
 use pg_kinetic_wire::tls::{ssl_request_packet, SslResponse};

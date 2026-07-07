@@ -181,8 +181,15 @@ fn metric_catalog_is_complete_and_stable() {
         );
         assert_eq!(descriptor.kind, kind, "wrong kind for {name}");
         assert_eq!(descriptor.unit, unit, "wrong unit for {name}");
-        assert_eq!(label_names(descriptor), expected_labels, "wrong labels for {name}");
-        assert!(!descriptor.cardinality_note.is_empty(), "missing cardinality note for {name}");
+        assert_eq!(
+            label_names(descriptor),
+            expected_labels,
+            "wrong labels for {name}"
+        );
+        assert!(
+            !descriptor.cardinality_note.is_empty(),
+            "missing cardinality note for {name}"
+        );
         assert!(
             !descriptor.description.is_empty(),
             "missing description for {name}"
@@ -229,6 +236,12 @@ fn catalog_never_exposes_sql_text_labels() {
     }
 }
 
-fn label_names(descriptor: &pg_kinetic::core::observability::MetricDescriptor) -> Vec<&'static str> {
-    descriptor.labels.iter().map(|label| label.as_str()).collect()
+fn label_names(
+    descriptor: &pg_kinetic::core::observability::MetricDescriptor,
+) -> Vec<&'static str> {
+    descriptor
+        .labels
+        .iter()
+        .map(|label| label.as_str())
+        .collect()
 }

@@ -120,10 +120,8 @@ impl BackendPool {
     }
 
     pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
-        *self
-            .snapshot_store
-            .lock()
-            .expect("snapshot store poisoned") = Some(snapshot_store.clone());
+        *self.snapshot_store.lock().expect("snapshot store poisoned") =
+            Some(snapshot_store.clone());
 
         if let Ok(mut idle_backends) = self.idle.try_lock() {
             for backend in idle_backends.iter_mut() {
@@ -200,9 +198,10 @@ impl BackendPool {
                 });
             }
 
-            let mut backend = Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket)
-                .await
-                .map_err(PoolError::Connect)?;
+            let mut backend =
+                Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket)
+                    .await
+                    .map_err(PoolError::Connect)?;
             self.active_backends.fetch_add(1, Ordering::AcqRel);
             self.attach_backend_snapshot_store(&mut backend);
             backend.mark_checked_out(Some(route.clone()));

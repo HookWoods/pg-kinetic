@@ -241,7 +241,11 @@ pub struct AdminConfig {
     #[arg(long, env = "PG_KINETIC_ADMIN_ALLOWED_USER")]
     pub admin_allowed_user: Option<String>,
 
-    #[arg(long, env = "PG_KINETIC_ADMIN_QUERY_TIMEOUT_MS", default_value_t = 1_000)]
+    #[arg(
+        long,
+        env = "PG_KINETIC_ADMIN_QUERY_TIMEOUT_MS",
+        default_value_t = 1_000
+    )]
     pub admin_query_timeout_ms: u64,
 
     #[arg(long, env = "PG_KINETIC_ADMIN_MAX_CLIENTS", default_value_t = 8)]
@@ -1016,10 +1020,7 @@ mod tests {
             config.observability.otel_endpoint,
             Some(String::from("http://otel.example.com:4318"))
         );
-        assert_eq!(
-            config.observability.otel_service_name,
-            "pg-kinetic-proxy"
-        );
+        assert_eq!(config.observability.otel_service_name, "pg-kinetic-proxy");
 
         assert_eq!(config.tls.client_tls_mode, ClientTlsMode::VerifyClient);
         assert_eq!(

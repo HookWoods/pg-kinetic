@@ -9,8 +9,8 @@ pub mod pool;
 pub mod proxy;
 pub mod reload;
 pub mod snapshot;
-pub mod telemetry;
 pub mod socket;
+pub mod telemetry;
 pub mod tls;
 
 pub use reload::ReloadDecision;

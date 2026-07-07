@@ -8,7 +8,10 @@ fn admin_view_labels_are_stable() {
     assert_eq!(AdminView::Clients.as_str(), "clients");
     assert_eq!(AdminView::Pools.as_str(), "pools");
     assert_eq!(AdminView::Backpressure.as_str(), "backpressure");
-    assert_eq!(AdminCommand::Show(AdminView::Prepared).view(), Some(AdminView::Prepared));
+    assert_eq!(
+        AdminCommand::Show(AdminView::Prepared).view(),
+        Some(AdminView::Prepared)
+    );
 }
 
 #[test]

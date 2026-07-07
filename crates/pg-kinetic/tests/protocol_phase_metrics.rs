@@ -16,10 +16,7 @@ fn phase_timer_records_startup_duration() {
 
     timer.finish(MetricOutcome::Ok);
 
-    assert_calls(
-        &recorder,
-        &[(ProtocolPhase::Startup, MetricOutcome::Ok)],
-    );
+    assert_calls(&recorder, &[(ProtocolPhase::Startup, MetricOutcome::Ok)]);
 }
 
 #[test]
@@ -103,10 +100,7 @@ impl PhaseTimingRecorder for TestPhaseTimingRecorder {
     }
 }
 
-fn assert_calls(
-    recorder: &TestPhaseTimingRecorder,
-    expected: &[(ProtocolPhase, MetricOutcome)],
-) {
+fn assert_calls(recorder: &TestPhaseTimingRecorder, expected: &[(ProtocolPhase, MetricOutcome)]) {
     let calls = recorder.calls.lock().expect("lock timing recorder");
     assert_eq!(calls.len(), expected.len());
     for (index, (phase, outcome)) in expected.iter().copied().enumerate() {

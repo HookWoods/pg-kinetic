@@ -1,8 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bytes::{BufMut, BytesMut};
@@ -18,13 +14,12 @@ use crate::{
     drain::DrainController,
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
-    telemetry,
     snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
         PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
         SnapshotStore,
     },
-    socket,
+    socket, telemetry,
 };
 use pg_kinetic_core::{
     admin::{
@@ -32,8 +27,8 @@ use pg_kinetic_core::{
         AdminView,
     },
     recovery::{RecoveryAction, RecoveryTrigger},
-    session::PinReason,
     route::RouteKey,
+    session::PinReason,
 };
 use pg_kinetic_wire::{
     admin::{build_admin_table_response, AdminWireColumn, AdminWireType},
@@ -316,7 +311,10 @@ fn startup_user(startup_packet: &[u8]) -> anyhow::Result<String> {
         .context("admin startup packet missing user")
 }
 
-async fn reject_admin_user(client: &mut ClientConnection, allowed_user: &str) -> anyhow::Result<()> {
+async fn reject_admin_user(
+    client: &mut ClientConnection,
+    allowed_user: &str,
+) -> anyhow::Result<()> {
     error_response_and_ready(
         client,
         ADMIN_AUTH_SQLSTATE,
@@ -334,7 +332,10 @@ async fn reject_during_drain(client: &mut ClientConnection) -> anyhow::Result<()
         ReadyStatusByte::Idle,
     )
     .await?;
-    client.shutdown().await.context("shutdown admin client during drain")
+    client
+        .shutdown()
+        .await
+        .context("shutdown admin client during drain")
 }
 
 async fn error_response_and_ready(
@@ -468,13 +469,25 @@ fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {
     admin_table(
         AdminView::Prepared,
         &[
-            ("statement_count", AdminColumnType::Int8),
-            ("materialization_count", AdminColumnType::Int8),
+            ("session_id", AdminColumnType::Int8),
+            ("client_statement_name", AdminColumnType::Text),
+            ("backend_statement_name", AdminColumnType::Text),
+            ("materialized_backend_count", AdminColumnType::Int8),
+            ("invalidation_count", AdminColumnType::Int8),
         ],
-        vec![AdminRow::new(vec![
-            prepared.statement_count.to_string(),
-            prepared.materialization_count.to_string(),
-        ])],
+        prepared
+            .statements
+            .iter()
+            .map(|statement| {
+                AdminRow::new(vec![
+                    statement.session_id.to_string(),
+                    statement.client_statement_name.clone(),
+                    statement.backend_statement_name.clone(),
+                    statement.materialized_backend_count.to_string(),
+                    statement.invalidation_count.to_string(),
+                ])
+            })
+            .collect(),
     )
 }
 
@@ -559,7 +572,10 @@ fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
     admin_table(
         AdminView::Routes,
         &[
-            ("route_key", AdminColumnType::Text),
+            ("database", AdminColumnType::Text),
+            ("user", AdminColumnType::Text),
+            ("application_name", AdminColumnType::Text),
+            ("query_class", AdminColumnType::Text),
             ("client_count", AdminColumnType::Int8),
             ("backend_count", AdminColumnType::Int8),
         ],
@@ -567,7 +583,10 @@ fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
             .iter()
             .map(|snapshot| {
                 AdminRow::new(vec![
-                    optional_route_key(Some(&snapshot.route_key)),
+                    snapshot.route_key.database().to_string(),
+                    snapshot.route_key.user().to_string(),
+                    optional_text(snapshot.route_key.application_name()),
+                    snapshot.route_key.query_class().to_string(),
                     snapshot.client_count.to_string(),
                     snapshot.backend_count.to_string(),
                 ])
@@ -705,12 +724,7 @@ fn admin_table_response(table: AdminTable) -> BytesMut {
     let columns = table
         .columns()
         .iter()
-        .map(|column| {
-            AdminWireColumn::new(
-                column.name(),
-                admin_wire_type(column.column_type()),
-            )
-        })
+        .map(|column| AdminWireColumn::new(column.name(), admin_wire_type(column.column_type())))
         .collect::<Vec<_>>();
     let rows = table
         .rows()
@@ -745,19 +759,7 @@ fn optional_u64(value: Option<u64>) -> String {
 }
 
 fn route_key_value(route_key: &RouteKey) -> String {
-    format!(
-        "{}/{}/{}/{}/{}",
-        route_key.database(),
-        route_key.user(),
-        route_key
-            .application_name()
-            .unwrap_or("<none>"),
-        route_key
-            .client_addr()
-            .map(|address| address.to_string())
-            .unwrap_or_else(|| String::from("<none>")),
-        route_key.query_class(),
-    )
+    route_key.metric_label()
 }
 
 fn duration_millis(duration: std::time::Duration) -> String {
@@ -783,9 +785,7 @@ fn optional_usize(value: Option<usize>) -> String {
 fn recovery_mode_label(mode: pg_kinetic_core::recovery::RecoveryMode) -> String {
     match mode {
         pg_kinetic_core::recovery::RecoveryMode::Recover => String::from("recover"),
-        pg_kinetic_core::recovery::RecoveryMode::RollbackOnly => {
-            String::from("rollback_only")
-        }
+        pg_kinetic_core::recovery::RecoveryMode::RollbackOnly => String::from("rollback_only"),
         pg_kinetic_core::recovery::RecoveryMode::Drop => String::from("drop"),
     }
 }

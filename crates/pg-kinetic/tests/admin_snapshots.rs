@@ -2,7 +2,9 @@ use std::{path::PathBuf, time::Duration};
 
 use pg_kinetic::{
     config::Config,
+    config::TlsConfig,
     core::observability::MetricOutcome,
+    core::prepare::PreparedStatementSnapshot,
     core::session::PinReason,
     pool::BackendPool,
     proxy_runtime::snapshot::{
@@ -10,7 +12,6 @@ use pg_kinetic::{
         PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
         SnapshotStore,
     },
-    config::TlsConfig,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
 };
@@ -71,7 +72,15 @@ fn snapshots_cover_pool_server_prepared_pinning_recovery_and_backpressure() {
     store.set_server_snapshot(server.clone());
 
     let prepared_handle = store.prepared_handle();
-    prepared_handle.set(PreparedSnapshot::new(3, 1));
+    prepared_handle.set(PreparedSnapshot::new(3, 1).with_statements(vec![
+        PreparedStatementSnapshot {
+            session_id: 11,
+            client_statement_name: String::from("stmt_a"),
+            backend_statement_name: String::from("pgk_11_1"),
+            materialized_backend_count: 2,
+            invalidation_count: 1,
+        },
+    ]));
     prepared_handle.increment_statement_count();
     prepared_handle.increment_materialization_count();
 
@@ -116,7 +125,16 @@ fn snapshots_cover_pool_server_prepared_pinning_recovery_and_backpressure() {
 
     assert_eq!(store.pool_snapshot(), pool);
     assert_eq!(store.server_snapshots(), vec![server]);
-    assert_eq!(store.prepared_snapshot(), PreparedSnapshot::new(4, 2));
+    assert_eq!(
+        store.prepared_snapshot(),
+        PreparedSnapshot::new(4, 2).with_statements(vec![PreparedStatementSnapshot {
+            session_id: 11,
+            client_statement_name: String::from("stmt_a"),
+            backend_statement_name: String::from("pgk_11_1"),
+            materialized_backend_count: 2,
+            invalidation_count: 1,
+        }])
+    );
     assert_eq!(store.pinning_snapshots(), vec![pinning]);
     assert_eq!(
         store.recovery_snapshots(),
@@ -183,7 +201,10 @@ async fn backend_checkout_updates_server_and_pool_snapshots() {
 
     let route = route_key();
 
-    let backend = pool.checkout(route.clone()).await.expect("checkout backend");
+    let backend = pool
+        .checkout(route.clone())
+        .await
+        .expect("checkout backend");
     assert!(backend.requires_startup());
 
     let pool_snapshot = store.pool_snapshot();
@@ -238,8 +259,7 @@ fn settings_and_limits_snapshots_do_not_expose_secrets() {
     config.tls.client_key_path = Some(PathBuf::from("client-key.pem"));
     config.tls.backend_ca_path = Some(PathBuf::from("backend-ca.pem"));
     config.auth.auth_mode = pg_kinetic::config::AuthMode::Trust;
-    config.auth.auth_failure_message_mode =
-        pg_kinetic::config::AuthFailureMessageMode::Detailed;
+    config.auth.auth_failure_message_mode = pg_kinetic::config::AuthFailureMessageMode::Detailed;
     config.auth.auth_users_file = Some(PathBuf::from("auth-users.toml"));
     config.auth.backend_user = Some(String::from("proxy_user"));
     config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));

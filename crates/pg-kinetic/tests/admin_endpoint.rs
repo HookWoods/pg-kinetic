@@ -1,6 +1,6 @@
 use std::{
-    path::PathBuf,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -15,12 +15,12 @@ use pg_kinetic::{
         ConnectionConfig, DrainConfig, HealthConfig, ObservabilityConfig, PerformanceConfig,
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
-    core::{observability::MetricOutcome, session::PinReason},
+    core::{observability::MetricOutcome, prepare::PreparedStatementSnapshot, session::PinReason},
+    proxy::Proxy,
     proxy_runtime::snapshot::{
         ClientSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot, RouteSnapshot,
         ServerSnapshot, SnapshotStore,
     },
-    proxy::Proxy,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     wire::{
@@ -55,7 +55,8 @@ async fn admin_listener_accepts_startup_without_backend_connection() {
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
     let admin_addr = free_port().await;
-    let (run_handle, _, _) = spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+    let (run_handle, _, _) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
 
     let mut stream = TcpStream::connect(admin_addr).await.expect("connect admin");
     stream
@@ -76,7 +77,8 @@ async fn admin_listener_rejects_non_admin_users() {
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
     let admin_addr = free_port().await;
-    let (run_handle, _, _) = spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+    let (run_handle, _, _) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
 
     let mut stream = TcpStream::connect(admin_addr).await.expect("connect admin");
     stream
@@ -85,7 +87,10 @@ async fn admin_listener_rejects_non_admin_users() {
         .expect("startup");
 
     let frames = read_until_ready(&mut stream).await;
-    let error = frames.iter().find(|frame| frame.tag == b'E').expect("error response");
+    let error = frames
+        .iter()
+        .find(|frame| frame.tag == b'E')
+        .expect("error response");
     assert!(error_message(error)
         .expect("error message")
         .contains("admin access restricted"));
@@ -100,7 +105,8 @@ async fn unknown_command_returns_error_response() {
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
     let admin_addr = free_port().await;
-    let (run_handle, _, _) = spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+    let (run_handle, _, _) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
 
     let mut stream = TcpStream::connect(admin_addr).await.expect("connect admin");
     stream
@@ -115,7 +121,10 @@ async fn unknown_command_returns_error_response() {
         .expect("query");
 
     let frames = read_until_ready(&mut stream).await;
-    let error = frames.iter().find(|frame| frame.tag == b'E').expect("error response");
+    let error = frames
+        .iter()
+        .find(|frame| frame.tag == b'E')
+        .expect("error response");
     assert_eq!(error.sqlstate().map(|state| state.as_str()), Some("0A000"));
     assert!(error_message(error)
         .expect("error message")
@@ -172,7 +181,7 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "reporter",
             "billing",
             "dashboard",
-            "billing/reporter/dashboard/127.0.0.1:6100/default",
+            "billing/reporter/dashboard/default",
             "active",
             "3000",
         ]],
@@ -203,7 +212,7 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
         ],
         &[vec![
             "42",
-            "billing/reporter/dashboard/127.0.0.1:6100/default",
+            "billing/reporter/dashboard/default",
             "active",
             "9000",
             "true",
@@ -225,10 +234,18 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
         spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
 
     let route_key = route_key();
-    let route_key_text = "billing/reporter/dashboard/127.0.0.1:6100/default";
+    let route_key_text = "billing/reporter/dashboard/default";
 
     let prepared_handle = snapshot_store.prepared_handle();
-    prepared_handle.set(PreparedSnapshot::new(3, 1));
+    prepared_handle.set(PreparedSnapshot::new(3, 1).with_statements(vec![
+        PreparedStatementSnapshot {
+            session_id: 11,
+            client_statement_name: String::from("stmt_a"),
+            backend_statement_name: String::from("pgk_11_1"),
+            materialized_backend_count: 2,
+            invalidation_count: 1,
+        },
+    ]));
     prepared_handle.increment_statement_count();
     prepared_handle.increment_materialization_count();
 
@@ -273,14 +290,26 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
     let prepared_frames = admin_query(admin_addr, "SHOW PREPARED").await;
     assert_admin_table_response(
         &prepared_frames,
-        &["statement_count", "materialization_count"],
-        &[vec!["4", "2"]],
+        &[
+            "session_id",
+            "client_statement_name",
+            "backend_statement_name",
+            "materialized_backend_count",
+            "invalidation_count",
+        ],
+        &[vec!["11", "stmt_a", "pgk_11_1", "2", "1"]],
     );
 
     let pinning_frames = admin_query(admin_addr, "SHOW PINNING").await;
     assert_admin_table_response(
         &pinning_frames,
-        &["client_id", "backend_id", "route_key", "reason", "duration_ms"],
+        &[
+            "client_id",
+            "backend_id",
+            "route_key",
+            "reason",
+            "duration_ms",
+        ],
         &[vec!["7", "42", route_key_text, "open_transaction", "4000"]],
     );
 
@@ -314,8 +343,22 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
     let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;
     assert_admin_table_response(
         &routes_frames,
-        &["route_key", "client_count", "backend_count"],
-        &[vec![route_key_text, "4", "2"]],
+        &[
+            "database",
+            "user",
+            "application_name",
+            "query_class",
+            "client_count",
+            "backend_count",
+        ],
+        &[vec![
+            "billing",
+            "reporter",
+            "dashboard",
+            "default",
+            "4",
+            "2",
+        ]],
     );
 
     assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
@@ -335,8 +378,7 @@ async fn show_settings_and_limits_keep_secrets_out() {
     config.tls.client_ca_path = Some(PathBuf::from("client-ca.pem"));
     config.tls.backend_ca_path = Some(PathBuf::from("backend-ca.pem"));
     config.tls.backend_server_name = Some(String::from("db.example.internal"));
-    config.auth.backend_password_env_var_name =
-        Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
+    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
     config.auth.backend_user = Some(String::from("proxy_user"));
     config.performance.backend_reset_query = String::from("DISCARD TEMP");
     config.admin.admin_query_timeout_ms = 75;
@@ -447,25 +489,8 @@ async fn show_settings_and_limits_keep_secrets_out() {
             "overload_error_code",
         ],
         &[vec![
-            "10",
-            "1",
-            "4",
-            "100",
-            "1000",
-            "250",
-            "30000",
-            "300000",
-            "60000",
-            "1048576",
-            "4194304",
-            "1000",
-            "30000",
-            "1000",
-            "5000",
-            "5000",
-            "75",
-            "9",
-            "53300",
+            "10", "1", "4", "100", "1000", "250", "30000", "300000", "60000", "1048576", "4194304",
+            "1000", "30000", "1000", "5000", "5000", "75", "9", "53300",
         ]],
     );
 
@@ -531,7 +556,10 @@ fn test_config(
             admin_query_timeout_ms: 100,
             admin_max_clients: 4,
         },
-        observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
+        observability: ObservabilityConfig {
+            metrics_addr: None,
+            ..Default::default()
+        },
         tls: TlsConfig {
             client_tls_mode: pg_kinetic::config::ClientTlsMode::Disable,
             client_cert_path: None,
@@ -687,8 +715,15 @@ fn assert_admin_table_response(
     expected_columns: &[&str],
     expected_rows: &[Vec<&str>],
 ) {
-    let row_description_frames = frames.iter().filter(|frame| frame.tag == b'T').collect::<Vec<_>>();
-    assert_eq!(row_description_frames.len(), 1, "expected one row description");
+    let row_description_frames = frames
+        .iter()
+        .filter(|frame| frame.tag == b'T')
+        .collect::<Vec<_>>();
+    assert_eq!(
+        row_description_frames.len(),
+        1,
+        "expected one row description"
+    );
     assert_eq!(
         row_description_columns(row_description_frames[0]),
         expected_columns
@@ -701,7 +736,11 @@ fn assert_admin_table_response(
         .collect::<Vec<_>>();
     let expected_rows = expected_rows
         .iter()
-        .map(|row| row.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>())
+        .map(|row| {
+            row.iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert_eq!(data_rows, expected_rows);
     assert!(

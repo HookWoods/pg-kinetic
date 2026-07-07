@@ -346,6 +346,7 @@ impl Proxy {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,
@@ -1152,6 +1153,7 @@ impl Drop for ClientSnapshotGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_client_snapshot(
     handle: &ClientSnapshotHandle,
     client_id: u64,
@@ -1456,6 +1458,7 @@ pub(crate) enum StartupRead {
     BufferLimitExceeded,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_startup(
     client: &mut ClientConnection,
     backend: &mut PooledBackend,
@@ -1690,6 +1693,7 @@ async fn forward_message_cycle(
                     .invalidate_for_sqlstate(sqlstate, backend.backend_id());
                 if scope != InvalidationScope::None {
                     metrics::increment_prepared_event(PreparedEvent::Invalidate);
+                    publish_prepared_snapshot(state.prepared, &state.prepared_snapshot_handle);
                 }
             }
 
@@ -1737,6 +1741,7 @@ fn prepare_frame_for_backend(
         metrics::increment_prepared_event(PreparedEvent::Parse);
         prepared_snapshot_handle.increment_statement_count();
         prepared.mark_materialized(backend_id, &statement);
+        publish_prepared_snapshot(prepared, prepared_snapshot_handle);
         timer.finish(MetricOutcome::Ok);
         return Ok(PreparedForwardPlan::single(rewrite_parse_statement_name(
             &frame,
@@ -1758,6 +1763,7 @@ fn prepare_frame_for_backend(
                 prepared.mark_materialized(backend_id, &statement);
                 metrics::increment_prepared_event(PreparedEvent::Materialize);
                 prepared_snapshot_handle.increment_materialization_count();
+                publish_prepared_snapshot(prepared, prepared_snapshot_handle);
             }
 
             timer.finish(MetricOutcome::Ok);
@@ -1782,6 +1788,7 @@ fn prepare_frame_for_backend(
                 prepared.mark_materialized(backend_id, &statement);
                 metrics::increment_prepared_event(PreparedEvent::Materialize);
                 prepared_snapshot_handle.increment_materialization_count();
+                publish_prepared_snapshot(prepared, prepared_snapshot_handle);
             }
 
             timer.finish(MetricOutcome::Ok);
@@ -1797,6 +1804,7 @@ fn prepare_frame_for_backend(
         let timer = PhaseTimer::start(ProtocolPhase::Close, phase_recorder);
         if let Some(statement) = prepared.remove(&statement_name) {
             metrics::increment_prepared_event(PreparedEvent::Close);
+            publish_prepared_snapshot(prepared, prepared_snapshot_handle);
             timer.finish(MetricOutcome::Ok);
             return Ok(PreparedForwardPlan::single(rewrite_close_statement_name(
                 &frame,
@@ -1812,6 +1820,13 @@ fn prepare_frame_for_backend(
     }
 
     Ok(PreparedForwardPlan::single(frame))
+}
+
+fn publish_prepared_snapshot(
+    prepared: &PreparedCatalog,
+    prepared_snapshot_handle: &PreparedSnapshotHandle,
+) {
+    prepared_snapshot_handle.set_statements(prepared.snapshot());
 }
 
 #[derive(Debug)]
@@ -1985,6 +2000,7 @@ async fn await_ready_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_backend(
     backend: &mut PooledBackend,
     route_key: RouteKey,
@@ -2156,6 +2172,7 @@ async fn reject_client_during_drain(
     client.shutdown().await.context("shutdown draining client")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_query_timeout(
     client: &mut ClientConnection,
     performance: &crate::config::PerformanceConfig,
@@ -2254,6 +2271,7 @@ async fn handle_idle_timeout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_backend_on_disconnect(
     mut backend: PooledBackend,
     pool: &Arc<BackendPool>,
