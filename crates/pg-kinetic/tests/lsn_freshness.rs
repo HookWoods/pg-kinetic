@@ -1,8 +1,6 @@
 use std::str::FromStr;
 
-use pg_kinetic_core::lsn::{
-    FreshnessRequirement, FreshnessStatus, PgLsn, ReplicaReplayState,
-};
+use pg_kinetic_core::lsn::{FreshnessRequirement, FreshnessStatus, PgLsn, ReplicaReplayState};
 
 #[test]
 fn parses_valid_postgres_lsn_strings() {
@@ -59,7 +57,10 @@ fn checks_replica_replay_against_session_lsn() {
 fn represents_freshness_states() {
     let requirement = FreshnessRequirement::session_write_lsn(PgLsn::from_parts(1, 0));
     let satisfied = requirement.status(ReplicaReplayState::ReplayLsn(PgLsn::from_parts(1, 0)));
-    let waiting = requirement.status(ReplicaReplayState::ReplayLsn(PgLsn::from_parts(0, u32::MAX)));
+    let waiting = requirement.status(ReplicaReplayState::ReplayLsn(PgLsn::from_parts(
+        0,
+        u32::MAX,
+    )));
     let stale = requirement.status(ReplicaReplayState::Stale);
     let unknown = requirement.status(ReplicaReplayState::Unknown);
     let unavailable = requirement.status(ReplicaReplayState::Unavailable);

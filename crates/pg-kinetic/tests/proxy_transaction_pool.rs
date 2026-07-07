@@ -58,6 +58,7 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             listen_addr,
             backend_addr,
         },
+        routes: Vec::new(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 1,

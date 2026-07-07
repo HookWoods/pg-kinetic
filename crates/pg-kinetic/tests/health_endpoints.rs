@@ -126,6 +126,7 @@ async fn spawn_proxy(
             listen_addr: proxy_addr,
             backend_addr,
         },
+        routes: Vec::new(),
         capacity: CapacityConfig {
             max_clients: 4,
             max_backends: 1,

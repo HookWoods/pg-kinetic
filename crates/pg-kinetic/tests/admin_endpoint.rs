@@ -528,6 +528,7 @@ fn test_config(
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             backend_addr,
         },
+        routes: Vec::new(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 1,

@@ -53,6 +53,7 @@ fn toml_path(path: &Path) -> String {
 fn base_config() -> Config {
     Config {
         connection: Default::default(),
+        routes: Vec::new(),
         capacity: Default::default(),
         performance: Default::default(),
         qos: Default::default(),

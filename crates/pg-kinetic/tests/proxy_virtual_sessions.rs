@@ -142,6 +142,7 @@ async fn spawn_proxy_with_recording_backend() -> (SocketAddr, mpsc::Receiver<Str
             listen_addr,
             backend_addr,
         },
+        routes: Vec::new(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 1,

@@ -55,7 +55,9 @@ impl FromStr for PgLsn {
     type Err = LsnParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let (segment, offset) = input.split_once('/').ok_or(LsnParseError::MissingSeparator)?;
+        let (segment, offset) = input
+            .split_once('/')
+            .ok_or(LsnParseError::MissingSeparator)?;
         if segment.is_empty() || offset.is_empty() {
             return Err(LsnParseError::EmptyPart);
         }

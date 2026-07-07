@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
     recovery::RecoveryMode,
+    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
         ClientTlsMode as CoreClientTlsMode,
@@ -139,6 +140,9 @@ pub struct Config {
     #[command(flatten)]
     pub connection: ConnectionConfig,
 
+    #[arg(skip)]
+    pub routes: Vec<RouteConfig>,
+
     #[command(flatten)]
     pub capacity: CapacityConfig,
 
@@ -185,6 +189,157 @@ pub struct ConnectionConfig {
         default_value = "127.0.0.1:5432"
     )]
     pub backend_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteConfig {
+    pub primary: BackendEndpointConfig,
+
+    #[serde(default)]
+    pub replicas: Vec<ReplicaConfig>,
+
+    #[serde(default)]
+    pub read_routing: ReadRoutingConfig,
+
+    #[serde(default)]
+    pub freshness: FreshnessConfig,
+
+    #[serde(default)]
+    pub ha: HaConfig,
+}
+
+impl RouteConfig {
+    #[must_use]
+    pub fn from_backend_addr(address: SocketAddr) -> Self {
+        Self {
+            primary: BackendEndpointConfig {
+                address,
+                ..BackendEndpointConfig::default()
+            },
+            replicas: Vec::new(),
+            read_routing: ReadRoutingConfig::default(),
+            freshness: FreshnessConfig::default(),
+            ha: HaConfig::default(),
+        }
+    }
+}
+
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self::from_backend_addr(BackendEndpointConfig::default().address)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendEndpointConfig {
+    pub address: SocketAddr,
+    pub connect_timeout_ms: u64,
+    pub tls_mode: BackendTlsMode,
+}
+
+impl Default for BackendEndpointConfig {
+    fn default() -> Self {
+        Self {
+            address: "127.0.0.1:5432"
+                .parse()
+                .expect("valid default backend addr"),
+            connect_timeout_ms: 1_000,
+            tls_mode: BackendTlsMode::Disable,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicaConfig {
+    pub address: SocketAddr,
+    pub connect_timeout_ms: u64,
+    pub tls_mode: BackendTlsMode,
+
+    #[serde(default = "default_replica_weight")]
+    pub weight: u32,
+}
+
+impl Default for ReplicaConfig {
+    fn default() -> Self {
+        Self {
+            address: "127.0.0.1:5432"
+                .parse()
+                .expect("valid default backend addr"),
+            connect_timeout_ms: 1_000,
+            tls_mode: BackendTlsMode::Disable,
+            weight: default_replica_weight(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReadRoutingConfig {
+    #[serde(
+        default = "default_read_routing_mode",
+        deserialize_with = "deserialize_read_routing_mode",
+        serialize_with = "serialize_read_routing_mode"
+    )]
+    pub read_routing_mode: ReadRoutingMode,
+
+    #[serde(
+        default = "default_fallback_policy",
+        deserialize_with = "deserialize_fallback_policy",
+        serialize_with = "serialize_fallback_policy"
+    )]
+    pub fallback_policy: FallbackPolicy,
+}
+
+impl Default for ReadRoutingConfig {
+    fn default() -> Self {
+        Self {
+            read_routing_mode: default_read_routing_mode(),
+            fallback_policy: default_fallback_policy(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FreshnessConfig {
+    #[serde(
+        default = "default_freshness_policy",
+        deserialize_with = "deserialize_freshness_policy",
+        serialize_with = "serialize_freshness_policy"
+    )]
+    pub freshness_policy: FreshnessPolicy,
+
+    #[serde(default = "default_max_replica_lag_ms")]
+    pub max_replica_lag_ms: u64,
+
+    #[serde(default = "default_read_after_write_timeout_ms")]
+    pub read_after_write_timeout_ms: u64,
+}
+
+impl Default for FreshnessConfig {
+    fn default() -> Self {
+        Self {
+            freshness_policy: default_freshness_policy(),
+            max_replica_lag_ms: default_max_replica_lag_ms(),
+            read_after_write_timeout_ms: default_read_after_write_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HaConfig {
+    #[serde(default = "default_replica_health_interval_ms")]
+    pub replica_health_interval_ms: u64,
+
+    #[serde(default = "default_replica_health_timeout_ms")]
+    pub replica_health_timeout_ms: u64,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            replica_health_interval_ms: default_replica_health_interval_ms(),
+            replica_health_timeout_ms: default_replica_health_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -633,8 +788,23 @@ impl Config {
     }
 
     #[must_use]
+    pub fn route_configs(&self) -> Vec<RouteConfig> {
+        self.effective_routes()
+    }
+
+    #[must_use]
+    pub fn effective_routes(&self) -> Vec<RouteConfig> {
+        if self.routes.is_empty() {
+            vec![RouteConfig::from_backend_addr(self.connection.backend_addr)]
+        } else {
+            self.routes.clone()
+        }
+    }
+
+    #[must_use]
     pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
         self.connection == next.connection
+            && self.routes == next.routes
             && self.capacity == next.capacity
             && self.admin == next.admin
             && self.observability == next.observability
@@ -756,11 +926,120 @@ fn parse_recovery_mode(value: &str) -> Result<RecoveryMode, String> {
     }
 }
 
+fn default_replica_weight() -> u32 {
+    1
+}
+
+fn default_read_routing_mode() -> ReadRoutingMode {
+    ReadRoutingMode::Off
+}
+
+fn default_fallback_policy() -> FallbackPolicy {
+    FallbackPolicy::Primary
+}
+
+fn default_freshness_policy() -> FreshnessPolicy {
+    FreshnessPolicy::SessionWriteLsn
+}
+
+fn default_max_replica_lag_ms() -> u64 {
+    1_000
+}
+
+fn default_read_after_write_timeout_ms() -> u64 {
+    500
+}
+
+fn default_replica_health_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_replica_health_timeout_ms() -> u64 {
+    500
+}
+
+fn deserialize_read_routing_mode<'de, D>(deserializer: D) -> Result<ReadRoutingMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_read_routing_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_read_routing_mode<S>(mode: &ReadRoutingMode, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
+}
+
+fn parse_read_routing_mode(value: &str) -> Result<ReadRoutingMode, String> {
+    match value {
+        "off" => Ok(ReadRoutingMode::Off),
+        "prefer_replica" => Ok(ReadRoutingMode::PreferReplica),
+        "require_replica" => Ok(ReadRoutingMode::RequireReplica),
+        "primary_only" => Ok(ReadRoutingMode::PrimaryOnly),
+        other => Err(format!("invalid read routing mode '{other}'")),
+    }
+}
+
+fn deserialize_fallback_policy<'de, D>(deserializer: D) -> Result<FallbackPolicy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_fallback_policy(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_fallback_policy<S>(mode: &FallbackPolicy, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
+}
+
+fn parse_fallback_policy(value: &str) -> Result<FallbackPolicy, String> {
+    match value {
+        "primary" => Ok(FallbackPolicy::Primary),
+        "reject" => Ok(FallbackPolicy::Reject),
+        "wait" => Ok(FallbackPolicy::Wait),
+        other => Err(format!("invalid fallback policy '{other}'")),
+    }
+}
+
+fn deserialize_freshness_policy<'de, D>(deserializer: D) -> Result<FreshnessPolicy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_freshness_policy(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_freshness_policy<S>(mode: &FreshnessPolicy, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
+}
+
+fn parse_freshness_policy(value: &str) -> Result<FreshnessPolicy, String> {
+    match value {
+        "none" => Ok(FreshnessPolicy::None),
+        "session_write_lsn" => Ok(FreshnessPolicy::SessionWriteLsn),
+        "max_replica_lag" => Ok(FreshnessPolicy::MaxReplicaLag),
+        "session_write_lsn_and_max_lag" => Ok(FreshnessPolicy::SessionWriteLsnAndMaxLag),
+        other => Err(format!("invalid freshness policy '{other}'")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, SocketConfig,
+        AuthFailureMessageMode, AuthMode, BackendEndpointConfig, BackendTlsMode, ClientTlsMode,
+        Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, ReadRoutingConfig,
+        ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
     };
+    use crate::snapshot::SettingsSnapshot;
     use clap::Parser;
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -783,6 +1062,7 @@ mod tests {
         assert_eq!(config.capacity.max_clients, 10_000);
         assert_eq!(config.capacity.max_backends, 100);
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
+        assert_eq!(config.routes.len(), 0);
         assert_eq!(
             config.performance.checkout_timeout(),
             Duration::from_secs(1)
@@ -855,6 +1135,42 @@ mod tests {
         assert_eq!(config.socket.tcp_send_buffer_bytes, None);
         assert_eq!(config.socket.tcp_recv_buffer_bytes, None);
         assert!(!config.socket.strict_socket_option_mode);
+    }
+
+    #[test]
+    fn config_maps_single_backend_to_default_route() {
+        let config = Config::try_parse_from(["pg-kinetic"]).expect("defaults parse");
+
+        let routes = config.route_configs();
+        assert_eq!(routes.len(), 1);
+
+        let route = &routes[0];
+        assert_eq!(
+            route.primary,
+            BackendEndpointConfig {
+                address: config.connection.backend_addr,
+                connect_timeout_ms: 1_000,
+                tls_mode: BackendTlsMode::Disable,
+            }
+        );
+        assert!(route.replicas.is_empty());
+        assert_eq!(route.read_routing.read_routing_mode, ReadRoutingMode::Off);
+        assert_eq!(route.read_routing.fallback_policy, FallbackPolicy::Primary);
+        assert_eq!(
+            route.freshness,
+            FreshnessConfig {
+                freshness_policy: FreshnessPolicy::SessionWriteLsn,
+                max_replica_lag_ms: 1_000,
+                read_after_write_timeout_ms: 500,
+            }
+        );
+        assert_eq!(
+            route.ha,
+            HaConfig {
+                replica_health_interval_ms: 1_000,
+                replica_health_timeout_ms: 500,
+            }
+        );
     }
 
     #[test]
@@ -1086,6 +1402,128 @@ mod tests {
         assert_eq!(config.socket.tcp_send_buffer_bytes, Some(4_444));
         assert_eq!(config.socket.tcp_recv_buffer_bytes, Some(5_555));
         assert!(config.socket.strict_socket_option_mode);
+    }
+
+    #[test]
+    fn route_config_parses_primary_and_replicas() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [connection]
+            listen_addr = "0.0.0.0:6432"
+            backend_addr = "127.0.0.1:5432"
+
+            [[routes]]
+            [routes.primary]
+            address = "10.0.0.1:5432"
+            connect_timeout_ms = 750
+            tls_mode = "require"
+
+            [[routes.replicas]]
+            address = "10.0.0.2:5432"
+            connect_timeout_ms = 250
+            tls_mode = "prefer"
+            weight = 2
+
+            [[routes.replicas]]
+            address = "10.0.0.3:5432"
+            connect_timeout_ms = 125
+            tls_mode = "verify_full"
+
+            [routes.read_routing]
+            read_routing_mode = "prefer_replica"
+            fallback_policy = "wait"
+
+            [routes.freshness]
+            freshness_policy = "session_write_lsn_and_max_lag"
+            max_replica_lag_ms = 2_500
+            read_after_write_timeout_ms = 750
+
+            [routes.ha]
+            replica_health_interval_ms = 2_000
+            replica_health_timeout_ms = 750
+            "#,
+        )
+        .expect("route config parses");
+
+        assert_eq!(config.routes.len(), 1);
+        let route = &config.routes[0];
+
+        assert_eq!(
+            route.primary,
+            BackendEndpointConfig {
+                address: "10.0.0.1:5432".parse().expect("valid socket"),
+                connect_timeout_ms: 750,
+                tls_mode: BackendTlsMode::Require,
+            }
+        );
+        assert_eq!(
+            route.replicas,
+            vec![
+                ReplicaConfig {
+                    address: "10.0.0.2:5432".parse().expect("valid socket"),
+                    connect_timeout_ms: 250,
+                    tls_mode: BackendTlsMode::Prefer,
+                    weight: 2,
+                },
+                ReplicaConfig {
+                    address: "10.0.0.3:5432".parse().expect("valid socket"),
+                    connect_timeout_ms: 125,
+                    tls_mode: BackendTlsMode::VerifyFull,
+                    weight: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            route.read_routing,
+            ReadRoutingConfig {
+                read_routing_mode: ReadRoutingMode::PreferReplica,
+                fallback_policy: FallbackPolicy::Wait,
+            }
+        );
+        assert_eq!(
+            route.freshness,
+            FreshnessConfig {
+                freshness_policy: FreshnessPolicy::SessionWriteLsnAndMaxLag,
+                max_replica_lag_ms: 2_500,
+                read_after_write_timeout_ms: 750,
+            }
+        );
+        assert_eq!(
+            route.ha,
+            HaConfig {
+                replica_health_interval_ms: 2_000,
+                replica_health_timeout_ms: 750,
+            }
+        );
+    }
+
+    #[test]
+    fn route_config_requires_primary_when_replicas_exist() {
+        let _error = toml::from_str::<Config>(
+            r#"
+            [[routes.replicas]]
+            address = "10.0.0.2:5432"
+            connect_timeout_ms = 250
+            tls_mode = "prefer"
+            "#,
+        )
+        .expect_err("missing primary is rejected");
+    }
+
+    #[test]
+    fn settings_snapshot_keeps_password_sources_out_of_debug_output() {
+        let mut config = Config::default();
+        config.auth.backend_password_env_var_name =
+            Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
+        config.routes = vec![RouteConfig::from_backend_addr(
+            "127.0.0.1:5433".parse().expect("valid socket"),
+        )];
+
+        let snapshot = SettingsSnapshot::from_config(&config);
+        let debug = format!("{snapshot:?}");
+
+        assert!(!debug.contains("PG_KINETIC_BACKEND_PASSWORD"));
+        assert!(!debug.contains("backend_password_env_var_name"));
     }
 
     #[test]
