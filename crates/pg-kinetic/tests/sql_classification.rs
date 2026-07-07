@@ -1,64 +1,126 @@
-use pg_kinetic::sql::{classify, SetScope, SqlCommand};
+use pg_kinetic_core::{
+    routing::{QueryClass, RoutingHint},
+    sql_classify::{
+        classify_sql, contains_data_modifying_cte, extract_routing_hint, has_multiple_statements,
+        strip_leading_comments_and_whitespace,
+    },
+};
 
 #[test]
-fn classifies_transaction_commands() {
-    assert_eq!(classify("begin"), SqlCommand::Begin);
-    assert_eq!(classify("START TRANSACTION"), SqlCommand::Begin);
-    assert_eq!(classify("commit;"), SqlCommand::Commit);
-    assert_eq!(classify("rollback"), SqlCommand::Rollback);
+fn classifies_read_only_candidates() {
+    for sql in [
+        "SELECT 1",
+        "VALUES (1)",
+        "TABLE name",
+        "SHOW server_version",
+    ] {
+        assert_eq!(classify_sql(sql), QueryClass::ReadCandidate);
+    }
 }
 
 #[test]
-fn classifies_set_commands() {
+fn classifies_explain_select_as_read_only_candidate() {
+    assert_eq!(classify_sql("EXPLAIN SELECT 1"), QueryClass::ReadCandidate);
+}
+
+#[test]
+fn classifies_write_and_unsafe_statements() {
+    for sql in [
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET id = 1",
+        "DELETE FROM t",
+        "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET id = u.id",
+        "TRUNCATE t",
+        "CREATE TABLE t(id int)",
+        "ALTER TABLE t ADD COLUMN name text",
+        "DROP TABLE t",
+        "CALL do_work()",
+        "DO $$ BEGIN NULL; END $$",
+        "VACUUM",
+        "ANALYZE t",
+        "REINDEX TABLE t",
+        "GRANT SELECT ON t TO app",
+        "REVOKE SELECT ON t FROM app",
+    ] {
+        assert!(!classify_sql(sql).routes_to_replica(), "{sql}");
+    }
+}
+
+#[test]
+fn classifies_session_mutation_and_primary_only_statements() {
+    for sql in [
+        "SET application_name = 'api'",
+        "RESET application_name",
+        "DISCARD ALL",
+        "LISTEN account_events",
+        "UNLISTEN account_events",
+        "NOTIFY account_events, 'ready'",
+        "LOCK TABLE t IN ACCESS EXCLUSIVE MODE",
+        "DECLARE c CURSOR FOR SELECT 1",
+    ] {
+        assert_eq!(classify_sql(sql), QueryClass::SessionMutation);
+    }
+}
+
+#[test]
+fn copy_to_stdout_differs_from_copy_from_stdin() {
     assert_eq!(
-        classify("set application_name = 'api'"),
-        SqlCommand::Set {
-            scope: SetScope::Session,
-            key: "application_name".to_string(),
-            value: "'api'".to_string(),
-        }
+        classify_sql("COPY accounts TO STDOUT"),
+        QueryClass::ReadCandidate
     );
+    assert_eq!(classify_sql("COPY accounts FROM STDIN"), QueryClass::Write);
+}
+
+#[test]
+fn data_modifying_ctes_are_not_replica_safe() {
+    assert!(contains_data_modifying_cte(
+        "WITH moved AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT 1"
+    ));
     assert_eq!(
-        classify("set local timezone = 'UTC'"),
-        SqlCommand::Set {
-            scope: SetScope::Local,
-            key: "timezone".to_string(),
-            value: "'UTC'".to_string(),
-        }
+        classify_sql("WITH moved AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT 1"),
+        QueryClass::Write
     );
 }
 
 #[test]
-fn classifies_discard_commands() {
-    assert_eq!(classify("discard all"), SqlCommand::DiscardAll);
-    assert_eq!(classify("discard temp"), SqlCommand::DiscardTemp);
-    assert_eq!(classify("discard plans"), SqlCommand::DiscardPlans);
-}
-
-#[test]
-fn classifies_temp_and_lock_commands() {
+fn multi_statement_batches_stay_primary_unless_safe() {
+    assert!(has_multiple_statements("BEGIN; SELECT 1; COMMIT"));
     assert_eq!(
-        classify("create temporary table t(id int)"),
-        SqlCommand::CreateTemp
+        classify_sql("BEGIN; SELECT 1; COMMIT"),
+        QueryClass::ReadCandidate
     );
-    assert_eq!(
-        classify("select pg_advisory_lock(42)"),
-        SqlCommand::AdvisoryLock
-    );
-    assert_eq!(
-        classify("select pg_advisory_unlock(42)"),
-        SqlCommand::AdvisoryUnlock
+    assert_ne!(
+        classify_sql("SELECT 1; UPDATE t SET id = 1"),
+        QueryClass::ReadCandidate
     );
 }
 
 #[test]
-fn classifies_copy_and_listen_commands() {
-    assert_eq!(classify("copy accounts to stdout"), SqlCommand::Copy);
-    assert_eq!(classify("listen account_events"), SqlCommand::Listen);
-    assert_eq!(classify("unlisten account_events"), SqlCommand::Unlisten);
+fn malformed_sql_routes_to_primary() {
+    assert_eq!(classify_sql(""), QueryClass::Unknown);
+    assert_eq!(classify_sql("???"), QueryClass::Unknown);
 }
 
 #[test]
-fn unknown_select_is_safe_query() {
-    assert_eq!(classify("select 1"), SqlCommand::Query);
+fn strips_leading_comments_and_extracts_supported_hints() {
+    assert_eq!(
+        strip_leading_comments_and_whitespace(" /* note */ SELECT 1"),
+        "SELECT 1"
+    );
+    assert_eq!(
+        extract_routing_hint("/* pg-kinetic: primary */ SELECT 1"),
+        RoutingHint::Primary
+    );
+    assert_eq!(
+        extract_routing_hint("/* pg-kinetic: replica */ SELECT 1"),
+        RoutingHint::Replica
+    );
+    assert_eq!(
+        extract_routing_hint("/* pg-kinetic: stale-ok */ SELECT 1"),
+        RoutingHint::StaleOk
+    );
+    assert_eq!(
+        extract_routing_hint("/* pg-kinetic: strict-fresh */ SELECT 1"),
+        RoutingHint::StrictFresh
+    );
 }

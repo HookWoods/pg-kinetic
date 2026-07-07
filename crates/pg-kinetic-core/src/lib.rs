@@ -12,4 +12,5 @@ pub mod secrets;
 pub mod security;
 pub mod session;
 pub mod sql;
+pub mod sql_classify;
 pub mod virtual_session;
