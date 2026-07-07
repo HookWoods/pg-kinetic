@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod pool;
 pub mod proxy;
 pub mod reload;
+pub mod snapshot;
 pub mod socket;
 pub mod tls;
 
