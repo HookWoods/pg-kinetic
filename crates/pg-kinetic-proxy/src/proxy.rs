@@ -151,10 +151,8 @@ impl Proxy {
 
     pub async fn run(self) -> anyhow::Result<()> {
         let effective_config = reload::load_effective_config(&self.config)?;
+        reload::validate_runtime_assets(&effective_config)?;
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
-        let runtime = Arc::new(RwLock::new(reload::build_reloadable_config(
-            &effective_config,
-        )?));
         let pool = BackendPool::new_with_socket(
             effective_config.connection.backend_addr,
             effective_config.tls.clone(),
@@ -188,9 +186,8 @@ impl Proxy {
             let base_config = self.config.clone();
             let reload_config = effective_config.reload.clone();
             let active_config = Arc::clone(&active_config);
-            let runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
-                reload::spawn_reload_loop(base_config, reload_config, active_config, runtime).await;
+                reload::spawn_reload_loop(base_config, reload_config, active_config).await;
             });
         }
 
@@ -227,8 +224,8 @@ impl Proxy {
                         }
                         accept = listener.accept() => {
                             let (client, client_addr) = accept.context("accept draining client")?;
-                            let runtime_snapshot = runtime.read().await.clone();
-                            let socket_options = socket::SocketOptions::from(&runtime_snapshot.socket);
+                            let config_snapshot = active_config.read().await.clone();
+                            let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
                             socket::apply_socket_options(&client, &socket_options, "client")
                                 .context("apply draining client socket options")?;
                             let mut client = ClientConnection::new(client);
@@ -253,8 +250,8 @@ impl Proxy {
                 }
                 accept = listener.accept() => {
                     let (client, client_addr) = accept.context("accept client")?;
-                    let runtime_snapshot = runtime.read().await.clone();
-                    let socket_options = socket::SocketOptions::from(&runtime_snapshot.socket);
+                    let config_snapshot = active_config.read().await.clone();
+                    let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
                     socket::apply_socket_options(&client, &socket_options, "client")
                         .context("apply client socket options")?;
                     let client = ClientConnection::new(client);
@@ -269,8 +266,6 @@ impl Proxy {
 
                     let permit = self.client_slots.clone().acquire_owned().await?;
                     let pool = Arc::clone(&pool);
-                    let auth = effective_config.auth.clone();
-                    let client_tls_mode = effective_config.tls.client_tls_mode;
 
                     tokio::spawn(async move {
                         let _client_guard = client_guard;
@@ -278,9 +273,7 @@ impl Proxy {
                             client,
                             client_addr,
                             pool,
-                            runtime_snapshot,
-                            auth,
-                            client_tls_mode,
+                            config_snapshot,
                         )
                         .await;
                         drop(permit);
@@ -300,17 +293,14 @@ async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,
     pool: Arc<BackendPool>,
-    runtime: reload::ReloadableConfig,
-    auth: crate::config::AuthConfig,
-    client_tls_mode: crate::config::ClientTlsMode,
+    config: Config,
 ) -> anyhow::Result<()> {
-    let reload::ReloadableConfig {
-        performance,
-        qos,
-        socket: _,
-        client_tls_server_config,
-        auth_users,
-    } = runtime;
+    let client_tls_mode = config.tls.client_tls_mode;
+    let client_tls_server_config = reload::load_client_tls_server_config(&config)?;
+    let auth_users = reload::load_auth_users(&config)?;
+    let auth = config.auth.clone();
+    let performance = config.performance.clone();
+    let qos = config.qos.clone();
 
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let mut session = VirtualSession::default();

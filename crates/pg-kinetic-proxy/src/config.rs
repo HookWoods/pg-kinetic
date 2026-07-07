@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
@@ -12,7 +12,7 @@ use pg_kinetic_core::{
     },
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum ClientTlsMode {
@@ -45,7 +45,7 @@ impl From<ClientTlsMode> for CoreClientTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum BackendTlsMode {
@@ -81,7 +81,7 @@ impl From<BackendTlsMode> for CoreBackendTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum AuthMode {
@@ -113,7 +113,7 @@ impl From<AuthMode> for CoreAuthMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum AuthFailureMessageMode {
@@ -131,7 +131,8 @@ impl AuthFailureMessageMode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Parser)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Parser, Serialize)]
+#[serde(default)]
 #[command(name = "pg-kinetic")]
 #[command(about = "Low-overhead PostgreSQL wire proxy")]
 pub struct Config {
@@ -169,7 +170,8 @@ pub struct Config {
     pub socket: SocketConfig,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct ConnectionConfig {
     #[arg(long, env = "PG_KINETIC_LISTEN_ADDR", default_value = "127.0.0.1:6543")]
     pub listen_addr: SocketAddr,
@@ -182,7 +184,8 @@ pub struct ConnectionConfig {
     pub backend_addr: SocketAddr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct CapacityConfig {
     #[arg(long, env = "PG_KINETIC_MAX_CLIENTS", default_value_t = 10_000)]
     pub max_clients: usize,
@@ -194,7 +197,8 @@ pub struct CapacityConfig {
     pub max_checkout_waiters: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct PerformanceConfig {
     #[arg(long, env = "PG_KINETIC_CHECKOUT_TIMEOUT_MS", default_value_t = 1_000)]
     pub checkout_timeout_ms: u64,
@@ -204,6 +208,10 @@ pub struct PerformanceConfig {
         env = "PG_KINETIC_RECOVERY_MODE",
         value_enum,
         default_value_t = RecoveryMode::Recover
+    )]
+    #[serde(
+        deserialize_with = "deserialize_recovery_mode",
+        serialize_with = "serialize_recovery_mode"
     )]
     pub recovery_mode: RecoveryMode,
 
@@ -218,7 +226,8 @@ pub struct PerformanceConfig {
     pub backend_reset_query: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct QosConfig {
     #[arg(
         long,
@@ -273,13 +282,15 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct TlsConfig {
     #[arg(
         long,
@@ -339,7 +350,8 @@ impl Default for TlsConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct AuthConfig {
     #[arg(
         long,
@@ -386,7 +398,8 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct ReloadConfig {
     #[arg(long, env = "PG_KINETIC_CONFIG_FILE")]
     pub config_file: Option<PathBuf>,
@@ -419,7 +432,8 @@ impl Default for ReloadConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct DrainConfig {
     #[arg(long, env = "PG_KINETIC_DRAIN_TIMEOUT_MS", default_value_t = 30_000)]
     pub drain_timeout_ms: u64,
@@ -444,7 +458,8 @@ impl Default for DrainConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct HealthConfig {
     #[arg(long, env = "PG_KINETIC_HEALTH_ADDR")]
     pub health_addr: Option<SocketAddr>,
@@ -482,7 +497,8 @@ impl Default for HealthConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct SocketConfig {
     #[arg(long, env = "PG_KINETIC_TCP_NODELAY", default_value_t = true)]
     pub tcp_nodelay: bool,
@@ -549,6 +565,24 @@ impl Config {
     #[must_use]
     pub fn parse_args() -> Self {
         Self::parse()
+    }
+
+    #[must_use]
+    pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
+        self.connection == next.connection
+            && self.capacity == next.capacity
+            && self.observability == next.observability
+            && self.tls.client_tls_mode == next.tls.client_tls_mode
+            && self.tls.backend_tls_mode == next.tls.backend_tls_mode
+            && self.tls.backend_ca_path == next.tls.backend_ca_path
+            && self.tls.backend_server_name == next.tls.backend_server_name
+            && self.auth.auth_mode == next.auth.auth_mode
+            && self.auth.backend_user == next.auth.backend_user
+            && self.auth.backend_password_env_var_name == next.auth.backend_password_env_var_name
+            && self.auth.auth_failure_message_mode == next.auth.auth_failure_message_mode
+            && self.reload == next.reload
+            && self.drain == next.drain
+            && self.health == next.health
     }
 }
 
@@ -625,6 +659,34 @@ impl QosConfig {
     #[must_use]
     pub const fn idle_transaction_timeout(&self) -> Duration {
         Duration::from_millis(self.idle_transaction_timeout_ms)
+    }
+}
+
+fn deserialize_recovery_mode<'de, D>(deserializer: D) -> Result<RecoveryMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_recovery_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_recovery_mode<S>(mode: &RecoveryMode, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(match mode {
+        RecoveryMode::Recover => "recover",
+        RecoveryMode::RollbackOnly => "rollback_only",
+        RecoveryMode::Drop => "drop",
+    })
+}
+
+fn parse_recovery_mode(value: &str) -> Result<RecoveryMode, String> {
+    match value {
+        "recover" => Ok(RecoveryMode::Recover),
+        "rollback_only" => Ok(RecoveryMode::RollbackOnly),
+        "drop" => Ok(RecoveryMode::Drop),
+        other => Err(format!("invalid recovery mode '{other}'")),
     }
 }
 

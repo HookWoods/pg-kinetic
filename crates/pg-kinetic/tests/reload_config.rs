@@ -9,7 +9,8 @@ use std::{
 use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
     proxy_runtime::reload::{
-        build_reloadable_config, load_effective_config, reload_once, ReloadDecision,
+        load_auth_users, load_client_tls_server_config, load_effective_config, reload_once,
+        ReloadDecision,
     },
 };
 use tokio::sync::RwLock;
@@ -269,18 +270,17 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
 
     let effective = load_effective_config(&config).expect("initial load");
     let active_config = Arc::new(RwLock::new(effective.clone()));
-    let runtime = Arc::new(RwLock::new(
-        build_reloadable_config(&effective).expect("runtime"),
-    ));
 
-    let initial_runtime = runtime.read().await.clone();
-    assert_eq!(initial_runtime.qos.query_timeout_ms, 2_222);
-    assert!(initial_runtime
-        .auth_users
+    assert_eq!(effective.qos.query_timeout_ms, 2_222);
+    assert!(load_auth_users(&effective)
+        .expect("users")
         .as_ref()
         .expect("users")
         .get("bob")
         .is_none());
+    assert!(load_client_tls_server_config(&effective)
+        .expect("tls config")
+        .is_some());
 
     let updated_config = write_temp_file(
         "config",
@@ -304,30 +304,25 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
     .expect("overwrite config file");
     fs::write(&auth_users_v2, "alice = trust\nbob = trust\n").expect("update auth users");
 
-    let decision = reload_once(&config, &active_config, &runtime)
-        .await
-        .expect("reload");
+    let decision = reload_once(&config, &active_config).await.expect("reload");
 
     assert_eq!(decision, ReloadDecision::Applied);
-    assert_eq!(active_config.read().await.qos.query_timeout_ms, 3_333);
-
-    let updated_runtime = runtime.read().await.clone();
-    assert_eq!(updated_runtime.qos.query_timeout_ms, 3_333);
-    assert!(!updated_runtime.socket.tcp_nodelay);
-    assert!(updated_runtime
-        .auth_users
+    let updated_config = active_config.read().await.clone();
+    assert_eq!(updated_config.qos.query_timeout_ms, 3_333);
+    assert!(!updated_config.socket.tcp_nodelay);
+    assert!(load_auth_users(&updated_config)
+        .expect("users")
         .as_ref()
         .expect("users")
         .get("bob")
         .is_some());
-
-    let initial_tls = initial_runtime
-        .client_tls_server_config
-        .expect("tls config");
-    let updated_tls = updated_runtime
-        .client_tls_server_config
-        .expect("tls config");
-    assert!(!Arc::ptr_eq(&initial_tls, &updated_tls));
+    assert_ne!(
+        effective.tls.client_cert_path,
+        updated_config.tls.client_cert_path
+    );
+    assert!(load_client_tls_server_config(&updated_config)
+        .expect("tls config")
+        .is_some());
 }
 
 #[tokio::test]
@@ -357,9 +352,6 @@ async fn unsafe_reload_rejects_listener_backend_and_auth_mode_changes() {
 
     let effective = load_effective_config(&config).expect("initial load");
     let active_config = Arc::new(RwLock::new(effective.clone()));
-    let runtime = Arc::new(RwLock::new(
-        build_reloadable_config(&effective).expect("runtime"),
-    ));
 
     fs::write(
         &config_file,
@@ -375,16 +367,14 @@ auth_users_file = "does-not-matter.toml"
     )
     .expect("write unsafe config");
 
-    let decision = reload_once(&config, &active_config, &runtime)
-        .await
-        .expect("reload");
+    let decision = reload_once(&config, &active_config).await.expect("reload");
 
     assert_eq!(decision, ReloadDecision::Rejected);
     assert_eq!(
         active_config.read().await.connection.listen_addr,
         "127.0.0.1:6543".parse().expect("listen")
     );
-    assert_eq!(runtime.read().await.qos.query_timeout_ms, 2_222);
+    assert_eq!(active_config.read().await.qos.query_timeout_ms, 2_222);
 }
 
 #[tokio::test]
@@ -414,17 +404,13 @@ async fn invalid_reload_keeps_previous_config_active() {
 
     let effective = load_effective_config(&config).expect("initial load");
     let active_config = Arc::new(RwLock::new(effective.clone()));
-    let runtime = Arc::new(RwLock::new(
-        build_reloadable_config(&effective).expect("runtime"),
-    ));
 
     fs::write(&config_file, "[qos\n").expect("write invalid config");
 
-    let error = reload_once(&config, &active_config, &runtime)
+    let error = reload_once(&config, &active_config)
         .await
         .expect_err("invalid reload");
     assert!(error.to_string().contains("parse config file"));
 
     assert_eq!(active_config.read().await.qos.query_timeout_ms, 2_222);
-    assert_eq!(runtime.read().await.qos.query_timeout_ms, 2_222);
 }

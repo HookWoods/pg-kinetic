@@ -10,7 +10,7 @@ pub mod reload;
 pub mod socket;
 pub mod tls;
 
-pub use reload::{ReloadDecision, ReloadableConfig};
+pub use reload::ReloadDecision;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
     metrics::install(metrics::MetricsConfig {
