@@ -2,17 +2,19 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{SocketConfig, TlsConfig},
     core::{
-        ha::{EndpointHealth, EndpointRoleState},
+        ha::{EndpointHealth, EndpointRoleState, ReplicaLagState},
+        lsn::PgLsn,
         routing::BackendRole,
     },
     proxy_runtime::health::EndpointHealthProbe,
+    proxy_runtime::snapshot::SnapshotStore,
     wire::{frame::parse_frontend_frame, message::parse_simple_query},
 };
 use tokio::{
@@ -25,6 +27,8 @@ use tokio::{
 async fn healthy_primary_reports_pg_is_in_recovery_false() {
     let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
         observed_role: BackendRole::Primary,
+        replay_lsn: None,
+        replay_lag: None,
     }])
     .await;
     let probe = probe(backend_addr, BackendRole::Primary);
@@ -39,6 +43,8 @@ async fn healthy_primary_reports_pg_is_in_recovery_false() {
 async fn healthy_replica_reports_pg_is_in_recovery_true() {
     let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
         observed_role: BackendRole::Replica,
+        replay_lsn: Some(PgLsn::from_parts(2, 16)),
+        replay_lag: Some(Duration::from_millis(250)),
     }])
     .await;
     let probe = probe(backend_addr, BackendRole::Replica);
@@ -47,6 +53,50 @@ async fn healthy_replica_reports_pg_is_in_recovery_true() {
     assert_eq!(snapshot.health.state, EndpointHealth::Healthy);
     assert_eq!(snapshot.role.state, EndpointRoleState::Replica);
     assert!(snapshot.role.warning.is_none());
+    assert_eq!(snapshot.replay_lsn, Some(PgLsn::from_parts(2, 16)));
+    assert_eq!(snapshot.lag_state, ReplicaLagState::Fresh);
+    assert!(snapshot.lag_duration.is_some());
+    assert!(snapshot.last_successful_probe_at.is_some());
+}
+
+#[tokio::test]
+async fn null_replay_timestamp_maps_to_unknown_lag() {
+    let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
+        observed_role: BackendRole::Replica,
+        replay_lsn: Some(PgLsn::from_parts(4, 32)),
+        replay_lag: None,
+    }])
+    .await;
+    let probe = probe(backend_addr, BackendRole::Replica);
+
+    let snapshot = probe.probe_once().await;
+    assert_eq!(snapshot.replay_lsn, Some(PgLsn::from_parts(4, 32)));
+    assert!(snapshot.replay_timestamp.is_none());
+    assert!(snapshot.lag_duration.is_none());
+    assert_eq!(snapshot.lag_state, ReplicaLagState::Unknown);
+}
+
+#[tokio::test]
+async fn stale_replica_is_published_to_snapshot_store() {
+    let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
+        observed_role: BackendRole::Replica,
+        replay_lsn: Some(PgLsn::from_parts(8, 64)),
+        replay_lag: Some(Duration::from_secs(3)),
+    }])
+    .await;
+    let store = SnapshotStore::new();
+    let probe = probe(backend_addr, BackendRole::Replica);
+    probe.set_max_replica_lag_ms(500);
+    probe.attach_snapshot_store(store.clone());
+
+    let snapshot = probe.probe_once().await;
+    assert_eq!(snapshot.lag_state, ReplicaLagState::Lagging);
+
+    let published = store.replica_health_snapshots();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].replay_lsn, Some(PgLsn::from_parts(8, 64)));
+    assert_eq!(published[0].lag_state, ReplicaLagState::Lagging);
+    assert!(published[0].last_successful_probe_at.is_some());
 }
 
 #[tokio::test]
@@ -64,6 +114,8 @@ async fn replica_marked_unhealthy_after_failed_probe() {
 async fn primary_marked_warning_if_it_reports_recovery_mode() {
     let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
         observed_role: BackendRole::Replica,
+        replay_lsn: None,
+        replay_lag: None,
     }])
     .await;
     let probe = probe(backend_addr, BackendRole::Primary);
@@ -80,6 +132,8 @@ async fn primary_marked_warning_if_it_reports_recovery_mode() {
 async fn replica_marked_warning_if_it_reports_primary_role() {
     let backend_addr = spawn_backend(vec![ProbePlan::Healthy {
         observed_role: BackendRole::Primary,
+        replay_lsn: None,
+        replay_lag: None,
     }])
     .await;
     let probe = probe(backend_addr, BackendRole::Replica);
@@ -134,6 +188,8 @@ async fn recovery_after_successful_probes_is_reported() {
         ProbePlan::Failure,
         ProbePlan::Healthy {
             observed_role: BackendRole::Primary,
+            replay_lsn: None,
+            replay_lag: None,
         },
     ])
     .await;
@@ -152,7 +208,11 @@ async fn recovery_after_successful_probes_is_reported() {
 
 #[derive(Clone, Debug)]
 enum ProbePlan {
-    Healthy { observed_role: BackendRole },
+    Healthy {
+        observed_role: BackendRole,
+        replay_lsn: Option<PgLsn>,
+        replay_lag: Option<Duration>,
+    },
     Failure,
     Timeout,
 }
@@ -195,6 +255,8 @@ async fn spawn_backend(plans: Vec<ProbePlan>) -> SocketAddr {
                 .pop_front()
                 .unwrap_or(ProbePlan::Healthy {
                     observed_role: BackendRole::Primary,
+                    replay_lsn: None,
+                    replay_lag: None,
                 });
 
             tokio::spawn(async move {
@@ -218,7 +280,11 @@ async fn handle_probe_connection(mut stream: TcpStream, plan: ProbePlan) {
         ProbePlan::Timeout => {
             time::sleep(Duration::from_millis(200)).await;
         }
-        ProbePlan::Healthy { observed_role } => {
+        ProbePlan::Healthy {
+            observed_role,
+            replay_lsn,
+            replay_lag,
+        } => {
             let response = if observed_role == BackendRole::Replica {
                 "t"
             } else {
@@ -254,6 +320,23 @@ async fn handle_probe_connection(mut stream: TcpStream, plan: ProbePlan) {
                                     return;
                                 }
                             }
+                            "select pg_last_wal_replay_lsn(), pg_last_xact_replay_timestamp()" => {
+                                let replay_timestamp = replay_lag.map(|lag| {
+                                    let replay_time =
+                                        SystemTime::now().checked_sub(lag).unwrap_or(UNIX_EPOCH);
+                                    format_system_time_as_unix_millis(replay_time)
+                                });
+                                let row = data_row_values(&[
+                                    replay_lsn.map(|lsn| lsn.to_string()),
+                                    replay_timestamp,
+                                ]);
+                                if stream.write_all(&row).await.is_err() {
+                                    return;
+                                }
+                                if stream.write_all(&ready_for_query()).await.is_err() {
+                                    return;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -277,11 +360,29 @@ async fn read_startup_packet(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn data_row(value: &str) -> BytesMut {
+    data_row_values(&[Some(String::from(value))])
+}
+
+fn data_row_values(values: &[Option<String>]) -> BytesMut {
     let mut payload = BytesMut::new();
-    payload.put_i16(1);
-    payload.put_i32(value.len() as i32);
-    payload.extend_from_slice(value.as_bytes());
+    payload.put_i16(values.len() as i16);
+    for value in values {
+        match value {
+            Some(value) => {
+                payload.put_i32(value.len() as i32);
+                payload.extend_from_slice(value.as_bytes());
+            }
+            None => {
+                payload.put_i32(-1);
+            }
+        }
+    }
     encode_backend_message(b'D', payload)
+}
+
+fn format_system_time_as_unix_millis(value: SystemTime) -> String {
+    let duration = value.duration_since(UNIX_EPOCH).expect("system time");
+    duration.as_millis().to_string()
 }
 
 fn ready_for_query() -> BytesMut {

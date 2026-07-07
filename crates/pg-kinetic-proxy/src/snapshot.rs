@@ -2,14 +2,17 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use pg_kinetic_core::{
+    ha::{HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome},
+    lsn::PgLsn,
     observability::MetricOutcome,
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
+    routing::BackendRole,
     session::PinReason,
 };
 
@@ -80,6 +83,44 @@ impl ServerSnapshot {
             state: state.into(),
             age,
             in_transaction: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaHealthSnapshot {
+    pub endpoint_id: u64,
+    pub endpoint_addr: SocketAddr,
+    pub expected_role: BackendRole,
+    pub health: HealthProbeOutcome,
+    pub role: RoleProbeOutcome,
+    pub replay_lsn: Option<PgLsn>,
+    pub replay_timestamp: Option<SystemTime>,
+    pub lag_duration: Option<Duration>,
+    pub lag_state: ReplicaLagState,
+    pub last_successful_probe_at: Option<SystemTime>,
+    pub last_error: Option<String>,
+}
+
+impl ReplicaHealthSnapshot {
+    #[must_use]
+    pub fn new(endpoint_id: u64, endpoint_addr: SocketAddr, expected_role: BackendRole) -> Self {
+        Self {
+            endpoint_id,
+            endpoint_addr,
+            expected_role,
+            health: HealthProbeOutcome::new(
+                pg_kinetic_core::ha::EndpointHealth::Unhealthy,
+                false,
+                0,
+            ),
+            role: RoleProbeOutcome::new(pg_kinetic_core::ha::EndpointRoleState::Unknown, None),
+            replay_lsn: None,
+            replay_timestamp: None,
+            lag_duration: None,
+            lag_state: ReplicaLagState::Unknown,
+            last_successful_probe_at: None,
+            last_error: None,
         }
     }
 }
@@ -369,6 +410,7 @@ struct SnapshotStoreInner {
     clients: BTreeMap<u64, ClientSnapshot>,
     pool: PoolSnapshot,
     servers: BTreeMap<u64, ServerSnapshot>,
+    replica_health: BTreeMap<u64, ReplicaHealthSnapshot>,
     prepared: PreparedSnapshot,
     pinning: BTreeMap<u64, PinningSnapshot>,
     recoveries: Vec<RecoverySnapshot>,
@@ -487,6 +529,38 @@ impl SnapshotStore {
             .cloned()
             .collect::<Vec<_>>();
         sort_by_key(servers, |snapshot| snapshot.backend_id)
+    }
+
+    pub fn set_replica_health_snapshot(&self, snapshot: ReplicaHealthSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .replica_health
+            .insert(snapshot.endpoint_id, snapshot);
+    }
+
+    pub fn remove_replica_health_snapshot(
+        &self,
+        endpoint_id: u64,
+    ) -> Option<ReplicaHealthSnapshot> {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .replica_health
+            .remove(&endpoint_id)
+    }
+
+    #[must_use]
+    pub fn replica_health_snapshots(&self) -> Vec<ReplicaHealthSnapshot> {
+        let replica_health = self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .replica_health
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_by_key(replica_health, |snapshot| snapshot.endpoint_id)
     }
 
     pub fn set_prepared_snapshot(&self, snapshot: PreparedSnapshot) {

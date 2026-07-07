@@ -71,3 +71,16 @@ fn represents_freshness_states() {
     assert_eq!(unknown, FreshnessStatus::Unknown);
     assert_eq!(unavailable, FreshnessStatus::Unavailable);
 }
+
+#[test]
+fn replica_replay_state_exposes_only_available_lsn_values() {
+    let replay_lsn = PgLsn::from_parts(7, 11);
+
+    assert_eq!(
+        ReplicaReplayState::ReplayLsn(replay_lsn).replay_lsn(),
+        Some(replay_lsn)
+    );
+    assert_eq!(ReplicaReplayState::Stale.replay_lsn(), None);
+    assert_eq!(ReplicaReplayState::Unknown.replay_lsn(), None);
+    assert_eq!(ReplicaReplayState::Unavailable.replay_lsn(), None);
+}
