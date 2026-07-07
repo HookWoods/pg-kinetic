@@ -19,7 +19,8 @@ use crate::{
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
-        ClientSnapshot, LimitsSnapshot, PoolSnapshot, ServerSnapshot, SettingsSnapshot,
+        BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
+        PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
         SnapshotStore,
     },
     socket,
@@ -29,6 +30,8 @@ use pg_kinetic_core::{
         parse_admin_command, AdminColumn, AdminColumnType, AdminCommand, AdminRow, AdminTable,
         AdminView,
     },
+    recovery::{RecoveryAction, RecoveryTrigger},
+    session::PinReason,
     route::RouteKey,
 };
 use pg_kinetic_wire::{
@@ -370,9 +373,15 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
         AdminView::Clients => clients_table(&state.snapshot_store.client_snapshots()),
         AdminView::Pools => pools_table(&state.snapshot_store.pool_snapshot()),
         AdminView::Servers => servers_table(&state.snapshot_store.server_snapshots()),
+        AdminView::Prepared => prepared_table(&state.snapshot_store.prepared_snapshot()),
+        AdminView::Pinning => pinning_table(&state.snapshot_store.pinning_snapshots()),
+        AdminView::Recovery => recovery_table(&state.snapshot_store.recovery_snapshots()),
+        AdminView::Backpressure => {
+            backpressure_table(&state.snapshot_store.backpressure_snapshots())
+        }
+        AdminView::Routes => routes_table(&state.snapshot_store.route_snapshots()),
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), &state.config),
-        _ => return None,
     };
 
     Some(admin_table_response(table))
@@ -446,6 +455,118 @@ fn servers_table(servers: &[ServerSnapshot]) -> AdminTable {
                     snapshot.state.clone(),
                     duration_millis(snapshot.age),
                     snapshot.in_transaction.to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {
+    admin_table(
+        AdminView::Prepared,
+        &[
+            ("statement_count", AdminColumnType::Int8),
+            ("materialization_count", AdminColumnType::Int8),
+        ],
+        vec![AdminRow::new(vec![
+            prepared.statement_count.to_string(),
+            prepared.materialization_count.to_string(),
+        ])],
+    )
+}
+
+fn pinning_table(pinnings: &[PinningSnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::Pinning,
+        &[
+            ("client_id", AdminColumnType::Int8),
+            ("backend_id", AdminColumnType::Int8),
+            ("route_key", AdminColumnType::Text),
+            ("reason", AdminColumnType::Text),
+            ("duration_ms", AdminColumnType::Int8),
+        ],
+        pinnings
+            .iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    snapshot.client_id.to_string(),
+                    optional_u64(snapshot.backend_id),
+                    optional_route_key(snapshot.route_key.as_ref()),
+                    pin_reason_label(snapshot.reason).to_string(),
+                    duration_millis(snapshot.duration),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn recovery_table(recoveries: &[RecoverySnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::Recovery,
+        &[
+            ("trigger", AdminColumnType::Text),
+            ("action", AdminColumnType::Text),
+            ("outcome", AdminColumnType::Text),
+            ("count", AdminColumnType::Int8),
+            ("last_error", AdminColumnType::Text),
+        ],
+        recoveries
+            .iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    recovery_trigger_label(snapshot.trigger).to_string(),
+                    recovery_action_label(snapshot.action).to_string(),
+                    snapshot.outcome.as_str().to_string(),
+                    snapshot.count.to_string(),
+                    optional_text(snapshot.last_error.as_deref()),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::Backpressure,
+        &[
+            ("route_key", AdminColumnType::Text),
+            ("waiting", AdminColumnType::Int8),
+            ("in_flight", AdminColumnType::Int8),
+            ("rejected", AdminColumnType::Int8),
+            ("timed_out", AdminColumnType::Int8),
+            ("canceled", AdminColumnType::Int8),
+        ],
+        backpressure
+            .iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    optional_route_key(Some(&snapshot.route_key)),
+                    snapshot.waiting.to_string(),
+                    snapshot.in_flight.to_string(),
+                    snapshot.rejected.to_string(),
+                    snapshot.timed_out.to_string(),
+                    snapshot.canceled.to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::Routes,
+        &[
+            ("route_key", AdminColumnType::Text),
+            ("client_count", AdminColumnType::Int8),
+            ("backend_count", AdminColumnType::Int8),
+        ],
+        routes
+            .iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    optional_route_key(Some(&snapshot.route_key)),
+                    snapshot.client_count.to_string(),
+                    snapshot.backend_count.to_string(),
                 ])
             })
             .collect(),
@@ -616,6 +737,10 @@ fn optional_route_key(value: Option<&RouteKey>) -> String {
         .unwrap_or_else(|| String::from("<none>"))
 }
 
+fn optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| String::from("<none>"), |number| number.to_string())
+}
+
 fn route_key_value(route_key: &RouteKey) -> String {
     format!(
         "{}/{}/{}/{}/{}",
@@ -659,5 +784,36 @@ fn recovery_mode_label(mode: pg_kinetic_core::recovery::RecoveryMode) -> String 
             String::from("rollback_only")
         }
         pg_kinetic_core::recovery::RecoveryMode::Drop => String::from("drop"),
+    }
+}
+
+fn pin_reason_label(reason: PinReason) -> &'static str {
+    match reason {
+        PinReason::OpenTransaction => "open_transaction",
+        PinReason::FailedTransaction => "failed_transaction",
+        PinReason::SessionState => "session_state",
+        PinReason::Copy => "copy",
+        PinReason::ListenNotify => "listen_notify",
+        PinReason::ExtendedQueryCycle => "extended_query_cycle",
+        PinReason::UnknownProtocolState => "unknown_protocol_state",
+    }
+}
+
+fn recovery_trigger_label(trigger: RecoveryTrigger) -> &'static str {
+    match trigger {
+        RecoveryTrigger::FailedTransaction => "failed_transaction",
+        RecoveryTrigger::AbandonedTransaction => "abandoned_transaction",
+        RecoveryTrigger::AbandonedResponse => "abandoned_response",
+        RecoveryTrigger::UnknownProtocolState => "unknown_protocol_state",
+    }
+}
+
+fn recovery_action_label(action: RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::None => "none",
+        RecoveryAction::Rollback => "rollback",
+        RecoveryAction::DrainAndSync => "drain_and_sync",
+        RecoveryAction::RollbackAndDrain => "rollback_and_drain",
+        RecoveryAction::Discard => "discard",
     }
 }

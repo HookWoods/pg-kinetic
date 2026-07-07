@@ -15,8 +15,13 @@ use pg_kinetic::{
         ConnectionConfig, DrainConfig, HealthConfig, ObservabilityConfig, PerformanceConfig,
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
-    proxy_runtime::snapshot::{ClientSnapshot, PoolSnapshot, ServerSnapshot, SnapshotStore},
+    core::{observability::MetricOutcome, session::PinReason},
+    proxy_runtime::snapshot::{
+        ClientSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot, RouteSnapshot,
+        ServerSnapshot, SnapshotStore,
+    },
     proxy::Proxy,
+    recovery::{RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     wire::{
         backend::{parse_backend_frame, BackendFrame, ReadyStatus},
@@ -203,6 +208,114 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "9000",
             "true",
         ]],
+    );
+
+    assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
+
+    run_handle.abort();
+    let _ = run_handle.await;
+}
+
+#[tokio::test]
+async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_columns() {
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
+    let admin_addr = free_port().await;
+    let (run_handle, _, snapshot_store) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+
+    let route_key = route_key();
+    let route_key_text = "billing/reporter/dashboard/127.0.0.1:6100/default";
+
+    let prepared_handle = snapshot_store.prepared_handle();
+    prepared_handle.set(PreparedSnapshot::new(3, 1));
+    prepared_handle.increment_statement_count();
+    prepared_handle.increment_materialization_count();
+
+    snapshot_store.set_pinning_snapshot(PinningSnapshot::new(
+        7,
+        Some(42),
+        Some(route_key.clone()),
+        PinReason::OpenTransaction,
+        Duration::from_secs(4),
+    ));
+
+    let recovery_handle = snapshot_store.recovery_handle();
+    recovery_handle.record(
+        RecoveryTrigger::AbandonedResponse,
+        RecoveryAction::DrainAndSync,
+        MetricOutcome::Timeout,
+    );
+    recovery_handle.record(
+        RecoveryTrigger::AbandonedResponse,
+        RecoveryAction::DrainAndSync,
+        MetricOutcome::Timeout,
+    );
+    recovery_handle.set_last_error(
+        RecoveryTrigger::AbandonedResponse,
+        RecoveryAction::DrainAndSync,
+        MetricOutcome::Timeout,
+        "backend closed unexpectedly",
+    );
+
+    let backpressure_handle = snapshot_store.backpressure_handle();
+    backpressure_handle.set_route(route_key.clone(), 3, 2);
+    backpressure_handle.increment_rejected(route_key.clone());
+    backpressure_handle.increment_timed_out(route_key.clone());
+    backpressure_handle.increment_canceled(route_key.clone());
+
+    snapshot_store.set_route_snapshot(RouteSnapshot {
+        route_key: route_key.clone(),
+        client_count: 4,
+        backend_count: 2,
+    });
+
+    let prepared_frames = admin_query(admin_addr, "SHOW PREPARED").await;
+    assert_admin_table_response(
+        &prepared_frames,
+        &["statement_count", "materialization_count"],
+        &[vec!["4", "2"]],
+    );
+
+    let pinning_frames = admin_query(admin_addr, "SHOW PINNING").await;
+    assert_admin_table_response(
+        &pinning_frames,
+        &["client_id", "backend_id", "route_key", "reason", "duration_ms"],
+        &[vec!["7", "42", route_key_text, "open_transaction", "4000"]],
+    );
+
+    let recovery_frames = admin_query(admin_addr, "SHOW RECOVERY").await;
+    assert_admin_table_response(
+        &recovery_frames,
+        &["trigger", "action", "outcome", "count", "last_error"],
+        &[vec![
+            "abandoned_response",
+            "drain_and_sync",
+            "timeout",
+            "2",
+            "backend closed unexpectedly",
+        ]],
+    );
+
+    let backpressure_frames = admin_query(admin_addr, "SHOW BACKPRESSURE").await;
+    assert_admin_table_response(
+        &backpressure_frames,
+        &[
+            "route_key",
+            "waiting",
+            "in_flight",
+            "rejected",
+            "timed_out",
+            "canceled",
+        ],
+        &[vec![route_key_text, "3", "2", "1", "1", "1"]],
+    );
+
+    let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;
+    assert_admin_table_response(
+        &routes_frames,
+        &["route_key", "client_count", "backend_count"],
+        &[vec![route_key_text, "4", "2"]],
     );
 
     assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
