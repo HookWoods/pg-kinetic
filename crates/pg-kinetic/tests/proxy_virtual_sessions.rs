@@ -163,7 +163,7 @@ async fn spawn_proxy_with_recording_backend() -> (SocketAddr, mpsc::Receiver<Str
             max_backend_buffer_bytes: 4_194_304,
             overload_error_code: "53300".to_string(),
         },
-        observability: ObservabilityConfig { metrics_addr: None },
+        observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
         tls: Default::default(),
         auth: Default::default(),
         reload: Default::default(),

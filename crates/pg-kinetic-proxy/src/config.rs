@@ -131,7 +131,7 @@ impl AuthFailureMessageMode {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Parser, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Parser, Serialize)]
 #[serde(default)]
 #[command(name = "pg-kinetic")]
 #[command(about = "Low-overhead PostgreSQL wire proxy")]
@@ -147,6 +147,9 @@ pub struct Config {
 
     #[command(flatten)]
     pub qos: QosConfig,
+
+    #[command(flatten)]
+    pub admin: AdminConfig,
 
     #[command(flatten)]
     pub observability: ObservabilityConfig,
@@ -226,6 +229,25 @@ pub struct PerformanceConfig {
     pub backend_reset_query: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    #[arg(long, env = "PG_KINETIC_ADMIN_ADDR")]
+    pub admin_addr: Option<SocketAddr>,
+
+    #[arg(long, env = "PG_KINETIC_ADMIN_REQUIRE_TLS")]
+    pub admin_require_tls: bool,
+
+    #[arg(long, env = "PG_KINETIC_ADMIN_ALLOWED_USER")]
+    pub admin_allowed_user: Option<String>,
+
+    #[arg(long, env = "PG_KINETIC_ADMIN_QUERY_TIMEOUT_MS", default_value_t = 1_000)]
+    pub admin_query_timeout_ms: u64,
+
+    #[arg(long, env = "PG_KINETIC_ADMIN_MAX_CLIENTS", default_value_t = 8)]
+    pub admin_max_clients: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct QosConfig {
@@ -282,11 +304,31 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_DEBUG_TRACE_SAMPLING_RATE",
+        default_value_t = 0.0
+    )]
+    pub debug_trace_sampling_rate: f64,
+
+    #[arg(long, env = "PG_KINETIC_OTEL_ENABLED")]
+    pub otel_enabled: bool,
+
+    #[arg(long, env = "PG_KINETIC_OTEL_ENDPOINT")]
+    pub otel_endpoint: Option<String>,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_OTEL_SERVICE_NAME",
+        default_value = "pg-kinetic"
+    )]
+    pub otel_service_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -571,6 +613,7 @@ impl Config {
     pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
         self.connection == next.connection
             && self.capacity == next.capacity
+            && self.admin == next.admin
             && self.observability == next.observability
             && self.tls.client_tls_mode == next.tls.client_tls_mode
             && self.tls.backend_tls_mode == next.tls.backend_tls_mode
@@ -741,7 +784,16 @@ mod tests {
         assert_eq!(config.qos.max_client_buffer_bytes, 1_048_576);
         assert_eq!(config.qos.max_backend_buffer_bytes, 4_194_304);
         assert_eq!(config.qos.overload_error_code, "53300");
+        assert_eq!(config.admin.admin_addr, None);
+        assert!(!config.admin.admin_require_tls);
+        assert_eq!(config.admin.admin_allowed_user, None);
+        assert_eq!(config.admin.admin_query_timeout_ms, 1_000);
+        assert_eq!(config.admin.admin_max_clients, 8);
         assert_eq!(config.observability.metrics_addr, None);
+        assert_eq!(config.observability.debug_trace_sampling_rate, 0.0);
+        assert!(!config.observability.otel_enabled);
+        assert_eq!(config.observability.otel_endpoint, None);
+        assert_eq!(config.observability.otel_service_name, "pg-kinetic");
 
         assert_eq!(config.tls.client_tls_mode, ClientTlsMode::Disable);
         assert_eq!(config.tls.client_cert_path, None);
@@ -820,6 +872,22 @@ mod tests {
             "222",
             "--overload-error-code",
             "53301",
+            "--admin-addr",
+            "127.0.0.1:7000",
+            "--admin-require-tls",
+            "--admin-allowed-user",
+            "admin",
+            "--admin-query-timeout-ms",
+            "2222",
+            "--admin-max-clients",
+            "16",
+            "--debug-trace-sampling-rate",
+            "0.25",
+            "--otel-enabled",
+            "--otel-endpoint",
+            "http://otel.example.com:4318",
+            "--otel-service-name",
+            "pg-kinetic-proxy",
             "--client-tls-mode",
             "verify_client",
             "--client-cert-path",
@@ -915,6 +983,24 @@ mod tests {
         assert_eq!(config.qos.max_client_buffer_bytes, 111);
         assert_eq!(config.qos.max_backend_buffer_bytes, 222);
         assert_eq!(config.qos.overload_error_code, "53301");
+        assert_eq!(
+            config.admin.admin_addr,
+            Some("127.0.0.1:7000".parse().expect("valid socket"))
+        );
+        assert!(config.admin.admin_require_tls);
+        assert_eq!(config.admin.admin_allowed_user, Some(String::from("admin")));
+        assert_eq!(config.admin.admin_query_timeout_ms, 2_222);
+        assert_eq!(config.admin.admin_max_clients, 16);
+        assert_eq!(config.observability.debug_trace_sampling_rate, 0.25);
+        assert!(config.observability.otel_enabled);
+        assert_eq!(
+            config.observability.otel_endpoint,
+            Some(String::from("http://otel.example.com:4318"))
+        );
+        assert_eq!(
+            config.observability.otel_service_name,
+            "pg-kinetic-proxy"
+        );
 
         assert_eq!(config.tls.client_tls_mode, ClientTlsMode::VerifyClient);
         assert_eq!(

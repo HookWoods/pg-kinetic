@@ -104,7 +104,7 @@ fn base_config(
             max_backend_buffer_bytes: 4_194_304,
             overload_error_code: String::from("53300"),
         },
-        observability: ObservabilityConfig { metrics_addr: None },
+        observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
         tls: proxy_tls_config(client_tls_mode),
         auth: Default::default(),
         reload: Default::default(),
