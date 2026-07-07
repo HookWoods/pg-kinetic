@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::socket::SocketOptionOutcome;
 use crate::snapshot::{PoolSnapshot, ServerSnapshot, SnapshotStore};
@@ -6,6 +7,9 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
+    observability::{
+        MetricName as ObservabilityMetricName, MetricOutcome, ProtocolPhase,
+    },
     route::RouteKey,
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
 };
@@ -39,6 +43,19 @@ pub fn record_pool_checkout(wait_ms: f64, outcome: &'static str) {
         "outcome" => outcome
     )
     .record(wait_ms);
+}
+
+pub fn record_protocol_phase_duration(
+    phase: ProtocolPhase,
+    outcome: MetricOutcome,
+    duration: Duration,
+) {
+    metrics_crate::histogram!(
+        ObservabilityMetricName::ProtocolPhaseDuration.as_str(),
+        "phase" => phase.as_str(),
+        "outcome" => outcome.as_str()
+    )
+    .record(duration.as_secs_f64() * 1_000.0);
 }
 
 pub fn record_pool_snapshot(snapshot_store: &SnapshotStore, snapshot: PoolSnapshot) {
@@ -258,6 +275,10 @@ fn describe_metrics() {
     metrics_crate::describe_histogram!(
         MetricName::PoolCheckoutWaitMs.as_str(),
         "Backend checkout wait time in milliseconds"
+    );
+    metrics_crate::describe_histogram!(
+        ObservabilityMetricName::ProtocolPhaseDuration.as_str(),
+        "Protocol phase duration in milliseconds"
     );
     metrics_crate::describe_counter!(
         MetricName::PreparedEventsTotal.as_str(),

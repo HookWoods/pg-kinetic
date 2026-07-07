@@ -25,6 +25,7 @@ use crate::{
     health, metrics,
     pool::{BackendPool, PooledBackend},
     reload, socket, tls,
+    telemetry::{self, PhaseTimer},
     snapshot::{
         ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
         PreparedSnapshotHandle, RecoverySnapshotHandle, SettingsSnapshot, SnapshotStore,
@@ -35,7 +36,7 @@ use pg_kinetic_core::{
     constants::{MetricName, PreparedEvent},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
-    observability::MetricOutcome,
+    observability::{MetricOutcome, ProtocolPhase},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
@@ -167,6 +168,7 @@ impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
+        let phase_recorder = telemetry::shared_phase_timing_recorder();
         self.snapshot_store
             .set_settings_snapshot(SettingsSnapshot::from_config(&effective_config));
         self.snapshot_store
@@ -263,7 +265,7 @@ impl Proxy {
                                 .context("apply draining client socket options")?;
                             let mut client = ClientConnection::new(client);
                             metrics::increment_client_connections();
-                            reject_client_during_drain(&mut client).await?;
+                            reject_client_during_drain(&mut client, phase_recorder.as_ref()).await?;
                             tracing::info!(%client_addr, "rejected client during drain");
                         }
                     }
@@ -292,7 +294,7 @@ impl Proxy {
 
                     let Some(client_guard) = self.drain.try_enter_client() else {
                         let mut client = client;
-                        reject_client_during_drain(&mut client).await?;
+                        reject_client_during_drain(&mut client, phase_recorder.as_ref()).await?;
                         tracing::info!(%client_addr, "rejected client during drain");
                         continue;
                     };
@@ -303,6 +305,7 @@ impl Proxy {
                     let client_snapshot_handle = snapshot_store.client_handle();
                     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
                     client_snapshot_handle.register(session_id);
+                    let phase_recorder = Arc::clone(&phase_recorder);
 
                     tokio::spawn(async move {
                         let _client_guard = client_guard;
@@ -314,6 +317,7 @@ impl Proxy {
                             session_id,
                             snapshot_store,
                             client_snapshot_handle,
+                            phase_recorder,
                         )
                         .await;
                         drop(permit);
@@ -337,8 +341,10 @@ async fn handle_client(
     session_id: u64,
     snapshot_store: SnapshotStore,
     client_snapshot_handle: ClientSnapshotHandle,
+    phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
 ) -> anyhow::Result<()> {
     let _client_snapshot_guard = ClientSnapshotGuard::new(client_snapshot_handle.clone(), session_id);
+    let startup_timer = PhaseTimer::start(ProtocolPhase::Startup, phase_recorder.as_ref());
     let client_tls_mode = config.tls.client_tls_mode;
     let client_tls_server_config = reload::load_client_tls_server_config(&config)?;
     let auth_users = reload::load_auth_users(&config)?;
@@ -361,13 +367,18 @@ async fn handle_client(
         client_tls_server_config.as_ref(),
         qos.idle_client_timeout(),
         qos.max_client_buffer_bytes,
+        phase_recorder.as_ref(),
     )
     .await
-    .with_context(|| format!("proxy client {client_addr}"))?
+    .with_context(|| format!("proxy client {client_addr}"))
     {
-        StartupRead::Packet(packet) => packet,
-        StartupRead::ClientClosed => return Ok(()),
-        StartupRead::TimedOut => {
+        Ok(StartupRead::Packet(packet)) => packet,
+        Ok(StartupRead::ClientClosed) => {
+            startup_timer.finish(MetricOutcome::Canceled);
+            return Ok(());
+        }
+        Ok(StartupRead::TimedOut) => {
+            startup_timer.finish(MetricOutcome::Timeout);
             error_response_and_ready_with_state(
                 &mut client,
                 SqlState::OperatorIntervention.as_str(),
@@ -377,9 +388,14 @@ async fn handle_client(
             .await?;
             return Ok(());
         }
-        StartupRead::BufferLimitExceeded => {
+        Ok(StartupRead::BufferLimitExceeded) => {
+            startup_timer.finish(MetricOutcome::Discarded);
             record_buffer_limit(BufferBudgetKind::Client);
             return Ok(());
+        }
+        Err(error) => {
+            startup_timer.finish(MetricOutcome::Error);
+            return Err(error);
         }
     };
 
@@ -402,20 +418,39 @@ async fn handle_client(
     );
 
     if !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
+        let auth_timer = PhaseTimer::start(ProtocolPhase::Auth, phase_recorder.as_ref());
+        let auth_users = match auth_users.as_deref().context("auth user store unavailable") {
+            Ok(users) => users,
+            Err(error) => {
+                auth_timer.finish(MetricOutcome::Error);
+                startup_timer.finish(MetricOutcome::Error);
+                return Err(error);
+            }
+        };
         match auth::authenticate_client(
             &mut client,
             &route_user,
             &auth,
-            auth_users
-                .as_deref()
-                .context("auth user store unavailable")?,
+            auth_users,
             qos.max_client_buffer_bytes,
         )
         .await
-        .with_context(|| format!("authenticate client {client_addr}"))?
+        .with_context(|| format!("authenticate client {client_addr}"))
         {
-            auth::ClientAuthOutcome::PassThrough | auth::ClientAuthOutcome::Authenticated => {}
-            auth::ClientAuthOutcome::Rejected => return Ok(()),
+            Ok(auth::ClientAuthOutcome::PassThrough)
+            | Ok(auth::ClientAuthOutcome::Authenticated) => {
+                auth_timer.finish(MetricOutcome::Ok);
+            }
+            Ok(auth::ClientAuthOutcome::Rejected) => {
+                auth_timer.finish(MetricOutcome::Rejected);
+                startup_timer.finish(MetricOutcome::Rejected);
+                return Ok(());
+            }
+            Err(error) => {
+                auth_timer.finish(MetricOutcome::Error);
+                startup_timer.finish(MetricOutcome::Error);
+                return Err(error);
+            }
         }
     }
 
@@ -429,16 +464,24 @@ async fn handle_client(
         ),
         "checkout backend for startup",
         CheckoutMode::AllowConnect,
+        phase_recorder.as_ref(),
     )
     .await
     {
         Ok(backend) => backend,
         Err(CheckoutFailure::Overload(message)) => {
+            startup_timer.finish(MetricOutcome::Rejected);
             error_response_and_ready(&mut client, &qos, message).await?;
             return Ok(());
         }
-        Err(CheckoutFailure::Close) => return Ok(()),
-        Err(CheckoutFailure::Fatal(error)) => return Err(error),
+        Err(CheckoutFailure::Close) => {
+            startup_timer.finish(MetricOutcome::Canceled);
+            return Ok(());
+        }
+        Err(CheckoutFailure::Fatal(error)) => {
+            startup_timer.finish(MetricOutcome::Error);
+            return Err(error);
+        }
     };
     if let Err(error) = proxy_startup(
         &mut client,
@@ -448,9 +491,15 @@ async fn handle_client(
         qos.max_backend_buffer_bytes,
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
+        phase_recorder.as_ref(),
     )
     .await
     {
+        startup_timer.finish(if buffer_limit_kind(&error).is_some() {
+            MetricOutcome::Discarded
+        } else {
+            MetricOutcome::Error
+        });
         if buffer_limit_kind(&error).is_some() {
             backend.discard();
             return Ok(());
@@ -460,6 +509,7 @@ async fn handle_client(
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
     }
     backend.release().await;
+    startup_timer.finish(MetricOutcome::Ok);
     update_client_snapshot(
         &client_snapshot_handle,
         session_id,
@@ -526,6 +576,7 @@ async fn handle_client(
                         ),
                         "checkout backend for cycle",
                         CheckoutMode::ReuseOnly,
+                        phase_recorder.as_ref(),
                     )
                     .await
                     {
@@ -569,6 +620,7 @@ async fn handle_client(
                         &mut state,
                         frames,
                         qos.max_backend_buffer_bytes,
+                        phase_recorder.as_ref(),
                     ),
                 )
                 .await;
@@ -595,6 +647,8 @@ async fn handle_client(
                                 backend.release().await;
                             }
                             CleanupAction::ResetThenReuse => {
+                                let reset_timer =
+                                    PhaseTimer::start(ProtocolPhase::Reset, phase_recorder.as_ref());
                                 execute_simple_query(
                                     &mut backend,
                                     pool.reset_query(),
@@ -602,6 +656,7 @@ async fn handle_client(
                                 )
                                 .await
                                 .context("reset backend before reuse")?;
+                                reset_timer.finish(MetricOutcome::Ok);
                                 clear_pinned_backend(
                                     &mut pinned_backend,
                                     &snapshot_store,
@@ -708,6 +763,7 @@ async fn handle_client(
                             &recovery_snapshot_handle,
                             progress,
                             qos.max_backend_buffer_bytes,
+                            phase_recorder.as_ref(),
                         )
                         .await?;
 
@@ -731,6 +787,7 @@ async fn handle_client(
                         session_id,
                         &recovery_snapshot_handle,
                         &qos,
+                        phase_recorder.as_ref(),
                     )
                     .await?;
                 }
@@ -748,6 +805,7 @@ async fn handle_client(
                         session_id,
                         &recovery_snapshot_handle,
                         &qos,
+                        phase_recorder.as_ref(),
                     )
                     .await?;
                 }
@@ -773,6 +831,7 @@ async fn handle_client(
                         session_id,
                         &recovery_snapshot_handle,
                         &qos,
+                        phase_recorder.as_ref(),
                     )
                     .await?;
                 }
@@ -788,7 +847,9 @@ async fn checkout_backend(
     route: RouteKey,
     context: &'static str,
     mode: CheckoutMode,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> Result<PooledBackend, CheckoutFailure> {
+    let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, phase_recorder);
     let started = Instant::now();
     let backend_result = match mode {
         CheckoutMode::AllowConnect => pool.checkout(route).await,
@@ -798,18 +859,29 @@ async fn checkout_backend(
         Ok(backend) => backend,
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
-        )) => return Err(CheckoutFailure::Overload("backend checkout queue is full")),
+        )) => {
+            timer.finish(MetricOutcome::Rejected);
+            return Err(CheckoutFailure::Overload("backend checkout queue is full"));
+        }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Timeout,
-        )) => return Err(CheckoutFailure::Overload("backend checkout timed out")),
+        )) => {
+            timer.finish(MetricOutcome::Timeout);
+            return Err(CheckoutFailure::Overload("backend checkout timed out"));
+        }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Closed,
-        )) => return Err(CheckoutFailure::Close),
+        )) => {
+            timer.finish(MetricOutcome::Canceled);
+            return Err(CheckoutFailure::Close);
+        }
         Err(crate::pool::PoolError::Connect(error)) => {
+            timer.finish(MetricOutcome::Error);
             return Err(CheckoutFailure::Fatal(error.context(context)));
         }
     };
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
+    timer.finish(MetricOutcome::Ok);
     Ok(backend)
 }
 
@@ -1066,6 +1138,7 @@ pub(crate) async fn read_startup_packet(
     client_tls_server_config: Option<&Arc<ServerConfig>>,
     idle_timeout: Duration,
     max_client_buffer_bytes: usize,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
     let client_tls_required = matches!(
@@ -1089,7 +1162,21 @@ pub(crate) async fn read_startup_packet(
                                 .context("accept startup encryption request")?;
                             let server_config = client_tls_server_config
                                 .context("client TLS server config is unavailable")?;
-                            client.start_tls(server_config).await?;
+                            let tls_timer = PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
+                            let tls_result = client.start_tls(server_config).await;
+                            let tls_outcome = match &tls_result {
+                                Ok(()) if matches!(
+                                    client_tls_mode,
+                                    crate::config::ClientTlsMode::VerifyClient
+                                ) && !client.has_peer_certificates() =>
+                                {
+                                    MetricOutcome::Rejected
+                                }
+                                Ok(()) => MetricOutcome::Ok,
+                                Err(_) => MetricOutcome::Error,
+                            };
+                            tls_timer.finish(tls_outcome);
+                            tls_result?;
                             if matches!(client_tls_mode, crate::config::ClientTlsMode::VerifyClient)
                                 && !client.has_peer_certificates()
                             {
@@ -1178,6 +1265,7 @@ async fn proxy_startup(
     max_backend_buffer_bytes: usize,
     forward_backend_auth_requests_to_client: bool,
     emit_auth_ok_when_backend_requires_no_startup: bool,
+    _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
         let startup_response = if emit_auth_ok_when_backend_requires_no_startup {
@@ -1335,8 +1423,10 @@ async fn forward_message_cycle(
     state: &mut ForwardCycleState<'_>,
     frames: Vec<FrontendFrame>,
     max_backend_buffer_bytes: usize,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
+    let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
     let mut outbound = BytesMut::new();
     for frame in frames {
         let plan = prepare_frame_for_backend(
@@ -1344,6 +1434,7 @@ async fn forward_message_cycle(
             state.prepared,
             &state.prepared_snapshot_handle,
             frame,
+            phase_recorder,
         )?;
         update_virtual_session_from_frame(
             state.session,
@@ -1363,11 +1454,14 @@ async fn forward_message_cycle(
         .write_all(&outbound)
         .await
         .context("write frontend cycle to backend")?;
+    execute_timer.finish(MetricOutcome::Ok);
 
+    let rows_timer = PhaseTimer::start(ProtocolPhase::Rows, phase_recorder);
     let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
     loop {
         if backend_buffer.len() >= max_backend_buffer_bytes {
             record_buffer_limit(BufferBudgetKind::Backend);
+            rows_timer.finish(MetricOutcome::Discarded);
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
@@ -1414,13 +1508,16 @@ async fn forward_message_cycle(
 
         if !forward.is_empty() && client.write_all(&forward).await.is_err() {
             if let Some(status) = ready {
+                rows_timer.finish(MetricOutcome::Canceled);
                 return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
             }
 
+            rows_timer.finish(MetricOutcome::Canceled);
             return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
         }
 
         if let Some(status) = ready {
+            rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));
         }
     }
@@ -1431,14 +1528,17 @@ fn prepare_frame_for_backend(
     prepared: &mut PreparedCatalog,
     prepared_snapshot_handle: &PreparedSnapshotHandle,
     frame: FrontendFrame,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<PreparedForwardPlan> {
     if let Some(parse) = parse_parse_message(&frame)? {
+        let timer = PhaseTimer::start(ProtocolPhase::Parse, phase_recorder);
         let statement = prepared
             .upsert(parse.statement_name, parse.query, parse.parameter_type_oids)
             .clone();
         metrics::increment_prepared_event(PreparedEvent::Parse);
         prepared_snapshot_handle.increment_statement_count();
         prepared.mark_materialized(backend_id, &statement);
+        timer.finish(MetricOutcome::Ok);
         return Ok(PreparedForwardPlan::single(rewrite_parse_statement_name(
             &frame,
             &statement.backend_name,
@@ -1446,6 +1546,7 @@ fn prepare_frame_for_backend(
     }
 
     if let Some(statement_name) = parse_bind_statement_name(&frame)? {
+        let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
         if let Some(statement) = prepared.get(&statement_name).cloned() {
             metrics::increment_prepared_event(PreparedEvent::Bind);
             let mut prelude = Vec::new();
@@ -1460,14 +1561,17 @@ fn prepare_frame_for_backend(
                 prepared_snapshot_handle.increment_materialization_count();
             }
 
+            timer.finish(MetricOutcome::Ok);
             return Ok(PreparedForwardPlan {
                 prelude,
                 frame: rewrite_bind_statement_name(&frame, &statement.backend_name)?,
             });
         }
+        timer.finish(MetricOutcome::Rejected);
     }
 
     if let Some(DescribeTarget::Statement(statement_name)) = parse_describe_target(&frame)? {
+        let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
         if let Some(statement) = prepared.get(&statement_name).cloned() {
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
@@ -1481,21 +1585,31 @@ fn prepare_frame_for_backend(
                 prepared_snapshot_handle.increment_materialization_count();
             }
 
+            timer.finish(MetricOutcome::Ok);
             return Ok(PreparedForwardPlan {
                 prelude,
                 frame: rewrite_describe_statement_name(&frame, &statement.backend_name)?,
             });
         }
+        timer.finish(MetricOutcome::Rejected);
     }
 
     if let Some(CloseTarget::Statement(statement_name)) = parse_close_target(&frame)? {
+        let timer = PhaseTimer::start(ProtocolPhase::Close, phase_recorder);
         if let Some(statement) = prepared.remove(&statement_name) {
             metrics::increment_prepared_event(PreparedEvent::Close);
+            timer.finish(MetricOutcome::Ok);
             return Ok(PreparedForwardPlan::single(rewrite_close_statement_name(
                 &frame,
                 &statement.backend_name,
             )?));
         }
+        timer.finish(MetricOutcome::Rejected);
+    }
+
+    if frame.tag == u8::from(FrontendTag::Execute) {
+        let timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
+        timer.finish(MetricOutcome::Ok);
     }
 
     Ok(PreparedForwardPlan::single(frame))
@@ -1792,13 +1906,18 @@ async fn error_response_only(
         .context("write timeout error response")
 }
 
-async fn reject_client_during_drain(client: &mut ClientConnection) -> anyhow::Result<()> {
+async fn reject_client_during_drain(
+    client: &mut ClientConnection,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+) -> anyhow::Result<()> {
+    let drain_timer = PhaseTimer::start(ProtocolPhase::Drain, phase_recorder);
     error_response_only(
         client,
         SqlState::OperatorIntervention.as_str(),
         "proxy is draining",
     )
     .await?;
+    drain_timer.finish(MetricOutcome::Rejected);
     client.shutdown().await.context("shutdown draining client")
 }
 
@@ -1813,6 +1932,7 @@ async fn handle_query_timeout(
     recovery_snapshot_handle: &RecoverySnapshotHandle,
     progress: QueryProgress,
     max_backend_buffer_bytes: usize,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<bool> {
     metrics_crate::counter!(
         MetricName::TimeoutTotal.as_str(),
@@ -1837,6 +1957,7 @@ async fn handle_query_timeout(
         .await?;
     }
 
+    let cancel_timer = PhaseTimer::start(ProtocolPhase::Cancel, phase_recorder);
     let reused = recover_backend(
         &mut backend,
         recovery_trigger,
@@ -1854,6 +1975,7 @@ async fn handle_query_timeout(
     } else {
         backend.discard();
     }
+    cancel_timer.finish(MetricOutcome::Timeout);
 
     Ok(!progress.response_started)
 }
@@ -1902,7 +2024,9 @@ async fn finalize_backend_on_disconnect(
     session_id: u64,
     recovery_snapshot_handle: &RecoverySnapshotHandle,
     qos: &crate::config::QosConfig,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
+    let close_timer = PhaseTimer::start(ProtocolPhase::Close, phase_recorder);
     match session.pin_reason() {
         Some(PinReason::OpenTransaction) | Some(PinReason::FailedTransaction) => {
             let reused = recover_backend(
@@ -1937,6 +2061,7 @@ async fn finalize_backend_on_disconnect(
         }
         None => {
             if session.has_replayable_settings() {
+                let reset_timer = PhaseTimer::start(ProtocolPhase::Reset, phase_recorder);
                 execute_simple_query(
                     &mut backend,
                     pool.reset_query(),
@@ -1944,12 +2069,14 @@ async fn finalize_backend_on_disconnect(
                 )
                 .await
                 .context("reset backend during disconnect cleanup")?;
+                reset_timer.finish(MetricOutcome::Ok);
             }
             clear_pinned_backend(pinned_backend, snapshot_store, session_id);
             backend.release().await;
         }
     }
 
+    close_timer.finish(MetricOutcome::Ok);
     Ok(())
 }
 

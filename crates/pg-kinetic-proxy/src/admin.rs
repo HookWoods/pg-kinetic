@@ -18,6 +18,7 @@ use crate::{
     drain::DrainController,
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
+    telemetry,
     snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
         PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
@@ -143,6 +144,7 @@ async fn handle_session(
     client_addr: SocketAddr,
     state: &AdminState,
 ) -> anyhow::Result<()> {
+    let phase_recorder = telemetry::shared_phase_timing_recorder();
     let admin_timeout = Duration::from_millis(state.config.admin.admin_query_timeout_ms);
     let startup_packet = match read_startup_packet(
         client,
@@ -150,6 +152,7 @@ async fn handle_session(
         state.client_tls_server_config.as_ref(),
         admin_timeout,
         state.config.qos.max_client_buffer_bytes,
+        phase_recorder.as_ref(),
     )
     .await
     .with_context(|| format!("admin client {client_addr}"))?
