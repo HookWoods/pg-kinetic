@@ -9,6 +9,11 @@ The first milestone focuses on:
 - transaction state tracking
 - reproducible benchmarks against direct PostgreSQL, PgBouncer, and PgDog
 
+## Public Docs
+
+- [Admin reference](docs/admin.md)
+- [Metrics catalog](docs/metrics.md)
+
 ## Local Benchmark Stack
 
 Start the local stack:
