@@ -8,6 +8,7 @@ use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
     observability::{
+        metric_catalog, MetricDescriptor, MetricKind,
         MetricName as ObservabilityMetricName, MetricOutcome, ProtocolPhase,
     },
     route::RouteKey,
@@ -179,7 +180,7 @@ pub fn increment_buffer_limit(kind: &'static str) {
     .increment(1);
 }
 
-pub fn record_tls_handshake<M: MetricLabel>(scope: TlsScope, mode: M) {
+pub fn record_tls_handshake<M: MetricLabelValue>(scope: TlsScope, mode: M) {
     metrics_crate::counter!(
         OperationalMetricName::TlsHandshakesTotal.as_str(),
         "scope" => scope.metric_label(),
@@ -188,7 +189,7 @@ pub fn record_tls_handshake<M: MetricLabel>(scope: TlsScope, mode: M) {
     .increment(1);
 }
 
-pub fn record_tls_failure<M: MetricLabel>(scope: TlsScope, mode: M, reason: TlsFailureReason) {
+pub fn record_tls_failure<M: MetricLabelValue>(scope: TlsScope, mode: M, reason: TlsFailureReason) {
     metrics_crate::counter!(
         OperationalMetricName::TlsFailuresTotal.as_str(),
         "scope" => scope.metric_label(),
@@ -253,7 +254,7 @@ pub fn record_health_status(kind: HealthKind, status: HealthStatus) {
     }
 }
 
-pub fn record_socket_option<S: MetricLabel, O: MetricLabel>(
+pub fn record_socket_option<S: MetricLabelValue, O: MetricLabelValue>(
     socket_kind: S,
     option: O,
     outcome: SocketOptionOutcome,
@@ -268,91 +269,23 @@ pub fn record_socket_option<S: MetricLabel, O: MetricLabel>(
 }
 
 fn describe_metrics() {
-    metrics_crate::describe_counter!(
-        MetricName::ClientConnectionsTotal.as_str(),
-        "Total accepted client connections"
-    );
-    metrics_crate::describe_histogram!(
-        MetricName::PoolCheckoutWaitMs.as_str(),
-        "Backend checkout wait time in milliseconds"
-    );
-    metrics_crate::describe_histogram!(
-        ObservabilityMetricName::ProtocolPhaseDuration.as_str(),
-        "Protocol phase duration in milliseconds"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::PreparedEventsTotal.as_str(),
-        "Prepared statement virtualization events"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::BackendPinTotal.as_str(),
-        "Backend pin decisions by reason"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::BackendCleanupTotal.as_str(),
-        "Backend cleanup decisions by action"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::BackendRecoveryTotal.as_str(),
-        "Backend recovery attempts by trigger, action, and outcome"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::BackendSqlstateTotal.as_str(),
-        "Backend ErrorResponse counts by SQLSTATE"
-    );
-    metrics_crate::describe_counter!(
-        MetricName::BackpressureEvents.as_str(),
-        "Backpressure outcomes by route"
-    );
-    metrics_crate::describe_histogram!(
-        MetricName::RouteCheckoutWaitMs.as_str(),
-        "Route checkout wait time in milliseconds"
-    );
-    metrics_crate::describe_gauge!(
-        MetricName::RouteInFlight.as_str(),
-        "Route in-flight checkout count"
-    );
-    metrics_crate::describe_gauge!(
-        MetricName::RouteWaiting.as_str(),
-        "Route waiting checkout count"
-    );
-    metrics_crate::describe_counter!(MetricName::TimeoutTotal.as_str(), "Timeouts by kind");
-    metrics_crate::describe_counter!(
-        MetricName::BufferLimitTotal.as_str(),
-        "Buffer limit breaches by kind"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::TlsHandshakesTotal.as_str(),
-        "Successful PostgreSQL TLS handshakes by scope and mode"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::TlsFailuresTotal.as_str(),
-        "Failed PostgreSQL TLS handshakes by scope, mode, and reason"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::AuthAttemptsTotal.as_str(),
-        "Authentication attempts by auth mode"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::AuthFailuresTotal.as_str(),
-        "Authentication failures by auth mode and reason"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::ConfigReloadTotal.as_str(),
-        "Config reload decisions by outcome"
-    );
-    metrics_crate::describe_gauge!(
-        OperationalMetricName::DrainState.as_str(),
-        "Current drain state series (1.0 for the active state, 0.0 otherwise)"
-    );
-    metrics_crate::describe_gauge!(
-        OperationalMetricName::HealthStatus.as_str(),
-        "Current health state by kind and status series (1.0 for the active state, 0.0 otherwise)"
-    );
-    metrics_crate::describe_counter!(
-        OperationalMetricName::SocketOptionTotal.as_str(),
-        "Socket option outcomes by socket kind, option, and result"
-    );
+    for descriptor in metric_catalog() {
+        describe_metric(descriptor);
+    }
+}
+
+fn describe_metric(descriptor: &MetricDescriptor) {
+    match descriptor.kind {
+        MetricKind::Counter => {
+            metrics_crate::describe_counter!(descriptor.name, descriptor.description);
+        }
+        MetricKind::Gauge => {
+            metrics_crate::describe_gauge!(descriptor.name, descriptor.description);
+        }
+        MetricKind::Histogram => {
+            metrics_crate::describe_histogram!(descriptor.name, descriptor.description);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -395,11 +328,11 @@ impl OperationalMetricName {
     }
 }
 
-pub trait MetricLabel {
+pub trait MetricLabelValue {
     fn metric_label(self) -> &'static str;
 }
 
-impl MetricLabel for TlsScope {
+impl MetricLabelValue for TlsScope {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Client => "client",
@@ -408,37 +341,37 @@ impl MetricLabel for TlsScope {
     }
 }
 
-impl MetricLabel for ClientTlsMode {
+impl MetricLabelValue for ClientTlsMode {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }
 }
 
-impl MetricLabel for BackendTlsMode {
+impl MetricLabelValue for BackendTlsMode {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }
 }
 
-impl MetricLabel for AuthMode {
+impl MetricLabelValue for AuthMode {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }
 }
 
-impl MetricLabel for DrainState {
+impl MetricLabelValue for DrainState {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }
 }
 
-impl MetricLabel for HealthStatus {
+impl MetricLabelValue for HealthStatus {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }
 }
 
-impl MetricLabel for SocketOptionOutcome {
+impl MetricLabelValue for SocketOptionOutcome {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Applied => "applied",
@@ -448,7 +381,7 @@ impl MetricLabel for SocketOptionOutcome {
     }
 }
 
-impl MetricLabel for TlsFailureReason {
+impl MetricLabelValue for TlsFailureReason {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Denied => "denied",
@@ -459,7 +392,7 @@ impl MetricLabel for TlsFailureReason {
     }
 }
 
-impl MetricLabel for AuthFailureReason {
+impl MetricLabelValue for AuthFailureReason {
     fn metric_label(self) -> &'static str {
         match self {
             Self::UnknownUser => "unknown_user",
@@ -471,7 +404,7 @@ impl MetricLabel for AuthFailureReason {
     }
 }
 
-impl MetricLabel for ReloadOutcome {
+impl MetricLabelValue for ReloadOutcome {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Applied => "applied",
@@ -482,7 +415,7 @@ impl MetricLabel for ReloadOutcome {
     }
 }
 
-impl MetricLabel for HealthKind {
+impl MetricLabelValue for HealthKind {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Process => "process",
@@ -492,7 +425,7 @@ impl MetricLabel for HealthKind {
     }
 }
 
-impl MetricLabel for SocketKind {
+impl MetricLabelValue for SocketKind {
     fn metric_label(self) -> &'static str {
         match self {
             Self::Client => "client",
@@ -501,7 +434,7 @@ impl MetricLabel for SocketKind {
     }
 }
 
-impl MetricLabel for SocketOption {
+impl MetricLabelValue for SocketOption {
     fn metric_label(self) -> &'static str {
         match self {
             Self::TcpNodelay => "tcp_nodelay",
