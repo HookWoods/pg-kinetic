@@ -17,20 +17,31 @@ use tokio::{
 };
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 
+use crate::routing::{
+    choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,
+    RoutingContext, RoutingReason, RoutingTarget,
+};
 use crate::{
     admin, auth,
-    config::Config,
+    config::{Config, RouteConfig},
     drain::{DrainController, DrainOutcome},
     health, metrics,
-    pool::{BackendPool, PooledBackend},
+    pool::{
+        BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
+        ReplicaSelectionStrategy, ReplicaSelector, RoutePools,
+    },
     reload,
     snapshot::{
         ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
-        PreparedSnapshotHandle, RecoverySnapshotHandle, SettingsSnapshot, SnapshotStore,
+        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot, SettingsSnapshot,
+        SnapshotStore,
     },
     socket,
     telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
     tls,
+};
+use pg_kinetic_core::routing::{
+    BackendRole, FallbackPolicy, ReadRoutingMode, RoutingReason as CoreRoutingReason,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
@@ -41,6 +52,7 @@ use pg_kinetic_core::{
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
+    session::TransactionState,
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
@@ -61,6 +73,7 @@ use pg_kinetic_wire::{
     sqlstate::SqlState,
     startup::{parse_startup_packet, StartupPacket},
 };
+use std::borrow::Cow;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -177,25 +190,29 @@ impl Proxy {
         self.snapshot_store
             .set_limits_snapshot(LimitsSnapshot::from_config(&effective_config));
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
-        let pool = BackendPool::new_with_socket(
-            effective_config.connection.backend_addr,
-            effective_config.tls.clone(),
-            effective_config.socket.clone(),
-            effective_config.capacity.max_backends,
-            effective_config.capacity.max_checkout_waiters,
-            effective_config.qos.max_route_in_flight,
-            effective_config.qos.max_route_waiters,
-            effective_config.performance.checkout_timeout(),
-            effective_config.performance.backend_reset_query.clone(),
+        let route_config = effective_config
+            .effective_routes()
+            .into_iter()
+            .next()
+            .context("missing effective route config")?;
+        let route_pools = Arc::new(build_route_pools(
+            &effective_config,
+            &route_config,
+            self.snapshot_store.clone(),
+        ));
+        let routing_planner = ReadRoutingPlanner::new(
+            route_config.read_routing.read_routing_mode,
+            route_config.read_routing.fallback_policy,
+            route_config.freshness.freshness_policy,
+            route_config.freshness.max_replica_lag_ms,
         );
-        pool.attach_snapshot_store(self.snapshot_store.clone());
 
         let _health_handle = if let Some(health_addr) = effective_config.health.health_addr {
             Some(
                 health::spawn(
                     health_addr,
                     Arc::clone(&self.drain),
-                    effective_config.connection.backend_addr,
+                    route_config.primary.address,
                     effective_config.tls.clone(),
                     effective_config.socket.clone(),
                     effective_config.health.readiness_timeout(),
@@ -303,7 +320,7 @@ impl Proxy {
                     };
 
                     let permit = self.client_slots.clone().acquire_owned().await?;
-                    let pool = Arc::clone(&pool);
+                    let route_pools = Arc::clone(&route_pools);
                     let snapshot_store = self.snapshot_store.clone();
                     let client_snapshot_handle = snapshot_store.client_handle();
                     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -322,15 +339,16 @@ impl Proxy {
                     tokio::spawn(async move {
                         let _client_guard = client_guard;
                         let result = handle_client(
-                            client,
-                            client_addr,
-                            pool,
-                            config_snapshot,
-                            session_id,
-                            snapshot_store,
-                            client_snapshot_handle,
-                            phase_recorder,
-                            debug_sampler,
+                        client,
+                        client_addr,
+                        route_pools,
+                        config_snapshot,
+                        routing_planner,
+                        session_id,
+                        snapshot_store,
+                        client_snapshot_handle,
+                        phase_recorder,
+                        debug_sampler,
                         )
                         .await;
                         drop(permit);
@@ -350,8 +368,9 @@ impl Proxy {
 async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,
-    pool: Arc<BackendPool>,
+    route_pools: Arc<RoutePools>,
     config: Config,
+    routing_planner: ReadRoutingPlanner,
     session_id: u64,
     snapshot_store: SnapshotStore,
     client_snapshot_handle: ClientSnapshotHandle,
@@ -373,6 +392,13 @@ async fn handle_client(
     let auth = config.auth.clone();
     let performance = config.performance.clone();
     let qos = config.qos.clone();
+    let route_config = config
+        .effective_routes()
+        .into_iter()
+        .next()
+        .context("missing effective route config")?;
+    let route_read_routing_mode = route_config.read_routing.read_routing_mode;
+    let route_fallback_policy = route_config.read_routing.fallback_policy;
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let recovery_snapshot_handle = snapshot_store.recovery_handle();
 
@@ -476,18 +502,24 @@ async fn handle_client(
     }
 
     let mut backend = match checkout_backend(
-        &pool,
+        &route_pools,
         route_key(
             &route_database,
             &route_user,
             route_application_name.as_deref(),
             client_addr,
         ),
+        RoutingTarget::Primary {
+            reason: RoutingReason::Off,
+        },
         "checkout backend for startup",
         CheckoutMode::AllowConnect,
         session_id,
         debug_sampler,
         phase_recorder.as_ref(),
+        &snapshot_store,
+        &startup_packet,
+        false,
     )
     .await
     {
@@ -606,19 +638,32 @@ async fn handle_client(
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
+                    let checkout_target = select_checkout_target(
+                        &routing_planner,
+                        &route_pools,
+                        route_read_routing_mode,
+                        route_fallback_policy,
+                        &session,
+                        &prepared,
+                        &frames,
+                    );
                     match checkout_backend(
-                        &pool,
+                        &route_pools,
                         route_key(
                             &route_database,
                             &route_user,
                             route_application_name.as_deref(),
                             client_addr,
                         ),
+                        checkout_target,
                         "checkout backend for cycle",
-                        CheckoutMode::ReuseOnly,
+                        CheckoutMode::AllowConnect,
                         session_id,
                         debug_sampler,
                         phase_recorder.as_ref(),
+                        &snapshot_store,
+                        &startup_packet,
+                        true,
                     )
                     .await
                     {
@@ -716,7 +761,7 @@ async fn handle_client(
                                 );
                                 execute_simple_query(
                                     &mut backend,
-                                    pool.reset_query(),
+                                    route_pools.primary().reset_query(),
                                     qos.max_backend_buffer_bytes,
                                 )
                                 .await
@@ -874,7 +919,7 @@ async fn handle_client(
                 if let Some(backend) = held_backend.take() {
                     finalize_backend_on_disconnect(
                         backend,
-                        &pool,
+                        &route_pools,
                         &performance,
                         &mut session,
                         &mut pinned_backend,
@@ -899,7 +944,7 @@ async fn handle_client(
                 if let Some(backend) = held_backend.take() {
                     finalize_backend_on_disconnect(
                         backend,
-                        &pool,
+                        &route_pools,
                         &performance,
                         &mut session,
                         &mut pinned_backend,
@@ -932,7 +977,7 @@ async fn handle_client(
                 if let Some(backend) = held_backend.take() {
                     finalize_backend_on_disconnect(
                         backend,
-                        &pool,
+                        &route_pools,
                         &performance,
                         &mut session,
                         &mut pinned_backend,
@@ -959,21 +1004,58 @@ async fn handle_client(
 }
 
 async fn checkout_backend(
-    pool: &Arc<BackendPool>,
+    route_pools: &Arc<RoutePools>,
     route: RouteKey,
+    target: RoutingTarget,
     context: &'static str,
     mode: CheckoutMode,
     session_id: u64,
     debug_sampler: DebugSampler,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+    snapshot_store: &SnapshotStore,
+    startup_packet: &[u8],
+    record_snapshot: bool,
 ) -> Result<PooledBackend, CheckoutFailure> {
     let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, phase_recorder);
     let started = Instant::now();
-    let backend_result = match mode {
-        CheckoutMode::AllowConnect => pool.checkout(route.clone()).await,
-        CheckoutMode::ReuseOnly => pool.checkout_reusable(route.clone()).await,
+    if record_snapshot {
+        let target_role = target.clone().target_role().map(|role| role.as_str());
+        let target_reason = target.clone().reason();
+        snapshot_store
+            .set_route_checkout_snapshot(RouteCheckoutSnapshot::new(route.clone(), target.clone()));
+        tracing::debug!(
+            route_key = ?route,
+            checkout_mode = %checkout_mode_label(mode),
+            target_role = ?target_role,
+            reason = %target_reason.as_str(),
+            "route checkout decision"
+        );
+    }
+
+    let pool_mode = match mode {
+        CheckoutMode::AllowConnect => PoolCheckoutMode::AllowConnect,
     };
-    let backend = match backend_result {
+    if matches!(
+        target,
+        RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
+    ) {
+        let reason = target.reason();
+        telemetry::emit_debug_sample(
+            &debug_sampler,
+            DebugSample::overload_rejected(session_id, route.clone(), checkout_mode_label(mode)),
+        );
+        timer.finish(MetricOutcome::Rejected);
+        return Err(CheckoutFailure::Overload(match reason {
+            RoutingReason::FallbackWait => "backend checkout is waiting for a replica",
+            RoutingReason::FallbackReject => "backend checkout rejected",
+            _ => "backend checkout rejected",
+        }));
+    }
+
+    let backend_result = route_pools
+        .checkout_target(route.clone(), &target, pool_mode)
+        .await;
+    let mut backend = match backend_result {
         Ok(backend) => backend,
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
@@ -983,10 +1065,7 @@ async fn checkout_backend(
                 DebugSample::overload_rejected(
                     session_id,
                     route.clone(),
-                    match mode {
-                        CheckoutMode::AllowConnect => "allow_connect",
-                        CheckoutMode::ReuseOnly => "reuse_only",
-                    },
+                    checkout_mode_label(mode),
                 ),
             );
             timer.finish(MetricOutcome::Rejected);
@@ -1000,10 +1079,7 @@ async fn checkout_backend(
                 DebugSample::overload_rejected(
                     session_id,
                     route.clone(),
-                    match mode {
-                        CheckoutMode::AllowConnect => "allow_connect",
-                        CheckoutMode::ReuseOnly => "reuse_only",
-                    },
+                    checkout_mode_label(mode),
                 ),
             );
             timer.finish(MetricOutcome::Timeout);
@@ -1017,10 +1093,7 @@ async fn checkout_backend(
                 DebugSample::backend_checkout(
                     session_id,
                     route.clone(),
-                    match mode {
-                        CheckoutMode::AllowConnect => "allow_connect",
-                        CheckoutMode::ReuseOnly => "reuse_only",
-                    },
+                    checkout_mode_label(mode),
                     MetricOutcome::Canceled,
                     started.elapsed(),
                 ),
@@ -1034,10 +1107,7 @@ async fn checkout_backend(
                 DebugSample::backend_checkout(
                     session_id,
                     route.clone(),
-                    match mode {
-                        CheckoutMode::AllowConnect => "allow_connect",
-                        CheckoutMode::ReuseOnly => "reuse_only",
-                    },
+                    checkout_mode_label(mode),
                     MetricOutcome::Error,
                     started.elapsed(),
                 ),
@@ -1046,16 +1116,19 @@ async fn checkout_backend(
             return Err(CheckoutFailure::Fatal(error.context(context)));
         }
     };
+
+    if record_snapshot && backend.requires_startup() {
+        bootstrap_backend(&mut backend, startup_packet)
+            .await
+            .map_err(CheckoutFailure::Fatal)?;
+    }
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
     telemetry::emit_debug_sample(
         &debug_sampler,
         DebugSample::backend_checkout(
             session_id,
             route.clone(),
-            match mode {
-                CheckoutMode::AllowConnect => "allow_connect",
-                CheckoutMode::ReuseOnly => "reuse_only",
-            },
+            checkout_mode_label(mode),
             MetricOutcome::Ok,
             started.elapsed(),
         ),
@@ -1067,7 +1140,6 @@ async fn checkout_backend(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckoutMode {
     AllowConnect,
-    ReuseOnly,
 }
 
 #[derive(Debug)]
@@ -1113,6 +1185,214 @@ fn route_key(
         application_name,
         Some(client_addr),
         QueryClass::Default,
+    )
+}
+
+fn select_checkout_target(
+    planner: &ReadRoutingPlanner,
+    route_pools: &RoutePools,
+    read_routing_mode: ReadRoutingMode,
+    fallback_policy: FallbackPolicy,
+    session: &VirtualSession,
+    prepared: &PreparedCatalog,
+    frames: &[FrontendFrame],
+) -> RoutingTarget {
+    match read_routing_mode {
+        ReadRoutingMode::Off => {
+            return RoutingTarget::Primary {
+                reason: RoutingReason::Off,
+            };
+        }
+        ReadRoutingMode::PrimaryOnly => {
+            return RoutingTarget::Primary {
+                reason: RoutingReason::PrimaryOnlyMode,
+            };
+        }
+        ReadRoutingMode::PreferReplica | ReadRoutingMode::RequireReplica => {}
+    }
+
+    if let Some(transaction_role) = session.current_transaction_target_role() {
+        let reason = session
+            .current_transaction_route_reason()
+            .map(routing_reason_from_core)
+            .unwrap_or(RoutingReason::TransactionControl);
+        return match transaction_role {
+            BackendRole::Primary => RoutingTarget::Primary { reason },
+            BackendRole::Replica => {
+                if let Some(replica) = route_pools.selector().select(route_pools.replicas()) {
+                    RoutingTarget::Replica {
+                        candidate: ReplicaCandidate::new(
+                            replica.id(),
+                            replica.is_healthy(),
+                            None,
+                            None,
+                        ),
+                        reason,
+                    }
+                } else {
+                    fallback_target(read_routing_mode, fallback_policy)
+                }
+            }
+            BackendRole::Unknown => RoutingTarget::Primary {
+                reason: RoutingReason::UnknownQuery,
+            },
+        };
+    }
+
+    let sql = routing_sql_for_frames(prepared, frames);
+    let health = build_route_health_snapshot(route_pools);
+    choose_routing_target(
+        planner,
+        RoutingContext::new(sql.as_ref(), TransactionState::Idle, None, &health),
+    )
+}
+
+fn fallback_target(
+    read_routing_mode: ReadRoutingMode,
+    fallback_policy: FallbackPolicy,
+) -> RoutingTarget {
+    if read_routing_mode == ReadRoutingMode::RequireReplica {
+        return RoutingTarget::Reject {
+            reason: RoutingReason::RequireReplicaMode,
+        };
+    }
+
+    match fallback_policy {
+        FallbackPolicy::Primary => RoutingTarget::Primary {
+            reason: RoutingReason::FallbackPrimary,
+        },
+        FallbackPolicy::Reject => RoutingTarget::Reject {
+            reason: RoutingReason::FallbackReject,
+        },
+        FallbackPolicy::Wait => RoutingTarget::Wait {
+            reason: RoutingReason::FallbackWait,
+        },
+    }
+}
+
+fn routing_reason_from_core(reason: CoreRoutingReason) -> RoutingReason {
+    match reason {
+        CoreRoutingReason::Off => RoutingReason::Off,
+        CoreRoutingReason::PrimaryOnlyMode => RoutingReason::PrimaryOnlyMode,
+        CoreRoutingReason::PreferReplicaMode => RoutingReason::ReadCandidateQuery,
+        CoreRoutingReason::RequireReplicaMode => RoutingReason::RequireReplicaMode,
+        CoreRoutingReason::WriteQuery => RoutingReason::WriteQuery,
+        CoreRoutingReason::ReadOnlyQuery => RoutingReason::ReadOnlyQuery,
+        CoreRoutingReason::ReadCandidateQuery => RoutingReason::ReadCandidateQuery,
+        CoreRoutingReason::TransactionControl => RoutingReason::TransactionControl,
+        CoreRoutingReason::SessionMutation => RoutingReason::SessionMutation,
+        CoreRoutingReason::Copy => RoutingReason::CopyQuery,
+        CoreRoutingReason::UnknownQuery => RoutingReason::UnknownQuery,
+        CoreRoutingReason::FreshnessRequired => RoutingReason::FreshnessRequired,
+        CoreRoutingReason::ReplicaStale => RoutingReason::ReplicaStale,
+        CoreRoutingReason::ReplicaUnavailable => RoutingReason::ReplicaUnavailable,
+        CoreRoutingReason::FallbackPrimary => RoutingReason::FallbackPrimary,
+        CoreRoutingReason::FallbackReject => RoutingReason::FallbackReject,
+        CoreRoutingReason::FallbackWait => RoutingReason::FallbackWait,
+    }
+}
+
+fn build_route_health_snapshot(route_pools: &RoutePools) -> RouteHealthSnapshot {
+    RouteHealthSnapshot::new(
+        route_pools
+            .replicas()
+            .iter()
+            .map(|replica| ReplicaCandidate::new(replica.id(), replica.is_healthy(), None, None))
+            .collect(),
+    )
+}
+
+fn routing_sql_for_frames<'a>(
+    prepared: &'a PreparedCatalog,
+    frames: &'a [FrontendFrame],
+) -> Cow<'a, str> {
+    for frame in frames {
+        if let Some(query) = parse_simple_query(frame).ok().flatten() {
+            return Cow::Borrowed(query);
+        }
+
+        if let Some(parse) = parse_parse_message(frame).ok().flatten() {
+            return Cow::Owned(parse.query);
+        }
+
+        if let Some(statement_name) = parse_bind_statement_name(frame).ok().flatten() {
+            if let Some(statement) = prepared.get(&statement_name) {
+                return Cow::Borrowed(statement.query.as_str());
+            }
+        }
+
+        if let Some(describe_target) = parse_describe_target(frame).ok().flatten() {
+            if let DescribeTarget::Statement(statement_name) = describe_target {
+                if let Some(statement) = prepared.get(&statement_name) {
+                    return Cow::Borrowed(statement.query.as_str());
+                }
+            }
+        }
+    }
+
+    Cow::Borrowed("")
+}
+
+fn checkout_mode_label(mode: CheckoutMode) -> &'static str {
+    match mode {
+        CheckoutMode::AllowConnect => "allow_connect",
+    }
+}
+
+fn build_route_pools(
+    config: &Config,
+    route_config: &RouteConfig,
+    snapshot_store: SnapshotStore,
+) -> RoutePools {
+    let pool_args = (
+        config.tls.clone(),
+        config.socket.clone(),
+        config.capacity.max_backends,
+        config.capacity.max_checkout_waiters,
+        config.qos.max_route_in_flight,
+        config.qos.max_route_waiters,
+        config.performance.checkout_timeout(),
+        config.performance.backend_reset_query.clone(),
+    );
+
+    let primary_pool = BackendPool::new_with_socket(
+        route_config.primary.address,
+        pool_args.0.clone(),
+        pool_args.1.clone(),
+        pool_args.2,
+        pool_args.3,
+        pool_args.4,
+        pool_args.5,
+        pool_args.6,
+        pool_args.7.clone(),
+    );
+    let primary = BackendPoolRef::primary(primary_pool);
+    primary.attach_snapshot_store(snapshot_store.clone());
+
+    let replicas = route_config
+        .replicas
+        .iter()
+        .enumerate()
+        .map(|(index, replica)| {
+            let pool = BackendPool::new_with_socket(
+                replica.address,
+                pool_args.0.clone(),
+                pool_args.1.clone(),
+                pool_args.2,
+                pool_args.3,
+                pool_args.4,
+                pool_args.5,
+                pool_args.6,
+                pool_args.7.clone(),
+            );
+            BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
+        })
+        .collect();
+
+    RoutePools::new(
+        primary,
+        replicas,
+        ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
     )
 }
 
@@ -1558,6 +1838,45 @@ async fn proxy_startup(
                     .write_all(&encode_backend_frame(&frame))
                     .await
                     .context("forward startup response")?;
+            }
+
+            if frame.ready_status() == Some(ReadyStatus::Idle) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn bootstrap_backend(
+    backend: &mut PooledBackend,
+    startup_packet: &[u8],
+) -> anyhow::Result<()> {
+    if !backend.requires_startup() {
+        return Ok(());
+    }
+
+    backend
+        .backend_mut()
+        .stream_mut()
+        .write_all(startup_packet)
+        .await
+        .context("forward backend startup")?;
+
+    let mut backend_buffer = BytesMut::with_capacity(8192);
+    loop {
+        backend
+            .backend_mut()
+            .stream_mut()
+            .read_buf(&mut backend_buffer)
+            .await
+            .context("read backend startup response")?;
+
+        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            if frame.tag == u8::from(BackendTag::Authentication) {
+                let code = auth_request_code(&frame.payload)?;
+                if code != 0 && auth_request_expects_client_response(&frame.payload)? {
+                    anyhow::bail!("backend authentication exchange requires client response");
+                }
             }
 
             if frame.ready_status() == Some(ReadyStatus::Idle) {
@@ -2298,7 +2617,7 @@ async fn handle_idle_timeout(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_backend_on_disconnect(
     mut backend: PooledBackend,
-    pool: &Arc<BackendPool>,
+    route_pools: &Arc<RoutePools>,
     performance: &crate::config::PerformanceConfig,
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
@@ -2351,7 +2670,7 @@ async fn finalize_backend_on_disconnect(
                 let reset_timer = PhaseTimer::start(ProtocolPhase::Reset, phase_recorder);
                 execute_simple_query(
                     &mut backend,
-                    pool.reset_query(),
+                    route_pools.primary().reset_query(),
                     qos.max_backend_buffer_bytes,
                 )
                 .await

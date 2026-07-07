@@ -11,6 +11,7 @@ use std::{
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
+use crate::routing::RoutingTarget;
 use crate::{
     backend::Backend,
     config::{SocketConfig, TlsConfig},
@@ -150,6 +151,15 @@ impl BackendPoolRef {
         self.inner
             .waiting_hint
             .store(waiting_hint, Ordering::Release);
+    }
+
+    pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
+        self.inner.pool.attach_snapshot_store(snapshot_store);
+    }
+
+    #[must_use]
+    pub fn reset_query(&self) -> &str {
+        self.inner.pool.reset_query()
     }
 
     fn new(id: u64, role: BackendRole, weight: usize, pool: Arc<BackendPool>) -> Self {
@@ -324,6 +334,24 @@ impl RoutePools {
 
         self.primary.checkout(route, mode).await
     }
+
+    pub async fn checkout_target(
+        &self,
+        route: RouteKey,
+        target: &RoutingTarget,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        match target {
+            RoutingTarget::Primary { .. } => self.checkout_primary(route, mode).await,
+            RoutingTarget::Replica { candidate, .. } => {
+                self.checkout_replica_by_id(route, candidate.replica_id, mode)
+                    .await
+            }
+            RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. } => {
+                Err(PoolError::Backpressure(BackpressureError::Closed))
+            }
+        }
+    }
 }
 
 impl RoutePoolRegistry {
@@ -395,6 +423,18 @@ impl RoutePoolRegistry {
             .route_pools(route)
             .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
         pools.checkout_replica_or_primary(route.clone(), mode).await
+    }
+
+    pub async fn checkout_target(
+        &self,
+        route: &RouteKey,
+        target: &RoutingTarget,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .route_pools(route)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_target(route.clone(), target, mode).await
     }
 }
 

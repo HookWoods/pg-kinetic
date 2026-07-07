@@ -14,6 +14,7 @@ use pg_kinetic_core::{
 };
 
 use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
+use crate::routing::RoutingTarget;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -200,6 +201,22 @@ impl RouteSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteCheckoutSnapshot {
+    pub route_key: RouteKey,
+    pub decision: RoutingTarget,
+}
+
+impl RouteCheckoutSnapshot {
+    #[must_use]
+    pub fn new(route_key: RouteKey, decision: RoutingTarget) -> Self {
+        Self {
+            route_key,
+            decision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub listen_addr: SocketAddr,
     pub backend_addr: SocketAddr,
@@ -357,6 +374,7 @@ struct SnapshotStoreInner {
     recoveries: Vec<RecoverySnapshot>,
     backpressure: HashMap<RouteKey, BackpressureSnapshot>,
     routes: HashMap<RouteKey, RouteSnapshot>,
+    route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     settings: SettingsSnapshot,
     limits: LimitsSnapshot,
 }
@@ -640,6 +658,37 @@ impl SnapshotStore {
         sort_by_route_key(routes)
     }
 
+    pub fn set_route_checkout_snapshot(&self, snapshot: RouteCheckoutSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .route_checkouts
+            .insert(snapshot.route_key.clone(), snapshot);
+    }
+
+    #[must_use]
+    pub fn route_checkout_snapshot(&self, route_key: &RouteKey) -> Option<RouteCheckoutSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_checkouts
+            .get(route_key)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn route_checkout_snapshots(&self) -> Vec<RouteCheckoutSnapshot> {
+        let route_checkouts = self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_checkouts
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_by_route_key(route_checkouts)
+    }
+
     pub fn set_settings_snapshot(&self, snapshot: SettingsSnapshot) {
         self.inner
             .write()
@@ -900,6 +949,12 @@ impl RouteSnapshotView for BackpressureSnapshot {
 }
 
 impl RouteSnapshotView for RouteSnapshot {
+    fn route_sort_key(&self) -> (String, String, Option<String>, String, String) {
+        route_sort_key(&self.route_key)
+    }
+}
+
+impl RouteSnapshotView for RouteCheckoutSnapshot {
     fn route_sort_key(&self) -> (String, String, Option<String>, String, String) {
         route_sort_key(&self.route_key)
     }
