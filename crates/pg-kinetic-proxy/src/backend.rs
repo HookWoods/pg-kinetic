@@ -4,6 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     task::{Context as TaskContext, Poll},
+    time::Instant,
 };
 
 use anyhow::Context as AnyhowContext;
@@ -16,8 +17,11 @@ use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig};
 
 use crate::{
     config::{BackendTlsMode, SocketConfig, TlsConfig},
+    metrics,
     socket, tls,
+    snapshot::{ServerSnapshot, SnapshotStore},
 };
+use pg_kinetic_core::route::RouteKey;
 use pg_kinetic_wire::tls::{ssl_request_packet, SslResponse};
 
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
@@ -27,6 +31,8 @@ pub struct Backend {
     id: u64,
     stream: BackendStream,
     addr: SocketAddr,
+    connected_at: Instant,
+    snapshot_store: Option<SnapshotStore>,
 }
 
 impl Backend {
@@ -58,6 +64,8 @@ impl Backend {
                 id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
                 stream: BackendStream::Plain(stream),
                 addr,
+                connected_at: Instant::now(),
+                snapshot_store: None,
             });
         }
 
@@ -95,6 +103,8 @@ impl Backend {
             id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
             stream,
             addr,
+            connected_at: Instant::now(),
+            snapshot_store: None,
         })
     }
 
@@ -108,8 +118,34 @@ impl Backend {
         self.addr
     }
 
+    pub fn attach_snapshot_store(&mut self, snapshot_store: SnapshotStore) {
+        self.snapshot_store = Some(snapshot_store);
+    }
+
+    pub fn mark_checked_out(&self, route_key: Option<RouteKey>) {
+        self.publish_snapshot("checked_out", route_key);
+    }
+
+    pub fn mark_idle(&self, route_key: Option<RouteKey>) {
+        self.publish_snapshot("idle", route_key);
+    }
+
+    pub fn mark_discarded(&self) {
+        if let Some(snapshot_store) = self.snapshot_store.as_ref() {
+            metrics::remove_server_snapshot(snapshot_store, self.id);
+        }
+    }
+
     pub fn stream_mut(&mut self) -> &mut BackendStream {
         &mut self.stream
+    }
+
+    fn publish_snapshot(&self, state: &'static str, route_key: Option<RouteKey>) {
+        if let Some(snapshot_store) = self.snapshot_store.as_ref() {
+            let mut snapshot = ServerSnapshot::new(self.id, state, self.connected_at.elapsed());
+            snapshot.route_key = route_key;
+            metrics::record_server_snapshot(snapshot_store, snapshot);
+        }
     }
 }
 

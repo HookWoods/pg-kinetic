@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use crate::socket::SocketOptionOutcome;
+use crate::snapshot::{PoolSnapshot, ServerSnapshot, SnapshotStore};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
@@ -38,6 +39,29 @@ pub fn record_pool_checkout(wait_ms: f64, outcome: &'static str) {
         "outcome" => outcome
     )
     .record(wait_ms);
+}
+
+pub fn record_pool_snapshot(snapshot_store: &SnapshotStore, snapshot: PoolSnapshot) {
+    snapshot_store.set_pool_snapshot(snapshot);
+}
+
+pub fn record_server_snapshot(snapshot_store: &SnapshotStore, snapshot: ServerSnapshot) {
+    snapshot_store.set_server_snapshot(snapshot);
+}
+
+pub fn remove_server_snapshot(snapshot_store: &SnapshotStore, backend_id: u64) {
+    let _ = snapshot_store.remove_server_snapshot(backend_id);
+}
+
+pub fn record_backpressure_snapshot(
+    snapshot_store: &SnapshotStore,
+    route: RouteKey,
+    waiting: usize,
+    in_flight: usize,
+) {
+    snapshot_store
+        .backpressure_handle()
+        .set_route(route, waiting, in_flight);
 }
 
 pub fn increment_client_connections() {

@@ -4,13 +4,17 @@ use pg_kinetic::{
     config::Config,
     core::observability::MetricOutcome,
     core::session::PinReason,
+    pool::BackendPool,
     proxy_runtime::snapshot::{
-        BackpressureSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot,
-        RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot, SnapshotStore,
+        BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
+        PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
+        SnapshotStore,
     },
+    config::TlsConfig,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
 };
+use tokio::net::TcpListener;
 
 fn route_key() -> RouteKey {
     RouteKey::new(
@@ -32,6 +36,18 @@ fn clients_can_be_registered_and_removed() {
     let client = store.client_snapshots();
     assert_eq!(client.len(), 1);
     assert_eq!(client[0].client_id, 7);
+    assert_eq!(client[0].state, "connected");
+
+    let mut enriched = ClientSnapshot::new(7);
+    enriched.user = Some(String::from("reporter"));
+    enriched.database = Some(String::from("billing"));
+    enriched.application_name = Some(String::from("dashboard"));
+    enriched.route_key = Some(route_key());
+    enriched.state = String::from("active");
+    enriched.connected_duration = Duration::from_secs(3);
+    handle.upsert(enriched.clone());
+    assert_eq!(store.client_snapshots(), vec![enriched]);
+
     assert_eq!(handle.remove(7).expect("client removed").client_id, 7);
     assert!(store.client_snapshots().is_empty());
 }
@@ -131,6 +147,84 @@ fn snapshots_cover_pool_server_prepared_pinning_recovery_and_backpressure() {
             backend_count: 2,
         }]
     );
+}
+
+async fn spawn_backend_listener() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = listener.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        let mut accepted_connections = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted_connections.push(stream);
+        }
+    });
+
+    backend_addr
+}
+
+#[tokio::test]
+async fn backend_checkout_updates_server_and_pool_snapshots() {
+    let store = SnapshotStore::new();
+    let backend_addr = spawn_backend_listener().await;
+    let pool = BackendPool::new(
+        backend_addr,
+        TlsConfig::default(),
+        2,
+        2,
+        2,
+        2,
+        Duration::from_secs(1),
+        "DISCARD ALL",
+    );
+    pool.attach_snapshot_store(store.clone());
+
+    let route = route_key();
+
+    let backend = pool.checkout(route.clone()).await.expect("checkout backend");
+    assert!(backend.requires_startup());
+
+    let pool_snapshot = store.pool_snapshot();
+    assert_eq!(pool_snapshot.configured_backends, 2);
+    assert_eq!(pool_snapshot.active_backends, 1);
+    assert_eq!(pool_snapshot.idle_backends, 0);
+
+    let server_snapshot = store.server_snapshots();
+    assert_eq!(server_snapshot.len(), 1);
+    assert_eq!(server_snapshot[0].backend_id, backend.backend_id());
+    assert_eq!(server_snapshot[0].state, "checked_out");
+    assert_eq!(server_snapshot[0].route_key, Some(route.clone()));
+
+    let backpressure_snapshot = store.backpressure_snapshots();
+    assert_eq!(backpressure_snapshot.len(), 1);
+    assert_eq!(backpressure_snapshot[0].route_key, route.clone());
+    assert_eq!(backpressure_snapshot[0].waiting, 0);
+    assert_eq!(backpressure_snapshot[0].in_flight, 1);
+
+    backend.release().await;
+
+    let pool_snapshot = store.pool_snapshot();
+    assert_eq!(pool_snapshot.active_backends, 1);
+    assert_eq!(pool_snapshot.idle_backends, 1);
+    assert_eq!(store.server_snapshots()[0].state, "idle");
+    assert_eq!(store.backpressure_snapshots()[0].in_flight, 0);
+
+    let backend = pool
+        .checkout_reusable(route.clone())
+        .await
+        .expect("reused checkout");
+    assert!(!backend.requires_startup());
+    assert_eq!(store.pool_snapshot().idle_backends, 0);
+    assert_eq!(store.server_snapshots()[0].state, "checked_out");
+
+    backend.discard();
+
+    assert!(store.server_snapshots().is_empty());
+    assert_eq!(store.pool_snapshot().active_backends, 0);
+    assert_eq!(store.pool_snapshot().idle_backends, 0);
+    assert_eq!(store.backpressure_snapshots()[0].in_flight, 0);
 }
 
 #[test]

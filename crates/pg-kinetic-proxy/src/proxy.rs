@@ -24,14 +24,20 @@ use crate::{
     health, metrics,
     pool::{BackendPool, PooledBackend},
     reload, socket, tls,
+    snapshot::{
+        ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
+        PreparedSnapshotHandle, RecoverySnapshotHandle, SettingsSnapshot, SnapshotStore,
+    },
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::{MetricName, PreparedEvent},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
+    observability::MetricOutcome,
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
+    session::PinReason as SessionPinReason,
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, VirtualSession},
 };
@@ -129,6 +135,7 @@ pub struct Proxy {
     config: Config,
     client_slots: Arc<Semaphore>,
     drain: Arc<DrainController>,
+    snapshot_store: SnapshotStore,
 }
 
 impl Proxy {
@@ -136,11 +143,13 @@ impl Proxy {
     pub fn new(config: Config) -> Self {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
         let drain = Arc::new(DrainController::new());
+        let snapshot_store = SnapshotStore::new();
 
         Self {
             config,
             client_slots,
             drain,
+            snapshot_store,
         }
     }
 
@@ -149,9 +158,18 @@ impl Proxy {
         Arc::clone(&self.drain)
     }
 
+    #[must_use]
+    pub fn snapshot_store(&self) -> SnapshotStore {
+        self.snapshot_store.clone()
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
+        self.snapshot_store
+            .set_settings_snapshot(SettingsSnapshot::from_config(&effective_config));
+        self.snapshot_store
+            .set_limits_snapshot(LimitsSnapshot::from_config(&effective_config));
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
         let pool = BackendPool::new_with_socket(
             effective_config.connection.backend_addr,
@@ -164,6 +182,7 @@ impl Proxy {
             effective_config.performance.checkout_timeout(),
             effective_config.performance.backend_reset_query.clone(),
         );
+        pool.attach_snapshot_store(self.snapshot_store.clone());
 
         let _health_handle = if let Some(health_addr) = effective_config.health.health_addr {
             Some(
@@ -266,6 +285,10 @@ impl Proxy {
 
                     let permit = self.client_slots.clone().acquire_owned().await?;
                     let pool = Arc::clone(&pool);
+                    let snapshot_store = self.snapshot_store.clone();
+                    let client_snapshot_handle = snapshot_store.client_handle();
+                    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+                    client_snapshot_handle.register(session_id);
 
                     tokio::spawn(async move {
                         let _client_guard = client_guard;
@@ -274,6 +297,9 @@ impl Proxy {
                             client_addr,
                             pool,
                             config_snapshot,
+                            session_id,
+                            snapshot_store,
+                            client_snapshot_handle,
                         )
                         .await;
                         drop(permit);
@@ -294,15 +320,21 @@ async fn handle_client(
     client_addr: SocketAddr,
     pool: Arc<BackendPool>,
     config: Config,
+    session_id: u64,
+    snapshot_store: SnapshotStore,
+    client_snapshot_handle: ClientSnapshotHandle,
 ) -> anyhow::Result<()> {
+    let _client_snapshot_guard = ClientSnapshotGuard::new(client_snapshot_handle.clone(), session_id);
     let client_tls_mode = config.tls.client_tls_mode;
     let client_tls_server_config = reload::load_client_tls_server_config(&config)?;
     let auth_users = reload::load_auth_users(&config)?;
     let auth = config.auth.clone();
     let performance = config.performance.clone();
     let qos = config.qos.clone();
+    let session_started = Instant::now();
+    let prepared_snapshot_handle = snapshot_store.prepared_handle();
+    let recovery_snapshot_handle = snapshot_store.recovery_handle();
 
-    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let mut session = VirtualSession::default();
     let mut pinned_backend = PinnedBackend::default();
     let mut prepared = PreparedCatalog::new(session_id);
@@ -339,6 +371,21 @@ async fn handle_client(
 
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
+    update_client_snapshot(
+        &client_snapshot_handle,
+        session_id,
+        route_database.clone(),
+        route_user.clone(),
+        route_application_name.clone(),
+        route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        ),
+        "startup",
+        session_started.elapsed(),
+    );
 
     if !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
         match auth::authenticate_client(
@@ -399,6 +446,21 @@ async fn handle_client(
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
     }
     backend.release().await;
+    update_client_snapshot(
+        &client_snapshot_handle,
+        session_id,
+        route_database.clone(),
+        route_user.clone(),
+        route_application_name.clone(),
+        route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        ),
+        "active",
+        session_started.elapsed(),
+    );
 
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
 
@@ -481,6 +543,7 @@ async fn handle_client(
                 let mut state = ForwardCycleState {
                     session: &mut session,
                     prepared: &mut prepared,
+                    prepared_snapshot_handle: prepared_snapshot_handle.clone(),
                     route_application_name: &mut route_application_name,
                     progress: &mut progress,
                 };
@@ -510,7 +573,11 @@ async fn handle_client(
 
                         match action {
                             CleanupAction::Reuse => {
-                                pinned_backend.clear();
+                                clear_pinned_backend(
+                                    &mut pinned_backend,
+                                    &snapshot_store,
+                                    session_id,
+                                );
                                 backend.release().await;
                             }
                             CleanupAction::ResetThenReuse => {
@@ -521,12 +588,29 @@ async fn handle_client(
                                 )
                                 .await
                                 .context("reset backend before reuse")?;
-                                pinned_backend.clear();
+                                clear_pinned_backend(
+                                    &mut pinned_backend,
+                                    &snapshot_store,
+                                    session_id,
+                                );
                                 backend.release().await;
                             }
                             CleanupAction::KeepPinned => {
                                 if let Some(reason) = session.pin_reason() {
                                     metrics::increment_pin(reason);
+                                    record_pinning_snapshot(
+                                        &snapshot_store,
+                                        session_id,
+                                        backend.backend_id(),
+                                        reason,
+                                        route_key(
+                                            &route_database,
+                                            &route_user,
+                                            route_application_name.as_deref(),
+                                            client_addr,
+                                        ),
+                                        session_started.elapsed(),
+                                    );
                                 }
                                 pinned_backend.mark_pinned(backend.backend_id());
                                 held_backend = Some(backend);
@@ -540,11 +624,19 @@ async fn handle_client(
                                 .await
                                 .context("rollback failed transaction")?;
                                 session.apply_sql(classify("rollback"));
-                                pinned_backend.clear();
+                                clear_pinned_backend(
+                                    &mut pinned_backend,
+                                    &snapshot_store,
+                                    session_id,
+                                );
                                 backend.release().await;
                             }
                             CleanupAction::Discard => {
-                                pinned_backend.clear();
+                                clear_pinned_backend(
+                                    &mut pinned_backend,
+                                    &snapshot_store,
+                                    session_id,
+                                );
                                 backend.discard();
                             }
                         }
@@ -561,10 +653,11 @@ async fn handle_client(
                             needs_sync,
                             &mut session,
                             qos.max_backend_buffer_bytes,
+                            &recovery_snapshot_handle,
                         )
                         .await
                         .context("recover abandoned response")?;
-                        pinned_backend.clear();
+                        clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
                         if reused {
                             backend.release().await;
                         } else {
@@ -573,16 +666,19 @@ async fn handle_client(
                         return Ok(());
                     }
                     Ok(Ok(ForwardOutcome::BufferLimitExceeded)) => {
+                        clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
                         backend.discard();
                         return Ok(());
                     }
                     Ok(Err(error)) => {
                         if let Some(kind) = buffer_limit_kind(&error) {
                             record_buffer_limit(kind);
+                            clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
                             backend.discard();
                             return Ok(());
                         }
 
+                        clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
                         backend.discard();
                         return Err(error).with_context(|| format!("proxy client {client_addr}"));
                     }
@@ -593,6 +689,9 @@ async fn handle_client(
                             backend,
                             &mut session,
                             &mut pinned_backend,
+                            &snapshot_store,
+                            session_id,
+                            &recovery_snapshot_handle,
                             progress,
                             qos.max_backend_buffer_bytes,
                         )
@@ -614,6 +713,9 @@ async fn handle_client(
                         &performance,
                         &mut session,
                         &mut pinned_backend,
+                        &snapshot_store,
+                        session_id,
+                        &recovery_snapshot_handle,
                         &qos,
                     )
                     .await?;
@@ -628,6 +730,9 @@ async fn handle_client(
                         &performance,
                         &mut session,
                         &mut pinned_backend,
+                        &snapshot_store,
+                        session_id,
+                        &recovery_snapshot_handle,
                         &qos,
                     )
                     .await?;
@@ -650,6 +755,9 @@ async fn handle_client(
                         &performance,
                         &mut session,
                         &mut pinned_backend,
+                        &snapshot_store,
+                        session_id,
+                        &recovery_snapshot_handle,
                         &qos,
                     )
                     .await?;
@@ -741,6 +849,83 @@ fn route_key(
         Some(client_addr),
         QueryClass::Default,
     )
+}
+
+#[derive(Debug)]
+struct ClientSnapshotGuard {
+    handle: ClientSnapshotHandle,
+    client_id: u64,
+}
+
+impl ClientSnapshotGuard {
+    fn new(handle: ClientSnapshotHandle, client_id: u64) -> Self {
+        Self { handle, client_id }
+    }
+}
+
+impl Drop for ClientSnapshotGuard {
+    fn drop(&mut self) {
+        let _ = self.handle.remove(self.client_id);
+    }
+}
+
+fn update_client_snapshot(
+    handle: &ClientSnapshotHandle,
+    client_id: u64,
+    database: String,
+    user: String,
+    application_name: Option<String>,
+    route_key: RouteKey,
+    state: &'static str,
+    connected_duration: Duration,
+) {
+    handle.upsert(ClientSnapshot {
+        client_id,
+        user: Some(user),
+        database: Some(database),
+        application_name,
+        route_key: Some(route_key),
+        state: state.to_string(),
+        connected_duration,
+    });
+}
+
+fn record_pinning_snapshot(
+    snapshot_store: &SnapshotStore,
+    client_id: u64,
+    backend_id: u64,
+    reason: PinReason,
+    route_key: RouteKey,
+    duration: Duration,
+) {
+    snapshot_store.set_pinning_snapshot(PinningSnapshot::new(
+        client_id,
+        Some(backend_id),
+        Some(route_key),
+        snapshot_pin_reason(reason),
+        duration,
+    ));
+}
+
+fn snapshot_pin_reason(reason: PinReason) -> SessionPinReason {
+    match reason {
+        PinReason::OpenTransaction => SessionPinReason::OpenTransaction,
+        PinReason::FailedTransaction => SessionPinReason::FailedTransaction,
+        PinReason::SessionState => SessionPinReason::SessionState,
+        PinReason::TempTable | PinReason::AdvisoryLock => SessionPinReason::SessionState,
+        PinReason::Copy => SessionPinReason::Copy,
+        PinReason::ListenNotify => SessionPinReason::ListenNotify,
+        PinReason::UnknownProtocolState => SessionPinReason::UnknownProtocolState,
+    }
+}
+
+fn clear_pinned_backend(
+    pinned_backend: &mut PinnedBackend,
+    snapshot_store: &SnapshotStore,
+    client_id: u64,
+) {
+    pinned_backend.clear();
+    let _ = snapshot_store.remove_pinning_snapshot(client_id);
 }
 
 async fn next_client_cycle(
@@ -1125,6 +1310,7 @@ fn auth_request_expects_client_response(payload: &[u8]) -> anyhow::Result<bool> 
 struct ForwardCycleState<'a> {
     session: &'a mut VirtualSession,
     prepared: &'a mut PreparedCatalog,
+    prepared_snapshot_handle: PreparedSnapshotHandle,
     route_application_name: &'a mut Option<String>,
     progress: &'a mut QueryProgress,
 }
@@ -1139,7 +1325,12 @@ async fn forward_message_cycle(
     let needs_sync = should_sync_for_frames(&frames);
     let mut outbound = BytesMut::new();
     for frame in frames {
-        let plan = prepare_frame_for_backend(backend.backend_id(), state.prepared, frame)?;
+        let plan = prepare_frame_for_backend(
+            backend.backend_id(),
+            state.prepared,
+            &state.prepared_snapshot_handle,
+            frame,
+        )?;
         update_virtual_session_from_frame(
             state.session,
             &plan.frame,
@@ -1224,6 +1415,7 @@ async fn forward_message_cycle(
 fn prepare_frame_for_backend(
     backend_id: u64,
     prepared: &mut PreparedCatalog,
+    prepared_snapshot_handle: &PreparedSnapshotHandle,
     frame: FrontendFrame,
 ) -> anyhow::Result<PreparedForwardPlan> {
     if let Some(parse) = parse_parse_message(&frame)? {
@@ -1231,6 +1423,7 @@ fn prepare_frame_for_backend(
             .upsert(parse.statement_name, parse.query, parse.parameter_type_oids)
             .clone();
         metrics::increment_prepared_event(PreparedEvent::Parse);
+        prepared_snapshot_handle.increment_statement_count();
         prepared.mark_materialized(backend_id, &statement);
         return Ok(PreparedForwardPlan::single(rewrite_parse_statement_name(
             &frame,
@@ -1250,6 +1443,7 @@ fn prepare_frame_for_backend(
                 ));
                 prepared.mark_materialized(backend_id, &statement);
                 metrics::increment_prepared_event(PreparedEvent::Materialize);
+                prepared_snapshot_handle.increment_materialization_count();
             }
 
             return Ok(PreparedForwardPlan {
@@ -1270,6 +1464,7 @@ fn prepare_frame_for_backend(
                 ));
                 prepared.mark_materialized(backend_id, &statement);
                 metrics::increment_prepared_event(PreparedEvent::Materialize);
+                prepared_snapshot_handle.increment_materialization_count();
             }
 
             return Ok(PreparedForwardPlan {
@@ -1470,6 +1665,7 @@ async fn recover_backend(
     needs_sync: bool,
     session: &mut VirtualSession,
     max_backend_buffer_bytes: usize,
+    recovery_snapshot_handle: &RecoverySnapshotHandle,
 ) -> anyhow::Result<bool> {
     let action = recovery_action(trigger, performance.recovery_mode);
     let recovered = timeout(performance.recovery_timeout(), async {
@@ -1516,18 +1712,23 @@ async fn recover_backend(
     match recovered {
         Ok(Ok(reuse)) => {
             metrics::increment_recovery(trigger, action, "ok");
+            recovery_snapshot_handle.record(trigger, action, MetricOutcome::Ok);
             Ok(reuse)
         }
         Ok(Err(error)) => {
             if buffer_limit_kind(&error).is_some() {
                 metrics::increment_recovery(trigger, action, "buffer_limit");
+                recovery_snapshot_handle.record(trigger, action, MetricOutcome::Discarded);
                 return Ok(false);
             }
             metrics::increment_recovery(trigger, action, "error");
+            recovery_snapshot_handle.record(trigger, action, MetricOutcome::Error);
+            recovery_snapshot_handle.set_last_error(trigger, action, MetricOutcome::Error, error.to_string());
             Err(error)
         }
         Err(_) => {
             metrics::increment_recovery(trigger, action, "timeout");
+            recovery_snapshot_handle.record(trigger, action, MetricOutcome::Timeout);
             Ok(false)
         }
     }
@@ -1593,6 +1794,9 @@ async fn handle_query_timeout(
     mut backend: PooledBackend,
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
+    snapshot_store: &SnapshotStore,
+    session_id: u64,
+    recovery_snapshot_handle: &RecoverySnapshotHandle,
     progress: QueryProgress,
     max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<bool> {
@@ -1626,10 +1830,11 @@ async fn handle_query_timeout(
         false,
         session,
         max_backend_buffer_bytes,
+        recovery_snapshot_handle,
     )
     .await
     .unwrap_or(false);
-    pinned_backend.clear();
+    clear_pinned_backend(pinned_backend, snapshot_store, session_id);
     if reused {
         backend.release().await;
     } else {
@@ -1679,6 +1884,9 @@ async fn finalize_backend_on_disconnect(
     performance: &crate::config::PerformanceConfig,
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
+    snapshot_store: &SnapshotStore,
+    session_id: u64,
+    recovery_snapshot_handle: &RecoverySnapshotHandle,
     qos: &crate::config::QosConfig,
 ) -> anyhow::Result<()> {
     match session.pin_reason() {
@@ -1690,10 +1898,11 @@ async fn finalize_backend_on_disconnect(
                 false,
                 session,
                 qos.max_backend_buffer_bytes,
+                recovery_snapshot_handle,
             )
             .await
             .context("recover abandoned transaction")?;
-            pinned_backend.clear();
+            clear_pinned_backend(pinned_backend, snapshot_store, session_id);
             if reused {
                 backend.release().await;
             } else {
@@ -1701,7 +1910,7 @@ async fn finalize_backend_on_disconnect(
             }
         }
         Some(PinReason::UnknownProtocolState) => {
-            pinned_backend.clear();
+            clear_pinned_backend(pinned_backend, snapshot_store, session_id);
             backend.discard();
         }
         Some(PinReason::Copy)
@@ -1709,7 +1918,7 @@ async fn finalize_backend_on_disconnect(
         | Some(PinReason::AdvisoryLock)
         | Some(PinReason::ListenNotify)
         | Some(PinReason::SessionState) => {
-            pinned_backend.clear();
+            clear_pinned_backend(pinned_backend, snapshot_store, session_id);
             backend.discard();
         }
         None => {
@@ -1722,7 +1931,7 @@ async fn finalize_backend_on_disconnect(
                 .await
                 .context("reset backend during disconnect cleanup")?;
             }
-            pinned_backend.clear();
+            clear_pinned_backend(pinned_backend, snapshot_store, session_id);
             backend.release().await;
         }
     }
