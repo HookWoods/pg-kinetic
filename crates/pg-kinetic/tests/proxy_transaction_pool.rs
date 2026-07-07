@@ -79,6 +79,7 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             max_backend_buffer_bytes: 4_194_304,
             overload_error_code: "53300".to_string(),
         },
+        admin: Default::default(),
         observability: ObservabilityConfig { metrics_addr: None, ..Default::default() },
         tls: Default::default(),
         auth: Default::default(),

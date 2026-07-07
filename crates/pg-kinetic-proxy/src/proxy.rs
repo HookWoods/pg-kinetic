@@ -18,6 +18,7 @@ use tokio::{
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 
 use crate::{
+    admin,
     auth,
     config::Config,
     drain::{DrainController, DrainOutcome},
@@ -194,6 +195,19 @@ impl Proxy {
                     effective_config.socket.clone(),
                     effective_config.health.readiness_timeout(),
                     effective_config.health.readiness_backend_check_interval(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let _admin_handle = if let Some(admin_addr) = effective_config.admin.admin_addr {
+            Some(
+                admin::spawn(
+                    admin_addr,
+                    effective_config.clone(),
+                    Arc::clone(&self.drain),
+                    self.snapshot_store.clone(),
                 )
                 .await?,
             )
@@ -1046,7 +1060,7 @@ struct QueryProgress {
     response_started: bool,
 }
 
-async fn read_startup_packet(
+pub(crate) async fn read_startup_packet(
     client: &mut ClientConnection,
     client_tls_mode: crate::config::ClientTlsMode,
     client_tls_server_config: Option<&Arc<ServerConfig>>,
@@ -1149,7 +1163,7 @@ async fn reject_startup_encryption_request(client: &mut ClientConnection) -> any
 }
 
 #[derive(Debug)]
-enum StartupRead {
+pub(crate) enum StartupRead {
     Packet(BytesMut),
     ClientClosed,
     TimedOut,

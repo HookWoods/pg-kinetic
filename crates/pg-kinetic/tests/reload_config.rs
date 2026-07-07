@@ -56,6 +56,7 @@ fn base_config() -> Config {
         capacity: Default::default(),
         performance: Default::default(),
         qos: Default::default(),
+        admin: Default::default(),
         observability: Default::default(),
         tls: Default::default(),
         auth: Default::default(),
