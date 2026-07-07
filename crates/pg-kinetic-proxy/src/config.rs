@@ -331,6 +331,17 @@ pub struct ObservabilityConfig {
     pub otel_service_name: String,
 }
 
+impl ObservabilityConfig {
+    #[must_use]
+    pub fn trace_sampling_ratio(&self) -> f64 {
+        if self.debug_trace_sampling_rate.is_finite() {
+            self.debug_trace_sampling_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct TlsConfig {
@@ -607,6 +618,14 @@ impl Config {
     #[must_use]
     pub fn parse_args() -> Self {
         Self::parse()
+    }
+
+    pub fn try_parse_from_args<I, T>(args: I) -> clap::error::Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::try_parse_from(args)
     }
 
     #[must_use]
