@@ -7,6 +7,7 @@ pub mod pin;
 pub mod prepare;
 pub mod recovery;
 pub mod route;
+pub mod routing;
 pub mod secrets;
 pub mod security;
 pub mod session;
