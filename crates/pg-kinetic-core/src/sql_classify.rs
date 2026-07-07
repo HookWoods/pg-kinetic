@@ -248,11 +248,13 @@ fn contains_select_side_effects(normalized: &str) -> bool {
 
 fn is_transaction_control(normalized: &str) -> bool {
     normalized == "begin"
+        || normalized.starts_with("begin ")
         || normalized == "commit"
         || normalized == "rollback"
         || normalized == "abort"
         || normalized == "end"
         || normalized.starts_with("start transaction")
+        || normalized.starts_with("set transaction ")
         || normalized.starts_with("savepoint ")
         || normalized.starts_with("release savepoint")
         || normalized.starts_with("rollback to")

@@ -601,6 +601,8 @@ async fn handle_client(
         wait_for_client_activity_after_timeout = false;
         match cycle {
             ClientCycle::Frames(frames) => {
+                update_transaction_state_from_frames(&mut session, &frames)
+                    .context("update transaction state before backend checkout")?;
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
@@ -1881,6 +1883,28 @@ fn sync_frame() -> FrontendFrame {
         tag: u8::from(FrontendTag::Sync),
         payload: BytesMut::new().freeze(),
     }
+}
+
+fn update_transaction_state_from_frames(
+    session: &mut VirtualSession,
+    frames: &[FrontendFrame],
+) -> anyhow::Result<()> {
+    for frame in frames {
+        if let Some(query) = parse_simple_query(frame)? {
+            update_transaction_state_from_sql(session, query);
+            continue;
+        }
+
+        if let Some(parse) = parse_parse_message(frame)? {
+            update_transaction_state_from_sql(session, &parse.query);
+        }
+    }
+
+    Ok(())
+}
+
+fn update_transaction_state_from_sql(session: &mut VirtualSession, sql: &str) {
+    session.apply_transaction_sql(sql);
 }
 
 fn update_virtual_session_from_frame(

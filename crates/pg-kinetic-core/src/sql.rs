@@ -1,8 +1,15 @@
+use crate::session::TransactionAccessMode;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlCommand {
-    Begin,
+    Begin {
+        access_mode: TransactionAccessMode,
+    },
     Commit,
     Rollback,
+    SetTransaction {
+        access_mode: TransactionAccessMode,
+    },
     Set {
         scope: SetScope,
         key: String,
@@ -34,8 +41,14 @@ pub fn classify(sql: &str) -> SqlCommand {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let normalized = normalize(trimmed);
 
+    if let Some(access_mode) = parse_begin_transaction(&normalized) {
+        return SqlCommand::Begin { access_mode };
+    }
+    if let Some(access_mode) = parse_set_transaction(&normalized) {
+        return SqlCommand::SetTransaction { access_mode };
+    }
+
     match normalized.as_str() {
-        "begin" | "start transaction" => return SqlCommand::Begin,
         "commit" | "end" => return SqlCommand::Commit,
         "rollback" => return SqlCommand::Rollback,
         "discard all" => return SqlCommand::DiscardAll,
@@ -94,6 +107,25 @@ fn parse_set(sql: &str, scope: SetScope) -> SqlCommand {
         scope,
         key: key.trim().to_ascii_lowercase(),
         value: value.trim().to_string(),
+    }
+}
+
+fn parse_begin_transaction(normalized: &str) -> Option<TransactionAccessMode> {
+    match normalized {
+        "begin" | "start transaction" => Some(TransactionAccessMode::ReadWrite),
+        "begin read only" | "start transaction read only" => Some(TransactionAccessMode::ReadOnly),
+        "begin read write" | "start transaction read write" => {
+            Some(TransactionAccessMode::ReadWrite)
+        }
+        _ => None,
+    }
+}
+
+fn parse_set_transaction(normalized: &str) -> Option<TransactionAccessMode> {
+    match normalized {
+        "set transaction read only" => Some(TransactionAccessMode::ReadOnly),
+        "set transaction read write" => Some(TransactionAccessMode::ReadWrite),
+        _ => None,
     }
 }
 

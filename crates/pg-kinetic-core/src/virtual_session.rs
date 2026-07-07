@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 
-use crate::sql::{SetScope, SqlCommand};
+use crate::{
+    routing::{BackendRole, RoutingReason},
+    session::{ReadRoutingTransactionState, TransactionAccessMode},
+    sql::{SetScope, SqlCommand},
+    sql_classify::classify_sql,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinReason {
@@ -41,6 +46,7 @@ pub enum TransactionState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VirtualSession {
     transaction: TransactionState,
+    read_routing_transaction: Option<ReadRoutingTransactionState>,
     settings: BTreeMap<String, String>,
     has_unsafe_session_state: bool,
     has_temp_table: bool,
@@ -53,8 +59,11 @@ pub struct VirtualSession {
 impl VirtualSession {
     pub fn apply_sql(&mut self, command: SqlCommand) {
         match command {
-            SqlCommand::Begin => self.transaction = TransactionState::InTransaction,
-            SqlCommand::Commit | SqlCommand::Rollback => self.transaction = TransactionState::Idle,
+            SqlCommand::Begin { access_mode } => self.begin_transaction(access_mode),
+            SqlCommand::Commit | SqlCommand::Rollback => self.end_transaction(),
+            SqlCommand::SetTransaction { access_mode } => {
+                self.set_transaction_access_mode(access_mode)
+            }
             SqlCommand::Set { scope, key, value } => self.apply_set(scope, key, value),
             SqlCommand::Reset { key } => {
                 self.settings.remove(&key);
@@ -75,16 +84,56 @@ impl VirtualSession {
         }
     }
 
+    pub fn apply_transaction_sql(&mut self, sql: &str) {
+        let normalized = normalize_sql(sql);
+        match normalized.as_str() {
+            "begin" | "start transaction" => {
+                self.begin_transaction(TransactionAccessMode::ReadWrite)
+            }
+            "begin read only" | "start transaction read only" => {
+                self.begin_transaction(TransactionAccessMode::ReadOnly)
+            }
+            "begin read write" | "start transaction read write" => {
+                self.begin_transaction(TransactionAccessMode::ReadWrite)
+            }
+            "commit" | "rollback" => self.end_transaction(),
+            prefix if prefix.starts_with("set transaction read only") => {
+                self.set_transaction_access_mode(TransactionAccessMode::ReadOnly)
+            }
+            prefix if prefix.starts_with("set transaction read write") => {
+                self.set_transaction_access_mode(TransactionAccessMode::ReadWrite)
+            }
+            _ => {}
+        }
+
+        if matches!(classify_sql(sql), crate::routing::QueryClass::Write) {
+            self.mark_transaction_write();
+        }
+    }
+
     pub fn mark_ready_after_copy(&mut self) {
         self.in_copy = false;
     }
 
     pub fn mark_failed_transaction(&mut self) {
+        self.mark_transaction_write();
         self.transaction = TransactionState::Failed;
     }
 
     pub fn mark_unknown_protocol_state(&mut self) {
         self.unknown_protocol_state = true;
+    }
+
+    pub fn mark_transaction_write(&mut self) {
+        if self.transaction != TransactionState::InTransaction {
+            return;
+        }
+
+        self.read_routing_transaction
+            .get_or_insert_with(|| {
+                ReadRoutingTransactionState::new(TransactionAccessMode::ReadWrite)
+            })
+            .force_primary();
     }
 
     #[must_use]
@@ -117,6 +166,29 @@ impl VirtualSession {
     }
 
     #[must_use]
+    pub fn read_routing_transaction_state(&self) -> Option<ReadRoutingTransactionState> {
+        self.read_routing_transaction
+    }
+
+    #[must_use]
+    pub fn transaction_access_mode(&self) -> Option<TransactionAccessMode> {
+        self.read_routing_transaction
+            .map(ReadRoutingTransactionState::access_mode)
+    }
+
+    #[must_use]
+    pub fn current_transaction_target_role(&self) -> Option<BackendRole> {
+        self.read_routing_transaction
+            .map(ReadRoutingTransactionState::target_role)
+    }
+
+    #[must_use]
+    pub fn current_transaction_route_reason(&self) -> Option<RoutingReason> {
+        self.read_routing_transaction
+            .map(ReadRoutingTransactionState::route_reason)
+    }
+
+    #[must_use]
     pub fn replay_sql(&self) -> Vec<String> {
         self.settings
             .iter()
@@ -141,8 +213,29 @@ impl VirtualSession {
         }
     }
 
+    fn begin_transaction(&mut self, access_mode: TransactionAccessMode) {
+        self.transaction = TransactionState::InTransaction;
+        self.read_routing_transaction = Some(ReadRoutingTransactionState::new(access_mode));
+    }
+
+    fn end_transaction(&mut self) {
+        self.transaction = TransactionState::Idle;
+        self.read_routing_transaction = None;
+    }
+
+    fn set_transaction_access_mode(&mut self, access_mode: TransactionAccessMode) {
+        if self.transaction != TransactionState::InTransaction {
+            return;
+        }
+
+        self.read_routing_transaction
+            .get_or_insert_with(|| ReadRoutingTransactionState::new(access_mode))
+            .set_access_mode(access_mode);
+    }
+
     fn clear_all(&mut self) {
         self.transaction = TransactionState::Idle;
+        self.read_routing_transaction = None;
         self.settings.clear();
         self.has_unsafe_session_state = false;
         self.has_temp_table = false;
@@ -151,6 +244,15 @@ impl VirtualSession {
         self.has_listen = false;
         self.unknown_protocol_state = false;
     }
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn is_replayable_setting(key: &str) -> bool {
