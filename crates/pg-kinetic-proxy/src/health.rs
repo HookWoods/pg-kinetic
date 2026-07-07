@@ -2,16 +2,18 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
 
 use anyhow::Context;
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::timeout,
+    sync::watch,
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -20,6 +22,17 @@ use crate::{
     drain::DrainController,
 };
 use pg_kinetic_core::security::{DrainState, HealthStatus};
+use pg_kinetic_core::{
+    ha::{
+        EndpointHealth as EndpointHealthState, EndpointRoleState, HealthProbeOutcome,
+        ReplicaLagState, RoleProbeOutcome, SplitBrainWarning,
+    },
+    routing::BackendRole,
+};
+use pg_kinetic_wire::{
+    backend::parse_backend_frame,
+    protocol::{BackendTag, FrontendTag, ProtocolVersion},
+};
 
 #[derive(Debug)]
 pub struct HealthState {
@@ -310,4 +323,302 @@ fn snapshot_body(snapshot: &HealthSnapshot) -> String {
         snapshot.active_clients,
         snapshot.backend_health.as_str()
     )
+}
+
+const UNAVAILABLE_FAILURE_THRESHOLD: u32 = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndpointHealthSnapshot {
+    pub endpoint_id: u64,
+    pub endpoint_addr: SocketAddr,
+    pub expected_role: BackendRole,
+    pub health: HealthProbeOutcome,
+    pub role: RoleProbeOutcome,
+    pub lag_state: ReplicaLagState,
+    pub last_error: Option<String>,
+}
+
+impl EndpointHealthSnapshot {
+    #[must_use]
+    pub fn new(endpoint_id: u64, endpoint_addr: SocketAddr, expected_role: BackendRole) -> Self {
+        Self {
+            endpoint_id,
+            endpoint_addr,
+            expected_role,
+            health: HealthProbeOutcome::new(EndpointHealthState::Unhealthy, false, 0),
+            role: RoleProbeOutcome::new(EndpointRoleState::Unknown, None),
+            lag_state: ReplicaLagState::Unknown,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EndpointHealthProbe {
+    endpoint_addr: SocketAddr,
+    expected_role: BackendRole,
+    probe_user: String,
+    probe_database: String,
+    tls_config: TlsConfig,
+    socket_config: SocketConfig,
+    probe_interval: Duration,
+    probe_timeout: Duration,
+    snapshot: StdMutex<EndpointHealthSnapshot>,
+    publisher: watch::Sender<EndpointHealthSnapshot>,
+}
+
+impl EndpointHealthProbe {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        endpoint_id: u64,
+        endpoint_addr: SocketAddr,
+        expected_role: BackendRole,
+        probe_user: impl Into<String>,
+        probe_database: impl Into<String>,
+        tls_config: TlsConfig,
+        socket_config: SocketConfig,
+        probe_interval: Duration,
+        probe_timeout: Duration,
+    ) -> Arc<Self> {
+        let snapshot = EndpointHealthSnapshot::new(endpoint_id, endpoint_addr, expected_role);
+        let (publisher, _receiver) = watch::channel(snapshot.clone());
+        Arc::new(Self {
+            endpoint_addr,
+            expected_role,
+            probe_user: probe_user.into(),
+            probe_database: probe_database.into(),
+            tls_config,
+            socket_config,
+            probe_interval,
+            probe_timeout,
+            snapshot: StdMutex::new(snapshot),
+            publisher,
+        })
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<EndpointHealthSnapshot> {
+        self.publisher.subscribe()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> EndpointHealthSnapshot {
+        self.snapshot
+            .lock()
+            .expect("endpoint health snapshot poisoned")
+            .clone()
+    }
+
+    pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let probe = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                probe.probe_once().await;
+                let delay = probe.backoff_delay();
+                if delay.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    sleep(delay).await;
+                }
+            }
+        })
+    }
+
+    pub async fn probe_once(&self) -> EndpointHealthSnapshot {
+        let previous = self.snapshot();
+        let outcome = timeout(self.probe_timeout, self.run_probe()).await;
+        let mut snapshot = previous.clone();
+
+        match outcome {
+            Ok(Ok(observed_role)) => {
+                let recovered = !previous.health.state.is_healthy();
+                snapshot.health =
+                    HealthProbeOutcome::new(EndpointHealthState::Healthy, recovered, 0);
+                snapshot.role = role_outcome(self.expected_role, observed_role);
+                snapshot.lag_state = ReplicaLagState::Unknown;
+                snapshot.last_error = None;
+            }
+            Ok(Err(error)) => {
+                let failure_count = previous.health.consecutive_failures.saturating_add(1);
+                let health = if failure_count >= UNAVAILABLE_FAILURE_THRESHOLD {
+                    EndpointHealthState::Unavailable
+                } else {
+                    EndpointHealthState::Unhealthy
+                };
+                snapshot.health = HealthProbeOutcome::new(health, false, failure_count);
+                snapshot.role = RoleProbeOutcome::new(EndpointRoleState::Unknown, None);
+                snapshot.lag_state = ReplicaLagState::Unknown;
+                snapshot.last_error = Some(error.to_string());
+            }
+            Err(_) => {
+                let failure_count = previous.health.consecutive_failures.saturating_add(1);
+                let health = if failure_count >= UNAVAILABLE_FAILURE_THRESHOLD {
+                    EndpointHealthState::Unavailable
+                } else {
+                    EndpointHealthState::Degraded
+                };
+                snapshot.health = HealthProbeOutcome::new(health, false, failure_count);
+                snapshot.role = RoleProbeOutcome::new(EndpointRoleState::Unknown, None);
+                snapshot.lag_state = ReplicaLagState::Unknown;
+                snapshot.last_error = Some(String::from("probe timed out"));
+            }
+        }
+
+        self.publish(snapshot.clone());
+        snapshot
+    }
+
+    fn backoff_delay(&self) -> Duration {
+        let snapshot = self.snapshot();
+        if snapshot.health.state.is_healthy() {
+            return self.probe_interval;
+        }
+
+        let exponent = snapshot
+            .health
+            .consecutive_failures
+            .saturating_sub(1)
+            .min(4);
+        let multiplier = 1_u32 << exponent;
+        self.probe_interval.saturating_mul(multiplier)
+    }
+
+    fn publish(&self, snapshot: EndpointHealthSnapshot) {
+        *self
+            .snapshot
+            .lock()
+            .expect("endpoint health snapshot poisoned") = snapshot.clone();
+        let _ = self.publisher.send(snapshot);
+    }
+
+    async fn run_probe(&self) -> anyhow::Result<BackendRole> {
+        let mut backend =
+            Backend::connect_with_socket(self.endpoint_addr, &self.tls_config, &self.socket_config)
+                .await
+                .with_context(|| format!("connect endpoint {}", self.endpoint_addr))?;
+
+        backend
+            .stream_mut()
+            .write_all(&startup_packet(&self.probe_user, &self.probe_database))
+            .await
+            .context("write probe startup packet")?;
+
+        execute_probe_query(&mut backend, "SELECT 1").await?;
+        let role = execute_probe_query(&mut backend, "SELECT pg_is_in_recovery()").await?;
+
+        match role.as_deref() {
+            Some("t") | Some("true") | Some("1") => Ok(BackendRole::Replica),
+            Some("f") | Some("false") | Some("0") => Ok(BackendRole::Primary),
+            Some(other) => anyhow::bail!("unexpected pg_is_in_recovery() result: {other}"),
+            None => anyhow::bail!("pg_is_in_recovery() returned no rows"),
+        }
+    }
+}
+
+fn role_outcome(expected_role: BackendRole, observed_role: BackendRole) -> RoleProbeOutcome {
+    if expected_role == observed_role {
+        let state = match observed_role {
+            BackendRole::Primary => EndpointRoleState::Primary,
+            BackendRole::Replica => EndpointRoleState::Replica,
+            BackendRole::Unknown => EndpointRoleState::Unknown,
+        };
+        return RoleProbeOutcome::new(state, None);
+    }
+
+    let warning = SplitBrainWarning::new(expected_role, observed_role);
+    RoleProbeOutcome::new(EndpointRoleState::Warning, Some(warning))
+}
+
+async fn execute_probe_query(backend: &mut Backend, sql: &str) -> anyhow::Result<Option<String>> {
+    backend
+        .stream_mut()
+        .write_all(&simple_query_packet(sql))
+        .await
+        .with_context(|| format!("write probe query {sql}"))?;
+
+    let mut buffer = BytesMut::with_capacity(8 * 1024);
+    let mut row_value = None;
+
+    loop {
+        let read = backend
+            .stream_mut()
+            .read_buf(&mut buffer)
+            .await
+            .with_context(|| format!("read probe response for {sql}"))?;
+        if read == 0 {
+            anyhow::bail!("endpoint disconnected during probe");
+        }
+
+        while let Some(frame) = parse_backend_frame(&mut buffer)? {
+            match frame.tag {
+                tag if tag == u8::from(BackendTag::DataRow) => {
+                    if row_value.is_none() {
+                        row_value = parse_probe_row(&frame.payload)?;
+                    }
+                }
+                tag if tag == u8::from(BackendTag::ErrorResponse) => {
+                    anyhow::bail!("endpoint returned error during probe");
+                }
+                tag if tag == u8::from(BackendTag::ReadyForQuery) => {
+                    return Ok(row_value);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn parse_probe_row(payload: &[u8]) -> anyhow::Result<Option<String>> {
+    let mut payload = payload;
+    if payload.remaining() < 2 {
+        return Ok(None);
+    }
+
+    let columns = payload.get_i16();
+    if columns <= 0 {
+        return Ok(None);
+    }
+
+    let length = payload.get_i32();
+    if length < 0 {
+        return Ok(None);
+    }
+
+    let length = length as usize;
+    if payload.remaining() < length {
+        return Ok(None);
+    }
+
+    let mut value = vec![0_u8; length];
+    payload.copy_to_slice(&mut value);
+    let value = String::from_utf8(value).context("probe row is not utf8")?;
+    Ok(Some(value))
+}
+
+fn startup_packet(user: &str, database: &str) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(ProtocolVersion::V3.to_i32());
+    body.extend_from_slice(b"user\0");
+    body.extend_from_slice(user.as_bytes());
+    body.put_u8(0);
+    body.extend_from_slice(b"database\0");
+    body.extend_from_slice(database.as_bytes());
+    body.put_u8(0);
+    body.extend_from_slice(b"application_name\0pg-kinetic-health\0");
+    body.put_u8(0);
+
+    let mut packet = BytesMut::new();
+    packet.put_i32((body.len() + 4) as i32);
+    packet.extend_from_slice(&body);
+    packet
+}
+
+fn simple_query_packet(sql: &str) -> BytesMut {
+    let mut packet = BytesMut::new();
+    packet.put_u8(u8::from(FrontendTag::Query));
+    packet.put_i32((sql.len() + 5) as i32);
+    packet.extend_from_slice(sql.as_bytes());
+    packet.put_u8(0);
+    packet
 }

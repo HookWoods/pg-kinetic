@@ -2,6 +2,7 @@ pub mod admin;
 pub mod backpressure;
 pub mod cleanup;
 pub mod constants;
+pub mod ha;
 pub mod lsn;
 pub mod observability;
 pub mod pin;

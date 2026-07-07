@@ -14,6 +14,7 @@ pub mod socket;
 pub mod telemetry;
 pub mod tls;
 
+pub use health::{EndpointHealthProbe, EndpointHealthSnapshot};
 pub use reload::ReloadDecision;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
