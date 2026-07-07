@@ -18,25 +18,26 @@ use tokio::{
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
 
 use crate::{
-    admin,
-    auth,
+    admin, auth,
     config::Config,
     drain::{DrainController, DrainOutcome},
     health, metrics,
     pool::{BackendPool, PooledBackend},
-    reload, socket, tls,
-    telemetry::{self, PhaseTimer},
+    reload,
     snapshot::{
         ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
         PreparedSnapshotHandle, RecoverySnapshotHandle, SettingsSnapshot, SnapshotStore,
     },
+    socket,
+    telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
+    tls,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::{MetricName, PreparedEvent},
+    observability::{MetricOutcome, ProtocolPhase},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
-    observability::{MetricOutcome, ProtocolPhase},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
@@ -169,6 +170,8 @@ impl Proxy {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
         let phase_recorder = telemetry::shared_phase_timing_recorder();
+        let debug_sampler =
+            DebugSampler::new(effective_config.observability.trace_sampling_ratio());
         self.snapshot_store
             .set_settings_snapshot(SettingsSnapshot::from_config(&effective_config));
         self.snapshot_store
@@ -305,6 +308,15 @@ impl Proxy {
                     let client_snapshot_handle = snapshot_store.client_handle();
                     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
                     client_snapshot_handle.register(session_id);
+                    telemetry::emit_debug_sample(
+                        &debug_sampler,
+                        DebugSample::client_accepted(
+                            session_id,
+                            client_addr,
+                            config_snapshot.tls.client_tls_mode.as_str(),
+                            client.has_peer_certificates(),
+                        ),
+                    );
                     let phase_recorder = Arc::clone(&phase_recorder);
 
                     tokio::spawn(async move {
@@ -318,6 +330,7 @@ impl Proxy {
                             snapshot_store,
                             client_snapshot_handle,
                             phase_recorder,
+                            debug_sampler,
                         )
                         .await;
                         drop(permit);
@@ -342,8 +355,16 @@ async fn handle_client(
     snapshot_store: SnapshotStore,
     client_snapshot_handle: ClientSnapshotHandle,
     phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    debug_sampler: DebugSampler,
 ) -> anyhow::Result<()> {
-    let _client_snapshot_guard = ClientSnapshotGuard::new(client_snapshot_handle.clone(), session_id);
+    let session_started = Instant::now();
+    let _client_snapshot_guard = ClientSnapshotGuard::new(
+        client_snapshot_handle.clone(),
+        session_id,
+        client_addr,
+        session_started,
+        debug_sampler,
+    );
     let startup_timer = PhaseTimer::start(ProtocolPhase::Startup, phase_recorder.as_ref());
     let client_tls_mode = config.tls.client_tls_mode;
     let client_tls_server_config = reload::load_client_tls_server_config(&config)?;
@@ -351,7 +372,6 @@ async fn handle_client(
     let auth = config.auth.clone();
     let performance = config.performance.clone();
     let qos = config.qos.clone();
-    let session_started = Instant::now();
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let recovery_snapshot_handle = snapshot_store.recovery_handle();
 
@@ -464,6 +484,8 @@ async fn handle_client(
         ),
         "checkout backend for startup",
         CheckoutMode::AllowConnect,
+        session_id,
+        debug_sampler,
         phase_recorder.as_ref(),
     )
     .await
@@ -510,6 +532,21 @@ async fn handle_client(
     }
     backend.release().await;
     startup_timer.finish(MetricOutcome::Ok);
+    telemetry::emit_debug_sample(
+        &debug_sampler,
+        DebugSample::startup_complete(
+            session_id,
+            route_key(
+                &route_database,
+                &route_user,
+                route_application_name.as_deref(),
+                client_addr,
+            ),
+            auth.auth_mode.as_str(),
+            client_tls_mode.as_str(),
+            MetricOutcome::Ok,
+        ),
+    );
     update_client_snapshot(
         &client_snapshot_handle,
         session_id,
@@ -576,6 +613,8 @@ async fn handle_client(
                         ),
                         "checkout backend for cycle",
                         CheckoutMode::ReuseOnly,
+                        session_id,
+                        debug_sampler,
                         phase_recorder.as_ref(),
                     )
                     .await
@@ -633,6 +672,27 @@ async fn handle_client(
                 match result {
                     Ok(Ok(ForwardOutcome::Ready(status)))
                     | Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(status))) => {
+                        telemetry::emit_debug_sample(
+                            &debug_sampler,
+                            DebugSample::query_complete(
+                                session_id,
+                                route_key(
+                                    &route_database,
+                                    &route_user,
+                                    route_application_name.as_deref(),
+                                    client_addr,
+                                ),
+                                MetricOutcome::Ok,
+                                0,
+                                match status {
+                                    ReadyStatus::Idle => "idle",
+                                    ReadyStatus::InTransaction => "in_transaction",
+                                    ReadyStatus::FailedTransaction => "failed_transaction",
+                                },
+                                None,
+                                &[],
+                            ),
+                        );
                         session.mark_ready_after_copy();
                         let action = cleanup_action(&session, status);
                         metrics::increment_cleanup(action);
@@ -647,8 +707,10 @@ async fn handle_client(
                                 backend.release().await;
                             }
                             CleanupAction::ResetThenReuse => {
-                                let reset_timer =
-                                    PhaseTimer::start(ProtocolPhase::Reset, phase_recorder.as_ref());
+                                let reset_timer = PhaseTimer::start(
+                                    ProtocolPhase::Reset,
+                                    phase_recorder.as_ref(),
+                                );
                                 execute_simple_query(
                                     &mut backend,
                                     pool.reset_query(),
@@ -667,6 +729,21 @@ async fn handle_client(
                             CleanupAction::KeepPinned => {
                                 if let Some(reason) = session.pin_reason() {
                                     metrics::increment_pin(reason);
+                                    telemetry::emit_debug_sample(
+                                        &debug_sampler,
+                                        DebugSample::pinning(
+                                            session_id,
+                                            route_key(
+                                                &route_database,
+                                                &route_user,
+                                                route_application_name.as_deref(),
+                                                client_addr,
+                                            ),
+                                            reason,
+                                            backend.backend_id(),
+                                            session_started.elapsed(),
+                                        ),
+                                    );
                                     record_pinning_snapshot(
                                         &snapshot_store,
                                         session_id,
@@ -717,6 +794,14 @@ async fn handle_client(
                     Ok(Ok(ForwardOutcome::AbandonedResponse { needs_sync })) => {
                         let reused = recover_backend(
                             &mut backend,
+                            route_key(
+                                &route_database,
+                                &route_user,
+                                route_application_name.as_deref(),
+                                client_addr,
+                            ),
+                            session_id,
+                            debug_sampler,
                             RecoveryTrigger::AbandonedResponse,
                             &performance,
                             needs_sync,
@@ -760,10 +845,17 @@ async fn handle_client(
                             &mut pinned_backend,
                             &snapshot_store,
                             session_id,
+                            route_key(
+                                &route_database,
+                                &route_user,
+                                route_application_name.as_deref(),
+                                client_addr,
+                            ),
                             &recovery_snapshot_handle,
                             progress,
                             qos.max_backend_buffer_bytes,
                             phase_recorder.as_ref(),
+                            debug_sampler,
                         )
                         .await?;
 
@@ -785,9 +877,16 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
+                        route_key(
+                            &route_database,
+                            &route_user,
+                            route_application_name.as_deref(),
+                            client_addr,
+                        ),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
+                        debug_sampler,
                     )
                     .await?;
                 }
@@ -803,9 +902,16 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
+                        route_key(
+                            &route_database,
+                            &route_user,
+                            route_application_name.as_deref(),
+                            client_addr,
+                        ),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
+                        debug_sampler,
                     )
                     .await?;
                 }
@@ -829,9 +935,16 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
+                        route_key(
+                            &route_database,
+                            &route_user,
+                            route_application_name.as_deref(),
+                            client_addr,
+                        ),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
+                        debug_sampler,
                     )
                     .await?;
                 }
@@ -847,40 +960,103 @@ async fn checkout_backend(
     route: RouteKey,
     context: &'static str,
     mode: CheckoutMode,
+    session_id: u64,
+    debug_sampler: DebugSampler,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> Result<PooledBackend, CheckoutFailure> {
     let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, phase_recorder);
     let started = Instant::now();
     let backend_result = match mode {
-        CheckoutMode::AllowConnect => pool.checkout(route).await,
-        CheckoutMode::ReuseOnly => pool.checkout_reusable(route).await,
+        CheckoutMode::AllowConnect => pool.checkout(route.clone()).await,
+        CheckoutMode::ReuseOnly => pool.checkout_reusable(route.clone()).await,
     };
     let backend = match backend_result {
         Ok(backend) => backend,
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
         )) => {
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::overload_rejected(
+                    session_id,
+                    route.clone(),
+                    match mode {
+                        CheckoutMode::AllowConnect => "allow_connect",
+                        CheckoutMode::ReuseOnly => "reuse_only",
+                    },
+                ),
+            );
             timer.finish(MetricOutcome::Rejected);
             return Err(CheckoutFailure::Overload("backend checkout queue is full"));
         }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Timeout,
         )) => {
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::overload_rejected(
+                    session_id,
+                    route.clone(),
+                    match mode {
+                        CheckoutMode::AllowConnect => "allow_connect",
+                        CheckoutMode::ReuseOnly => "reuse_only",
+                    },
+                ),
+            );
             timer.finish(MetricOutcome::Timeout);
             return Err(CheckoutFailure::Overload("backend checkout timed out"));
         }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Closed,
         )) => {
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::backend_checkout(
+                    session_id,
+                    route.clone(),
+                    match mode {
+                        CheckoutMode::AllowConnect => "allow_connect",
+                        CheckoutMode::ReuseOnly => "reuse_only",
+                    },
+                    MetricOutcome::Canceled,
+                    started.elapsed(),
+                ),
+            );
             timer.finish(MetricOutcome::Canceled);
             return Err(CheckoutFailure::Close);
         }
         Err(crate::pool::PoolError::Connect(error)) => {
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::backend_checkout(
+                    session_id,
+                    route.clone(),
+                    match mode {
+                        CheckoutMode::AllowConnect => "allow_connect",
+                        CheckoutMode::ReuseOnly => "reuse_only",
+                    },
+                    MetricOutcome::Error,
+                    started.elapsed(),
+                ),
+            );
             timer.finish(MetricOutcome::Error);
             return Err(CheckoutFailure::Fatal(error.context(context)));
         }
     };
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
+    telemetry::emit_debug_sample(
+        &debug_sampler,
+        DebugSample::backend_checkout(
+            session_id,
+            route.clone(),
+            match mode {
+                CheckoutMode::AllowConnect => "allow_connect",
+                CheckoutMode::ReuseOnly => "reuse_only",
+            },
+            MetricOutcome::Ok,
+            started.elapsed(),
+        ),
+    );
     timer.finish(MetricOutcome::Ok);
     Ok(backend)
 }
@@ -941,17 +1117,38 @@ fn route_key(
 struct ClientSnapshotGuard {
     handle: ClientSnapshotHandle,
     client_id: u64,
+    session_id: u64,
+    started: Instant,
+    client_addr: SocketAddr,
+    debug_sampler: DebugSampler,
 }
 
 impl ClientSnapshotGuard {
-    fn new(handle: ClientSnapshotHandle, client_id: u64) -> Self {
-        Self { handle, client_id }
+    fn new(
+        handle: ClientSnapshotHandle,
+        client_id: u64,
+        client_addr: SocketAddr,
+        started: Instant,
+        debug_sampler: DebugSampler,
+    ) -> Self {
+        Self {
+            handle,
+            client_id,
+            session_id: client_id,
+            started,
+            client_addr,
+            debug_sampler,
+        }
     }
 }
 
 impl Drop for ClientSnapshotGuard {
     fn drop(&mut self) {
         let _ = self.handle.remove(self.client_id);
+        telemetry::emit_debug_sample(
+            &self.debug_sampler,
+            DebugSample::client_close(self.session_id, self.client_addr, self.started.elapsed()),
+        );
     }
 }
 
@@ -1162,13 +1359,15 @@ pub(crate) async fn read_startup_packet(
                                 .context("accept startup encryption request")?;
                             let server_config = client_tls_server_config
                                 .context("client TLS server config is unavailable")?;
-                            let tls_timer = PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
+                            let tls_timer =
+                                PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
                             let tls_result = client.start_tls(server_config).await;
                             let tls_outcome = match &tls_result {
-                                Ok(()) if matches!(
-                                    client_tls_mode,
-                                    crate::config::ClientTlsMode::VerifyClient
-                                ) && !client.has_peer_certificates() =>
+                                Ok(())
+                                    if matches!(
+                                        client_tls_mode,
+                                        crate::config::ClientTlsMode::VerifyClient
+                                    ) && !client.has_peer_certificates() =>
                                 {
                                     MetricOutcome::Rejected
                                 }
@@ -1788,6 +1987,9 @@ async fn await_ready_status(
 
 async fn recover_backend(
     backend: &mut PooledBackend,
+    route_key: RouteKey,
+    session_id: u64,
+    debug_sampler: DebugSampler,
     trigger: RecoveryTrigger,
     performance: &crate::config::PerformanceConfig,
     needs_sync: bool,
@@ -1841,22 +2043,55 @@ async fn recover_backend(
         Ok(Ok(reuse)) => {
             metrics::increment_recovery(trigger, action, "ok");
             recovery_snapshot_handle.record(trigger, action, MetricOutcome::Ok);
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Ok),
+            );
             Ok(reuse)
         }
         Ok(Err(error)) => {
             if buffer_limit_kind(&error).is_some() {
                 metrics::increment_recovery(trigger, action, "buffer_limit");
                 recovery_snapshot_handle.record(trigger, action, MetricOutcome::Discarded);
+                telemetry::emit_debug_sample(
+                    &debug_sampler,
+                    DebugSample::recovery(
+                        session_id,
+                        route_key,
+                        trigger,
+                        action,
+                        MetricOutcome::Discarded,
+                    ),
+                );
                 return Ok(false);
             }
             metrics::increment_recovery(trigger, action, "error");
             recovery_snapshot_handle.record(trigger, action, MetricOutcome::Error);
-            recovery_snapshot_handle.set_last_error(trigger, action, MetricOutcome::Error, error.to_string());
+            recovery_snapshot_handle.set_last_error(
+                trigger,
+                action,
+                MetricOutcome::Error,
+                error.to_string(),
+            );
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Error),
+            );
             Err(error)
         }
         Err(_) => {
             metrics::increment_recovery(trigger, action, "timeout");
             recovery_snapshot_handle.record(trigger, action, MetricOutcome::Timeout);
+            telemetry::emit_debug_sample(
+                &debug_sampler,
+                DebugSample::recovery(
+                    session_id,
+                    route_key,
+                    trigger,
+                    action,
+                    MetricOutcome::Timeout,
+                ),
+            );
             Ok(false)
         }
     }
@@ -1929,10 +2164,12 @@ async fn handle_query_timeout(
     pinned_backend: &mut PinnedBackend,
     snapshot_store: &SnapshotStore,
     session_id: u64,
+    route_key: RouteKey,
     recovery_snapshot_handle: &RecoverySnapshotHandle,
     progress: QueryProgress,
     max_backend_buffer_bytes: usize,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+    debug_sampler: DebugSampler,
 ) -> anyhow::Result<bool> {
     metrics_crate::counter!(
         MetricName::TimeoutTotal.as_str(),
@@ -1960,6 +2197,9 @@ async fn handle_query_timeout(
     let cancel_timer = PhaseTimer::start(ProtocolPhase::Cancel, phase_recorder);
     let reused = recover_backend(
         &mut backend,
+        route_key,
+        session_id,
+        debug_sampler,
         recovery_trigger,
         performance,
         false,
@@ -2022,15 +2262,20 @@ async fn finalize_backend_on_disconnect(
     pinned_backend: &mut PinnedBackend,
     snapshot_store: &SnapshotStore,
     session_id: u64,
+    route_key: RouteKey,
     recovery_snapshot_handle: &RecoverySnapshotHandle,
     qos: &crate::config::QosConfig,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+    debug_sampler: DebugSampler,
 ) -> anyhow::Result<()> {
     let close_timer = PhaseTimer::start(ProtocolPhase::Close, phase_recorder);
     match session.pin_reason() {
         Some(PinReason::OpenTransaction) | Some(PinReason::FailedTransaction) => {
             let reused = recover_backend(
                 &mut backend,
+                route_key.clone(),
+                session_id,
+                debug_sampler,
                 RecoveryTrigger::AbandonedTransaction,
                 performance,
                 false,
