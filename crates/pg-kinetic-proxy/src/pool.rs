@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant},
@@ -20,6 +20,7 @@ use crate::{
 use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
     route::RouteKey,
+    routing::BackendRole,
 };
 
 #[derive(Debug)]
@@ -58,6 +59,343 @@ pub enum PoolError {
 
     #[error("backend connection failed: {0}")]
     Connect(#[source] anyhow::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckoutMode {
+    AllowConnect,
+    ReuseOnly,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackendPoolRef {
+    inner: Arc<BackendPoolRefInner>,
+}
+
+#[derive(Debug)]
+struct BackendPoolRefInner {
+    id: u64,
+    role: BackendRole,
+    weight: usize,
+    healthy: AtomicBool,
+    waiting_hint: AtomicUsize,
+    pool: Arc<BackendPool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplicaSelector {
+    strategy: ReplicaSelectionStrategy,
+    cursor: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicaSelectionStrategy {
+    LeastWaiting,
+    WeightedRoundRobin,
+}
+
+#[derive(Clone, Debug)]
+pub struct RoutePools {
+    primary: BackendPoolRef,
+    replicas: Vec<BackendPoolRef>,
+    selector: ReplicaSelector,
+}
+
+#[derive(Debug, Default)]
+pub struct RoutePoolRegistry {
+    routes: StdMutex<HashMap<RouteKey, RoutePools>>,
+}
+
+impl BackendPoolRef {
+    #[must_use]
+    pub fn primary(pool: Arc<BackendPool>) -> Self {
+        Self::new(0, BackendRole::Primary, 1, pool)
+    }
+
+    #[must_use]
+    pub fn replica(id: u64, weight: usize, pool: Arc<BackendPool>) -> Self {
+        Self::new(id, BackendRole::Replica, weight, pool)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    #[must_use]
+    pub fn role(&self) -> BackendRole {
+        self.inner.role
+    }
+
+    #[must_use]
+    pub fn weight(&self) -> usize {
+        self.inner.weight
+    }
+
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.inner.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.inner.healthy.store(healthy, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn waiting_hint(&self) -> usize {
+        self.inner.waiting_hint.load(Ordering::Acquire)
+    }
+
+    pub fn set_waiting_hint(&self, waiting_hint: usize) {
+        self.inner
+            .waiting_hint
+            .store(waiting_hint, Ordering::Release);
+    }
+
+    fn new(id: u64, role: BackendRole, weight: usize, pool: Arc<BackendPool>) -> Self {
+        Self {
+            inner: Arc::new(BackendPoolRefInner {
+                id,
+                role,
+                weight: weight.max(1),
+                healthy: AtomicBool::new(true),
+                waiting_hint: AtomicUsize::new(0),
+                pool,
+            }),
+        }
+    }
+
+    async fn checkout(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        match mode {
+            CheckoutMode::AllowConnect => self.inner.pool.checkout_primary(route).await,
+            CheckoutMode::ReuseOnly => self.inner.pool.checkout_primary_reusable(route).await,
+        }
+    }
+}
+
+impl ReplicaSelector {
+    #[must_use]
+    pub fn new(strategy: ReplicaSelectionStrategy) -> Self {
+        Self {
+            strategy,
+            cursor: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[must_use]
+    pub const fn strategy(&self) -> ReplicaSelectionStrategy {
+        self.strategy
+    }
+
+    pub fn select<'a>(&self, replicas: &'a [BackendPoolRef]) -> Option<&'a BackendPoolRef> {
+        let healthy: Vec<&BackendPoolRef> = replicas
+            .iter()
+            .filter(|replica| replica.is_healthy())
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+
+        match self.strategy {
+            ReplicaSelectionStrategy::LeastWaiting => healthy
+                .into_iter()
+                .min_by_key(|replica| (replica.waiting_hint(), replica.id())),
+            ReplicaSelectionStrategy::WeightedRoundRobin => {
+                let total_weight = healthy
+                    .iter()
+                    .map(|replica| replica.weight())
+                    .sum::<usize>();
+                if total_weight == 0 {
+                    return None;
+                }
+
+                let cursor = self.cursor.fetch_add(1, Ordering::AcqRel) % total_weight;
+                let mut offset = 0;
+                for replica in healthy {
+                    offset += replica.weight();
+                    if cursor < offset {
+                        return Some(replica);
+                    }
+                }
+
+                None
+            }
+        }
+    }
+}
+
+impl RoutePools {
+    #[must_use]
+    pub fn new(
+        primary: BackendPoolRef,
+        replicas: Vec<BackendPoolRef>,
+        selector: ReplicaSelector,
+    ) -> Self {
+        assert_eq!(primary.role(), BackendRole::Primary);
+        assert!(replicas
+            .iter()
+            .all(|replica| replica.role() == BackendRole::Replica));
+        Self {
+            primary,
+            replicas,
+            selector,
+        }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> &BackendPoolRef {
+        &self.primary
+    }
+
+    #[must_use]
+    pub fn replicas(&self) -> &[BackendPoolRef] {
+        &self.replicas
+    }
+
+    #[must_use]
+    pub fn replica_by_id(&self, replica_id: u64) -> Option<&BackendPoolRef> {
+        self.replicas
+            .iter()
+            .find(|replica| replica.id() == replica_id)
+    }
+
+    #[must_use]
+    pub fn selector(&self) -> &ReplicaSelector {
+        &self.selector
+    }
+
+    pub async fn checkout_primary(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        self.primary.checkout(route, mode).await
+    }
+
+    pub async fn checkout_any_replica(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let replica = self
+            .selector
+            .select(&self.replicas)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        replica.checkout(route, mode).await
+    }
+
+    pub async fn checkout_replica_by_id(
+        &self,
+        route: RouteKey,
+        replica_id: u64,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let replica = self
+            .replica_by_id(replica_id)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+
+        if !replica.is_healthy() {
+            return Err(PoolError::Backpressure(BackpressureError::Closed));
+        }
+
+        replica.checkout(route, mode).await
+    }
+
+    pub async fn checkout_replica_or_primary(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        if let Some(replica) = self.selector.select(&self.replicas) {
+            match replica.checkout(route.clone(), mode).await {
+                Ok(backend) => return Ok(backend),
+                Err(replica_error) => {
+                    return match self.primary.checkout(route, mode).await {
+                        Ok(backend) => Ok(backend),
+                        Err(_) => Err(replica_error),
+                    };
+                }
+            }
+        }
+
+        self.primary.checkout(route, mode).await
+    }
+}
+
+impl RoutePoolRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            routes: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, route: RouteKey, pools: RoutePools) {
+        self.routes
+            .lock()
+            .expect("route registry poisoned")
+            .insert(route, pools);
+    }
+
+    #[must_use]
+    pub fn route_pools(&self, route: &RouteKey) -> Option<RoutePools> {
+        self.routes
+            .lock()
+            .expect("route registry poisoned")
+            .get(route)
+            .cloned()
+    }
+
+    pub async fn checkout_primary(
+        &self,
+        route: &RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .route_pools(route)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_primary(route.clone(), mode).await
+    }
+
+    pub async fn checkout_any_replica(
+        &self,
+        route: &RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .route_pools(route)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_any_replica(route.clone(), mode).await
+    }
+
+    pub async fn checkout_replica_by_id(
+        &self,
+        route: &RouteKey,
+        replica_id: u64,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .route_pools(route)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools
+            .checkout_replica_by_id(route.clone(), replica_id, mode)
+            .await
+    }
+
+    pub async fn checkout_replica_or_primary(
+        &self,
+        route: &RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .route_pools(route)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_replica_or_primary(route.clone(), mode).await
+    }
 }
 
 impl BackendPool {
@@ -133,11 +471,25 @@ impl BackendPool {
     }
 
     pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
+        self.checkout_primary(route).await
+    }
+
+    pub async fn checkout_primary(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
         self.checkout_with_mode(route, CheckoutMode::AllowConnect)
             .await
     }
 
     pub async fn checkout_reusable(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.checkout_primary_reusable(route).await
+    }
+
+    pub async fn checkout_primary_reusable(
         self: &Arc<Self>,
         route: RouteKey,
     ) -> Result<PooledBackend, PoolError> {
@@ -332,12 +684,6 @@ impl BackendPool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CheckoutMode {
-    AllowConnect,
-    ReuseOnly,
-}
-
 fn backpressure_outcome(error: BackpressureError) -> &'static str {
     match error {
         BackpressureError::QueueFull => "queue_full",
@@ -400,5 +746,234 @@ impl PooledBackend {
 
         drop(_permit);
         pool.record_backpressure_counts(&route_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg_kinetic_core::route::QueryClass;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::net::TcpListener;
+
+    fn route_key(label: &str) -> RouteKey {
+        RouteKey::new(
+            "pgkinetic",
+            "postgres",
+            Some(label),
+            None,
+            QueryClass::Default,
+        )
+    }
+
+    fn test_pool(addr: SocketAddr) -> Arc<BackendPool> {
+        BackendPool::new(
+            addr,
+            TlsConfig::default(),
+            1,
+            1,
+            1,
+            1,
+            Duration::from_millis(200),
+            "DISCARD ALL",
+        )
+    }
+
+    fn backend_ref_primary(addr: SocketAddr) -> BackendPoolRef {
+        BackendPoolRef::primary(test_pool(addr))
+    }
+
+    fn backend_ref_replica(id: u64, weight: usize, addr: SocketAddr) -> BackendPoolRef {
+        BackendPoolRef::replica(id, weight, test_pool(addr))
+    }
+
+    async fn backend_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let addr = listener.local_addr().expect("listener addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_probe = accepted.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept backend");
+                accepted_probe.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+
+        (addr, accepted)
+    }
+
+    async fn wait_for_accepts(accepted: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::Relaxed) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend accept observed");
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_primary_pool_checkout_uses_primary_pool() {
+        let route = route_key("primary-only");
+        let (primary_addr, primary_accepts) = backend_listener().await;
+        let (replica_addr, replica_accepts) = backend_listener().await;
+
+        let pools = RoutePools::new(
+            backend_ref_primary(primary_addr),
+            vec![backend_ref_replica(1, 1, replica_addr)],
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let registry = RoutePoolRegistry::new();
+        registry.insert(route.clone(), pools.clone());
+
+        let checkout = registry
+            .checkout_primary(&route, CheckoutMode::AllowConnect)
+            .await
+            .expect("primary checkout");
+
+        assert!(checkout.requires_startup());
+        wait_for_accepts(&primary_accepts, 1).await;
+        assert_eq!(primary_accepts.load(Ordering::Relaxed), 1);
+        assert_eq!(replica_accepts.load(Ordering::Relaxed), 0);
+        assert_eq!(pools.primary().role(), BackendRole::Primary);
+        assert_eq!(pools.replicas().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_primary_only_routes_continue_to_checkout_primary() {
+        let route = route_key("primary-only-route");
+        let (primary_addr, primary_accepts) = backend_listener().await;
+
+        let pools = RoutePools::new(
+            backend_ref_primary(primary_addr),
+            Vec::new(),
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let registry = RoutePoolRegistry::new();
+        registry.insert(route.clone(), pools.clone());
+
+        let checkout = registry
+            .checkout_replica_or_primary(&route, CheckoutMode::AllowConnect)
+            .await
+            .expect("primary-only checkout");
+
+        assert!(checkout.requires_startup());
+        wait_for_accepts(&primary_accepts, 1).await;
+        assert!(pools.replicas().is_empty());
+        assert_eq!(primary_accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_replica_selection_skips_unhealthy_replicas() {
+        let route = route_key("least-waiting");
+        let (primary_addr, primary_accepts) = backend_listener().await;
+        let (replica_one_addr, replica_one_accepts) = backend_listener().await;
+        let (replica_two_addr, replica_two_accepts) = backend_listener().await;
+
+        let primary = backend_ref_primary(primary_addr);
+        let replica_one = backend_ref_replica(1, 1, replica_one_addr);
+        let replica_two = backend_ref_replica(2, 1, replica_two_addr);
+
+        replica_one.set_healthy(false);
+        replica_one.set_waiting_hint(0);
+        replica_two.set_waiting_hint(4);
+
+        let pools = RoutePools::new(
+            primary,
+            vec![replica_one.clone(), replica_two.clone()],
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+
+        let checkout = pools
+            .checkout_any_replica(route.clone(), CheckoutMode::AllowConnect)
+            .await
+            .expect("healthy replica checkout");
+
+        assert!(checkout.requires_startup());
+        wait_for_accepts(&replica_two_accepts, 1).await;
+        assert_eq!(replica_one_accepts.load(Ordering::Relaxed), 0);
+        assert_eq!(replica_two_accepts.load(Ordering::Relaxed), 1);
+        assert_eq!(primary_accepts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn replica_selector_weighted_round_robin_is_deterministic() {
+        let first = backend_ref_replica(1, 1, "127.0.0.1:54321".parse().expect("socket"));
+        let second = backend_ref_replica(2, 2, "127.0.0.1:54322".parse().expect("socket"));
+        let third = backend_ref_replica(3, 1, "127.0.0.1:54323".parse().expect("socket"));
+        let selector = ReplicaSelector::new(ReplicaSelectionStrategy::WeightedRoundRobin);
+
+        let replicas = vec![first.clone(), second.clone(), third.clone()];
+        let selected_ids: Vec<u64> = (0..6)
+            .map(|_| selector.select(&replicas).expect("replica selection").id())
+            .collect();
+
+        assert_eq!(selected_ids, vec![1, 2, 2, 3, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_checkout_replica_by_id_targets_specific_replica() {
+        let route = route_key("replica-by-id");
+        let (primary_addr, primary_accepts) = backend_listener().await;
+        let (replica_one_addr, replica_one_accepts) = backend_listener().await;
+        let (replica_two_addr, replica_two_accepts) = backend_listener().await;
+
+        let pools = RoutePools::new(
+            backend_ref_primary(primary_addr),
+            vec![
+                backend_ref_replica(11, 1, replica_one_addr),
+                backend_ref_replica(22, 1, replica_two_addr),
+            ],
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let registry = RoutePoolRegistry::new();
+        registry.insert(route.clone(), pools);
+
+        let checkout = registry
+            .checkout_replica_by_id(&route, 22, CheckoutMode::AllowConnect)
+            .await
+            .expect("specific replica checkout");
+
+        assert!(checkout.requires_startup());
+        wait_for_accepts(&replica_two_accepts, 1).await;
+        assert_eq!(primary_accepts.load(Ordering::Relaxed), 0);
+        assert_eq!(replica_one_accepts.load(Ordering::Relaxed), 0);
+        assert_eq!(replica_two_accepts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_checkout_replica_or_primary_falls_back_to_primary() {
+        let route = route_key("fallback");
+        let (primary_addr, primary_accepts) = backend_listener().await;
+        let primary = backend_ref_primary(primary_addr);
+        let failing_replica = backend_ref_replica(77, 1, "127.0.0.1:9".parse().expect("socket"));
+
+        let pools = RoutePools::new(
+            primary,
+            vec![failing_replica],
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let registry = RoutePoolRegistry::new();
+        registry.insert(route.clone(), pools);
+
+        let checkout = registry
+            .checkout_replica_or_primary(&route, CheckoutMode::AllowConnect)
+            .await
+            .expect("primary fallback checkout");
+
+        assert!(checkout.requires_startup());
+        wait_for_accepts(&primary_accepts, 1).await;
+        assert_eq!(primary_accepts.load(Ordering::Relaxed), 1);
     }
 }
