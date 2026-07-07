@@ -4,6 +4,22 @@ pub enum AdminCommand {
     Unknown(String),
 }
 
+#[must_use]
+pub fn parse_admin_command(sql: &str) -> AdminCommand {
+    let normalized_sql = normalize_admin_sql(sql);
+    let mut parts = normalized_sql.split_whitespace();
+
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(command), Some(view), None) if command == "show" => {
+            match parse_admin_view(view) {
+                Some(view) => AdminCommand::Show(view),
+                None => AdminCommand::Unknown(normalized_sql),
+            }
+        }
+        _ => AdminCommand::Unknown(normalized_sql),
+    }
+}
+
 impl AdminCommand {
     #[must_use]
     pub fn view(&self) -> Option<AdminView> {
@@ -11,6 +27,28 @@ impl AdminCommand {
             Self::Show(view) => Some(*view),
             Self::Unknown(_) => None,
         }
+    }
+}
+
+fn normalize_admin_sql(sql: &str) -> String {
+    let trimmed = sql.trim();
+    let without_semicolon = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    without_semicolon.trim().to_ascii_lowercase()
+}
+
+fn parse_admin_view(view: &str) -> Option<AdminView> {
+    match view {
+        "clients" => Some(AdminView::Clients),
+        "pools" => Some(AdminView::Pools),
+        "servers" => Some(AdminView::Servers),
+        "prepared" => Some(AdminView::Prepared),
+        "pinning" => Some(AdminView::Pinning),
+        "recovery" => Some(AdminView::Recovery),
+        "backpressure" => Some(AdminView::Backpressure),
+        "routes" => Some(AdminView::Routes),
+        "settings" => Some(AdminView::Settings),
+        "limits" => Some(AdminView::Limits),
+        _ => None,
     }
 }
 
