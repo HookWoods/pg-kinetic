@@ -14,11 +14,13 @@ use pg_kinetic_core::{
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
+    sharding::ShardId,
 };
 
 use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
 use crate::metrics;
 use crate::routing::RoutingTarget;
+use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -293,6 +295,26 @@ impl RouteCheckoutSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteMapReloadSnapshot {
+    pub route_map_generation_id: u64,
+    pub success: bool,
+    pub error_code: Option<RouteMapReloadErrorCode>,
+    pub draining_shard_ids: Vec<ShardId>,
+}
+
+impl RouteMapReloadSnapshot {
+    #[must_use]
+    pub fn new(route_map_generation_id: u64, success: bool) -> Self {
+        Self {
+            route_map_generation_id,
+            success,
+            error_code: None,
+            draining_shard_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub listen_addr: SocketAddr,
     pub backend_addr: SocketAddr,
@@ -453,6 +475,7 @@ struct SnapshotStoreInner {
     routes: HashMap<RouteKey, RouteSnapshot>,
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
+    route_map_reloads: Vec<RouteMapReloadSnapshot>,
     settings: SettingsSnapshot,
     limits: LimitsSnapshot,
 }
@@ -832,6 +855,23 @@ impl SnapshotStore {
         sort_by_route_key(route_checkouts)
     }
 
+    pub fn set_route_map_reload_snapshot(&self, snapshot: RouteMapReloadSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .route_map_reloads
+            .push(snapshot);
+    }
+
+    #[must_use]
+    pub fn route_map_reload_snapshots(&self) -> Vec<RouteMapReloadSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_map_reloads
+            .clone()
+    }
+
     pub fn set_settings_snapshot(&self, snapshot: SettingsSnapshot) {
         self.inner
             .write()
@@ -959,6 +999,20 @@ impl PreparedSnapshotHandle {
             .expect("snapshot store poisoned")
             .prepared
             .statements = statements;
+    }
+}
+
+impl From<&RouteMapReloadResult> for RouteMapReloadSnapshot {
+    fn from(result: &RouteMapReloadResult) -> Self {
+        let mut draining_shard_ids = result.draining_shard_ids.clone();
+        draining_shard_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        Self {
+            route_map_generation_id: result.route_map_generation_id,
+            success: result.success,
+            error_code: result.error_code,
+            draining_shard_ids,
+        }
     }
 }
 

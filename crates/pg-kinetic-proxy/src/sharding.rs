@@ -1,9 +1,17 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+};
+
 use pg_kinetic_core::{
     routing::FallbackPolicy,
     session::TransactionState,
     shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
     sharding::{
-        deterministic_shard_hash, MultiShardPolicy, RouteMapValidationInput, ShardRoute,
+        deterministic_shard_hash, MultiShardPolicy, RouteMapValidationInput, ShardId, ShardRoute,
         ShardRouteDecision, ShardRouteMap, ShardRouteReason, ShardScope,
     },
     virtual_session::ReadAfterWriteState,
@@ -13,6 +21,7 @@ use crate::routing::{
     bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, RouteHealthSnapshot,
     RoutingContext, RoutingTarget,
 };
+use crate::{reload, snapshot::SnapshotStore};
 
 #[derive(Clone, Debug)]
 pub struct ShardRoutingPlanner {
@@ -74,22 +83,249 @@ impl<'a> ShardRoutingContext<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ShardRouteMapStore {
-    route_maps: Vec<ShardRouteMap>,
+    inner: Arc<ShardRouteMapStoreInner>,
+}
+
+#[derive(Debug)]
+struct ShardRouteMapStoreInner {
+    route_maps: RwLock<Arc<[ShardRouteMap]>>,
+    generation_id: AtomicU64,
+    active_transaction_shard_affinities: RwLock<HashMap<u64, ShardId>>,
+    draining_shard_ids: RwLock<HashSet<ShardId>>,
+}
+
+impl ShardRouteMapStoreInner {
+    fn new(route_maps: Arc<[ShardRouteMap]>) -> Self {
+        Self {
+            route_maps: RwLock::new(route_maps),
+            generation_id: AtomicU64::new(0),
+            active_transaction_shard_affinities: RwLock::new(HashMap::new()),
+            draining_shard_ids: RwLock::new(HashSet::new()),
+        }
+    }
+}
+
+impl Default for ShardRouteMapStore {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteMapReloadErrorCode {
+    EmptyRouteMapSet,
+    ConflictingRouteScopes,
+}
+
+impl RouteMapReloadErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyRouteMapSet => "empty_route_map_set",
+            Self::ConflictingRouteScopes => "conflicting_route_scopes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteMapReloadResult {
+    pub success: bool,
+    pub route_map_generation_id: u64,
+    pub error_code: Option<RouteMapReloadErrorCode>,
+    pub error: Option<String>,
+    pub draining_shard_ids: Vec<ShardId>,
 }
 
 impl ShardRouteMapStore {
     #[must_use]
     pub fn new(route_maps: impl Into<Vec<ShardRouteMap>>) -> Self {
         Self {
-            route_maps: route_maps.into(),
+            inner: Arc::new(ShardRouteMapStoreInner::new(Arc::from(
+                route_maps.into().into_boxed_slice(),
+            ))),
         }
     }
 
     #[must_use]
-    pub fn route_maps(&self) -> &[ShardRouteMap] {
-        &self.route_maps
+    pub fn route_maps(&self) -> Arc<[ShardRouteMap]> {
+        self.inner
+            .route_maps
+            .read()
+            .expect("route map store poisoned")
+            .clone()
+    }
+
+    #[must_use]
+    pub fn generation_id(&self) -> u64 {
+        self.inner.generation_id.load(Ordering::Acquire)
+    }
+
+    pub fn set_transaction_shard_affinity(&self, session_id: u64, shard_id: ShardId) {
+        let mut affinities = self
+            .inner
+            .active_transaction_shard_affinities
+            .write()
+            .expect("route map store poisoned");
+        affinities.insert(session_id, shard_id);
+        drop(affinities);
+        self.refresh_draining_shards();
+    }
+
+    #[must_use]
+    pub fn transaction_shard_affinity(&self, session_id: u64) -> Option<ShardId> {
+        self.inner
+            .active_transaction_shard_affinities
+            .read()
+            .expect("route map store poisoned")
+            .get(&session_id)
+            .cloned()
+    }
+
+    pub fn clear_transaction_shard_affinity(&self, session_id: u64) -> Option<ShardId> {
+        let removed = self
+            .inner
+            .active_transaction_shard_affinities
+            .write()
+            .expect("route map store poisoned")
+            .remove(&session_id);
+        self.refresh_draining_shards();
+        removed
+    }
+
+    #[must_use]
+    pub fn draining_shard_ids(&self) -> Vec<ShardId> {
+        let draining = self
+            .inner
+            .draining_shard_ids
+            .read()
+            .expect("route map store poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_shard_ids(draining)
+    }
+
+    pub fn reload(
+        &self,
+        route_maps: impl Into<Vec<ShardRouteMap>>,
+        snapshot_store: Option<&SnapshotStore>,
+    ) -> RouteMapReloadResult {
+        let route_maps = route_maps.into();
+        let current_generation = self.generation_id();
+
+        let result = match validate_reload_route_maps(&route_maps) {
+            Ok(()) => {
+                let next_route_maps = Arc::from(route_maps.into_boxed_slice());
+                let mut route_map_guard = self
+                    .inner
+                    .route_maps
+                    .write()
+                    .expect("route map store poisoned");
+                *route_map_guard = next_route_maps;
+                let next_generation = self.inner.generation_id.fetch_add(1, Ordering::AcqRel) + 1;
+                drop(route_map_guard);
+                self.refresh_draining_shards();
+                let draining_shard_ids = self.draining_shard_ids();
+
+                RouteMapReloadResult {
+                    success: true,
+                    route_map_generation_id: next_generation,
+                    error_code: None,
+                    error: None,
+                    draining_shard_ids,
+                }
+            }
+            Err(error_code) => {
+                let draining_shard_ids = self.draining_shard_ids();
+                RouteMapReloadResult {
+                    success: false,
+                    route_map_generation_id: current_generation,
+                    error_code: Some(error_code),
+                    error: Some(validation_error_message(error_code)),
+                    draining_shard_ids,
+                }
+            }
+        };
+
+        if let Some(snapshot_store) = snapshot_store {
+            reload::record_route_map_reload(snapshot_store, &result);
+        }
+
+        result
+    }
+
+    fn refresh_draining_shards(&self) {
+        let active_shards = self.active_transaction_shard_ids();
+        let current_shards = self.current_shard_ids();
+        let mut draining = self
+            .inner
+            .draining_shard_ids
+            .write()
+            .expect("route map store poisoned");
+        draining.clear();
+        for shard_id in active_shards {
+            if !current_shards.contains(&shard_id) {
+                draining.insert(shard_id);
+            }
+        }
+    }
+
+    fn active_transaction_shard_ids(&self) -> HashSet<ShardId> {
+        self.inner
+            .active_transaction_shard_affinities
+            .read()
+            .expect("route map store poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn current_shard_ids(&self) -> HashSet<ShardId> {
+        self.inner
+            .route_maps
+            .read()
+            .expect("route map store poisoned")
+            .iter()
+            .flat_map(|route_map| {
+                route_map
+                    .routes()
+                    .iter()
+                    .map(|route| route.target().shard_id().clone())
+            })
+            .collect()
+    }
+}
+
+fn sort_shard_ids(mut shard_ids: Vec<ShardId>) -> Vec<ShardId> {
+    shard_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    shard_ids
+}
+
+fn validate_reload_route_maps(route_maps: &[ShardRouteMap]) -> Result<(), RouteMapReloadErrorCode> {
+    if route_maps.is_empty() {
+        return Err(RouteMapReloadErrorCode::EmptyRouteMapSet);
+    }
+
+    let mut seen_scopes = HashSet::new();
+    for route_map in route_maps {
+        if !seen_scopes.insert(route_map.scope().clone()) {
+            return Err(RouteMapReloadErrorCode::ConflictingRouteScopes);
+        }
+    }
+
+    Ok(())
+}
+
+fn validation_error_message(error_code: RouteMapReloadErrorCode) -> String {
+    match error_code {
+        RouteMapReloadErrorCode::EmptyRouteMapSet => {
+            String::from("route map reload requires at least one route map")
+        }
+        RouteMapReloadErrorCode::ConflictingRouteScopes => {
+            String::from("route map reload contains conflicting scopes")
+        }
     }
 }
 
@@ -103,18 +339,13 @@ pub fn plan_sharded_route(
     }
 
     let explicit_hint = parsed_shard_hint(context.sql);
-    let route_map = match planner
-        .route_map_store
-        .route_maps()
-        .iter()
-        .find(|route_map| {
-            route_map_matches_context(route_map, &context)
-                && route_map_matches_explicit_hint(route_map, &explicit_hint)
-        }) {
+    let route_maps = planner.route_map_store.route_maps();
+    let route_map = match route_maps.iter().find(|route_map| {
+        route_map_matches_context(route_map, &context)
+            && route_map_matches_explicit_hint(route_map, &explicit_hint)
+    }) {
         Some(route_map) => route_map,
-        None => match planner
-            .route_map_store
-            .route_maps()
+        None => match route_maps
             .iter()
             .find(|route_map| route_map_matches_context(route_map, &context))
         {

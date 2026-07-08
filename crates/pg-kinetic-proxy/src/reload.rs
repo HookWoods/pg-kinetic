@@ -11,6 +11,8 @@ use toml::Value;
 use crate::{
     auth,
     config::{ClientTlsMode, Config, ReloadConfig},
+    sharding::RouteMapReloadResult,
+    snapshot::{RouteMapReloadSnapshot, SnapshotStore},
     tls,
 };
 use pg_kinetic_core::secrets::UserStore;
@@ -20,6 +22,10 @@ pub enum ReloadDecision {
     Applied,
     Rejected,
     Unchanged,
+}
+
+pub fn record_route_map_reload(snapshot_store: &SnapshotStore, result: &RouteMapReloadResult) {
+    snapshot_store.set_route_map_reload_snapshot(RouteMapReloadSnapshot::from(result));
 }
 
 pub fn load_effective_config(base: &Config) -> anyhow::Result<Config> {
