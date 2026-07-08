@@ -656,6 +656,12 @@ async fn handle_client(
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
+                    let route = route_key(
+                        &route_database,
+                        &route_user,
+                        route_application_name.as_deref(),
+                        client_addr,
+                    );
                     let checkout_target = select_checkout_target(
                         &routing_planner,
                         &route_pools,
@@ -673,6 +679,7 @@ async fn handle_client(
                         }
                     ) {
                         wait_for_checkout_target(
+                            &route,
                             &routing_planner,
                             &route_pools,
                             &snapshot_store,
@@ -689,12 +696,7 @@ async fn handle_client(
                     };
                     match checkout_backend(
                         &route_pools,
-                        route_key(
-                            &route_database,
-                            &route_user,
-                            route_application_name.as_deref(),
-                            client_addr,
-                        ),
+                        route,
                         checkout_target,
                         "checkout backend for cycle",
                         CheckoutMode::AllowConnect,
@@ -1491,6 +1493,7 @@ fn checkout_mode_label(mode: CheckoutMode) -> &'static str {
 }
 
 async fn wait_for_checkout_target(
+    route: &RouteKey,
     planner: &ReadRoutingPlanner,
     route_pools: &RoutePools,
     snapshot_store: &SnapshotStore,
@@ -1512,6 +1515,7 @@ async fn wait_for_checkout_target(
         prepared,
         frames,
     );
+    let mut waited = false;
 
     while matches!(
         checkout_target,
@@ -1520,6 +1524,7 @@ async fn wait_for_checkout_target(
         }
     ) && started.elapsed() < wait_timeout
     {
+        waited = true;
         let remaining = wait_timeout.saturating_sub(started.elapsed());
         let sleep_for = remaining.min(Duration::from_millis(25));
         if sleep_for.is_zero() {
@@ -1539,12 +1544,26 @@ async fn wait_for_checkout_target(
         );
     }
 
-    if matches!(
+    let timed_out = matches!(
         checkout_target,
         RoutingTarget::Wait {
             reason: RoutingReason::FallbackWait,
         }
-    ) {
+    );
+
+    if waited {
+        metrics::record_read_after_write_wait(
+            route,
+            started.elapsed().as_secs_f64() * 1_000.0,
+            if timed_out {
+                FreshnessStatus::Unavailable
+            } else {
+                FreshnessStatus::Waiting
+            },
+        );
+    }
+
+    if timed_out {
         fallback_target(read_routing_mode, FallbackPolicy::Primary)
     } else {
         checkout_target

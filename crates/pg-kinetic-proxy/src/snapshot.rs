@@ -17,6 +17,7 @@ use pg_kinetic_core::{
 };
 
 use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
+use crate::metrics;
 use crate::routing::RoutingTarget;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -538,6 +539,7 @@ impl SnapshotStore {
     }
 
     pub fn set_replica_health_snapshot(&self, snapshot: ReplicaHealthSnapshot) {
+        metrics::record_replica_health_snapshot(&snapshot);
         self.inner
             .write()
             .expect("snapshot store poisoned")
@@ -739,6 +741,7 @@ impl SnapshotStore {
     }
 
     pub fn set_route_checkout_snapshot(&self, snapshot: RouteCheckoutSnapshot) {
+        metrics::record_route_checkout_snapshot(&snapshot);
         self.inner
             .write()
             .expect("snapshot store poisoned")

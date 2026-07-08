@@ -21,6 +21,7 @@ use crate::{
     backend::Backend,
     config::{SocketConfig, TlsConfig},
     drain::DrainController,
+    metrics,
     snapshot::{ReplicaHealthSnapshot, SnapshotStore},
 };
 use pg_kinetic_core::security::{DrainState, HealthStatus};
@@ -530,6 +531,9 @@ impl EndpointHealthProbe {
             .snapshot
             .lock()
             .expect("endpoint health snapshot poisoned") = snapshot.clone();
+        if snapshot.role.warning.is_some() {
+            metrics::record_split_brain_warning(snapshot.endpoint_id, snapshot.expected_role);
+        }
         if let Some(snapshot_store) = self
             .snapshot_store
             .lock()

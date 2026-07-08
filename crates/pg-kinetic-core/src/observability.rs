@@ -77,6 +77,14 @@ pub enum MetricName {
     BackendRecoveryTotal,
     BackendSqlstateTotal,
     ReadAfterWriteTotal,
+    ReadAfterWriteWaitMs,
+    ReadAfterWriteRejectionsTotal,
+    RouteDecisionsTotal,
+    RouteFallbacksTotal,
+    ReplicaHealth,
+    ReplicaLagMs,
+    ReplicaReplayLsn,
+    SplitBrainWarningsTotal,
     RouteCheckoutWaitMs,
     RouteInFlight,
     RouteWaiting,
@@ -98,6 +106,14 @@ impl MetricName {
             Self::BackendRecoveryTotal => "pg_kinetic_backend_recovery_total",
             Self::BackendSqlstateTotal => "pg_kinetic_backend_sqlstate_total",
             Self::ReadAfterWriteTotal => "pg_kinetic_read_after_write_total",
+            Self::ReadAfterWriteWaitMs => "pg_kinetic_read_after_write_wait_ms",
+            Self::ReadAfterWriteRejectionsTotal => "pg_kinetic_read_after_write_rejections_total",
+            Self::RouteDecisionsTotal => "pg_kinetic_route_decisions_total",
+            Self::RouteFallbacksTotal => "pg_kinetic_route_fallbacks_total",
+            Self::ReplicaHealth => "pg_kinetic_replica_health",
+            Self::ReplicaLagMs => "pg_kinetic_replica_lag_ms",
+            Self::ReplicaReplayLsn => "pg_kinetic_replica_replay_lsn",
+            Self::SplitBrainWarningsTotal => "pg_kinetic_split_brain_warnings_total",
             Self::RouteCheckoutWaitMs => "pg_kinetic_route_checkout_wait_ms",
             Self::RouteInFlight => "pg_kinetic_route_in_flight",
             Self::RouteWaiting => "pg_kinetic_route_waiting",
@@ -154,18 +170,24 @@ impl MetricKind {
 pub enum MetricLabel {
     Action,
     Event,
+    Endpoint,
     Kind,
+    LagState,
+    FallbackPolicy,
+    Health,
     Mode,
     Option,
     Outcome,
     Phase,
     Reason,
+    QueryClass,
     Route,
     Scope,
     Socket,
     Sqlstate,
     State,
     Status,
+    TargetRole,
     Trigger,
 }
 
@@ -175,18 +197,24 @@ impl MetricLabel {
         match self {
             Self::Action => "action",
             Self::Event => "event",
+            Self::Endpoint => "endpoint",
             Self::Kind => "kind",
+            Self::LagState => "lag_state",
+            Self::FallbackPolicy => "fallback_policy",
+            Self::Health => "health",
             Self::Mode => "mode",
             Self::Option => "option",
             Self::Outcome => "outcome",
             Self::Phase => "phase",
             Self::Reason => "reason",
+            Self::QueryClass => "query_class",
             Self::Route => "route",
             Self::Scope => "scope",
             Self::Socket => "socket",
             Self::Sqlstate => "sqlstate",
             Self::State => "state",
             Self::Status => "status",
+            Self::TargetRole => "target_role",
             Self::Trigger => "trigger",
         }
     }
@@ -227,6 +255,16 @@ const EVENT_LABELS: &[MetricLabel] = &[MetricLabel::Event];
 const REASON_LABELS: &[MetricLabel] = &[MetricLabel::Reason];
 const ACTION_LABELS: &[MetricLabel] = &[MetricLabel::Action];
 const OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];
+const ROUTE_DECISION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Route,
+    MetricLabel::TargetRole,
+    MetricLabel::QueryClass,
+];
+const ROUTE_FALLBACK_LABELS: &[MetricLabel] = &[
+    MetricLabel::Route,
+    MetricLabel::Reason,
+    MetricLabel::FallbackPolicy,
+];
 const ROUTE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Outcome];
 const ROUTE_SCOPE_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Scope];
 const TRIGGER_ACTION_OUTCOME_LABELS: &[MetricLabel] = &[
@@ -242,6 +280,15 @@ const SCOPE_MODE_REASON_LABELS: &[MetricLabel] =
 const MODE_LABELS: &[MetricLabel] = &[MetricLabel::Mode];
 const MODE_REASON_LABELS: &[MetricLabel] = &[MetricLabel::Mode, MetricLabel::Reason];
 const OUTCOME_ONLY_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];
+const ENDPOINT_HEALTH_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::Health];
+const ENDPOINT_LAG_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::LagState];
+const ENDPOINT_TARGET_ROLE_LABELS: &[MetricLabel] =
+    &[MetricLabel::Endpoint, MetricLabel::TargetRole];
+const ENDPOINT_TARGET_ROLE_REASON_LABELS: &[MetricLabel] = &[
+    MetricLabel::Endpoint,
+    MetricLabel::TargetRole,
+    MetricLabel::Reason,
+];
 const STATE_LABELS: &[MetricLabel] = &[MetricLabel::State];
 const KIND_STATUS_LABELS: &[MetricLabel] = &[MetricLabel::Kind, MetricLabel::Status];
 const SOCKET_OPTION_OUTCOME_LABELS: &[MetricLabel] = &[
@@ -315,6 +362,70 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Read-after-write freshness outcomes",
         OUTCOME_LABELS,
         "Outcome values stay aligned with freshness states.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_read_after_write_wait_ms",
+        MetricKind::Histogram,
+        "ms",
+        "Read-after-write wait time in milliseconds by route and outcome",
+        ROUTE_OUTCOME_LABELS,
+        "Route labels omit raw client addresses and outcome values stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_read_after_write_rejections_total",
+        MetricKind::Counter,
+        "1",
+        "Read-after-write rejections by route and outcome",
+        ROUTE_OUTCOME_LABELS,
+        "Route labels omit raw client addresses and outcome values stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_route_decisions_total",
+        MetricKind::Counter,
+        "1",
+        "Routing decisions by route, target role, and query class",
+        ROUTE_DECISION_LABELS,
+        "Route, target role, and query class stay aligned with routing enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_route_fallbacks_total",
+        MetricKind::Counter,
+        "1",
+        "Routing fallbacks by route, reason, and fallback policy",
+        ROUTE_FALLBACK_LABELS,
+        "Fallback reasons and policies stay aligned with routing enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_replica_health",
+        MetricKind::Gauge,
+        "1",
+        "Replica health series by endpoint and health state",
+        ENDPOINT_HEALTH_LABELS,
+        "Endpoint identifiers are stable numeric ids and health states are bounded enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_replica_lag_ms",
+        MetricKind::Gauge,
+        "ms",
+        "Replica lag in milliseconds by endpoint and lag state",
+        ENDPOINT_LAG_LABELS,
+        "Endpoint identifiers are stable numeric ids and lag states are bounded enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_replica_replay_lsn",
+        MetricKind::Gauge,
+        "lsn",
+        "Replica replay LSN by endpoint and target role",
+        ENDPOINT_TARGET_ROLE_LABELS,
+        "Endpoint identifiers are stable numeric ids and target roles are bounded enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_split_brain_warnings_total",
+        MetricKind::Counter,
+        "1",
+        "Split-brain warnings by endpoint, target role, and reason",
+        ENDPOINT_TARGET_ROLE_REASON_LABELS,
+        "Endpoint identifiers are stable numeric ids and role mismatch reasons stay bounded.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_backpressure_events_total",
@@ -449,14 +560,28 @@ pub struct LabelPolicy;
 impl LabelPolicy {
     pub const PHASE: &'static str = "phase";
     pub const OUTCOME: &'static str = "outcome";
+    pub const ENDPOINT: &'static str = "endpoint";
     pub const ROUTE: &'static str = "route";
     pub const VIEW: &'static str = "view";
     pub const STATE: &'static str = "state";
     pub const EVENT: &'static str = "event";
-    pub const ALLOWED_LABELS: [&'static str; 6] = [
+    pub const TARGET_ROLE: &'static str = "target_role";
+    pub const QUERY_CLASS: &'static str = "query_class";
+    pub const REASON: &'static str = "reason";
+    pub const FALLBACK_POLICY: &'static str = "fallback_policy";
+    pub const HEALTH: &'static str = "health";
+    pub const LAG_STATE: &'static str = "lag_state";
+    pub const ALLOWED_LABELS: [&'static str; 13] = [
         Self::PHASE,
         Self::OUTCOME,
+        Self::ENDPOINT,
         Self::ROUTE,
+        Self::TARGET_ROLE,
+        Self::QUERY_CLASS,
+        Self::REASON,
+        Self::FALLBACK_POLICY,
+        Self::HEALTH,
+        Self::LAG_STATE,
         Self::VIEW,
         Self::STATE,
         Self::EVENT,

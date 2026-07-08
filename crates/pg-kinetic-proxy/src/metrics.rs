@@ -1,18 +1,23 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::snapshot::{PoolSnapshot, ServerSnapshot, SnapshotStore};
+use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
+use crate::snapshot::{
+    PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, ServerSnapshot, SnapshotStore,
+};
 use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
+    ha::{EndpointHealth, ReplicaLagState},
     lsn::FreshnessStatus,
     observability::{
         metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
         MetricOutcome, ProtocolPhase,
     },
-    route::RouteKey,
+    route::{QueryClass as RouteQueryClass, RouteKey},
+    routing::{BackendRole, FallbackPolicy},
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
 };
 use pg_kinetic_core::{
@@ -66,6 +71,113 @@ pub fn record_pool_snapshot(snapshot_store: &SnapshotStore, snapshot: PoolSnapsh
 
 pub fn record_server_snapshot(snapshot_store: &SnapshotStore, snapshot: ServerSnapshot) {
     snapshot_store.set_server_snapshot(snapshot);
+}
+
+pub fn record_route_checkout_snapshot(snapshot: &RouteCheckoutSnapshot) {
+    let decision = snapshot.decision.clone();
+    let target_role = decision.clone().target_role();
+    let reason = decision.clone().reason();
+    metrics_crate::counter!(
+        ObservabilityMetricName::RouteDecisionsTotal.as_str(),
+        "route" => snapshot.route_key.metric_label(),
+        "target_role" => target_role_label(target_role),
+        "query_class" => route_query_class_label(snapshot.route_key.query_class())
+    )
+    .increment(1);
+
+    if let Some(fallback_policy) = fallback_policy_from_reason(reason) {
+        metrics_crate::counter!(
+            ObservabilityMetricName::RouteFallbacksTotal.as_str(),
+            "route" => snapshot.route_key.metric_label(),
+            "reason" => reason.as_str(),
+            "fallback_policy" => fallback_policy.as_str()
+        )
+        .increment(1);
+    }
+
+    if matches!(decision, RoutingTarget::Reject { .. }) {
+        if let Some(outcome) = snapshot.freshness_outcome {
+            increment_read_after_write_rejection(&snapshot.route_key, outcome);
+        }
+    }
+}
+
+pub fn record_replica_health_snapshot(snapshot: &ReplicaHealthSnapshot) {
+    let endpoint = endpoint_label(snapshot.endpoint_id);
+
+    for candidate in [
+        EndpointHealth::Healthy,
+        EndpointHealth::Degraded,
+        EndpointHealth::Unhealthy,
+        EndpointHealth::Unavailable,
+    ] {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::ReplicaHealth.as_str(),
+            "endpoint" => endpoint.clone(),
+            "health" => candidate.as_str()
+        )
+        .set(if candidate == snapshot.health.state {
+            1.0
+        } else {
+            0.0
+        });
+    }
+
+    let lag_ms = snapshot
+        .lag_duration
+        .map(|duration| duration.as_secs_f64() * 1_000.0)
+        .unwrap_or(0.0);
+    for candidate in [
+        ReplicaLagState::Unknown,
+        ReplicaLagState::Fresh,
+        ReplicaLagState::Lagging,
+    ] {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::ReplicaLagMs.as_str(),
+            "endpoint" => endpoint.clone(),
+            "lag_state" => candidate.as_str()
+        )
+        .set(if candidate == snapshot.lag_state {
+            lag_ms
+        } else {
+            0.0
+        });
+    }
+
+    metrics_crate::gauge!(
+        ObservabilityMetricName::ReplicaReplayLsn.as_str(),
+        "endpoint" => endpoint,
+        "target_role" => snapshot.expected_role.as_str()
+    )
+    .set(snapshot.replay_lsn.map_or(0.0, |lsn| lsn.as_u64() as f64));
+}
+
+pub fn record_split_brain_warning(endpoint_id: u64, expected_role: BackendRole) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::SplitBrainWarningsTotal.as_str(),
+        "endpoint" => endpoint_label(endpoint_id),
+        "target_role" => expected_role.as_str(),
+        "reason" => "role_mismatch"
+    )
+    .increment(1);
+}
+
+pub fn record_read_after_write_wait(route: &RouteKey, wait_ms: f64, outcome: FreshnessStatus) {
+    metrics_crate::histogram!(
+        ObservabilityMetricName::ReadAfterWriteWaitMs.as_str(),
+        "route" => route.metric_label(),
+        "outcome" => freshness_outcome_label(outcome)
+    )
+    .record(wait_ms);
+}
+
+pub fn increment_read_after_write_rejection(route: &RouteKey, outcome: FreshnessStatus) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::ReadAfterWriteRejectionsTotal.as_str(),
+        "route" => route.metric_label(),
+        "outcome" => freshness_outcome_label(outcome)
+    )
+    .increment(1);
 }
 
 pub fn remove_server_snapshot(snapshot_store: &SnapshotStore, backend_id: u64) {
@@ -304,6 +416,35 @@ fn freshness_outcome_label(outcome: FreshnessStatus) -> &'static str {
         FreshnessStatus::Stale => "stale",
         FreshnessStatus::Unknown => "unknown",
         FreshnessStatus::Unavailable => "unavailable",
+    }
+}
+
+fn endpoint_label(endpoint_id: u64) -> String {
+    endpoint_id.to_string()
+}
+
+fn route_query_class_label(query_class: RouteQueryClass) -> &'static str {
+    match query_class {
+        RouteQueryClass::Default => "default",
+        RouteQueryClass::Read => "read",
+        RouteQueryClass::Write => "write",
+        RouteQueryClass::Maintenance => "maintenance",
+    }
+}
+
+fn target_role_label(target_role: Option<BackendRole>) -> &'static str {
+    match target_role {
+        Some(role) => role.as_str(),
+        None => "unknown",
+    }
+}
+
+fn fallback_policy_from_reason(reason: ProxyRoutingReason) -> Option<FallbackPolicy> {
+    match reason {
+        ProxyRoutingReason::FallbackPrimary => Some(FallbackPolicy::Primary),
+        ProxyRoutingReason::FallbackReject => Some(FallbackPolicy::Reject),
+        ProxyRoutingReason::FallbackWait => Some(FallbackPolicy::Wait),
+        _ => None,
     }
 }
 
