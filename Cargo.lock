@@ -920,6 +920,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
+ "clap",
  "hmac",
  "metrics",
  "pg-kinetic-core",

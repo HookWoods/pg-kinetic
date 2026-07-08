@@ -7,19 +7,25 @@ use std::{
 };
 
 use pg_kinetic_core::{
-    routing::FallbackPolicy,
+    route::{QueryClass, RouteKey},
+    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::TransactionState,
     shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
     sharding::{
-        deterministic_shard_hash, MultiShardPolicy, RouteMapValidationInput, ShardId, ShardRoute,
-        ShardRouteDecision, ShardRouteMap, ShardRouteReason, ShardScope,
+        deterministic_shard_hash, MultiShardPolicy, RouteDefinition, RouteMapValidationInput,
+        ShardId, ShardRoute, ShardRouteDecision, ShardRouteMap, ShardRouteReason, ShardScope,
+        ShardStrategy, ShardValidationError, ShardedTableDefinition, TableScope, TenantScope,
     },
     virtual_session::ReadAfterWriteState,
 };
 
+use crate::config::{
+    MultiShardPolicyConfig, RouteMapConfig, ShardScopeConfig, ShardStrategyConfig,
+    ShardTargetConfig, ShardingConfig,
+};
 use crate::routing::{
-    bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, RouteHealthSnapshot,
-    RoutingContext, RoutingTarget,
+    bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, ReplicaCandidate,
+    RouteHealthSnapshot, RoutingContext, RoutingTarget,
 };
 use crate::{reload, snapshot::SnapshotStore};
 
@@ -55,6 +61,128 @@ impl ShardRoutingPlanner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutePreviewRequest<'a> {
+    pub database: &'a str,
+    pub user: &'a str,
+    pub application_name: Option<&'a str>,
+    pub sql: &'a str,
+}
+
+impl<'a> RoutePreviewRequest<'a> {
+    #[must_use]
+    pub const fn new(
+        database: &'a str,
+        user: &'a str,
+        application_name: Option<&'a str>,
+        sql: &'a str,
+    ) -> Self {
+        Self {
+            database,
+            user,
+            application_name,
+            sql,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutePreviewSummary {
+    pub route: String,
+    pub shard_id: Option<String>,
+    pub backend_role: Option<String>,
+    pub reason: String,
+    pub shard_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutePreviewError {
+    pub code: String,
+    pub message: String,
+}
+
+impl RoutePreviewError {
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+pub fn preview_route(
+    config: &ShardingConfig,
+    request: RoutePreviewRequest<'_>,
+) -> Result<RoutePreviewSummary, RoutePreviewError> {
+    let route_key = RouteKey::new(
+        request.database,
+        request.user,
+        request.application_name,
+        None,
+        QueryClass::Default,
+    );
+    let route_map_validation_input = preview_route_map_validation_input(&config.route_maps);
+    let selected_route_map = select_preview_route_map(
+        &config.route_maps,
+        request,
+        route_map_validation_input.as_ref(),
+    );
+    let route_maps = match selected_route_map {
+        Some(route_map) => vec![build_preview_route_map(
+            route_map,
+            &route_key,
+            config.multi_shard_policy,
+        )?],
+        None => Vec::new(),
+    };
+
+    let health = preview_route_health_snapshot(&route_maps);
+    let read_routing = ReadRoutingPlanner::new(
+        ReadRoutingMode::PreferReplica,
+        FallbackPolicy::Primary,
+        FreshnessPolicy::None,
+        1_000,
+    );
+    let planner = ShardRoutingPlanner::new(
+        read_routing,
+        config.sharding_enabled,
+        ShardRouteMapStore::new(route_maps),
+    );
+    let context = ShardRoutingContext::new(
+        request.sql,
+        TransactionState::Idle,
+        ReadAfterWriteState::Disabled,
+        &health,
+        route_map_validation_input.as_ref(),
+    );
+    let decision = planner.plan_sharded_route(context);
+    let target = choose_sharded_routing_target(&planner, context);
+    let (shard_id, backend_role, reason) = match decision.route() {
+        Some(route) => (
+            Some(route.target().shard_id().as_str().to_owned()),
+            Some(route.target().backend_role().as_str().to_owned()),
+            decision.reason().as_str().to_owned(),
+        ),
+        None => (
+            None,
+            target
+                .clone()
+                .target_role()
+                .map(|role| role.as_str().to_owned()),
+            target.clone().reason().as_str().to_owned(),
+        ),
+    };
+
+    Ok(RoutePreviewSummary {
+        route: route_key.metric_label(),
+        shard_id,
+        backend_role,
+        reason,
+        shard_reason: Some(decision.reason().as_str().to_owned()),
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ShardRoutingContext<'a> {
     pub sql: &'a str,
@@ -81,6 +209,189 @@ impl<'a> ShardRoutingContext<'a> {
             route_map_validation_input,
         }
     }
+}
+
+fn select_preview_route_map<'a>(
+    route_maps: &'a [RouteMapConfig],
+    request: RoutePreviewRequest<'_>,
+    route_map_validation_input: Option<&RouteMapValidationInput>,
+) -> Option<&'a RouteMapConfig> {
+    let explicit_hint = extract_shard_hint(request.sql);
+    let extraction = route_map_validation_input
+        .map(|validation_input| extract_shard_key(request.sql, validation_input))
+        .unwrap_or(ShardExtraction::Unknown);
+
+    route_maps
+        .iter()
+        .enumerate()
+        .filter(|(_, route_map)| {
+            route_map_matches_preview_context(route_map, request, &explicit_hint, &extraction)
+        })
+        .min_by_key(|(index, route_map)| {
+            (
+                route_map
+                    .priority
+                    .map(|priority| priority.0)
+                    .unwrap_or(u32::MAX),
+                *index as u32,
+            )
+        })
+        .map(|(_, route_map)| route_map)
+}
+
+fn route_map_matches_preview_context(
+    route_map: &RouteMapConfig,
+    request: RoutePreviewRequest<'_>,
+    explicit_hint: &ShardHint,
+    extraction: &ShardExtraction,
+) -> bool {
+    match &route_map.scope {
+        ShardScopeConfig::DatabaseUser { database, user } => {
+            request.database.eq_ignore_ascii_case(database)
+                && request.user.eq_ignore_ascii_case(user)
+        }
+        ShardScopeConfig::ApplicationName { application_name } => request
+            .application_name
+            .is_some_and(|value| value.eq_ignore_ascii_case(application_name)),
+        ShardScopeConfig::TenantKey { tenant_key } => {
+            matches_explicit_tenant_hint(explicit_hint, tenant_key)
+        }
+        ShardScopeConfig::SchemaTable {
+            schema,
+            table: expected_table,
+        } => matches!(
+            extraction,
+            ShardExtraction::Key {
+                schema: actual_schema,
+                table: actual_table,
+                ..
+            } if actual_table.eq_ignore_ascii_case(expected_table)
+                && schema_matches_scope(actual_schema.as_deref(), schema)
+        ),
+    }
+}
+
+fn matches_explicit_tenant_hint(hint: &ShardHint, tenant_key: &str) -> bool {
+    match hint {
+        ShardHint::Shard(value) | ShardHint::Tenant(value) | ShardHint::Route(value) => {
+            value.as_ref().eq_ignore_ascii_case(tenant_key)
+        }
+        ShardHint::None | ShardHint::Unknown => false,
+    }
+}
+
+fn schema_matches_scope(actual_schema: Option<&str>, expected_schema: &str) -> bool {
+    actual_schema.is_some_and(|schema| schema.eq_ignore_ascii_case(expected_schema))
+}
+
+fn build_preview_route_map(
+    route_map: &RouteMapConfig,
+    route_key: &RouteKey,
+    policy_config: MultiShardPolicyConfig,
+) -> Result<ShardRouteMap, RoutePreviewError> {
+    let scope = match &route_map.scope {
+        ShardScopeConfig::DatabaseUser { .. } | ShardScopeConfig::ApplicationName { .. } => {
+            ShardScope::global()
+        }
+        ShardScopeConfig::SchemaTable { schema, table } => {
+            ShardScope::table(TableScope::new(schema.as_str(), table.as_str()))
+        }
+        ShardScopeConfig::TenantKey { tenant_key } => {
+            ShardScope::tenant(TenantScope::new(tenant_key.as_str()))
+        }
+    };
+    let strategy = match route_map.strategy {
+        ShardStrategyConfig::Hash => ShardStrategy::Hash,
+        ShardStrategyConfig::Range => ShardStrategy::Range,
+        ShardStrategyConfig::List => ShardStrategy::List,
+    };
+    let policy = match policy_config {
+        MultiShardPolicyConfig::Reject => MultiShardPolicy::Reject,
+        MultiShardPolicyConfig::FirstMatch => MultiShardPolicy::FirstMatch,
+        MultiShardPolicyConfig::FanOut => MultiShardPolicy::FanOut,
+    };
+
+    let routes = route_map
+        .targets
+        .iter()
+        .map(|target| {
+            let backend_role = match target {
+                ShardTargetConfig::Primary { .. } => pg_kinetic_core::routing::BackendRole::Primary,
+                ShardTargetConfig::Replicas { .. } => {
+                    pg_kinetic_core::routing::BackendRole::Replica
+                }
+            };
+            let shard_id = ShardId::new(match target {
+                ShardTargetConfig::Primary { shard_id }
+                | ShardTargetConfig::Replicas { shard_id } => shard_id.as_str().to_owned(),
+            })
+            .map_err(|error| RoutePreviewError::new("invalid_shard_id", error.to_string()))?;
+            Ok(ShardRoute::new(
+                pg_kinetic_core::sharding::ShardTarget::new(
+                    route_key.clone(),
+                    backend_role,
+                    shard_id,
+                ),
+                ShardRouteReason::AdminOverride,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    ShardRouteMap::new(scope, strategy, policy, routes).map_err(|error| match error {
+        ShardValidationError::MultiShardRejected => {
+            RoutePreviewError::new("multi_shard_rejected", error.to_string())
+        }
+        other => RoutePreviewError::new("invalid_route_map", other.to_string()),
+    })
+}
+
+fn preview_route_map_validation_input(
+    route_maps: &[RouteMapConfig],
+) -> Option<RouteMapValidationInput> {
+    let sharded_tables = route_maps
+        .iter()
+        .filter_map(|route_map| match &route_map.scope {
+            ShardScopeConfig::SchemaTable { schema, table } => Some(ShardedTableDefinition {
+                name: format!("{schema}.{table}"),
+                enabled: true,
+                shard_key_column: Some(String::from("tenant_id")),
+            }),
+            ShardScopeConfig::DatabaseUser { .. }
+            | ShardScopeConfig::ApplicationName { .. }
+            | ShardScopeConfig::TenantKey { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    if sharded_tables.is_empty() {
+        None
+    } else {
+        Some(RouteMapValidationInput {
+            routes: vec![RouteDefinition {
+                name: String::from("primary"),
+                priority: None,
+                is_default: true,
+            }],
+            sharded_tables,
+            shard_rules: Vec::new(),
+        })
+    }
+}
+
+fn preview_route_health_snapshot(route_maps: &[ShardRouteMap]) -> RouteHealthSnapshot {
+    let mut replicas = Vec::new();
+    for (offset, _) in route_maps
+        .iter()
+        .flat_map(|route_map| route_map.routes().iter())
+        .filter(|route| {
+            route.target().backend_role() == pg_kinetic_core::routing::BackendRole::Replica
+        })
+        .enumerate()
+    {
+        let replica_id = offset as u64 + 1;
+        replicas.push(ReplicaCandidate::new(replica_id, true, None, Some(0)));
+    }
+
+    RouteHealthSnapshot::new(replicas)
 }
 
 #[derive(Clone, Debug)]

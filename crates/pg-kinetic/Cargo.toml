@@ -7,9 +7,12 @@ readme.workspace = true
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+serde = { version = "1", features = ["derive"] }
 pg-kinetic-core = { path = "../pg-kinetic-core" }
 pg-kinetic-proxy = { path = "../pg-kinetic-proxy" }
 pg-kinetic-wire = { path = "../pg-kinetic-wire" }
+toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
