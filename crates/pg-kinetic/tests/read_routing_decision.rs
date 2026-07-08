@@ -297,6 +297,80 @@ fn strict_fresh_requires_session_lsn_and_lag_freshness() {
 }
 
 #[test]
+fn no_healthy_replica_with_primary_routes_to_primary() {
+    let planner = planner(
+        ReadRoutingMode::PreferReplica,
+        FallbackPolicy::Primary,
+        FreshnessPolicy::SessionWriteLsn,
+        1_000,
+    );
+    let health = snapshot(vec![replica(
+        1,
+        false,
+        Some(PgLsn::from_parts(1, 10)),
+        Some(5),
+    )]);
+
+    let target = choose_routing_target(
+        &planner,
+        context("SELECT 1", TransactionState::Idle, None, &health),
+    );
+
+    assert_primary(target, RoutingReason::FallbackPrimary);
+}
+
+#[test]
+fn no_healthy_replica_with_reject_returns_reject() {
+    let planner = planner(
+        ReadRoutingMode::PreferReplica,
+        FallbackPolicy::Reject,
+        FreshnessPolicy::SessionWriteLsn,
+        1_000,
+    );
+    let health = snapshot(vec![replica(
+        1,
+        false,
+        Some(PgLsn::from_parts(1, 10)),
+        Some(5),
+    )]);
+
+    let target = choose_routing_target(
+        &planner,
+        context("SELECT 1", TransactionState::Idle, None, &health),
+    );
+
+    assert_reject(target, RoutingReason::FallbackReject);
+}
+
+#[test]
+fn stale_replica_with_strict_freshness_follows_fallback_policy() {
+    let planner = planner(
+        ReadRoutingMode::PreferReplica,
+        FallbackPolicy::Reject,
+        FreshnessPolicy::SessionWriteLsnAndMaxLag,
+        10,
+    );
+    let health = snapshot(vec![replica(
+        9,
+        true,
+        Some(PgLsn::from_parts(2, 10)),
+        Some(100),
+    )]);
+
+    let target = choose_routing_target(
+        &planner,
+        context(
+            "/* pg-kinetic: strict-fresh */ SELECT 1",
+            TransactionState::Idle,
+            Some(PgLsn::from_parts(2, 20)),
+            &health,
+        ),
+    );
+
+    assert_reject(target, RoutingReason::ReplicaStale);
+}
+
+#[test]
 fn no_healthy_replica_follows_fallback_policy() {
     let planner = planner(
         ReadRoutingMode::PreferReplica,
@@ -586,6 +660,7 @@ async fn reject_fallback_returns_a_postgresql_error_response() {
         .iter()
         .any(|event| event.starts_with("primary:query:")));
     assert_eq!(response.first().copied(), Some(b'E'));
+    assert_eq!(error_sqlstate(&response), Some("57P03"));
 
     let checkout = checkout_snapshot(&snapshot_store).await;
     assert_reject(checkout.decision, RoutingReason::FallbackReject);
@@ -868,10 +943,20 @@ async fn read_until_ready_for_query(stream: &mut TcpStream, context: &str) {
 }
 
 async fn read_response_bytes(stream: &mut TcpStream, context: &str) -> Vec<u8> {
-    let mut response = vec![0_u8; 1024];
-    let read = stream.read(&mut response).await.expect(context);
-    response.truncate(read);
-    response
+    let mut response = Vec::new();
+    let mut buffer = BytesMut::with_capacity(1024);
+    loop {
+        let before = buffer.len();
+        let read = stream.read_buf(&mut buffer).await.expect(context);
+        assert!(read > 0, "{context}: client disconnected");
+        response.extend_from_slice(&buffer[before..]);
+
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect(context) {
+            if frame.ready_status().is_some() {
+                return response;
+            }
+        }
+    }
 }
 
 fn normalize_sql(sql: &str) -> String {
@@ -988,4 +1073,15 @@ fn ready_in_transaction() -> Vec<u8> {
     bytes.put_i32(5);
     bytes.put_u8(b'T');
     bytes.to_vec()
+}
+
+fn error_sqlstate(response: &[u8]) -> Option<&'static str> {
+    let mut buffer = BytesMut::from(response);
+    while let Some(frame) = parse_backend_frame(&mut buffer).ok().flatten() {
+        if let Some(sqlstate) = frame.sqlstate() {
+            return Some(sqlstate.as_str());
+        }
+    }
+
+    None
 }

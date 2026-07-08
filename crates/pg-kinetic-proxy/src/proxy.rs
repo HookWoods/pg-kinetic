@@ -78,6 +78,8 @@ use pg_kinetic_wire::{
 use std::borrow::Cow;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
+const REPLICA_UNAVAILABLE_MESSAGE: &str = "no healthy replica available";
 
 #[derive(Debug)]
 pub(crate) struct ClientConnection {
@@ -538,6 +540,12 @@ async fn handle_client(
             error_response_and_ready(&mut client, &qos, message).await?;
             return Ok(());
         }
+        Err(CheckoutFailure::Postgres { sqlstate, message }) => {
+            startup_timer.finish(MetricOutcome::Rejected);
+            error_response_and_ready_with_state(&mut client, sqlstate, message, ReadyStatus::Idle)
+                .await?;
+            return Ok(());
+        }
         Err(CheckoutFailure::Close) => {
             startup_timer.finish(MetricOutcome::Canceled);
             return Ok(());
@@ -703,6 +711,16 @@ async fn handle_client(
                         Ok(backend) => backend,
                         Err(CheckoutFailure::Overload(message)) => {
                             error_response_and_ready(&mut client, &qos, message).await?;
+                            return Ok(());
+                        }
+                        Err(CheckoutFailure::Postgres { sqlstate, message }) => {
+                            error_response_and_ready_with_state(
+                                &mut client,
+                                sqlstate,
+                                message,
+                                ReadyStatus::Idle,
+                            )
+                            .await?;
                             return Ok(());
                         }
                         Err(CheckoutFailure::Close) => {
@@ -1092,21 +1110,26 @@ async fn checkout_backend(
     let pool_mode = match mode {
         CheckoutMode::AllowConnect => PoolCheckoutMode::AllowConnect,
     };
-    if matches!(
-        target,
-        RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
-    ) {
-        let reason = target.reason();
+    if matches!(target, RoutingTarget::Wait { .. }) {
         telemetry::emit_debug_sample(
             &debug_sampler,
             DebugSample::overload_rejected(session_id, route.clone(), checkout_mode_label(mode)),
         );
         timer.finish(MetricOutcome::Rejected);
-        return Err(CheckoutFailure::Overload(match reason {
-            RoutingReason::FallbackWait => "backend checkout is waiting for a replica",
-            RoutingReason::FallbackReject => "backend checkout rejected",
-            _ => "backend checkout rejected",
-        }));
+        return Err(CheckoutFailure::Overload(
+            "backend checkout is waiting for a replica",
+        ));
+    }
+    if matches!(target, RoutingTarget::Reject { .. }) {
+        telemetry::emit_debug_sample(
+            &debug_sampler,
+            DebugSample::overload_rejected(session_id, route.clone(), checkout_mode_label(mode)),
+        );
+        timer.finish(MetricOutcome::Rejected);
+        return Err(CheckoutFailure::Postgres {
+            sqlstate: CANNOT_CONNECT_NOW_SQLSTATE,
+            message: REPLICA_UNAVAILABLE_MESSAGE,
+        });
     }
 
     let backend_result = route_pools
@@ -1202,6 +1225,10 @@ enum CheckoutMode {
 #[derive(Debug)]
 enum CheckoutFailure {
     Overload(&'static str),
+    Postgres {
+        sqlstate: &'static str,
+        message: &'static str,
+    },
     Close,
     Fatal(anyhow::Error),
 }
@@ -1374,8 +1401,20 @@ fn build_route_health_snapshot(
                         .lag_duration
                         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
                 });
+                let split_brain_warning = replica_health.and_then(|snapshot| snapshot.role.warning);
+                if let Some(warning) = split_brain_warning {
+                    tracing::warn!(
+                        endpoint_id = replica.id(),
+                        expected_role = warning.expected_role.as_str(),
+                        observed_role = warning.observed_role.as_str(),
+                        "split-brain warning: replica role does not match expected role"
+                    );
+                }
 
-                ReplicaCandidate::new(replica.id(), replica.is_healthy(), replay_lsn, lag_ms)
+                let mut candidate =
+                    ReplicaCandidate::new(replica.id(), replica.is_healthy(), replay_lsn, lag_ms);
+                candidate.split_brain = split_brain_warning.is_some();
+                candidate
             })
             .collect(),
     )
@@ -1429,9 +1468,9 @@ fn route_checkout_freshness_outcome(
         RoutingTarget::Reject { reason } => Some(match reason {
             RoutingReason::ReplicaStale => FreshnessStatus::Stale,
             RoutingReason::FreshnessRequired => FreshnessStatus::Unknown,
-            RoutingReason::ReplicaUnavailable | RoutingReason::FallbackReject => {
-                FreshnessStatus::Unavailable
-            }
+            RoutingReason::ReplicaUnavailable
+            | RoutingReason::FallbackReject
+            | RoutingReason::RequireReplicaMode => FreshnessStatus::Unavailable,
             _ => FreshnessStatus::Unknown,
         }),
         RoutingTarget::Primary { reason } => match reason {
@@ -1500,7 +1539,16 @@ async fn wait_for_checkout_target(
         );
     }
 
-    checkout_target
+    if matches!(
+        checkout_target,
+        RoutingTarget::Wait {
+            reason: RoutingReason::FallbackWait,
+        }
+    ) {
+        fallback_target(read_routing_mode, FallbackPolicy::Primary)
+    } else {
+        checkout_target
+    }
 }
 
 fn build_route_pools(

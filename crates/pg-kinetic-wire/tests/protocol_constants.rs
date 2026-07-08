@@ -18,6 +18,7 @@ fn protocol_constants_match_postgres_wire_values() {
 fn sqlstate_constants_are_stable() {
     assert_eq!(SqlState::TooManyConnections.as_str(), "53300");
     assert_eq!(SqlState::QueryCanceled.as_str(), "57014");
+    assert_eq!(SqlState::CannotConnectNow.as_str(), "57P03");
     assert_eq!(SqlState::InvalidSqlStatementName.as_str(), "26000");
     assert_eq!(SqlState::FeatureNotSupported.as_str(), "0A000");
 }

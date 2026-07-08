@@ -133,6 +133,7 @@ impl RouteHealthSnapshot {
 pub struct ReplicaCandidate {
     pub replica_id: u64,
     pub healthy: bool,
+    pub split_brain: bool,
     pub replay_lsn: Option<PgLsn>,
     pub lag_ms: Option<u64>,
 }
@@ -148,6 +149,7 @@ impl ReplicaCandidate {
         Self {
             replica_id,
             healthy,
+            split_brain: false,
             replay_lsn,
             lag_ms,
         }
@@ -362,7 +364,7 @@ fn select_safe_replica(
     let mut candidates: Vec<&ReplicaCandidate> = health
         .replicas
         .iter()
-        .filter(|candidate| candidate.healthy)
+        .filter(|candidate| candidate.healthy && !candidate.split_brain)
         .filter(|candidate| {
             replica_satisfies_freshness(
                 candidate,

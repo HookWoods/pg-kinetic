@@ -1,10 +1,12 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use bytes::{BufMut, BytesMut};
+use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 use pg_kinetic::{
     config::{
         BackendEndpointConfig, CapacityConfig, Config, ConnectionConfig, FreshnessConfig, HaConfig,
@@ -24,6 +26,7 @@ use pg_kinetic::{
 use pg_kinetic_core::{
     ha::{
         EndpointHealth, EndpointRoleState, HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome,
+        SplitBrainWarning,
     },
     lsn::PgLsn,
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
@@ -34,6 +37,100 @@ use tokio::{
     sync::Mutex,
     time::sleep,
 };
+
+static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
+
+fn install_metrics_recorder() -> Arc<TestRecorder> {
+    METRICS_RECORDER
+        .get_or_init(|| {
+            let recorder = Arc::new(TestRecorder::default());
+            metrics::set_global_recorder(recorder.clone()).expect("install metrics recorder");
+            recorder
+        })
+        .clone()
+}
+
+#[derive(Debug, Default)]
+struct TestRecorder {
+    registrations: StdMutex<HashSet<String>>,
+}
+
+impl TestRecorder {
+    fn has_metric(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .contains(&metric_signature(name, labels))
+    }
+}
+
+impl Recorder for TestRecorder {
+    fn describe_counter(
+        &self,
+        _key: metrics::KeyName,
+        _unit: Option<metrics::Unit>,
+        _description: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _key: metrics::KeyName,
+        _unit: Option<metrics::Unit>,
+        _description: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _key: metrics::KeyName,
+        _unit: Option<metrics::Unit>,
+        _description: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Counter::noop()
+    }
+
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Gauge::noop()
+    }
+
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Histogram::noop()
+    }
+}
+
+fn metric_signature_from_key(key: &Key) -> String {
+    let labels = key
+        .labels()
+        .map(|label| format!("{}={}", label.key(), label.value()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{}", key.name(), labels)
+}
+
+fn metric_signature(name: &str, labels: &[(&str, &str)]) -> String {
+    let labels = labels
+        .iter()
+        .map(|(label_key, label_value)| format!("{label_key}={label_value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}|{labels}")
+}
 
 fn query_packet(sql: &str) -> Vec<u8> {
     let mut packet = BytesMut::new();
@@ -212,6 +309,17 @@ fn ready_in_transaction() -> Vec<u8> {
     bytes.to_vec()
 }
 
+fn error_sqlstate(response: &[u8]) -> Option<&'static str> {
+    let mut buffer = BytesMut::from(response);
+    while let Some(frame) = parse_backend_frame(&mut buffer).ok().flatten() {
+        if let Some(sqlstate) = frame.sqlstate() {
+            return Some(sqlstate.as_str());
+        }
+    }
+
+    None
+}
+
 async fn spawn_proxy(
     primary_addr: SocketAddr,
     replica_addr: SocketAddr,
@@ -220,6 +328,7 @@ async fn spawn_proxy(
     max_replica_lag_ms: u64,
     read_after_write_timeout_ms: u64,
 ) -> (SocketAddr, SnapshotStore) {
+    let _metrics_recorder = install_metrics_recorder();
     let route = RouteConfig {
         primary: BackendEndpointConfig {
             address: primary_addr,
@@ -309,6 +418,36 @@ fn publish_replica_health(
     );
     snapshot.health = HealthProbeOutcome::new(EndpointHealth::Healthy, false, 0);
     snapshot.role = RoleProbeOutcome::new(EndpointRoleState::Replica, None);
+    snapshot.replay_lsn = Some(replay_lsn);
+    snapshot.lag_duration = Some(Duration::from_millis(lag_ms));
+    snapshot.lag_state = if lag_ms == 0 {
+        ReplicaLagState::Fresh
+    } else {
+        ReplicaLagState::Lagging
+    };
+    snapshot.last_successful_probe_at = Some(std::time::SystemTime::now());
+    snapshot_store.set_replica_health_snapshot(snapshot);
+}
+
+fn publish_replica_split_brain_health(
+    snapshot_store: &SnapshotStore,
+    replica_id: u64,
+    replica_addr: SocketAddr,
+    replay_lsn: PgLsn,
+    lag_ms: u64,
+    expected_role: pg_kinetic_core::routing::BackendRole,
+    observed_role: pg_kinetic_core::routing::BackendRole,
+) {
+    let mut snapshot = ReplicaHealthSnapshot::new(
+        replica_id,
+        replica_addr,
+        pg_kinetic_core::routing::BackendRole::Replica,
+    );
+    snapshot.health = HealthProbeOutcome::new(EndpointHealth::Healthy, false, 0);
+    snapshot.role = RoleProbeOutcome::new(
+        EndpointRoleState::Warning,
+        Some(SplitBrainWarning::new(expected_role, observed_role)),
+    );
     snapshot.replay_lsn = Some(replay_lsn);
     snapshot.lag_duration = Some(Duration::from_millis(lag_ms));
     snapshot.lag_state = if lag_ms == 0 {
@@ -571,6 +710,7 @@ async fn fallback_wait_waits_until_replica_is_fresh_enough() {
 
 #[tokio::test]
 async fn fallback_reject_returns_postgresql_error_when_freshness_is_impossible() {
+    let recorder = install_metrics_recorder();
     let (primary_addr, primary_events) = spawn_backend("primary", Some("0/20")).await;
     let (replica_addr, _replica_events) = spawn_backend("replica", None).await;
     let (proxy_addr, snapshot_store) = spawn_proxy(
@@ -605,6 +745,7 @@ async fn fallback_reject_returns_postgresql_error_when_freshness_is_impossible()
 
     let response = run_simple_query(&mut client, "select 1").await;
     assert_eq!(response.first().copied(), Some(b'E'));
+    assert_eq!(error_sqlstate(&response), Some("57P03"));
 
     let primary_events_snapshot = collect_events(&primary_events).await;
     assert!(
@@ -613,6 +754,138 @@ async fn fallback_reject_returns_postgresql_error_when_freshness_is_impossible()
             .any(|event| event == "primary:query:select 1"),
         "events: {primary_events_snapshot:?}"
     );
+
+    let checkout = snapshot_store
+        .route_checkout_snapshots()
+        .into_iter()
+        .next()
+        .expect("checkout snapshot");
+    assert_eq!(checkout.decision.reason().as_str(), "replica_stale");
+    assert!(recorder.has_metric("pg_kinetic_read_after_write_total", &[("outcome", "stale")]));
+}
+
+#[tokio::test]
+async fn wait_fallback_times_out_then_routes_to_primary() {
+    let recorder = install_metrics_recorder();
+    let (primary_addr, primary_events) = spawn_backend("primary", Some("0/20")).await;
+    let (replica_addr, replica_events) = spawn_backend("replica", None).await;
+    let (proxy_addr, snapshot_store) = spawn_proxy(
+        primary_addr,
+        replica_addr,
+        FallbackPolicy::Wait,
+        FreshnessPolicy::SessionWriteLsn,
+        1_000,
+        150,
+    )
+    .await;
+
+    let mut client = open_client(proxy_addr).await;
+    run_transaction(
+        &mut client,
+        &[
+            "begin read write",
+            "insert into accounts values (1)",
+            "commit",
+        ],
+    )
+    .await;
+    sleep(Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    let response = run_simple_query(&mut client, "select 1").await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(120),
+        "wait path returned too early: {elapsed:?}"
+    );
+    assert_ne!(response.first().copied(), Some(b'E'));
+
+    let primary_events_snapshot = collect_events(&primary_events).await;
+    assert!(
+        primary_events_snapshot
+            .iter()
+            .any(|event| event == "primary:query:select 1"),
+        "events: {primary_events_snapshot:?}"
+    );
+    assert!(!collect_events(&replica_events)
+        .await
+        .iter()
+        .any(|event| event == "replica:query:select 1"));
+
+    let checkout = snapshot_store
+        .route_checkout_snapshots()
+        .into_iter()
+        .next()
+        .expect("checkout snapshot");
+    assert_eq!(checkout.decision.reason().as_str(), "fallback_primary");
+    assert!(recorder.has_metric("pg_kinetic_read_after_write_total", &[("outcome", "stale")]));
+}
+
+#[tokio::test]
+async fn split_brain_role_warning_follows_fallback_policy() {
+    let recorder = install_metrics_recorder();
+    let (primary_addr, primary_events) = spawn_backend("primary", Some("0/20")).await;
+    let (replica_addr, replica_events) = spawn_backend("replica", None).await;
+    let (proxy_addr, snapshot_store) = spawn_proxy(
+        primary_addr,
+        replica_addr,
+        FallbackPolicy::Primary,
+        FreshnessPolicy::SessionWriteLsn,
+        1_000,
+        200,
+    )
+    .await;
+
+    publish_replica_split_brain_health(
+        &snapshot_store,
+        1,
+        replica_addr,
+        PgLsn::from_parts(0, 40),
+        5,
+        pg_kinetic_core::routing::BackendRole::Replica,
+        pg_kinetic_core::routing::BackendRole::Primary,
+    );
+
+    let mut client = open_client(proxy_addr).await;
+    run_transaction(
+        &mut client,
+        &[
+            "begin read write",
+            "insert into accounts values (1)",
+            "commit",
+        ],
+    )
+    .await;
+    sleep(Duration::from_millis(100)).await;
+
+    let response = run_simple_query(&mut client, "select 1").await;
+    assert_ne!(response.first().copied(), Some(b'E'));
+
+    assert!(collect_events(&primary_events)
+        .await
+        .iter()
+        .any(|event| event == "primary:query:select 1"));
+    assert!(!collect_events(&replica_events)
+        .await
+        .iter()
+        .any(|event| event == "replica:query:select 1"));
+
+    let checkout = snapshot_store
+        .route_checkout_snapshots()
+        .into_iter()
+        .next()
+        .expect("checkout snapshot");
+    assert_eq!(checkout.decision.reason().as_str(), "fallback_primary");
+    assert!(snapshot_store
+        .replica_health_snapshots()
+        .into_iter()
+        .next()
+        .expect("replica health snapshot")
+        .role
+        .warning
+        .is_some());
+    assert!(recorder.has_metric("pg_kinetic_read_after_write_total", &[("outcome", "stale")]));
 }
 
 #[tokio::test]
