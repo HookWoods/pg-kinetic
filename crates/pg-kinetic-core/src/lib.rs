@@ -16,4 +16,5 @@ pub mod security;
 pub mod session;
 pub mod sql;
 pub mod sql_classify;
+pub mod shard_extract;
 pub mod virtual_session;
