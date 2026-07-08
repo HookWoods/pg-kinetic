@@ -13,6 +13,7 @@ The first milestone focuses on:
 
 - [Admin reference](docs/admin.md)
 - [Metrics catalog](docs/metrics.md)
+- [Read routing guide](docs/read-routing.md)
 
 ## Local Benchmark Stack
 
@@ -145,6 +146,18 @@ Metrics:
 - `pg_kinetic_backend_cleanup_total`
 - `pg_kinetic_backend_recovery_total`
 - `pg_kinetic_backend_sqlstate_total`
+
+## Read Routing
+
+pg-kinetic can route safe reads to replicas while keeping conservative fallbacks for anything ambiguous or stale.
+
+- Read-only statements and read-only transactions are the best fit for replica routing.
+- `BEGIN READ ONLY` and `SET TRANSACTION READ ONLY` strengthen the read signal inside a transaction.
+- `/* pg-kinetic: replica */`, `/* pg-kinetic: primary */`, `/* pg-kinetic: stale-ok */`, and `/* pg-kinetic: strict-fresh */` provide explicit per-statement hints.
+- Read-after-write protection uses session write LSN tracking, replica lag checks, and the configured timeout before falling back.
+- `SHOW CLIENTS`, `SHOW SERVERS`, and `SHOW ROUTES` expose the live routing picture for operators.
+
+See [docs/read-routing.md](docs/read-routing.md) for the full rollout and policy guide.
 
 ## Production Security And Operations
 

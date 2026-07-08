@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Context;
 use bytes::{BufMut, BytesMut};
@@ -16,8 +21,8 @@ use crate::{
     reload,
     snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
-        PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
-        SnapshotStore,
+        PreparedSnapshot, RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
+        RoutePolicySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -26,6 +31,7 @@ use pg_kinetic_core::{
         parse_admin_command, AdminColumn, AdminColumnType, AdminCommand, AdminRow, AdminTable,
         AdminView,
     },
+    lsn::PgLsn,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     session::PinReason,
@@ -374,16 +380,25 @@ fn ready_for_query(status: ReadyStatusByte) -> BytesMut {
 
 fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
     let table = match view {
-        AdminView::Clients => clients_table(&state.snapshot_store.client_snapshots()),
+        AdminView::Clients => clients_table(
+            &state.snapshot_store.client_snapshots(),
+            &state.snapshot_store.route_checkout_snapshots(),
+        ),
         AdminView::Pools => pools_table(&state.snapshot_store.pool_snapshot()),
-        AdminView::Servers => servers_table(&state.snapshot_store.server_snapshots()),
+        AdminView::Servers => servers_table(
+            &state.snapshot_store.server_snapshots(),
+            &state.snapshot_store.replica_health_snapshots(),
+        ),
         AdminView::Prepared => prepared_table(&state.snapshot_store.prepared_snapshot()),
         AdminView::Pinning => pinning_table(&state.snapshot_store.pinning_snapshots()),
         AdminView::Recovery => recovery_table(&state.snapshot_store.recovery_snapshots()),
         AdminView::Backpressure => {
             backpressure_table(&state.snapshot_store.backpressure_snapshots())
         }
-        AdminView::Routes => routes_table(&state.snapshot_store.route_snapshots()),
+        AdminView::Routes => routes_table(
+            &state.snapshot_store.route_snapshots(),
+            &state.snapshot_store.route_policy_snapshots(),
+        ),
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), &state.config),
     };
@@ -391,7 +406,15 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
     Some(admin_table_response(table))
 }
 
-fn clients_table(clients: &[ClientSnapshot]) -> AdminTable {
+fn clients_table(
+    clients: &[ClientSnapshot],
+    route_checkouts: &[RouteCheckoutSnapshot],
+) -> AdminTable {
+    let route_checkouts = route_checkouts
+        .iter()
+        .map(|snapshot| (snapshot.route_key.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
+
     admin_table(
         AdminView::Clients,
         &[
@@ -402,10 +425,17 @@ fn clients_table(clients: &[ClientSnapshot]) -> AdminTable {
             ("route_key", AdminColumnType::Text),
             ("state", AdminColumnType::Text),
             ("connected_duration_ms", AdminColumnType::Int8),
+            ("current_target_role", AdminColumnType::Text),
+            ("required_session_write_lsn", AdminColumnType::Text),
         ],
         clients
             .iter()
             .map(|snapshot| {
+                let checkout = snapshot
+                    .route_key
+                    .as_ref()
+                    .and_then(|route_key| route_checkouts.get(route_key).copied());
+
                 AdminRow::new(vec![
                     snapshot.client_id.to_string(),
                     optional_text(snapshot.user.as_deref()),
@@ -414,6 +444,14 @@ fn clients_table(clients: &[ClientSnapshot]) -> AdminTable {
                     optional_route_key(snapshot.route_key.as_ref()),
                     snapshot.state.clone(),
                     duration_millis(snapshot.connected_duration),
+                    optional_text(
+                        checkout
+                            .and_then(|checkout| checkout.decision.clone().target_role())
+                            .map(|role| role.as_str()),
+                    ),
+                    optional_pglsn(
+                        checkout.and_then(|checkout| checkout.required_session_write_lsn),
+                    ),
                 ])
             })
             .collect(),
@@ -440,7 +478,15 @@ fn pools_table(pool: &PoolSnapshot) -> AdminTable {
     )
 }
 
-fn servers_table(servers: &[ServerSnapshot]) -> AdminTable {
+fn servers_table(
+    servers: &[ServerSnapshot],
+    replica_health: &[ReplicaHealthSnapshot],
+) -> AdminTable {
+    let replica_health = replica_health
+        .iter()
+        .map(|snapshot| (snapshot.endpoint_id, snapshot))
+        .collect::<HashMap<_, _>>();
+
     admin_table(
         AdminView::Servers,
         &[
@@ -449,16 +495,32 @@ fn servers_table(servers: &[ServerSnapshot]) -> AdminTable {
             ("state", AdminColumnType::Text),
             ("last_checkout_age_ms", AdminColumnType::Int8),
             ("in_transaction", AdminColumnType::Bool),
+            ("endpoint_role", AdminColumnType::Text),
+            ("detected_role", AdminColumnType::Text),
+            ("health", AdminColumnType::Text),
+            ("lag_ms", AdminColumnType::Text),
+            ("replay_lsn", AdminColumnType::Text),
+            ("last_probe_age_ms", AdminColumnType::Text),
         ],
         servers
             .iter()
             .map(|snapshot| {
+                let health = replica_health.get(&snapshot.backend_id).copied();
+
                 AdminRow::new(vec![
                     snapshot.backend_id.to_string(),
                     optional_route_key(snapshot.route_key.as_ref()),
                     snapshot.state.clone(),
                     duration_millis(snapshot.age),
                     snapshot.in_transaction.to_string(),
+                    optional_text(health.map(|snapshot| snapshot.expected_role.as_str())),
+                    optional_text(health.map(|snapshot| snapshot.role.state.as_str())),
+                    optional_text(health.map(|snapshot| snapshot.health.state.as_str())),
+                    optional_duration(health.and_then(|snapshot| snapshot.lag_duration)),
+                    optional_pglsn(health.and_then(|snapshot| snapshot.replay_lsn)),
+                    optional_probe_age(
+                        health.and_then(|snapshot| snapshot.last_successful_probe_at),
+                    ),
                 ])
             })
             .collect(),
@@ -568,7 +630,13 @@ fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
     )
 }
 
-fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
+fn routes_table(routes: &[RouteSnapshot], route_policies: &[RoutePolicySnapshot]) -> AdminTable {
+    let route_policies = route_policies
+        .iter()
+        .cloned()
+        .map(|snapshot| (snapshot.route_key.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
+
     admin_table(
         AdminView::Routes,
         &[
@@ -578,10 +646,21 @@ fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
             ("query_class", AdminColumnType::Text),
             ("client_count", AdminColumnType::Int8),
             ("backend_count", AdminColumnType::Int8),
+            ("primary_count", AdminColumnType::Int8),
+            ("replica_count", AdminColumnType::Int8),
+            ("read_routing_mode", AdminColumnType::Text),
+            ("fallback_policy", AdminColumnType::Text),
+            ("freshness_policy", AdminColumnType::Text),
+            ("read_after_write_timeout_ms", AdminColumnType::Int8),
         ],
         routes
             .iter()
             .map(|snapshot| {
+                let policy = route_policies
+                    .get(&snapshot.route_key)
+                    .cloned()
+                    .unwrap_or_else(|| RoutePolicySnapshot::new(snapshot.route_key.clone()));
+
                 AdminRow::new(vec![
                     snapshot.route_key.database().to_string(),
                     snapshot.route_key.user().to_string(),
@@ -589,6 +668,12 @@ fn routes_table(routes: &[RouteSnapshot]) -> AdminTable {
                     snapshot.route_key.query_class().to_string(),
                     snapshot.client_count.to_string(),
                     snapshot.backend_count.to_string(),
+                    policy.primary_count.to_string(),
+                    policy.replica_count.to_string(),
+                    policy.read_routing_mode.as_str().to_string(),
+                    policy.fallback_policy.as_str().to_string(),
+                    policy.freshness_policy.as_str().to_string(),
+                    policy.read_after_write_timeout_ms.to_string(),
                 ])
             })
             .collect(),
@@ -770,6 +855,10 @@ fn optional_duration(value: Option<std::time::Duration>) -> String {
     value.map_or_else(|| String::from("<none>"), duration_millis)
 }
 
+fn optional_pglsn(value: Option<PgLsn>) -> String {
+    value.map_or_else(|| String::from("<none>"), |lsn| lsn.to_string())
+}
+
 fn optional_socket_addr(value: Option<std::net::SocketAddr>) -> String {
     value.map_or_else(|| String::from("<none>"), |address| address.to_string())
 }
@@ -780,6 +869,17 @@ fn optional_u32(value: Option<u32>) -> String {
 
 fn optional_usize(value: Option<usize>) -> String {
     value.map_or_else(|| String::from("<none>"), |number| number.to_string())
+}
+
+fn optional_probe_age(value: Option<SystemTime>) -> String {
+    value.map_or_else(
+        || String::from("<none>"),
+        |probe_time| {
+            SystemTime::now()
+                .duration_since(probe_time)
+                .map_or_else(|_| String::from("0"), duration_millis)
+        },
+    )
 }
 
 fn recovery_mode_label(mode: pg_kinetic_core::recovery::RecoveryMode) -> String {

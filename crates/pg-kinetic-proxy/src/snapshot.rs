@@ -12,7 +12,7 @@ use pg_kinetic_core::{
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
-    routing::BackendRole,
+    routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
 };
 
@@ -243,10 +243,37 @@ impl RouteSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutePolicySnapshot {
+    pub route_key: RouteKey,
+    pub primary_count: usize,
+    pub replica_count: usize,
+    pub read_routing_mode: ReadRoutingMode,
+    pub fallback_policy: FallbackPolicy,
+    pub freshness_policy: FreshnessPolicy,
+    pub read_after_write_timeout_ms: u64,
+}
+
+impl RoutePolicySnapshot {
+    #[must_use]
+    pub fn new(route_key: RouteKey) -> Self {
+        Self {
+            route_key,
+            primary_count: 0,
+            replica_count: 0,
+            read_routing_mode: ReadRoutingMode::default(),
+            fallback_policy: FallbackPolicy::Primary,
+            freshness_policy: FreshnessPolicy::SessionWriteLsn,
+            read_after_write_timeout_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteCheckoutSnapshot {
     pub route_key: RouteKey,
     pub decision: RoutingTarget,
     pub freshness_outcome: Option<FreshnessStatus>,
+    pub required_session_write_lsn: Option<PgLsn>,
 }
 
 impl RouteCheckoutSnapshot {
@@ -260,6 +287,7 @@ impl RouteCheckoutSnapshot {
             route_key,
             decision,
             freshness_outcome,
+            required_session_write_lsn: None,
         }
     }
 }
@@ -423,6 +451,7 @@ struct SnapshotStoreInner {
     recoveries: Vec<RecoverySnapshot>,
     backpressure: HashMap<RouteKey, BackpressureSnapshot>,
     routes: HashMap<RouteKey, RouteSnapshot>,
+    route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     settings: SettingsSnapshot,
     limits: LimitsSnapshot,
@@ -740,6 +769,37 @@ impl SnapshotStore {
         sort_by_route_key(routes)
     }
 
+    pub fn set_route_policy_snapshot(&self, snapshot: RoutePolicySnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .route_policies
+            .insert(snapshot.route_key.clone(), snapshot);
+    }
+
+    #[must_use]
+    pub fn route_policy_snapshot(&self, route_key: &RouteKey) -> Option<RoutePolicySnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_policies
+            .get(route_key)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn route_policy_snapshots(&self) -> Vec<RoutePolicySnapshot> {
+        let route_policies = self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_policies
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_by_route_key(route_policies)
+    }
+
     pub fn set_route_checkout_snapshot(&self, snapshot: RouteCheckoutSnapshot) {
         metrics::record_route_checkout_snapshot(&snapshot);
         self.inner
@@ -1032,6 +1092,12 @@ impl RouteSnapshotView for BackpressureSnapshot {
 }
 
 impl RouteSnapshotView for RouteSnapshot {
+    fn route_sort_key(&self) -> (String, String, Option<String>, String, String) {
+        route_sort_key(&self.route_key)
+    }
+}
+
+impl RouteSnapshotView for RoutePolicySnapshot {
     fn route_sort_key(&self) -> (String, String, Option<String>, String, String) {
         route_sort_key(&self.route_key)
     }

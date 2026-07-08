@@ -21,6 +21,19 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 | `pg_kinetic_timeout_total` | counter | `kind` | `1` | Bounded by timeout kind. | Split query, idle client, and idle transaction timeouts to tell workload pressure from hygiene issues. |
 | `pg_kinetic_buffer_limit_total` | counter | `kind` | `1` | Bounded by client/backend buffer kind. | Client limits point to request size; backend limits point to response bursts. |
 
+## Read Routing And Replica Safety
+
+| Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
+| --- | --- | --- | --- | --- | --- |
+| `pg_kinetic_route_decisions_total` | counter | `route`, `target_role`, `query_class` | `1` | Route labels stay bounded by database, user, application name, and query class. | A rising replica share means read routing is working; a rising primary share means the classifier or safety checks are falling back. |
+| `pg_kinetic_route_fallbacks_total` | counter | `route`, `reason`, `fallback_policy` | `1` | Bounded by route, routing reason, and configured fallback policy. | `fallback_wait` or `fallback_reject` spikes point to replica freshness or availability pressure. |
+| `pg_kinetic_read_after_write_wait_ms` | histogram | `route`, `outcome` | `ms` | Outcome is a small freshness enum. | Long waits show read-after-write protection is holding traffic until a replica catches up. |
+| `pg_kinetic_read_after_write_rejections_total` | counter | `route`, `outcome` | `1` | Bounded by freshness outcome. | `stale` or `unavailable` rejections usually mean a strict policy or an unhealthy replica. |
+| `pg_kinetic_replica_health` | gauge | `endpoint`, `health` | `1` | Endpoint labels use numeric ids. | A healthy replica should keep one `healthy` series at `1.0`; anything else should stay `0.0`. |
+| `pg_kinetic_replica_lag_ms` | gauge | `endpoint`, `lag_state` | `1` | Bounded by replica lag state. | Rising lag in `lagging` state means the replica is drifting behind the primary. |
+| `pg_kinetic_replica_replay_lsn` | gauge | `endpoint`, `target_role` | `1` | Bounded by endpoint id and expected role. | Use it with `SHOW SERVERS` to confirm the detected role and replay position line up. |
+| `pg_kinetic_split_brain_warnings_total` | counter | `endpoint`, `target_role`, `reason` | `1` | Bounded by endpoint id, expected role, and warning reason. | Any nonzero value means role autodetection disagrees with the configured target role. |
+
 ## Pinning And Recovery
 
 | Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
@@ -54,6 +67,9 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 - Pool checkout wait: graph p95 of `pg_kinetic_pool_checkout_wait_ms` and overlay `timeout` and `canceled` outcomes.
 - Route waiting clients: plot `pg_kinetic_route_waiting` by route and add `pg_kinetic_route_in_flight` for queue depth context.
 - Overload rejection rate: chart `rate(pg_kinetic_backpressure_events_total{outcome="rejected"}[5m]) / rate(pg_kinetic_backpressure_events_total[5m])`.
+- Read routing mix: compare `pg_kinetic_route_decisions_total{target_role="replica"}` with `target_role="primary"`.
+- Replica freshness: graph `pg_kinetic_read_after_write_wait_ms` and `pg_kinetic_read_after_write_rejections_total` together.
+- Replica safety: show `pg_kinetic_replica_health`, `pg_kinetic_replica_lag_ms`, and `pg_kinetic_split_brain_warnings_total` side by side.
 - Pinning reason counts: bar chart `pg_kinetic_backend_pin_total` by `reason`.
 - Recovery outcomes: stacked bars for `pg_kinetic_backend_recovery_total` by `trigger`, `action`, and `outcome`.
 - Prepared cache materialization/invalidation: compare `pg_kinetic_prepared_events_total{event="materialize"}` with `event="invalidate"`.
@@ -66,6 +82,8 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 
 - A rising checkout wait with flat in-flight usually means the pool is full and work is waiting.
 - A rising route wait with one hot route usually means noisy-neighbor pressure rather than a global capacity issue.
+- A rising primary share in route decisions usually means replicas are unhealthy, too stale, or blocked by a strict freshness policy.
+- A spike in split-brain warnings means role autodetection and the configured endpoint role need attention before trusting replica reads.
 - A sharp rise in prepared invalidations usually means client-side churn or a workload that does not benefit from caching.
 - A sustained spike in TLS or auth failures usually means a rollout or secret mismatch rather than normal traffic variation.
 - A long tail in `backend_checkout` or `auth` usually points to startup-path regressions before user queries are affected.

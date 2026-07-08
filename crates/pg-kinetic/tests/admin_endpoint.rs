@@ -175,6 +175,8 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "route_key",
             "state",
             "connected_duration_ms",
+            "current_target_role",
+            "required_session_write_lsn",
         ],
         &[vec![
             "7",
@@ -184,6 +186,8 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "billing/reporter/dashboard/default",
             "active",
             "3000",
+            "<none>",
+            "<none>",
         ]],
     );
 
@@ -209,6 +213,12 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "state",
             "last_checkout_age_ms",
             "in_transaction",
+            "endpoint_role",
+            "detected_role",
+            "health",
+            "lag_ms",
+            "replay_lsn",
+            "last_probe_age_ms",
         ],
         &[vec![
             "42",
@@ -216,6 +226,12 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "active",
             "9000",
             "true",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
+            "<none>",
         ]],
     );
 
@@ -350,6 +366,12 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "query_class",
             "client_count",
             "backend_count",
+            "primary_count",
+            "replica_count",
+            "read_routing_mode",
+            "fallback_policy",
+            "freshness_policy",
+            "read_after_write_timeout_ms",
         ],
         &[vec![
             "billing",
@@ -358,6 +380,12 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "default",
             "4",
             "2",
+            "0",
+            "0",
+            "off",
+            "primary",
+            "session_write_lsn",
+            "0",
         ]],
     );
 
