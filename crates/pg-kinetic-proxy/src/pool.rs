@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
-use crate::routing::RoutingTarget;
+use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
     backend::Backend,
     config::{SocketConfig, TlsConfig},
@@ -22,6 +22,7 @@ use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
     route::RouteKey,
     routing::BackendRole,
+    sharding::ShardId,
 };
 
 #[derive(Debug)]
@@ -105,6 +106,31 @@ pub struct RoutePools {
 #[derive(Debug, Default)]
 pub struct RoutePoolRegistry {
     routes: StdMutex<HashMap<RouteKey, RoutePools>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ShardPoolKey {
+    route: RouteKey,
+    shard_id: ShardId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardPoolCheckoutTarget {
+    route: RouteKey,
+    shard_id: ShardId,
+    target_role: BackendRole,
+    fallback_reason: Option<RoutingReason>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShardPools {
+    shard_id: ShardId,
+    pools: RoutePools,
+}
+
+#[derive(Debug, Default)]
+pub struct ShardedPoolRegistry {
+    routes: StdMutex<HashMap<ShardPoolKey, ShardPools>>,
 }
 
 impl BackendPoolRef {
@@ -435,6 +461,224 @@ impl RoutePoolRegistry {
             .route_pools(route)
             .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
         pools.checkout_target(route.clone(), target, mode).await
+    }
+}
+
+impl ShardPoolKey {
+    #[must_use]
+    pub fn new(route: RouteKey, shard_id: ShardId) -> Self {
+        Self { route, shard_id }
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &RouteKey {
+        &self.route
+    }
+
+    #[must_use]
+    pub fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    #[must_use]
+    pub fn metric_label(&self) -> String {
+        self.shard_id.as_str().to_owned()
+    }
+}
+
+impl ShardPoolCheckoutTarget {
+    #[must_use]
+    pub fn new(
+        route: RouteKey,
+        shard_id: ShardId,
+        target_role: BackendRole,
+        fallback_reason: Option<RoutingReason>,
+    ) -> Self {
+        Self {
+            route,
+            shard_id,
+            target_role,
+            fallback_reason,
+        }
+    }
+
+    #[must_use]
+    pub fn route_key(&self) -> &RouteKey {
+        &self.route
+    }
+
+    #[must_use]
+    pub fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    #[must_use]
+    pub const fn target_role(&self) -> BackendRole {
+        self.target_role
+    }
+
+    #[must_use]
+    pub const fn fallback_reason(&self) -> Option<RoutingReason> {
+        self.fallback_reason
+    }
+
+    #[must_use]
+    pub fn key(&self) -> ShardPoolKey {
+        ShardPoolKey::new(self.route.clone(), self.shard_id.clone())
+    }
+}
+
+impl ShardPools {
+    #[must_use]
+    pub fn new(
+        shard_id: ShardId,
+        primary: BackendPoolRef,
+        replicas: Vec<BackendPoolRef>,
+        selector: ReplicaSelector,
+    ) -> Self {
+        Self {
+            shard_id,
+            pools: RoutePools::new(primary, replicas, selector),
+        }
+    }
+
+    #[must_use]
+    pub fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    #[must_use]
+    pub fn metric_label(&self) -> String {
+        self.shard_id.as_str().to_owned()
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> &BackendPoolRef {
+        self.pools.primary()
+    }
+
+    #[must_use]
+    pub fn replicas(&self) -> &[BackendPoolRef] {
+        self.pools.replicas()
+    }
+
+    #[must_use]
+    pub fn replica_by_id(&self, replica_id: u64) -> Option<&BackendPoolRef> {
+        self.pools.replica_by_id(replica_id)
+    }
+
+    #[must_use]
+    pub fn selector(&self) -> &ReplicaSelector {
+        self.pools.selector()
+    }
+
+    pub async fn checkout_primary(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        self.pools.checkout_primary(route, mode).await
+    }
+
+    pub async fn checkout_any_replica(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        self.pools.checkout_any_replica(route, mode).await
+    }
+
+    pub async fn checkout_replica_or_primary(
+        &self,
+        route: RouteKey,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        self.pools.checkout_replica_or_primary(route, mode).await
+    }
+
+    pub async fn checkout_target(
+        &self,
+        target: &ShardPoolCheckoutTarget,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        if target.shard_id() != self.shard_id() {
+            return Err(PoolError::Backpressure(BackpressureError::Closed));
+        }
+
+        match target.target_role() {
+            BackendRole::Primary => {
+                self.checkout_primary(target.route_key().clone(), mode)
+                    .await
+            }
+            BackendRole::Replica => {
+                self.checkout_any_replica(target.route_key().clone(), mode)
+                    .await
+            }
+            BackendRole::Unknown => Err(PoolError::Backpressure(BackpressureError::Closed)),
+        }
+    }
+}
+
+impl ShardedPoolRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            routes: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, key: ShardPoolKey, pools: ShardPools) {
+        assert_eq!(key.shard_id(), pools.shard_id());
+        self.routes
+            .lock()
+            .expect("sharded route registry poisoned")
+            .insert(key, pools);
+    }
+
+    #[must_use]
+    pub fn shard_pools(&self, key: &ShardPoolKey) -> Option<ShardPools> {
+        self.routes
+            .lock()
+            .expect("sharded route registry poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub async fn checkout_target(
+        &self,
+        target: &ShardPoolCheckoutTarget,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let pools = self
+            .shard_pools(&target.key())
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_target(target, mode).await
+    }
+
+    pub async fn checkout_primary(
+        &self,
+        route: &RouteKey,
+        shard_id: &ShardId,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let key = ShardPoolKey::new(route.clone(), shard_id.clone());
+        let pools = self
+            .shard_pools(&key)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_primary(route.clone(), mode).await
+    }
+
+    pub async fn checkout_any_replica(
+        &self,
+        route: &RouteKey,
+        shard_id: &ShardId,
+        mode: CheckoutMode,
+    ) -> Result<PooledBackend, PoolError> {
+        let key = ShardPoolKey::new(route.clone(), shard_id.clone());
+        let pools = self
+            .shard_pools(&key)
+            .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
+        pools.checkout_any_replica(route.clone(), mode).await
     }
 }
 
