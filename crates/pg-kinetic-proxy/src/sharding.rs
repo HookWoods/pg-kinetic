@@ -543,9 +543,8 @@ impl ShardRouteMapStore {
                 }
             }
             Ok(()) => {
-                let migration_override_explicit = rebalance_plan.is_some_and(|plan| {
-                    plan.migration_override_explicit()
-                });
+                let migration_override_explicit =
+                    rebalance_plan.is_some_and(|plan| plan.migration_override_explicit());
                 let active_shard_ids = self.active_transaction_shard_ids();
                 let current_shard_ids = self.current_shard_ids();
                 let next_shard_ids = route_map_shard_ids(&route_maps);
@@ -736,12 +735,13 @@ pub fn plan_sharded_route(
 
     if let Some(shard_id) = explicit_shard_id(&explicit_hint) {
         if let Some(route) = select_route_for_shard_id(route_map.routes(), shard_id) {
-            let reason = if matches!(explicit_hint, ShardHint::Tenant(_) | ShardHint::Route(_)) {
-                ShardRouteReason::AdminOverride
-            } else {
-                ShardRouteReason::AdminOverride
-            };
-            return choose_shard_route(route_map, route, reason, planner, context);
+            return choose_shard_route(
+                route_map,
+                route,
+                ShardRouteReason::AdminOverride,
+                planner,
+                context,
+            );
         }
 
         return ShardRouteDecision::new(

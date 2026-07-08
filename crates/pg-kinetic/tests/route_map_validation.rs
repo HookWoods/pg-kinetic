@@ -83,9 +83,12 @@ shard_id = "tenant-b"
 "#,
     );
 
-    assert_eq!(sharding.route_maps[0].scope, ShardScopeConfig::ApplicationName {
-        application_name: String::from("api"),
-    });
+    assert_eq!(
+        sharding.route_maps[0].scope,
+        ShardScopeConfig::ApplicationName {
+            application_name: String::from("api"),
+        }
+    );
 }
 
 #[test]
@@ -375,7 +378,10 @@ shard_id = "tenant-b"
 "#,
     );
 
-    assert_eq!(prioritized.route_maps[0].priority, Some(RouteMapPriority(10)));
+    assert_eq!(
+        prioritized.route_maps[0].priority,
+        Some(RouteMapPriority(10))
+    );
 }
 
 #[test]
@@ -421,7 +427,11 @@ fn every_shard_target_references_an_existing_route() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::UnknownShardTarget.as_str()]
     );
 }
@@ -465,7 +475,11 @@ fn every_enabled_sharded_table_defines_a_shard_key_column() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::MissingShardKeyColumn.as_str()]
     );
 }
@@ -486,7 +500,11 @@ fn hash_shard_weights_must_be_positive() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::InvalidHashWeight.as_str()]
     );
 }
@@ -510,7 +528,11 @@ fn range_boundaries_must_be_ordered() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::InvalidRangeBoundaries.as_str()]
     );
 }
@@ -531,7 +553,11 @@ fn list_values_must_be_unique() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::DuplicateListValue.as_str()]
     );
 }
@@ -609,7 +635,11 @@ fn conflicting_default_routes_are_rejected() {
     });
 
     assert_eq!(
-        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        report
+            .errors()
+            .iter()
+            .map(|error| error.code().as_str())
+            .collect::<Vec<_>>(),
         vec![RouteMapValidationErrorCode::ConflictingDefaultRoutes.as_str()]
     );
 }

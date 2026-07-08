@@ -119,9 +119,7 @@ impl MetricName {
             Self::RouteDecisionsTotal => "pg_kinetic_route_decisions_total",
             Self::RouteFallbacksTotal => "pg_kinetic_route_fallbacks_total",
             Self::ShardRouteDecisionsTotal => "pg_kinetic_shard_route_decisions_total",
-            Self::ShardMultiShardRejectionsTotal => {
-                "pg_kinetic_shard_multi_shard_rejections_total"
-            }
+            Self::ShardMultiShardRejectionsTotal => "pg_kinetic_shard_multi_shard_rejections_total",
             Self::ShardPrimaryFallbacksTotal => "pg_kinetic_shard_primary_fallbacks_total",
             Self::RouteMapReloadTotal => "pg_kinetic_route_map_reload_total",
             Self::RouteMapGeneration => "pg_kinetic_route_map_generation",
@@ -314,8 +312,7 @@ const SHARD_PRIMARY_FALLBACK_LABELS: &[MetricLabel] = &[
     MetricLabel::Outcome,
 ];
 const ROUTE_MAP_RELOAD_LABELS: &[MetricLabel] = &[MetricLabel::Outcome, MetricLabel::ErrorCode];
-const SHARD_LIFECYCLE_LABELS: &[MetricLabel] =
-    &[MetricLabel::Shard, MetricLabel::LifecycleState];
+const SHARD_LIFECYCLE_LABELS: &[MetricLabel] = &[MetricLabel::Shard, MetricLabel::LifecycleState];
 const SHARD_COUNT_LABELS: &[MetricLabel] = &[MetricLabel::Shard];
 const ROUTE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Outcome];
 const ROUTE_SCOPE_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Scope];

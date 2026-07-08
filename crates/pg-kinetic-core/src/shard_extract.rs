@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::sharding::{RouteMapValidationInput, ShardedTableDefinition, ShardKey};
+use crate::sharding::{RouteMapValidationInput, ShardKey, ShardedTableDefinition};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShardExtraction {
@@ -130,7 +130,10 @@ fn parse_insert(tokens: &[Token], route_map: &RouteMapValidationInput) -> Option
         None
     };
 
-    if !matches!(tokens.get(index).and_then(Token::as_keyword), Some("values")) {
+    if !matches!(
+        tokens.get(index).and_then(Token::as_keyword),
+        Some("values")
+    ) {
         return None;
     }
 
@@ -200,10 +203,7 @@ fn parse_table_reference(tokens: &[Token], start: usize) -> Option<ParsedTableRe
     })
 }
 
-fn parse_identifier_list(
-    tokens: &[Token],
-    start: usize,
-) -> Option<(Vec<Arc<str>>, usize)> {
+fn parse_identifier_list(tokens: &[Token], start: usize) -> Option<(Vec<Arc<str>>, usize)> {
     let mut index = start;
     if !matches!(tokens.get(index), Some(Token::LParen)) {
         return None;
@@ -232,11 +232,8 @@ fn parse_identifier_list(
     Some((values, index))
 }
 
-fn extract_where_key(
-    clause: &[Token],
-    table: &ResolvedTable<'_>,
-) -> Option<ShardExtraction> {
-    let values = collect_key_values(clause, table.shard_key_column.as_deref())?;
+fn extract_where_key(clause: &[Token], table: &ResolvedTable<'_>) -> Option<ShardExtraction> {
+    let values = collect_key_values(clause, table.shard_key_column)?;
     build_extraction(table, values)
 }
 
@@ -245,8 +242,8 @@ fn extract_combined_key(
     where_clause: &[Token],
     table: &ResolvedTable<'_>,
 ) -> Option<ShardExtraction> {
-    let mut values = collect_key_values(set_clause, table.shard_key_column.as_deref())?;
-    values.extend(collect_key_values(where_clause, table.shard_key_column.as_deref())?);
+    let mut values = collect_key_values(set_clause, table.shard_key_column)?;
+    values.extend(collect_key_values(where_clause, table.shard_key_column)?);
     build_extraction(table, values)
 }
 
@@ -255,7 +252,7 @@ fn extract_insert_values(
     table: &ResolvedTable<'_>,
     columns: &[Arc<str>],
 ) -> Option<ShardExtraction> {
-    let shard_key_column = table.shard_key_column.as_deref()?;
+    let shard_key_column = table.shard_key_column?;
     let column_index = columns
         .iter()
         .position(|column| identifier_matches(column.as_ref(), shard_key_column))?;
@@ -369,7 +366,10 @@ fn parse_column_equality(
 
 fn parse_literal(tokens: &[Token], index: usize) -> Option<(ShardKey, usize)> {
     match tokens.get(index)? {
-        Token::Number(value) => value.parse::<i64>().ok().map(|parsed| (ShardKey::integer(parsed), index + 1)),
+        Token::Number(value) => value
+            .parse::<i64>()
+            .ok()
+            .map(|parsed| (ShardKey::integer(parsed), index + 1)),
         Token::String(value) => Some((ShardKey::text(value.clone()), index + 1)),
         Token::Ident(value) if value.eq_ignore_ascii_case("null") => None,
         Token::Param => None,
@@ -377,10 +377,7 @@ fn parse_literal(tokens: &[Token], index: usize) -> Option<(ShardKey, usize)> {
     }
 }
 
-fn build_extraction(
-    table: &ResolvedTable<'_>,
-    values: Vec<ShardKey>,
-) -> Option<ShardExtraction> {
+fn build_extraction(table: &ResolvedTable<'_>, values: Vec<ShardKey>) -> Option<ShardExtraction> {
     let mut unique_values = Vec::new();
 
     for value in values {
@@ -395,9 +392,9 @@ fn build_extraction(
 
     let key = unique_values.into_iter().next()?;
     Some(ShardExtraction::Key {
-        schema: table.schema.as_ref().map(|value| Arc::from(value.as_ref())),
-        table: Arc::from(table.table.as_ref()),
-        column: Arc::from(table.shard_key_column.as_deref()?),
+        schema: table.schema.map(Arc::from),
+        table: Arc::from(table.table),
+        column: Arc::from(table.shard_key_column?),
         key,
     })
 }
@@ -494,9 +491,7 @@ fn is_literal_terminator(token: Option<&Token>) -> bool {
 
 fn parse_hint_comment(comment: &str) -> Option<ShardHint> {
     let comment = comment.trim();
-    let Some(body) = comment.strip_prefix("pg-kinetic:") else {
-        return None;
-    };
+    let body = comment.strip_prefix("pg-kinetic:")?;
 
     let directive = body.trim();
     let (kind, value) = directive.split_once('=')?;
@@ -516,9 +511,9 @@ fn parse_hint_comment(comment: &str) -> Option<ShardHint> {
 
 fn is_hint_value(value: &str) -> bool {
     !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
 }
 
 fn find_keyword(tokens: &[Token], keyword: &str, start: usize) -> Option<usize> {
@@ -577,7 +572,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
             whitespace if whitespace.is_whitespace() => {}
             '-' if matches!(chars.peek(), Some('-')) => {
                 chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if next == '\n' {
                         break;
                     }
@@ -587,7 +582,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
                 chars.next();
                 let mut previous = '\0';
                 let mut closed = false;
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if previous == '*' && next == '/' {
                         closed = true;
                         break;
@@ -601,9 +596,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
             '\'' => {
                 let mut value = String::new();
                 loop {
-                    let Some(next) = chars.next() else {
-                        return None;
-                    };
+                    let next = chars.next()?;
                     if next == '\'' {
                         if matches!(chars.peek(), Some('\'')) {
                             chars.next();
@@ -619,9 +612,7 @@ fn tokenize(sql: &str) -> Option<Vec<Token>> {
             '"' => {
                 let mut value = String::new();
                 loop {
-                    let Some(next) = chars.next() else {
-                        return None;
-                    };
+                    let next = chars.next()?;
                     if next == '"' {
                         if matches!(chars.peek(), Some('"')) {
                             chars.next();

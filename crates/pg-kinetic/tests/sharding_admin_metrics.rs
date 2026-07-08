@@ -52,10 +52,7 @@ static TEST_MUTEX: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 #[tokio::test]
 async fn sharding_admin_views_expose_routes_maps_shards_and_migrations() {
-    let _test_guard = TEST_MUTEX
-        .get_or_init(|| AsyncMutex::new(()))
-        .lock()
-        .await;
+    let _test_guard = TEST_MUTEX.get_or_init(|| AsyncMutex::new(())).lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
 
@@ -102,9 +99,8 @@ async fn sharding_admin_views_expose_routes_maps_shards_and_migrations() {
         ShardDrainPolicy::default(),
     ));
 
-    snapshot_store.set_shard_migration_safety_snapshot(ShardMigrationSafetySnapshot::new(
-        migration_plan(),
-    ));
+    snapshot_store
+        .set_shard_migration_safety_snapshot(ShardMigrationSafetySnapshot::new(migration_plan()));
 
     let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;
     assert_admin_table_response(
@@ -161,21 +157,24 @@ async fn sharding_admin_views_expose_routes_maps_shards_and_migrations() {
             "replica_backend_count",
             "health_summary",
         ],
-        &[vec![
-            "tenant-a",
-            "billing/reporter",
-            "active",
-            "1",
-            "0",
-            "healthy",
-        ], vec![
-            "tenant-b",
-            "billing/reporter",
-            "draining",
-            "0",
-            "1",
-            "draining",
-        ]],
+        &[
+            vec![
+                "tenant-a",
+                "billing/reporter",
+                "active",
+                "1",
+                "0",
+                "healthy",
+            ],
+            vec![
+                "tenant-b",
+                "billing/reporter",
+                "draining",
+                "0",
+                "1",
+                "draining",
+            ],
+        ],
     );
 
     let migrations_frames = admin_query(admin_addr, "SHOW MIGRATIONS").await;
@@ -204,7 +203,10 @@ async fn sharding_admin_views_expose_routes_maps_shards_and_migrations() {
     );
 
     assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
-    assert!(!recorder.signatures().is_empty(), "expected sharding metrics to be recorded");
+    assert!(
+        !recorder.signatures().is_empty(),
+        "expected sharding metrics to be recorded"
+    );
     assert_no_sensitive_labels(&recorder);
 
     run_handle.abort();
@@ -213,10 +215,7 @@ async fn sharding_admin_views_expose_routes_maps_shards_and_migrations() {
 
 #[tokio::test]
 async fn sharding_metrics_use_bucketed_labels_and_reject_sensitive_data() {
-    let _test_guard = TEST_MUTEX
-        .get_or_init(|| AsyncMutex::new(()))
-        .lock()
-        .await;
+    let _test_guard = TEST_MUTEX.get_or_init(|| AsyncMutex::new(())).lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
 
@@ -262,9 +261,8 @@ async fn sharding_metrics_use_bucketed_labels_and_reject_sensitive_data() {
         ShardLifecycleState::Readonly,
         ShardDrainPolicy::default(),
     ));
-    snapshot_store.set_shard_migration_safety_snapshot(ShardMigrationSafetySnapshot::new(
-        migration_plan(),
-    ));
+    snapshot_store
+        .set_shard_migration_safety_snapshot(ShardMigrationSafetySnapshot::new(migration_plan()));
 
     let shard_bucket = bucket_label("tenant-a");
     assert!(recorder.has_metric(
@@ -353,18 +351,15 @@ fn sharding_snapshot() -> ShardingConfig {
 }
 
 fn migration_plan() -> ShardRebalancePlan {
-    ShardRebalancePlan::new(
-        vec![shard_id("tenant-a")],
-        vec![shard_id("tenant-b")],
-    )
-    .with_migration_state(ShardMigrationState::Assessing)
-    .with_migration_override_explicit(true)
-    .with_safety_report(ShardMigrationSafetyReport::new(
-        vec![11, 17],
-        vec![String::from("stmt_a"), String::from("stmt_b")],
-        vec![88],
-        Some(PgLsn::from_parts(2, 16)),
-    ))
+    ShardRebalancePlan::new(vec![shard_id("tenant-a")], vec![shard_id("tenant-b")])
+        .with_migration_state(ShardMigrationState::Assessing)
+        .with_migration_override_explicit(true)
+        .with_safety_report(ShardMigrationSafetyReport::new(
+            vec![11, 17],
+            vec![String::from("stmt_a"), String::from("stmt_b")],
+            vec![88],
+            Some(PgLsn::from_parts(2, 16)),
+        ))
 }
 
 fn shard_id(value: &str) -> ShardId {
@@ -685,7 +680,11 @@ fn assert_admin_table_response(
         .collect::<Vec<_>>();
     let expected_rows = expected_rows
         .iter()
-        .map(|row| row.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>())
+        .map(|row| {
+            row.iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert_eq!(data_rows, expected_rows);
     assert!(

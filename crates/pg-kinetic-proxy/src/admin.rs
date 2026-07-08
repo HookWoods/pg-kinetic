@@ -15,9 +15,7 @@ use tokio::{
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::{
-    config::{
-        Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig,
-    },
+    config::{Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig},
     drain::DrainController,
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
@@ -37,8 +35,8 @@ use pg_kinetic_core::{
     lsn::PgLsn,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
-    sharding::ShardLifecycleState,
     session::PinReason,
+    sharding::ShardLifecycleState,
 };
 use pg_kinetic_wire::{
     admin::{build_admin_table_response, AdminWireColumn, AdminWireType},
@@ -411,7 +409,9 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &sharding_snapshot,
             &state.snapshot_store.shard_lifecycle_snapshots(),
         ),
-        AdminView::Migrations => migrations_table(&state.snapshot_store.shard_migration_safety_snapshots()),
+        AdminView::Migrations => {
+            migrations_table(&state.snapshot_store.shard_migration_safety_snapshots())
+        }
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), &state.config),
     };
@@ -747,7 +747,8 @@ fn shards_table(
         let route_key = route_map_scope_label(&route_map.scope);
         for target in &route_map.targets {
             let shard_id = match target {
-                ShardTargetConfig::Primary { shard_id } | ShardTargetConfig::Replicas { shard_id } => shard_id,
+                ShardTargetConfig::Primary { shard_id }
+                | ShardTargetConfig::Replicas { shard_id } => shard_id,
             };
             let summary = shards.entry(shard_id.clone()).or_default();
             if summary.route_key.is_none() {

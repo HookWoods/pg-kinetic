@@ -357,10 +357,18 @@ pub struct ShardingConfig {
     )]
     pub multi_shard_policy: MultiShardPolicyConfig,
 
-    #[arg(long, env = "PG_KINETIC_ROUTE_MAP_RELOAD_STRICT", default_value_t = true)]
+    #[arg(
+        long,
+        env = "PG_KINETIC_ROUTE_MAP_RELOAD_STRICT",
+        default_value_t = true
+    )]
     pub route_map_reload_strict: bool,
 
-    #[arg(long, env = "PG_KINETIC_ROUTE_PREVIEW_ENABLED", default_value_t = false)]
+    #[arg(
+        long,
+        env = "PG_KINETIC_ROUTE_PREVIEW_ENABLED",
+        default_value_t = false
+    )]
     pub route_preview_enabled: bool,
 
     #[serde(default)]
@@ -375,11 +383,8 @@ impl ShardingConfig {
         }
 
         for (left_index, left_route_map) in self.route_maps.iter().enumerate() {
-            for (right_index, right_route_map) in self
-                .route_maps
-                .iter()
-                .enumerate()
-                .skip(left_index + 1)
+            for (right_index, right_route_map) in
+                self.route_maps.iter().enumerate().skip(left_index + 1)
             {
                 if left_route_map.scope.overlaps(&right_route_map.scope)
                     && left_route_map.priority.is_none()
@@ -496,20 +501,10 @@ pub struct RouteMapPriority(pub u32);
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShardScopeConfig {
-    DatabaseUser {
-        database: String,
-        user: String,
-    },
-    ApplicationName {
-        application_name: String,
-    },
-    SchemaTable {
-        schema: String,
-        table: String,
-    },
-    TenantKey {
-        tenant_key: String,
-    },
+    DatabaseUser { database: String, user: String },
+    ApplicationName { application_name: String },
+    SchemaTable { schema: String, table: String },
+    TenantKey { tenant_key: String },
 }
 
 impl ShardScopeConfig {
@@ -564,12 +559,8 @@ pub enum ShardStrategyConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShardTargetConfig {
-    Primary {
-        shard_id: String,
-    },
-    Replicas {
-        shard_id: String,
-    },
+    Primary { shard_id: String },
+    Replicas { shard_id: String },
 }
 
 impl ShardTargetConfig {

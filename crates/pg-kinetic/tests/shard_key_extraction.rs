@@ -1,6 +1,6 @@
 use pg_kinetic_core::{
     shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
-    sharding::{RouteDefinition, RouteMapValidationInput, ShardedTableDefinition, ShardKey},
+    sharding::{RouteDefinition, RouteMapValidationInput, ShardKey, ShardedTableDefinition},
 };
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -173,7 +173,10 @@ fn returns_unknown_for_bind_placeholders() {
     let route_map = route_map("accounts", "tenant_id");
 
     assert_eq!(
-        extract_shard_key("update accounts set name = 'Ada' where tenant_id = $1", &route_map),
+        extract_shard_key(
+            "update accounts set name = 'Ada' where tenant_id = $1",
+            &route_map
+        ),
         ShardExtraction::Unknown,
     );
 }

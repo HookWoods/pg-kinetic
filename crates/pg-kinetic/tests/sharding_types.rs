@@ -255,7 +255,10 @@ fn migration_reports_and_rebalance_plans_keep_control_plane_state_only() {
         &[String::from("stmt_a"), String::from("stmt_z")]
     );
     assert_eq!(report.open_transaction_ids(), &[12, 88]);
-    assert_eq!(report.last_required_lsn(), Some(pg_kinetic_core::lsn::PgLsn::new(99)));
+    assert_eq!(
+        report.last_required_lsn(),
+        Some(pg_kinetic_core::lsn::PgLsn::new(99))
+    );
 
     assert_eq!(plan.source_shard_ids()[0].as_str(), "tenant-a");
     assert_eq!(plan.target_shard_ids()[0].as_str(), "tenant-b");

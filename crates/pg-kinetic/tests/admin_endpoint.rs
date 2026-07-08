@@ -359,7 +359,7 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
     let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;
     assert_admin_table_response(
         &routes_frames,
-        &[ 
+        &[
             "database",
             "user",
             "application_name",

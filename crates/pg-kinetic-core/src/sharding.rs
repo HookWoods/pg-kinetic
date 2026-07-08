@@ -9,17 +9,12 @@ use std::{
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::{
-    lsn::PgLsn,
-    route::RouteKey,
-    routing::BackendRole,
-};
+use crate::{lsn::PgLsn, route::RouteKey, routing::BackendRole};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ShardId(Arc<str>);
 
 impl ShardId {
-    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, ShardValidationError> {
         let value = value.into();
         if value.is_empty() {
@@ -161,7 +156,6 @@ pub struct HashShardRule {
 }
 
 impl HashShardRule {
-    #[must_use]
     pub fn new(
         shard_key_type: ShardKeyType,
         bucket_count: usize,
@@ -206,12 +200,10 @@ pub struct RangeShardRule {
 }
 
 impl RangeShardRule {
-    #[must_use]
     pub fn new(lower_bound: ShardKey, upper_bound: ShardKey) -> Result<Self, ShardValidationError> {
         Self::with_bounds(lower_bound, true, upper_bound, true)
     }
 
-    #[must_use]
     pub fn with_bounds(
         lower_bound: ShardKey,
         lower_inclusive: bool,
@@ -280,7 +272,6 @@ pub struct ListShardRule {
 }
 
 impl ListShardRule {
-    #[must_use]
     pub fn new(values: impl Into<Vec<ShardKey>>) -> Result<Self, ShardValidationError> {
         let values = values.into();
         if values.is_empty() {
@@ -341,14 +332,12 @@ impl ShardStrategyEvaluator {
         Self::Hash(rule)
     }
 
-    #[must_use]
     pub fn range(rules: impl Into<Vec<RangeShardRule>>) -> Result<Self, ShardValidationError> {
         let rules = rules.into();
         validate_range_rules(&rules)?;
         Ok(Self::Range(rules))
     }
 
-    #[must_use]
     pub fn list(rules: impl Into<Vec<ListShardRule>>) -> Result<Self, ShardValidationError> {
         let rules = rules.into();
         validate_list_rules(&rules)?;
@@ -768,8 +757,9 @@ impl ShardLifecycleState {
         match self {
             Self::Active => true,
             Self::Readonly | Self::Disabled => false,
-            Self::Draining => drain_policy
-                .is_some_and(|policy| !policy.reject_new_writes_while_draining()),
+            Self::Draining => {
+                drain_policy.is_some_and(|policy| !policy.reject_new_writes_while_draining())
+            }
         }
     }
 }
@@ -1027,7 +1017,6 @@ pub struct ShardRouteMap {
 }
 
 impl ShardRouteMap {
-    #[must_use]
     pub fn new(
         scope: ShardScope,
         strategy: ShardStrategy,

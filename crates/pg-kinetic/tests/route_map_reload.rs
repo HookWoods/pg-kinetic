@@ -243,7 +243,11 @@ fn removed_shard_with_active_sessions_enters_draining_state_with_explicit_overri
     store.set_transaction_shard_affinity(88, shard_id("tenant-a"));
 
     let plan = migration_plan(true);
-    let result = store.reload(vec![route_map("tenant-b")], Some(&snapshot_store), Some(&plan));
+    let result = store.reload(
+        vec![route_map("tenant-b")],
+        Some(&snapshot_store),
+        Some(&plan),
+    );
 
     assert!(result.success);
     assert_eq!(result.draining_shard_ids.len(), 1);
@@ -252,7 +256,9 @@ fn removed_shard_with_active_sessions_enters_draining_state_with_explicit_overri
     let migration_snapshots = snapshot_store.shard_migration_safety_snapshots();
     assert_eq!(migration_snapshots.len(), 1);
 
-    let snapshot = migration_snapshots.last().expect("migration safety snapshot");
+    let snapshot = migration_snapshots
+        .last()
+        .expect("migration safety snapshot");
     assert!(snapshot.rebalance_plan.migration_override_explicit());
     assert_eq!(
         snapshot

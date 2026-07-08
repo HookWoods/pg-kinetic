@@ -14,9 +14,7 @@ use pg_kinetic_core::{
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
-    sharding::{
-        ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan,
-    },
+    sharding::{ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan},
 };
 
 use crate::config::{
@@ -915,7 +913,10 @@ impl SnapshotStore {
     }
 
     pub fn set_sharding_snapshot(&self, snapshot: ShardingConfig) {
-        self.inner.write().expect("snapshot store poisoned").sharding = snapshot;
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .sharding = snapshot;
     }
 
     #[must_use]

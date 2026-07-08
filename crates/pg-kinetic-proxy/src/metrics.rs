@@ -20,8 +20,8 @@ use pg_kinetic_core::{
     },
     route::{QueryClass as RouteQueryClass, RouteKey},
     routing::{BackendRole, FallbackPolicy},
-    sharding::{MultiShardPolicy, ShardLifecycleState, ShardRouteReason, ShardStrategy},
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
+    sharding::{MultiShardPolicy, ShardLifecycleState, ShardRouteReason, ShardStrategy},
 };
 use pg_kinetic_core::{
     recovery::{RecoveryAction, RecoveryTrigger},
