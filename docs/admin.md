@@ -36,6 +36,9 @@ Unset optional fields render as `<none>`.
 | `SHOW RECOVERY` | Recovery trigger/action/outcome counts plus the latest error text for each combination. |
 | `SHOW BACKPRESSURE` | Per-route waiting, in-flight, rejected, timed-out, and canceled counts. |
 | `SHOW ROUTES` | Per-route client and backend counts plus primary and replica counts, routing mode, fallback policy, freshness policy, and read-after-write timeout. |
+| `SHOW ROUTE MAPS` | Sharding scopes, strategies, priorities, and the active multi-shard policy. |
+| `SHOW SHARDS` | Shard lifecycle state, route scope, primary and replica target counts, and a health summary. |
+| `SHOW MIGRATIONS` | Migration state, override status, source and target shard ids, and the current safety report. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
 
@@ -50,5 +53,6 @@ Unset optional fields render as `<none>`.
 
 - Use `SHOW POOLS` and `SHOW BACKPRESSURE` together to see whether a queue is forming because the pool is full or because a specific route is overloaded.
 - Use `SHOW CLIENTS`, `SHOW SERVERS`, and `SHOW ROUTES` together to understand how read traffic is flowing, whether replicas are healthy, and which policy is active.
+- Use `SHOW ROUTE MAPS`, `SHOW SHARDS`, and `SHOW MIGRATIONS` together to see how shard scopes, lifecycle state, and migration safety line up.
 - Use `SHOW PINNING` and `SHOW RECOVERY` together to distinguish long-lived state from recovery churn.
 - Use `SHOW SETTINGS` and `SHOW LIMITS` to verify the live configuration after a reload or before a support investigation.

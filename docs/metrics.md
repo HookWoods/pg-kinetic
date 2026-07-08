@@ -34,6 +34,19 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 | `pg_kinetic_replica_replay_lsn` | gauge | `endpoint`, `target_role` | `1` | Bounded by endpoint id and expected role. | Use it with `SHOW SERVERS` to confirm the detected role and replay position line up. |
 | `pg_kinetic_split_brain_warnings_total` | counter | `endpoint`, `target_role`, `reason` | `1` | Bounded by endpoint id, expected role, and warning reason. | Any nonzero value means role autodetection disagrees with the configured target role. |
 
+## Sharding
+
+| Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
+| --- | --- | --- | --- | --- | --- |
+| `pg_kinetic_shard_route_decisions_total` | counter | `route`, `shard`, `strategy`, `reason`, `outcome` | `1` | Shard labels are bucketed and strategy/reason enums are bounded. | Rising `hash_match`, `range_match`, or `list_match` shares show sharded routing is active on that path. |
+| `pg_kinetic_shard_multi_shard_rejections_total` | counter | `route`, `shard`, `policy`, `reason`, `outcome` | `1` | Bucketed shard labels and bounded policy labels. | Spikes mean fan-out was attempted but the policy rejected it. |
+| `pg_kinetic_shard_primary_fallbacks_total` | counter | `route`, `shard`, `policy`, `outcome` | `1` | Bucketed shard labels and bounded policy labels. | Fallbacks usually mean the shard key was missing, ambiguous, or unusable. |
+| `pg_kinetic_route_map_reload_total` | counter | `outcome`, `error_code` | `1` | Bounded by reload outcome and reload error code. | Rejected reloads point to scope conflicts, empty route maps, or migration safety blockers. |
+| `pg_kinetic_route_map_generation` | gauge | none | `1` | Single series. | A higher generation means a newer route-map snapshot is live. |
+| `pg_kinetic_shard_lifecycle_state` | gauge | `shard`, `lifecycle_state` | `1` | Bucketed shard labels and a bounded lifecycle enum. | A nonzero `draining` or `readonly` series should line up with a planned migration. |
+| `pg_kinetic_shard_active_transactions` | gauge | `shard` | `1` | Bucketed shard labels. | Nonzero values on a shard being removed mean migration safety is not settled yet. |
+| `pg_kinetic_shard_prepared_statements` | gauge | `shard` | `1` | Bucketed shard labels. | Nonzero values tell you prepared work still needs to be cleaned up before a move. |
+
 ## Pinning And Recovery
 
 | Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
@@ -70,6 +83,9 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 - Read routing mix: compare `pg_kinetic_route_decisions_total{target_role="replica"}` with `target_role="primary"`.
 - Replica freshness: graph `pg_kinetic_read_after_write_wait_ms` and `pg_kinetic_read_after_write_rejections_total` together.
 - Replica safety: show `pg_kinetic_replica_health`, `pg_kinetic_replica_lag_ms`, and `pg_kinetic_split_brain_warnings_total` side by side.
+- Shard routing mix: compare `pg_kinetic_shard_route_decisions_total{strategy="hash"}` with `strategy="range"` and `strategy="list"`.
+- Route-map reload health: graph `pg_kinetic_route_map_reload_total` by `outcome` and `error_code`.
+- Shard lifecycle: show `pg_kinetic_shard_lifecycle_state` with `pg_kinetic_shard_active_transactions` and `pg_kinetic_shard_prepared_statements`.
 - Pinning reason counts: bar chart `pg_kinetic_backend_pin_total` by `reason`.
 - Recovery outcomes: stacked bars for `pg_kinetic_backend_recovery_total` by `trigger`, `action`, and `outcome`.
 - Prepared cache materialization/invalidation: compare `pg_kinetic_prepared_events_total{event="materialize"}` with `event="invalidate"`.
@@ -84,6 +100,8 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 - A rising route wait with one hot route usually means noisy-neighbor pressure rather than a global capacity issue.
 - A rising primary share in route decisions usually means replicas are unhealthy, too stale, or blocked by a strict freshness policy.
 - A spike in split-brain warnings means role autodetection and the configured endpoint role need attention before trusting replica reads.
+- A spike in shard primary fallbacks usually means shard-key extraction failed or the route map did not cover the statement.
+- A rejected route-map reload usually means scope overlap, missing shards, or a migration safety check stopped the change.
 - A sharp rise in prepared invalidations usually means client-side churn or a workload that does not benefit from caching.
 - A sustained spike in TLS or auth failures usually means a rollout or secret mismatch rather than normal traffic variation.
 - A long tail in `backend_checkout` or `auth` usually points to startup-path regressions before user queries are affected.

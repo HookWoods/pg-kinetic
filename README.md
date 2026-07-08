@@ -14,6 +14,7 @@ The first milestone focuses on:
 - [Admin reference](docs/admin.md)
 - [Metrics catalog](docs/metrics.md)
 - [Read routing guide](docs/read-routing.md)
+- [Sharding guide](docs/sharding.md)
 
 ## Local Benchmark Stack
 
@@ -59,6 +60,7 @@ Windows:
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\read-routing.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\sharding.ps1
 ```
 
 Unix:
@@ -147,6 +149,22 @@ Metrics:
 - `pg_kinetic_backend_cleanup_total`
 - `pg_kinetic_backend_recovery_total`
 - `pg_kinetic_backend_sqlstate_total`
+
+## Sharding
+
+Sharding adds route maps, shard lifecycle tracking, and conservative shard-key extraction on top of the existing routing and backpressure model.
+
+Useful checks:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\sharding.ps1
+```
+
+For manual inspection:
+
+```bash
+cargo run -p pg-kinetic -- route-preview --config path/to/sharding.toml --database billing --user reporter --sql "select * from public.orders where tenant_id = 'tenant-a'"
+```
 
 ## Read Routing
 
