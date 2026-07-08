@@ -2,6 +2,10 @@ use pg_kinetic::config::{
     MultiShardPolicyConfig, RouteMapPriority, ShardScopeConfig, ShardStrategyConfig,
     ShardTargetConfig, ShardingConfig,
 };
+use pg_kinetic_core::sharding::{
+    ordered_route_indices, validate_route_map, RouteDefinition, RouteMapValidationErrorCode,
+    RouteMapValidationInput, ShardKey, ShardRuleDefinition, ShardedTableDefinition,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -399,4 +403,271 @@ shard_id = "tenant-secret"
 
     assert!(!debug.contains("tenant-secret-value"));
     assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn every_shard_target_references_an_existing_route() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: Some(10),
+            is_default: false,
+        }],
+        sharded_tables: vec![],
+        shard_rules: vec![ShardRuleDefinition::Hash {
+            route: String::from("missing"),
+            weight: 1,
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::UnknownShardTarget.as_str()]
+    );
+}
+
+#[test]
+fn route_map_requires_at_least_one_shard_rule() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: None,
+            is_default: false,
+        }],
+        sharded_tables: vec![],
+        shard_rules: vec![],
+    });
+
+    assert_eq!(report.errors().len(), 1);
+    assert_eq!(
+        report.errors()[0].code(),
+        RouteMapValidationErrorCode::MissingShardRule
+    );
+}
+
+#[test]
+fn every_enabled_sharded_table_defines_a_shard_key_column() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: None,
+            is_default: false,
+        }],
+        sharded_tables: vec![ShardedTableDefinition {
+            name: String::from("public.orders"),
+            enabled: true,
+            shard_key_column: None,
+        }],
+        shard_rules: vec![ShardRuleDefinition::Hash {
+            route: String::from("primary"),
+            weight: 1,
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::MissingShardKeyColumn.as_str()]
+    );
+}
+
+#[test]
+fn hash_shard_weights_must_be_positive() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: None,
+            is_default: false,
+        }],
+        sharded_tables: vec![],
+        shard_rules: vec![ShardRuleDefinition::Hash {
+            route: String::from("primary"),
+            weight: 0,
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::InvalidHashWeight.as_str()]
+    );
+}
+
+#[test]
+fn range_boundaries_must_be_ordered() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: None,
+            is_default: false,
+        }],
+        sharded_tables: vec![],
+        shard_rules: vec![ShardRuleDefinition::Range {
+            route: String::from("primary"),
+            lower_bound: ShardKey::integer(20),
+            lower_inclusive: true,
+            upper_bound: ShardKey::integer(10),
+            upper_inclusive: true,
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::InvalidRangeBoundaries.as_str()]
+    );
+}
+
+#[test]
+fn list_values_must_be_unique() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![RouteDefinition {
+            name: String::from("primary"),
+            priority: None,
+            is_default: false,
+        }],
+        sharded_tables: vec![],
+        shard_rules: vec![ShardRuleDefinition::List {
+            route: String::from("primary"),
+            values: vec![ShardKey::text("alpha"), ShardKey::text("alpha")],
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::DuplicateListValue.as_str()]
+    );
+}
+
+#[test]
+fn route_priorities_are_deterministic() {
+    let routes_a = vec![
+        RouteDefinition {
+            name: String::from("gamma"),
+            priority: Some(50),
+            is_default: false,
+        },
+        RouteDefinition {
+            name: String::from("alpha"),
+            priority: None,
+            is_default: false,
+        },
+        RouteDefinition {
+            name: String::from("beta"),
+            priority: Some(10),
+            is_default: false,
+        },
+    ];
+    let routes_b = vec![
+        RouteDefinition {
+            name: String::from("beta"),
+            priority: Some(10),
+            is_default: false,
+        },
+        RouteDefinition {
+            name: String::from("gamma"),
+            priority: Some(50),
+            is_default: false,
+        },
+        RouteDefinition {
+            name: String::from("alpha"),
+            priority: None,
+            is_default: false,
+        },
+    ];
+
+    let ordered_a = ordered_route_indices(&routes_a)
+        .into_iter()
+        .map(|index| routes_a[index].name.as_str())
+        .collect::<Vec<_>>();
+    let ordered_b = ordered_route_indices(&routes_b)
+        .into_iter()
+        .map(|index| routes_b[index].name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ordered_a, vec!["beta", "gamma", "alpha"]);
+    assert_eq!(ordered_a, ordered_b);
+}
+
+#[test]
+fn conflicting_default_routes_are_rejected() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![
+            RouteDefinition {
+                name: String::from("primary-a"),
+                priority: Some(10),
+                is_default: true,
+            },
+            RouteDefinition {
+                name: String::from("primary-b"),
+                priority: Some(20),
+                is_default: true,
+            },
+        ],
+        sharded_tables: vec![],
+        shard_rules: vec![ShardRuleDefinition::Hash {
+            route: String::from("primary-a"),
+            weight: 1,
+        }],
+    });
+
+    assert_eq!(
+        report.errors().iter().map(|error| error.code().as_str()).collect::<Vec<_>>(),
+        vec![RouteMapValidationErrorCode::ConflictingDefaultRoutes.as_str()]
+    );
+}
+
+#[test]
+fn route_map_validation_reports_stable_error_codes() {
+    let report = validate_route_map(&RouteMapValidationInput {
+        routes: vec![
+            RouteDefinition {
+                name: String::from("primary"),
+                priority: Some(20),
+                is_default: true,
+            },
+            RouteDefinition {
+                name: String::from("replica"),
+                priority: Some(10),
+                is_default: true,
+            },
+        ],
+        sharded_tables: vec![ShardedTableDefinition {
+            name: String::from("public.orders"),
+            enabled: true,
+            shard_key_column: None,
+        }],
+        shard_rules: vec![
+            ShardRuleDefinition::Hash {
+                route: String::from("missing"),
+                weight: 0,
+            },
+            ShardRuleDefinition::Range {
+                route: String::from("primary"),
+                lower_bound: ShardKey::integer(50),
+                lower_inclusive: true,
+                upper_bound: ShardKey::integer(10),
+                upper_inclusive: false,
+            },
+            ShardRuleDefinition::List {
+                route: String::from("replica"),
+                values: vec![ShardKey::text("alpha"), ShardKey::text("alpha")],
+            },
+        ],
+    });
+
+    let error_codes = report
+        .errors()
+        .iter()
+        .map(|error| error.code().as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        error_codes,
+        vec![
+            RouteMapValidationErrorCode::ConflictingDefaultRoutes.as_str(),
+            RouteMapValidationErrorCode::MissingShardKeyColumn.as_str(),
+            RouteMapValidationErrorCode::UnknownShardTarget.as_str(),
+            RouteMapValidationErrorCode::InvalidHashWeight.as_str(),
+            RouteMapValidationErrorCode::InvalidRangeBoundaries.as_str(),
+            RouteMapValidationErrorCode::DuplicateListValue.as_str(),
+        ]
+    );
 }

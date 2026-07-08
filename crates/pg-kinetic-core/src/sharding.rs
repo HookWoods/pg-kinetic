@@ -859,6 +859,252 @@ impl ShardRouteDecision {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RouteMapValidationReport {
+    errors: Vec<RouteMapValidationError>,
+}
+
+impl RouteMapValidationReport {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    #[must_use]
+    pub fn errors(&self) -> &[RouteMapValidationError] {
+        &self.errors
+    }
+
+    fn push(&mut self, code: RouteMapValidationErrorCode, message: impl Into<String>) {
+        self.errors.push(RouteMapValidationError::new(code, message));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteMapValidationError {
+    code: RouteMapValidationErrorCode,
+    message: String,
+}
+
+impl RouteMapValidationError {
+    #[must_use]
+    pub fn new(code: RouteMapValidationErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> RouteMapValidationErrorCode {
+        self.code
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RouteMapValidationErrorCode {
+    UnknownShardTarget,
+    MissingShardRule,
+    MissingShardKeyColumn,
+    InvalidHashWeight,
+    InvalidRangeBoundaries,
+    DuplicateListValue,
+    ConflictingDefaultRoutes,
+}
+
+impl RouteMapValidationErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownShardTarget => "unknown_shard_target",
+            Self::MissingShardRule => "missing_shard_rule",
+            Self::MissingShardKeyColumn => "missing_shard_key_column",
+            Self::InvalidHashWeight => "invalid_hash_weight",
+            Self::InvalidRangeBoundaries => "invalid_range_boundaries",
+            Self::DuplicateListValue => "duplicate_list_value",
+            Self::ConflictingDefaultRoutes => "conflicting_default_routes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteMapValidationInput {
+    pub routes: Vec<RouteDefinition>,
+    pub sharded_tables: Vec<ShardedTableDefinition>,
+    pub shard_rules: Vec<ShardRuleDefinition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteDefinition {
+    pub name: String,
+    pub priority: Option<u32>,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardedTableDefinition {
+    pub name: String,
+    pub enabled: bool,
+    pub shard_key_column: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShardRuleDefinition {
+    Hash {
+        route: String,
+        weight: usize,
+    },
+    Range {
+        route: String,
+        lower_bound: ShardKey,
+        lower_inclusive: bool,
+        upper_bound: ShardKey,
+        upper_inclusive: bool,
+    },
+    List {
+        route: String,
+        values: Vec<ShardKey>,
+    },
+}
+
+#[must_use]
+pub fn ordered_route_indices(routes: &[RouteDefinition]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..routes.len()).collect();
+    indices.sort_by(|left_index, right_index| {
+        route_priority_key(&routes[*left_index]).cmp(&route_priority_key(&routes[*right_index]))
+    });
+    indices
+}
+
+#[must_use]
+pub fn validate_route_map(route_map: &RouteMapValidationInput) -> RouteMapValidationReport {
+    let mut report = RouteMapValidationReport::default();
+    let known_routes: HashSet<&str> = route_map.routes.iter().map(|route| route.name.as_str()).collect();
+
+    let default_route_count = route_map.routes.iter().filter(|route| route.is_default).count();
+    if default_route_count > 1 {
+        report.push(
+            RouteMapValidationErrorCode::ConflictingDefaultRoutes,
+            format!(
+                "route map defines {default_route_count} default routes; only one default route is allowed"
+            ),
+        );
+    }
+
+    for sharded_table in &route_map.sharded_tables {
+        if sharded_table.enabled && sharded_table.shard_key_column.is_none() {
+            report.push(
+                RouteMapValidationErrorCode::MissingShardKeyColumn,
+                format!(
+                    "enabled sharded table '{}' must define a shard key column",
+                    sharded_table.name
+                ),
+            );
+        }
+    }
+
+    if route_map.shard_rules.is_empty() {
+        report.push(
+            RouteMapValidationErrorCode::MissingShardRule,
+            String::from("route map must define at least one shard rule"),
+        );
+    }
+
+    let mut seen_list_values: HashSet<ShardKey> = HashSet::new();
+    for (rule_index, shard_rule) in route_map.shard_rules.iter().enumerate() {
+        match shard_rule {
+            ShardRuleDefinition::Hash { route, weight } => {
+                if !known_routes.contains(route.as_str()) {
+                    report.push(
+                        RouteMapValidationErrorCode::UnknownShardTarget,
+                        format!(
+                            "hash shard rule {rule_index} targets unknown route '{}'",
+                            route
+                        ),
+                    );
+                }
+
+                if *weight == 0 {
+                    report.push(
+                        RouteMapValidationErrorCode::InvalidHashWeight,
+                        format!("hash shard rule {rule_index} must use a positive weight"),
+                    );
+                }
+            }
+            ShardRuleDefinition::Range {
+                route,
+                lower_bound,
+                lower_inclusive,
+                upper_bound,
+                upper_inclusive,
+            } => {
+                if !known_routes.contains(route.as_str()) {
+                    report.push(
+                        RouteMapValidationErrorCode::UnknownShardTarget,
+                        format!(
+                            "range shard rule {rule_index} targets unknown route '{}'",
+                            route
+                        ),
+                    );
+                }
+
+                if RangeShardRule::with_bounds(
+                    lower_bound.clone(),
+                    *lower_inclusive,
+                    upper_bound.clone(),
+                    *upper_inclusive,
+                )
+                .is_err()
+                {
+                    report.push(
+                        RouteMapValidationErrorCode::InvalidRangeBoundaries,
+                        format!("range shard rule {rule_index} has unordered boundaries"),
+                    );
+                }
+            }
+            ShardRuleDefinition::List { route, values } => {
+                if !known_routes.contains(route.as_str()) {
+                    report.push(
+                        RouteMapValidationErrorCode::UnknownShardTarget,
+                        format!(
+                            "list shard rule {rule_index} targets unknown route '{}'",
+                            route
+                        ),
+                    );
+                }
+
+                let mut seen_rule_values: HashSet<ShardKey> = HashSet::new();
+                for value in values {
+                    let rule_duplicate = !seen_rule_values.insert(value.clone());
+                    let map_duplicate = !seen_list_values.insert(value.clone());
+                    if rule_duplicate || map_duplicate {
+                        report.push(
+                            RouteMapValidationErrorCode::DuplicateListValue,
+                            format!("list shard rule {rule_index} contains a duplicate value"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    report
+}
+
+#[must_use]
+fn route_priority_key(route: &RouteDefinition) -> (u32, bool, &str) {
+    (
+        route.priority.unwrap_or(u32::MAX),
+        route.is_default,
+        route.name.as_str(),
+    )
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ShardValidationError {
     #[error("shard id cannot be empty")]
