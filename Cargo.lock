@@ -926,10 +926,12 @@ dependencies = [
  "pg-kinetic-proxy",
  "pg-kinetic-wire",
  "pretty_assertions",
+ "serde",
  "sha2",
  "subtle",
  "tokio",
  "tokio-rustls",
+ "toml",
  "tracing-subscriber",
 ]
 

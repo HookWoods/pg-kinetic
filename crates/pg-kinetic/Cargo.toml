@@ -19,9 +19,11 @@ bytes = "1"
 hmac = "0.12"
 metrics = "0.24"
 pretty_assertions = "1"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 subtle = "2"
 tokio-rustls = "0.26"
+toml = "0.8"
 
 [lints]
 workspace = true

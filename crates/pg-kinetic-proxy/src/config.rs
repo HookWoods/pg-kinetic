@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::HashSet, fmt, net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -11,6 +11,7 @@ use pg_kinetic_core::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
         ClientTlsMode as CoreClientTlsMode,
     },
+    sharding::ShardId,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -338,6 +339,243 @@ impl Default for HaConfig {
         Self {
             replica_health_interval_ms: default_replica_health_interval_ms(),
             replica_health_timeout_ms: default_replica_health_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Parser, Serialize)]
+#[serde(default)]
+pub struct ShardingConfig {
+    #[arg(long, env = "PG_KINETIC_SHARDING_ENABLED", default_value_t = false)]
+    pub sharding_enabled: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_MULTI_SHARD_POLICY",
+        value_enum,
+        default_value_t = MultiShardPolicyConfig::Reject
+    )]
+    pub multi_shard_policy: MultiShardPolicyConfig,
+
+    #[arg(long, env = "PG_KINETIC_ROUTE_MAP_RELOAD_STRICT", default_value_t = true)]
+    pub route_map_reload_strict: bool,
+
+    #[arg(long, env = "PG_KINETIC_ROUTE_PREVIEW_ENABLED", default_value_t = false)]
+    pub route_preview_enabled: bool,
+
+    #[serde(default)]
+    #[arg(skip)]
+    pub route_maps: Vec<RouteMapConfig>,
+}
+
+impl ShardingConfig {
+    fn validate(&self) -> Result<(), String> {
+        for route_map in &self.route_maps {
+            route_map.validate()?;
+        }
+
+        for (left_index, left_route_map) in self.route_maps.iter().enumerate() {
+            for (right_index, right_route_map) in self
+                .route_maps
+                .iter()
+                .enumerate()
+                .skip(left_index + 1)
+            {
+                if left_route_map.scope.overlaps(&right_route_map.scope)
+                    && left_route_map.priority.is_none()
+                    && right_route_map.priority.is_none()
+                {
+                    return Err(format!(
+                        "route maps {left_index} and {right_index} overlap without explicit priority"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for ShardingConfig {
+    fn default() -> Self {
+        Self {
+            sharding_enabled: false,
+            multi_shard_policy: MultiShardPolicyConfig::Reject,
+            route_map_reload_strict: true,
+            route_preview_enabled: false,
+            route_maps: Vec::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShardingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = ShardingConfigRaw::deserialize(deserializer)?;
+        let config = Self {
+            sharding_enabled: raw.sharding_enabled,
+            multi_shard_policy: raw.multi_shard_policy,
+            route_map_reload_strict: raw.route_map_reload_strict,
+            route_preview_enabled: raw.route_preview_enabled,
+            route_maps: raw.route_maps,
+        };
+
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct ShardingConfigRaw {
+    #[serde(default)]
+    sharding_enabled: bool,
+
+    #[serde(default)]
+    multi_shard_policy: MultiShardPolicyConfig,
+
+    #[serde(default)]
+    route_map_reload_strict: bool,
+
+    #[serde(default)]
+    route_preview_enabled: bool,
+
+    #[serde(default)]
+    route_maps: Vec<RouteMapConfig>,
+}
+
+impl Default for ShardingConfigRaw {
+    fn default() -> Self {
+        Self {
+            sharding_enabled: false,
+            multi_shard_policy: MultiShardPolicyConfig::Reject,
+            route_map_reload_strict: true,
+            route_preview_enabled: false,
+            route_maps: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteMapConfig {
+    pub scope: ShardScopeConfig,
+
+    pub strategy: ShardStrategyConfig,
+
+    pub targets: Vec<ShardTargetConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<RouteMapPriority>,
+}
+
+impl RouteMapConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.targets.is_empty() {
+            return Err(String::from("route map must define at least one target"));
+        }
+
+        let mut seen_shard_ids = HashSet::new();
+        for target in &self.targets {
+            let shard_id =
+                ShardId::new(target.shard_id().to_owned()).map_err(|error| error.to_string())?;
+            if !seen_shard_ids.insert(shard_id.clone()) {
+                return Err(format!("duplicate shard id '{shard_id}'"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RouteMapPriority(pub u32);
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShardScopeConfig {
+    DatabaseUser {
+        database: String,
+        user: String,
+    },
+    ApplicationName {
+        application_name: String,
+    },
+    SchemaTable {
+        schema: String,
+        table: String,
+    },
+    TenantKey {
+        tenant_key: String,
+    },
+}
+
+impl ShardScopeConfig {
+    fn overlaps(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl fmt::Debug for ShardScopeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseUser { database, user } => formatter
+                .debug_struct("DatabaseUser")
+                .field("database", database)
+                .field("user", user)
+                .finish(),
+            Self::ApplicationName { application_name } => formatter
+                .debug_struct("ApplicationName")
+                .field("application_name", application_name)
+                .finish(),
+            Self::SchemaTable { schema, table } => formatter
+                .debug_struct("SchemaTable")
+                .field("schema", schema)
+                .field("table", table)
+                .finish(),
+            Self::TenantKey { .. } => formatter
+                .debug_struct("TenantKey")
+                .field("tenant_key", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum MultiShardPolicyConfig {
+    #[default]
+    Reject,
+    FirstMatch,
+    FanOut,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShardStrategyConfig {
+    Hash,
+    Range,
+    List,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShardTargetConfig {
+    Primary {
+        shard_id: String,
+    },
+    Replicas {
+        shard_id: String,
+    },
+}
+
+impl ShardTargetConfig {
+    fn shard_id(&self) -> &str {
+        match self {
+            Self::Primary { shard_id } | Self::Replicas { shard_id } => shard_id,
         }
     }
 }
