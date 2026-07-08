@@ -4,8 +4,9 @@ use pg_kinetic_core::{
     routing::BackendRole,
     sharding::{
         deterministic_shard_hash, evaluate_shard_key, HashShardRule, ListShardRule,
-        MultiShardPolicy, RangeShardRule, ShardId, ShardKey, ShardKeyType, ShardMatch,
-        ShardRouteReason, ShardStrategy, ShardStrategyEvaluator, ShardTarget,
+        MultiShardPolicy, RangeShardRule, ShardDrainPolicy, ShardId, ShardKey, ShardKeyType,
+        ShardLifecycleState, ShardMatch, ShardMigrationSafetyReport, ShardMigrationState,
+        ShardRebalancePlan, ShardRouteReason, ShardStrategy, ShardStrategyEvaluator, ShardTarget,
         ShardValidationError,
     },
 };
@@ -70,20 +71,12 @@ fn hash_strategy_is_deterministic_across_evaluators() {
 
 #[test]
 fn range_strategy_respects_inclusive_and_exclusive_boundaries() {
-    let first_range = RangeShardRule::with_bounds(
-        ShardKey::integer(0),
-        true,
-        ShardKey::integer(10),
-        true,
-    )
-    .expect("valid inclusive range");
-    let second_range = RangeShardRule::with_bounds(
-        ShardKey::integer(10),
-        false,
-        ShardKey::integer(20),
-        false,
-    )
-    .expect("valid exclusive range");
+    let first_range =
+        RangeShardRule::with_bounds(ShardKey::integer(0), true, ShardKey::integer(10), true)
+            .expect("valid inclusive range");
+    let second_range =
+        RangeShardRule::with_bounds(ShardKey::integer(10), false, ShardKey::integer(20), false)
+            .expect("valid exclusive range");
     let strategy = ShardStrategyEvaluator::range(vec![first_range, second_range])
         .expect("valid range strategy");
 
@@ -110,8 +103,8 @@ fn list_strategy_maps_explicit_values() {
     let first_rule = ListShardRule::new(vec![ShardKey::text("alpha"), ShardKey::text("beta")])
         .expect("valid list rule");
     let second_rule = ListShardRule::new(vec![ShardKey::text("gamma")]).expect("valid list rule");
-    let strategy = ShardStrategyEvaluator::list(vec![first_rule, second_rule])
-        .expect("valid list strategy");
+    let strategy =
+        ShardStrategyEvaluator::list(vec![first_rule, second_rule]).expect("valid list strategy");
 
     assert_eq!(
         evaluate_shard_key(&strategy, &ShardKey::text("alpha")),
@@ -133,20 +126,12 @@ fn list_strategy_maps_explicit_values() {
 
 #[test]
 fn overlapping_range_rules_are_rejected() {
-    let left_range = RangeShardRule::with_bounds(
-        ShardKey::integer(0),
-        true,
-        ShardKey::integer(10),
-        true,
-    )
-    .expect("valid range");
-    let right_range = RangeShardRule::with_bounds(
-        ShardKey::integer(10),
-        true,
-        ShardKey::integer(20),
-        true,
-    )
-    .expect("valid range");
+    let left_range =
+        RangeShardRule::with_bounds(ShardKey::integer(0), true, ShardKey::integer(10), true)
+            .expect("valid range");
+    let right_range =
+        RangeShardRule::with_bounds(ShardKey::integer(10), true, ShardKey::integer(20), true)
+            .expect("valid range");
 
     assert_eq!(
         ShardStrategyEvaluator::range(vec![left_range, right_range]),
@@ -203,10 +188,81 @@ fn multi_shard_policy_defaults_to_reject() {
 
 #[test]
 fn shard_route_reason_exposes_stable_admin_and_metric_labels() {
-    assert_eq!(ShardRouteReason::AdminOverride.admin_label(), "admin_override");
-    assert_eq!(ShardRouteReason::AdminOverride.metric_label(), "admin_override");
-    assert_eq!(ShardRouteReason::MultiShardRejected.admin_label(), "multi_shard_rejected");
-    assert_eq!(ShardRouteReason::MultiShardRejected.metric_label(), "multi_shard_rejected");
+    assert_eq!(
+        ShardRouteReason::AdminOverride.admin_label(),
+        "admin_override"
+    );
+    assert_eq!(
+        ShardRouteReason::AdminOverride.metric_label(),
+        "admin_override"
+    );
+    assert_eq!(
+        ShardRouteReason::MultiShardRejected.admin_label(),
+        "multi_shard_rejected"
+    );
+    assert_eq!(
+        ShardRouteReason::MultiShardRejected.metric_label(),
+        "multi_shard_rejected"
+    );
+}
+
+#[test]
+fn shard_lifecycle_states_follow_drain_policy() {
+    let read_only_drain = ShardDrainPolicy::default();
+
+    assert_eq!(ShardLifecycleState::Active.as_str(), "active");
+    assert_eq!(ShardLifecycleState::Draining.as_str(), "draining");
+    assert_eq!(ShardLifecycleState::Readonly.as_str(), "readonly");
+    assert_eq!(ShardLifecycleState::Disabled.as_str(), "disabled");
+
+    assert!(ShardLifecycleState::Active.allows_reads(None));
+    assert!(ShardLifecycleState::Active.allows_writes(None));
+
+    assert!(ShardLifecycleState::Draining.allows_reads(Some(&read_only_drain)));
+    assert!(!ShardLifecycleState::Draining.allows_writes(Some(&read_only_drain)));
+
+    assert!(ShardLifecycleState::Readonly.allows_reads(None));
+    assert!(!ShardLifecycleState::Readonly.allows_writes(None));
+
+    assert!(!ShardLifecycleState::Disabled.allows_reads(None));
+    assert!(!ShardLifecycleState::Disabled.allows_writes(None));
+}
+
+#[test]
+fn migration_reports_and_rebalance_plans_keep_control_plane_state_only() {
+    let report = ShardMigrationSafetyReport::new(
+        vec![11, 3, 11],
+        vec![
+            String::from("stmt_z"),
+            String::from("stmt_a"),
+            String::from("stmt_a"),
+        ],
+        vec![88, 12, 88],
+        Some(pg_kinetic_core::lsn::PgLsn::new(99)),
+    );
+    let plan = ShardRebalancePlan::new(
+        vec![ShardId::new("tenant-a").expect("source shard")],
+        vec![ShardId::new("tenant-b").expect("target shard")],
+    )
+    .with_drain_policy(ShardDrainPolicy::default())
+    .with_migration_override_explicit(true)
+    .with_migration_state(ShardMigrationState::Assessing)
+    .with_safety_report(report.clone());
+
+    assert_eq!(report.active_client_ids(), &[3, 11]);
+    assert_eq!(
+        report.prepared_statements(),
+        &[String::from("stmt_a"), String::from("stmt_z")]
+    );
+    assert_eq!(report.open_transaction_ids(), &[12, 88]);
+    assert_eq!(report.last_required_lsn(), Some(pg_kinetic_core::lsn::PgLsn::new(99)));
+
+    assert_eq!(plan.source_shard_ids()[0].as_str(), "tenant-a");
+    assert_eq!(plan.target_shard_ids()[0].as_str(), "tenant-b");
+    assert_eq!(plan.drain_policy(), ShardDrainPolicy::default());
+    assert!(plan.migration_override_explicit());
+    assert_eq!(plan.migration_state(), ShardMigrationState::Assessing);
+    assert_eq!(plan.safety_report().expect("migration report"), &report);
 }
 
 fn expected_shard_hash(key: &ShardKey) -> u64 {

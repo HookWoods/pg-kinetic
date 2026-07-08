@@ -9,7 +9,11 @@ use std::{
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::{route::RouteKey, routing::BackendRole};
+use crate::{
+    lsn::PgLsn,
+    route::RouteKey,
+    routing::BackendRole,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ShardId(Arc<str>);
@@ -203,10 +207,7 @@ pub struct RangeShardRule {
 
 impl RangeShardRule {
     #[must_use]
-    pub fn new(
-        lower_bound: ShardKey,
-        upper_bound: ShardKey,
-    ) -> Result<Self, ShardValidationError> {
+    pub fn new(lower_bound: ShardKey, upper_bound: ShardKey) -> Result<Self, ShardValidationError> {
         Self::with_bounds(lower_bound, true, upper_bound, true)
     }
 
@@ -443,13 +444,10 @@ fn boundary_satisfies_upper(boundary: &ShardKey, inclusive: bool, key: &ShardKey
 
 #[must_use]
 fn list_lookup(rules: &[ListShardRule], key: &ShardKey) -> Option<usize> {
-    rules
-        .iter()
-        .enumerate()
-        .find_map(|(rule_index, rule)| {
-            (rule.key_type() == key.key_type() && rule.values().iter().any(|value| value == key))
-                .then_some(rule_index)
-        })
+    rules.iter().enumerate().find_map(|(rule_index, rule)| {
+        (rule.key_type() == key.key_type() && rule.values().iter().any(|value| value == key))
+            .then_some(rule_index)
+    })
 }
 
 fn validate_range_rules(rules: &[RangeShardRule]) -> Result<(), ShardValidationError> {
@@ -734,6 +732,269 @@ impl fmt::Display for MultiShardPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ShardLifecycleState {
+    #[default]
+    Active,
+    Draining,
+    Readonly,
+    Disabled,
+}
+
+impl ShardLifecycleState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::Readonly => "readonly",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    #[must_use]
+    pub fn allows_reads(self, drain_policy: Option<&ShardDrainPolicy>) -> bool {
+        match self {
+            Self::Active | Self::Readonly => true,
+            Self::Draining => {
+                drain_policy.is_some_and(ShardDrainPolicy::serve_reads_while_draining)
+            }
+            Self::Disabled => false,
+        }
+    }
+
+    #[must_use]
+    pub fn allows_writes(self, drain_policy: Option<&ShardDrainPolicy>) -> bool {
+        match self {
+            Self::Active => true,
+            Self::Readonly | Self::Disabled => false,
+            Self::Draining => drain_policy
+                .is_some_and(|policy| !policy.reject_new_writes_while_draining()),
+        }
+    }
+}
+
+impl fmt::Display for ShardLifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShardDrainPolicy {
+    serve_reads_while_draining: bool,
+    reject_new_writes_while_draining: bool,
+}
+
+impl Default for ShardDrainPolicy {
+    fn default() -> Self {
+        Self::read_only()
+    }
+}
+
+impl ShardDrainPolicy {
+    #[must_use]
+    pub const fn new(
+        serve_reads_while_draining: bool,
+        reject_new_writes_while_draining: bool,
+    ) -> Self {
+        Self {
+            serve_reads_while_draining,
+            reject_new_writes_while_draining,
+        }
+    }
+
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self::new(true, true)
+    }
+
+    #[must_use]
+    pub const fn serve_reads_while_draining(&self) -> bool {
+        self.serve_reads_while_draining
+    }
+
+    #[must_use]
+    pub const fn reject_new_writes_while_draining(&self) -> bool {
+        self.reject_new_writes_while_draining
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ShardMigrationState {
+    #[default]
+    Idle,
+    Assessing,
+    Ready,
+    Blocked,
+}
+
+impl ShardMigrationState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Assessing => "assessing",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl fmt::Display for ShardMigrationState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShardMigrationSafetyReport {
+    active_client_ids: Vec<u64>,
+    prepared_statements: Vec<String>,
+    open_transaction_ids: Vec<u64>,
+    last_required_lsn: Option<PgLsn>,
+}
+
+impl ShardMigrationSafetyReport {
+    #[must_use]
+    pub fn new(
+        active_client_ids: impl Into<Vec<u64>>,
+        prepared_statements: impl Into<Vec<String>>,
+        open_transaction_ids: impl Into<Vec<u64>>,
+        last_required_lsn: Option<PgLsn>,
+    ) -> Self {
+        let mut active_client_ids = active_client_ids.into();
+        active_client_ids.sort_unstable();
+        active_client_ids.dedup();
+
+        let mut prepared_statements = prepared_statements.into();
+        prepared_statements.sort();
+        prepared_statements.dedup();
+
+        let mut open_transaction_ids = open_transaction_ids.into();
+        open_transaction_ids.sort_unstable();
+        open_transaction_ids.dedup();
+
+        Self {
+            active_client_ids,
+            prepared_statements,
+            open_transaction_ids,
+            last_required_lsn,
+        }
+    }
+
+    #[must_use]
+    pub fn active_client_ids(&self) -> &[u64] {
+        &self.active_client_ids
+    }
+
+    #[must_use]
+    pub fn prepared_statements(&self) -> &[String] {
+        &self.prepared_statements
+    }
+
+    #[must_use]
+    pub fn open_transaction_ids(&self) -> &[u64] {
+        &self.open_transaction_ids
+    }
+
+    #[must_use]
+    pub const fn last_required_lsn(&self) -> Option<PgLsn> {
+        self.last_required_lsn
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardRebalancePlan {
+    source_shard_ids: Vec<ShardId>,
+    target_shard_ids: Vec<ShardId>,
+    drain_policy: ShardDrainPolicy,
+    migration_override_explicit: bool,
+    migration_state: ShardMigrationState,
+    safety_report: Option<ShardMigrationSafetyReport>,
+}
+
+impl ShardRebalancePlan {
+    #[must_use]
+    pub fn new(
+        source_shard_ids: impl Into<Vec<ShardId>>,
+        target_shard_ids: impl Into<Vec<ShardId>>,
+    ) -> Self {
+        let source_shard_ids = sort_shard_ids(source_shard_ids.into());
+        let target_shard_ids = sort_shard_ids(target_shard_ids.into());
+
+        Self {
+            source_shard_ids,
+            target_shard_ids,
+            drain_policy: ShardDrainPolicy::default(),
+            migration_override_explicit: false,
+            migration_state: ShardMigrationState::default(),
+            safety_report: None,
+        }
+    }
+
+    #[must_use]
+    pub fn source_shard_ids(&self) -> &[ShardId] {
+        &self.source_shard_ids
+    }
+
+    #[must_use]
+    pub fn target_shard_ids(&self) -> &[ShardId] {
+        &self.target_shard_ids
+    }
+
+    #[must_use]
+    pub const fn drain_policy(&self) -> ShardDrainPolicy {
+        self.drain_policy
+    }
+
+    #[must_use]
+    pub const fn migration_override_explicit(&self) -> bool {
+        self.migration_override_explicit
+    }
+
+    #[must_use]
+    pub const fn migration_state(&self) -> ShardMigrationState {
+        self.migration_state
+    }
+
+    #[must_use]
+    pub fn safety_report(&self) -> Option<&ShardMigrationSafetyReport> {
+        self.safety_report.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_drain_policy(mut self, drain_policy: ShardDrainPolicy) -> Self {
+        self.drain_policy = drain_policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_migration_override_explicit(mut self, explicit: bool) -> Self {
+        self.migration_override_explicit = explicit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_migration_state(mut self, migration_state: ShardMigrationState) -> Self {
+        self.migration_state = migration_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_safety_report(mut self, safety_report: ShardMigrationSafetyReport) -> Self {
+        self.safety_report = Some(safety_report);
+        self
+    }
+}
+
+#[must_use]
+fn sort_shard_ids(mut shard_ids: Vec<ShardId>) -> Vec<ShardId> {
+    shard_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    shard_ids.dedup();
+    shard_ids
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardRoute {
     target: ShardTarget,
@@ -876,7 +1137,8 @@ impl RouteMapValidationReport {
     }
 
     fn push(&mut self, code: RouteMapValidationErrorCode, message: impl Into<String>) {
-        self.errors.push(RouteMapValidationError::new(code, message));
+        self.errors
+            .push(RouteMapValidationError::new(code, message));
     }
 }
 
@@ -984,9 +1246,17 @@ pub fn ordered_route_indices(routes: &[RouteDefinition]) -> Vec<usize> {
 #[must_use]
 pub fn validate_route_map(route_map: &RouteMapValidationInput) -> RouteMapValidationReport {
     let mut report = RouteMapValidationReport::default();
-    let known_routes: HashSet<&str> = route_map.routes.iter().map(|route| route.name.as_str()).collect();
+    let known_routes: HashSet<&str> = route_map
+        .routes
+        .iter()
+        .map(|route| route.name.as_str())
+        .collect();
 
-    let default_route_count = route_map.routes.iter().filter(|route| route.is_default).count();
+    let default_route_count = route_map
+        .routes
+        .iter()
+        .filter(|route| route.is_default)
+        .count();
     if default_route_count > 1 {
         report.push(
             RouteMapValidationErrorCode::ConflictingDefaultRoutes,

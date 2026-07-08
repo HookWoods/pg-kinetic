@@ -13,8 +13,9 @@ use pg_kinetic_core::{
     shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
     sharding::{
         deterministic_shard_hash, MultiShardPolicy, RouteDefinition, RouteMapValidationInput,
-        ShardId, ShardRoute, ShardRouteDecision, ShardRouteMap, ShardRouteReason, ShardScope,
-        ShardStrategy, ShardValidationError, ShardedTableDefinition, TableScope, TenantScope,
+        ShardId, ShardRebalancePlan, ShardRoute, ShardRouteDecision, ShardRouteMap,
+        ShardRouteReason, ShardScope, ShardStrategy, ShardValidationError, ShardedTableDefinition,
+        TableScope, TenantScope,
     },
     virtual_session::ReadAfterWriteState,
 };
@@ -428,6 +429,7 @@ impl Default for ShardRouteMapStore {
 pub enum RouteMapReloadErrorCode {
     EmptyRouteMapSet,
     ConflictingRouteScopes,
+    ActiveTransactionsRequireMigrationOverride,
 }
 
 impl RouteMapReloadErrorCode {
@@ -436,6 +438,9 @@ impl RouteMapReloadErrorCode {
         match self {
             Self::EmptyRouteMapSet => "empty_route_map_set",
             Self::ConflictingRouteScopes => "conflicting_route_scopes",
+            Self::ActiveTransactionsRequireMigrationOverride => {
+                "active_transactions_require_migration_override"
+            }
         }
     }
 }
@@ -522,32 +527,11 @@ impl ShardRouteMapStore {
         &self,
         route_maps: impl Into<Vec<ShardRouteMap>>,
         snapshot_store: Option<&SnapshotStore>,
+        rebalance_plan: Option<&ShardRebalancePlan>,
     ) -> RouteMapReloadResult {
         let route_maps = route_maps.into();
         let current_generation = self.generation_id();
-
         let result = match validate_reload_route_maps(&route_maps) {
-            Ok(()) => {
-                let next_route_maps = Arc::from(route_maps.into_boxed_slice());
-                let mut route_map_guard = self
-                    .inner
-                    .route_maps
-                    .write()
-                    .expect("route map store poisoned");
-                *route_map_guard = next_route_maps;
-                let next_generation = self.inner.generation_id.fetch_add(1, Ordering::AcqRel) + 1;
-                drop(route_map_guard);
-                self.refresh_draining_shards();
-                let draining_shard_ids = self.draining_shard_ids();
-
-                RouteMapReloadResult {
-                    success: true,
-                    route_map_generation_id: next_generation,
-                    error_code: None,
-                    error: None,
-                    draining_shard_ids,
-                }
-            }
             Err(error_code) => {
                 let draining_shard_ids = self.draining_shard_ids();
                 RouteMapReloadResult {
@@ -558,9 +542,65 @@ impl ShardRouteMapStore {
                     draining_shard_ids,
                 }
             }
+            Ok(()) => {
+                let migration_override_explicit = rebalance_plan.is_some_and(|plan| {
+                    plan.migration_override_explicit()
+                });
+                let active_shard_ids = self.active_transaction_shard_ids();
+                let current_shard_ids = self.current_shard_ids();
+                let next_shard_ids = route_map_shard_ids(&route_maps);
+                let removed_shard_ids = current_shard_ids
+                    .difference(&next_shard_ids)
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if !migration_override_explicit
+                    && removed_shard_ids
+                        .iter()
+                        .any(|shard_id| active_shard_ids.contains(shard_id))
+                {
+                    RouteMapReloadResult {
+                        success: false,
+                        route_map_generation_id: current_generation,
+                        error_code: Some(
+                            RouteMapReloadErrorCode::ActiveTransactionsRequireMigrationOverride,
+                        ),
+                        error: Some(validation_error_message(
+                            RouteMapReloadErrorCode::ActiveTransactionsRequireMigrationOverride,
+                        )),
+                        draining_shard_ids: self.draining_shard_ids(),
+                    }
+                } else {
+                    let next_route_maps = Arc::from(route_maps.into_boxed_slice());
+                    let mut route_map_guard = self
+                        .inner
+                        .route_maps
+                        .write()
+                        .expect("route map store poisoned");
+                    *route_map_guard = next_route_maps;
+                    let next_generation =
+                        self.inner.generation_id.fetch_add(1, Ordering::AcqRel) + 1;
+                    drop(route_map_guard);
+                    self.refresh_draining_shards();
+                    let draining_shard_ids = self.draining_shard_ids();
+
+                    RouteMapReloadResult {
+                        success: true,
+                        route_map_generation_id: next_generation,
+                        error_code: None,
+                        error: None,
+                        draining_shard_ids,
+                    }
+                }
+            }
         };
 
         if let Some(snapshot_store) = snapshot_store {
+            if let Some(rebalance_plan) = rebalance_plan {
+                snapshot_store.set_shard_migration_safety_snapshot(
+                    crate::snapshot::ShardMigrationSafetySnapshot::from(rebalance_plan),
+                );
+            }
             reload::record_route_map_reload(snapshot_store, &result);
         }
 
@@ -637,7 +677,22 @@ fn validation_error_message(error_code: RouteMapReloadErrorCode) -> String {
         RouteMapReloadErrorCode::ConflictingRouteScopes => {
             String::from("route map reload contains conflicting scopes")
         }
+        RouteMapReloadErrorCode::ActiveTransactionsRequireMigrationOverride => String::from(
+            "route map reload removes an active shard and requires an explicit migration override",
+        ),
     }
+}
+
+fn route_map_shard_ids(route_maps: &[ShardRouteMap]) -> HashSet<ShardId> {
+    route_maps
+        .iter()
+        .flat_map(|route_map| {
+            route_map
+                .routes()
+                .iter()
+                .map(|route| route.target().shard_id().clone())
+        })
+        .collect()
 }
 
 #[must_use]

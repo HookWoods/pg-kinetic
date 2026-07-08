@@ -14,7 +14,9 @@ use pg_kinetic_core::{
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
-    sharding::ShardId,
+    sharding::{
+        ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan,
+    },
 };
 
 use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
@@ -315,6 +317,40 @@ impl RouteMapReloadSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardLifecycleSnapshot {
+    pub shard_id: ShardId,
+    pub lifecycle_state: ShardLifecycleState,
+    pub drain_policy: ShardDrainPolicy,
+}
+
+impl ShardLifecycleSnapshot {
+    #[must_use]
+    pub fn new(
+        shard_id: ShardId,
+        lifecycle_state: ShardLifecycleState,
+        drain_policy: ShardDrainPolicy,
+    ) -> Self {
+        Self {
+            shard_id,
+            lifecycle_state,
+            drain_policy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardMigrationSafetySnapshot {
+    pub rebalance_plan: ShardRebalancePlan,
+}
+
+impl ShardMigrationSafetySnapshot {
+    #[must_use]
+    pub fn new(rebalance_plan: ShardRebalancePlan) -> Self {
+        Self { rebalance_plan }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub listen_addr: SocketAddr,
     pub backend_addr: SocketAddr,
@@ -476,6 +512,8 @@ struct SnapshotStoreInner {
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     route_map_reloads: Vec<RouteMapReloadSnapshot>,
+    shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
+    shard_migration_safety: Vec<ShardMigrationSafetySnapshot>,
     settings: SettingsSnapshot,
     limits: LimitsSnapshot,
 }
@@ -872,6 +910,55 @@ impl SnapshotStore {
             .clone()
     }
 
+    pub fn set_shard_lifecycle_snapshot(&self, snapshot: ShardLifecycleSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .shard_lifecycles
+            .insert(snapshot.shard_id.clone(), snapshot);
+    }
+
+    #[must_use]
+    pub fn shard_lifecycle_snapshot(&self, shard_id: &ShardId) -> Option<ShardLifecycleSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .shard_lifecycles
+            .get(shard_id)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn shard_lifecycle_snapshots(&self) -> Vec<ShardLifecycleSnapshot> {
+        let mut snapshots = self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .shard_lifecycles
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.shard_id.as_str().cmp(right.shard_id.as_str()));
+        snapshots
+    }
+
+    pub fn set_shard_migration_safety_snapshot(&self, snapshot: ShardMigrationSafetySnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .shard_migration_safety
+            .push(snapshot);
+    }
+
+    #[must_use]
+    pub fn shard_migration_safety_snapshots(&self) -> Vec<ShardMigrationSafetySnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .shard_migration_safety
+            .clone()
+    }
+
     pub fn set_settings_snapshot(&self, snapshot: SettingsSnapshot) {
         self.inner
             .write()
@@ -1013,6 +1100,12 @@ impl From<&RouteMapReloadResult> for RouteMapReloadSnapshot {
             error_code: result.error_code,
             draining_shard_ids,
         }
+    }
+}
+
+impl From<&ShardRebalancePlan> for ShardMigrationSafetySnapshot {
+    fn from(rebalance_plan: &ShardRebalancePlan) -> Self {
+        Self::new(rebalance_plan.clone())
     }
 }
 
