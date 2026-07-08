@@ -19,7 +19,9 @@ use pg_kinetic_core::{
     },
 };
 
-use crate::config::{AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config};
+use crate::config::{
+    AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
+};
 use crate::metrics;
 use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
@@ -512,6 +514,7 @@ struct SnapshotStoreInner {
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     route_map_reloads: Vec<RouteMapReloadSnapshot>,
+    sharding: ShardingConfig,
     shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
     shard_migration_safety: Vec<ShardMigrationSafetySnapshot>,
     settings: SettingsSnapshot,
@@ -894,6 +897,7 @@ impl SnapshotStore {
     }
 
     pub fn set_route_map_reload_snapshot(&self, snapshot: RouteMapReloadSnapshot) {
+        metrics::record_route_map_reload_snapshot(&snapshot);
         self.inner
             .write()
             .expect("snapshot store poisoned")
@@ -910,7 +914,21 @@ impl SnapshotStore {
             .clone()
     }
 
+    pub fn set_sharding_snapshot(&self, snapshot: ShardingConfig) {
+        self.inner.write().expect("snapshot store poisoned").sharding = snapshot;
+    }
+
+    #[must_use]
+    pub fn sharding_snapshot(&self) -> ShardingConfig {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .sharding
+            .clone()
+    }
+
     pub fn set_shard_lifecycle_snapshot(&self, snapshot: ShardLifecycleSnapshot) {
+        metrics::record_shard_lifecycle_snapshot(&snapshot);
         self.inner
             .write()
             .expect("snapshot store poisoned")
@@ -943,6 +961,7 @@ impl SnapshotStore {
     }
 
     pub fn set_shard_migration_safety_snapshot(&self, snapshot: ShardMigrationSafetySnapshot) {
+        metrics::record_shard_migration_safety_snapshot(&snapshot);
         self.inner
             .write()
             .expect("snapshot store poisoned")

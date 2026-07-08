@@ -259,6 +259,8 @@ async fn show_routes_servers_clients_and_backpressure_include_phase_7_columns() 
             "fallback_policy",
             "freshness_policy",
             "read_after_write_timeout_ms",
+            "route_map_generation_id",
+            "sharding_enabled",
         ],
         &[vec![
             "postgres",
@@ -273,6 +275,8 @@ async fn show_routes_servers_clients_and_backpressure_include_phase_7_columns() 
             "wait",
             "session_write_lsn_and_max_lag",
             "750",
+            "0",
+            "false",
         ]],
     );
 

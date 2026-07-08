@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
+use crate::sharding::RouteMapReloadErrorCode;
 use crate::snapshot::{
-    PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, ServerSnapshot, SnapshotStore,
+    PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
+    ServerSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
 };
 use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -18,6 +20,7 @@ use pg_kinetic_core::{
     },
     route::{QueryClass as RouteQueryClass, RouteKey},
     routing::{BackendRole, FallbackPolicy},
+    sharding::{MultiShardPolicy, ShardLifecycleState, ShardRouteReason, ShardStrategy},
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
 };
 use pg_kinetic_core::{
@@ -178,6 +181,119 @@ pub fn increment_read_after_write_rejection(route: &RouteKey, outcome: Freshness
         "outcome" => freshness_outcome_label(outcome)
     )
     .increment(1);
+}
+
+pub fn record_shard_route_decision(
+    route: &RouteKey,
+    shard: Option<&str>,
+    strategy: ShardStrategy,
+    reason: ShardRouteReason,
+    outcome: &'static str,
+) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::ShardRouteDecisionsTotal.as_str(),
+        "route" => route.metric_label(),
+        "shard" => shard_bucket_label(shard),
+        "strategy" => strategy.as_str(),
+        "reason" => reason.as_str(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+pub fn record_shard_multi_shard_rejection(
+    route: &RouteKey,
+    shard: Option<&str>,
+    policy: MultiShardPolicy,
+    reason: ShardRouteReason,
+    outcome: &'static str,
+) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::ShardMultiShardRejectionsTotal.as_str(),
+        "route" => route.metric_label(),
+        "shard" => shard_bucket_label(shard),
+        "policy" => policy.as_str(),
+        "reason" => reason.as_str(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+pub fn record_shard_primary_fallback(
+    route: &RouteKey,
+    shard: Option<&str>,
+    policy: MultiShardPolicy,
+    outcome: &'static str,
+) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::ShardPrimaryFallbacksTotal.as_str(),
+        "route" => route.metric_label(),
+        "shard" => shard_bucket_label(shard),
+        "policy" => policy.as_str(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+pub fn record_route_map_reload_snapshot(snapshot: &RouteMapReloadSnapshot) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::RouteMapReloadTotal.as_str(),
+        "outcome" => if snapshot.success { "success" } else { "failure" },
+        "error_code" => route_map_reload_error_code_label(snapshot.error_code),
+    )
+    .increment(1);
+
+    metrics_crate::gauge!(ObservabilityMetricName::RouteMapGeneration.as_str())
+        .set(snapshot.route_map_generation_id as f64);
+}
+
+pub fn record_shard_lifecycle_snapshot(snapshot: &ShardLifecycleSnapshot) {
+    let shard = shard_bucket_label(Some(snapshot.shard_id.as_str()));
+    for candidate in [
+        ShardLifecycleState::Active,
+        ShardLifecycleState::Draining,
+        ShardLifecycleState::Readonly,
+        ShardLifecycleState::Disabled,
+    ] {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::ShardLifecycleState.as_str(),
+            "shard" => shard.clone(),
+            "lifecycle_state" => candidate.as_str(),
+        )
+        .set(if candidate == snapshot.lifecycle_state {
+            1.0
+        } else {
+            0.0
+        });
+    }
+}
+
+pub fn record_shard_migration_safety_snapshot(snapshot: &ShardMigrationSafetySnapshot) {
+    let Some(report) = snapshot.rebalance_plan.safety_report() else {
+        return;
+    };
+
+    let shard_values = snapshot
+        .rebalance_plan
+        .source_shard_ids()
+        .iter()
+        .map(|shard_id| shard_bucket_label(Some(shard_id.as_str())))
+        .collect::<Vec<_>>();
+    let prepared_statement_count = report.prepared_statements().len() as f64;
+    let active_transaction_count = report.open_transaction_ids().len() as f64;
+
+    for shard in shard_values {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::ShardActiveTransactions.as_str(),
+            "shard" => shard.clone(),
+        )
+        .set(active_transaction_count);
+        metrics_crate::gauge!(
+            ObservabilityMetricName::ShardPreparedStatements.as_str(),
+            "shard" => shard,
+        )
+        .set(prepared_statement_count);
+    }
 }
 
 pub fn remove_server_snapshot(snapshot_store: &SnapshotStore, backend_id: u64) {
@@ -406,6 +522,30 @@ fn describe_metric(descriptor: &MetricDescriptor) {
         MetricKind::Histogram => {
             metrics_crate::describe_histogram!(descriptor.name, descriptor.description);
         }
+    }
+}
+
+fn shard_bucket_label(shard: Option<&str>) -> String {
+    match shard {
+        Some(shard) => format!("bucket_{}", shard_bucket(shard)),
+        None => String::from("unassigned"),
+    }
+}
+
+fn shard_bucket(value: &str) -> u8 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    (hash % 8) as u8
+}
+
+fn route_map_reload_error_code_label(error_code: Option<RouteMapReloadErrorCode>) -> &'static str {
+    match error_code {
+        Some(error_code) => error_code.as_str(),
+        None => "none",
     }
 }
 

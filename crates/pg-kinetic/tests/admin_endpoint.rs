@@ -359,7 +359,7 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
     let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;
     assert_admin_table_response(
         &routes_frames,
-        &[
+        &[ 
             "database",
             "user",
             "application_name",
@@ -372,6 +372,8 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "fallback_policy",
             "freshness_policy",
             "read_after_write_timeout_ms",
+            "route_map_generation_id",
+            "sharding_enabled",
         ],
         &[vec![
             "billing",
@@ -386,6 +388,8 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "primary",
             "session_write_lsn",
             "0",
+            "0",
+            "false",
         ]],
     );
 

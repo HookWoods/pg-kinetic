@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -15,14 +15,17 @@ use tokio::{
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::{
-    config::Config,
+    config::{
+        Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig,
+    },
     drain::DrainController,
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
         PreparedSnapshot, RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
-        RoutePolicySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot, SnapshotStore,
+        RouteMapReloadSnapshot, RoutePolicySnapshot, RouteSnapshot, ServerSnapshot,
+        SettingsSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -34,6 +37,7 @@ use pg_kinetic_core::{
     lsn::PgLsn,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
+    sharding::ShardLifecycleState,
     session::PinReason,
 };
 use pg_kinetic_wire::{
@@ -379,6 +383,7 @@ fn ready_for_query(status: ReadyStatusByte) -> BytesMut {
 }
 
 fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
+    let sharding_snapshot = state.snapshot_store.sharding_snapshot();
     let table = match view {
         AdminView::Clients => clients_table(
             &state.snapshot_store.client_snapshots(),
@@ -396,9 +401,17 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             backpressure_table(&state.snapshot_store.backpressure_snapshots())
         }
         AdminView::Routes => routes_table(
+            latest_route_map_generation(&state.snapshot_store.route_map_reload_snapshots()),
+            sharding_snapshot.sharding_enabled,
             &state.snapshot_store.route_snapshots(),
             &state.snapshot_store.route_policy_snapshots(),
         ),
+        AdminView::RouteMaps => route_maps_table(&sharding_snapshot),
+        AdminView::Shards => shards_table(
+            &sharding_snapshot,
+            &state.snapshot_store.shard_lifecycle_snapshots(),
+        ),
+        AdminView::Migrations => migrations_table(&state.snapshot_store.shard_migration_safety_snapshots()),
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), &state.config),
     };
@@ -630,7 +643,12 @@ fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
     )
 }
 
-fn routes_table(routes: &[RouteSnapshot], route_policies: &[RoutePolicySnapshot]) -> AdminTable {
+fn routes_table(
+    route_map_generation_id: u64,
+    sharding_enabled: bool,
+    routes: &[RouteSnapshot],
+    route_policies: &[RoutePolicySnapshot],
+) -> AdminTable {
     let route_policies = route_policies
         .iter()
         .cloned()
@@ -652,6 +670,8 @@ fn routes_table(routes: &[RouteSnapshot], route_policies: &[RoutePolicySnapshot]
             ("fallback_policy", AdminColumnType::Text),
             ("freshness_policy", AdminColumnType::Text),
             ("read_after_write_timeout_ms", AdminColumnType::Int8),
+            ("route_map_generation_id", AdminColumnType::Int8),
+            ("sharding_enabled", AdminColumnType::Bool),
         ],
         routes
             .iter()
@@ -674,6 +694,151 @@ fn routes_table(routes: &[RouteSnapshot], route_policies: &[RoutePolicySnapshot]
                     policy.fallback_policy.as_str().to_string(),
                     policy.freshness_policy.as_str().to_string(),
                     policy.read_after_write_timeout_ms.to_string(),
+                    route_map_generation_id.to_string(),
+                    sharding_enabled.to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn route_maps_table(sharding: &ShardingConfig) -> AdminTable {
+    admin_table(
+        AdminView::RouteMaps,
+        &[
+            ("scope", AdminColumnType::Text),
+            ("strategy", AdminColumnType::Text),
+            ("priority", AdminColumnType::Text),
+            ("multi_shard_policy", AdminColumnType::Text),
+        ],
+        sharding
+            .route_maps
+            .iter()
+            .map(|route_map| {
+                AdminRow::new(vec![
+                    route_map_scope_label(&route_map.scope),
+                    shard_strategy_label(&route_map.strategy).to_string(),
+                    route_map
+                        .priority
+                        .map(|priority| priority.0.to_string())
+                        .unwrap_or_else(|| String::from("<none>")),
+                    multi_shard_policy_label(sharding.multi_shard_policy).to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn shards_table(
+    sharding: &ShardingConfig,
+    lifecycle_snapshots: &[ShardLifecycleSnapshot],
+) -> AdminTable {
+    #[derive(Default)]
+    struct ShardSummary {
+        route_key: Option<String>,
+        primary_backend_count: usize,
+        replica_backend_count: usize,
+        lifecycle_state: Option<ShardLifecycleState>,
+    }
+
+    let mut shards = BTreeMap::<String, ShardSummary>::new();
+
+    for route_map in &sharding.route_maps {
+        let route_key = route_map_scope_label(&route_map.scope);
+        for target in &route_map.targets {
+            let shard_id = match target {
+                ShardTargetConfig::Primary { shard_id } | ShardTargetConfig::Replicas { shard_id } => shard_id,
+            };
+            let summary = shards.entry(shard_id.clone()).or_default();
+            if summary.route_key.is_none() {
+                summary.route_key = Some(route_key.clone());
+            }
+
+            match target {
+                ShardTargetConfig::Primary { .. } => summary.primary_backend_count += 1,
+                ShardTargetConfig::Replicas { .. } => summary.replica_backend_count += 1,
+            }
+        }
+    }
+
+    for snapshot in lifecycle_snapshots {
+        shards
+            .entry(snapshot.shard_id.as_str().to_owned())
+            .or_default()
+            .lifecycle_state = Some(snapshot.lifecycle_state);
+    }
+
+    admin_table(
+        AdminView::Shards,
+        &[
+            ("shard_id", AdminColumnType::Text),
+            ("route_key", AdminColumnType::Text),
+            ("lifecycle_state", AdminColumnType::Text),
+            ("primary_backend_count", AdminColumnType::Int8),
+            ("replica_backend_count", AdminColumnType::Int8),
+            ("health_summary", AdminColumnType::Text),
+        ],
+        shards
+            .into_iter()
+            .map(|(shard_id, summary)| {
+                let lifecycle_state = summary.lifecycle_state.unwrap_or_default();
+                let route_key = summary.route_key.unwrap_or_else(|| String::from("<none>"));
+                let health_summary = shard_health_summary(
+                    lifecycle_state,
+                    summary.primary_backend_count,
+                    summary.replica_backend_count,
+                );
+
+                AdminRow::new(vec![
+                    shard_id,
+                    route_key,
+                    lifecycle_state.as_str().to_string(),
+                    summary.primary_backend_count.to_string(),
+                    summary.replica_backend_count.to_string(),
+                    health_summary.to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn migrations_table(migrations: &[ShardMigrationSafetySnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::Migrations,
+        &[
+            ("migration_state", AdminColumnType::Text),
+            ("migration_override_explicit", AdminColumnType::Bool),
+            ("source_shard_ids", AdminColumnType::Text),
+            ("target_shard_ids", AdminColumnType::Text),
+            ("active_client_count", AdminColumnType::Int8),
+            ("prepared_statement_count", AdminColumnType::Int8),
+            ("open_transaction_count", AdminColumnType::Int8),
+            ("last_required_lsn", AdminColumnType::Text),
+        ],
+        migrations
+            .iter()
+            .map(|snapshot| {
+                let plan = &snapshot.rebalance_plan;
+                let report = plan.safety_report();
+
+                AdminRow::new(vec![
+                    plan.migration_state().as_str().to_string(),
+                    plan.migration_override_explicit().to_string(),
+                    join_shard_ids(plan.source_shard_ids()),
+                    join_shard_ids(plan.target_shard_ids()),
+                    report
+                        .map(|report| report.active_client_ids().len())
+                        .unwrap_or(0)
+                        .to_string(),
+                    report
+                        .map(|report| report.prepared_statements().len())
+                        .unwrap_or(0)
+                        .to_string(),
+                    report
+                        .map(|report| report.open_transaction_ids().len())
+                        .unwrap_or(0)
+                        .to_string(),
+                    optional_pglsn(report.and_then(|report| report.last_required_lsn())),
                 ])
             })
             .collect(),
@@ -841,6 +1006,68 @@ fn optional_route_key(value: Option<&RouteKey>) -> String {
 
 fn optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| String::from("<none>"), |number| number.to_string())
+}
+
+fn latest_route_map_generation(route_map_reloads: &[RouteMapReloadSnapshot]) -> u64 {
+    route_map_reloads
+        .last()
+        .map_or(0, |snapshot| snapshot.route_map_generation_id)
+}
+
+fn route_map_scope_label(scope: &ShardScopeConfig) -> String {
+    match scope {
+        ShardScopeConfig::DatabaseUser { database, user } => format!("{database}/{user}"),
+        ShardScopeConfig::ApplicationName { application_name } => application_name.clone(),
+        ShardScopeConfig::SchemaTable { schema, table } => format!("{schema}.{table}"),
+        ShardScopeConfig::TenantKey { tenant_key } => tenant_key.clone(),
+    }
+}
+
+fn shard_strategy_label(strategy: &crate::config::ShardStrategyConfig) -> &'static str {
+    match strategy {
+        crate::config::ShardStrategyConfig::Hash => "hash",
+        crate::config::ShardStrategyConfig::Range => "range",
+        crate::config::ShardStrategyConfig::List => "list",
+    }
+}
+
+fn multi_shard_policy_label(policy: MultiShardPolicyConfig) -> &'static str {
+    match policy {
+        MultiShardPolicyConfig::Reject => "reject",
+        MultiShardPolicyConfig::FirstMatch => "first_match",
+        MultiShardPolicyConfig::FanOut => "fan_out",
+    }
+}
+
+fn join_shard_ids(shard_ids: &[pg_kinetic_core::sharding::ShardId]) -> String {
+    if shard_ids.is_empty() {
+        return String::from("<none>");
+    }
+
+    shard_ids
+        .iter()
+        .map(|shard_id| shard_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn shard_health_summary(
+    lifecycle_state: ShardLifecycleState,
+    primary_backend_count: usize,
+    replica_backend_count: usize,
+) -> &'static str {
+    match lifecycle_state {
+        ShardLifecycleState::Active => {
+            if primary_backend_count + replica_backend_count == 0 {
+                "unassigned"
+            } else {
+                "healthy"
+            }
+        }
+        ShardLifecycleState::Draining => "draining",
+        ShardLifecycleState::Readonly => "readonly",
+        ShardLifecycleState::Disabled => "disabled",
+    }
 }
 
 fn route_key_value(route_key: &RouteKey) -> String {

@@ -19,6 +19,18 @@ fn parses_supported_show_commands() {
         AdminCommand::Show(AdminView::Backpressure)
     );
     assert_eq!(
+        parse_admin_command("show route maps"),
+        AdminCommand::Show(AdminView::RouteMaps)
+    );
+    assert_eq!(
+        parse_admin_command("show shards"),
+        AdminCommand::Show(AdminView::Shards)
+    );
+    assert_eq!(
+        parse_admin_command("show migrations"),
+        AdminCommand::Show(AdminView::Migrations)
+    );
+    assert_eq!(
         parse_admin_command("show limits"),
         AdminCommand::Show(AdminView::Limits)
     );

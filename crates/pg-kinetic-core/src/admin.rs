@@ -7,13 +7,22 @@ pub enum AdminCommand {
 #[must_use]
 pub fn parse_admin_command(sql: &str) -> AdminCommand {
     let normalized_sql = normalize_admin_sql(sql);
-    let mut parts = normalized_sql.split_whitespace();
+    let parts = normalized_sql.split_whitespace().collect::<Vec<_>>();
 
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("show"), Some(view), None) => match parse_admin_view(view) {
-            Some(view) => AdminCommand::Show(view),
-            None => AdminCommand::Unknown(normalized_sql),
-        },
+    match parts.as_slice() {
+        ["show", "clients"] => AdminCommand::Show(AdminView::Clients),
+        ["show", "pools"] => AdminCommand::Show(AdminView::Pools),
+        ["show", "servers"] => AdminCommand::Show(AdminView::Servers),
+        ["show", "prepared"] => AdminCommand::Show(AdminView::Prepared),
+        ["show", "pinning"] => AdminCommand::Show(AdminView::Pinning),
+        ["show", "recovery"] => AdminCommand::Show(AdminView::Recovery),
+        ["show", "backpressure"] => AdminCommand::Show(AdminView::Backpressure),
+        ["show", "routes"] => AdminCommand::Show(AdminView::Routes),
+        ["show", "route", "maps"] => AdminCommand::Show(AdminView::RouteMaps),
+        ["show", "shards"] => AdminCommand::Show(AdminView::Shards),
+        ["show", "migrations"] => AdminCommand::Show(AdminView::Migrations),
+        ["show", "settings"] => AdminCommand::Show(AdminView::Settings),
+        ["show", "limits"] => AdminCommand::Show(AdminView::Limits),
         _ => AdminCommand::Unknown(normalized_sql),
     }
 }
@@ -34,22 +43,6 @@ fn normalize_admin_sql(sql: &str) -> String {
     without_semicolon.trim().to_ascii_lowercase()
 }
 
-fn parse_admin_view(view: &str) -> Option<AdminView> {
-    match view {
-        "clients" => Some(AdminView::Clients),
-        "pools" => Some(AdminView::Pools),
-        "servers" => Some(AdminView::Servers),
-        "prepared" => Some(AdminView::Prepared),
-        "pinning" => Some(AdminView::Pinning),
-        "recovery" => Some(AdminView::Recovery),
-        "backpressure" => Some(AdminView::Backpressure),
-        "routes" => Some(AdminView::Routes),
-        "settings" => Some(AdminView::Settings),
-        "limits" => Some(AdminView::Limits),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AdminView {
     Clients,
@@ -60,6 +53,9 @@ pub enum AdminView {
     Recovery,
     Backpressure,
     Routes,
+    RouteMaps,
+    Shards,
+    Migrations,
     Settings,
     Limits,
 }
@@ -76,6 +72,9 @@ impl AdminView {
             Self::Recovery => "recovery",
             Self::Backpressure => "backpressure",
             Self::Routes => "routes",
+            Self::RouteMaps => "route maps",
+            Self::Shards => "shards",
+            Self::Migrations => "migrations",
             Self::Settings => "settings",
             Self::Limits => "limits",
         }

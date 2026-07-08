@@ -81,6 +81,14 @@ pub enum MetricName {
     ReadAfterWriteRejectionsTotal,
     RouteDecisionsTotal,
     RouteFallbacksTotal,
+    ShardRouteDecisionsTotal,
+    ShardMultiShardRejectionsTotal,
+    ShardPrimaryFallbacksTotal,
+    RouteMapReloadTotal,
+    RouteMapGeneration,
+    ShardLifecycleState,
+    ShardActiveTransactions,
+    ShardPreparedStatements,
     ReplicaHealth,
     ReplicaLagMs,
     ReplicaReplayLsn,
@@ -110,6 +118,16 @@ impl MetricName {
             Self::ReadAfterWriteRejectionsTotal => "pg_kinetic_read_after_write_rejections_total",
             Self::RouteDecisionsTotal => "pg_kinetic_route_decisions_total",
             Self::RouteFallbacksTotal => "pg_kinetic_route_fallbacks_total",
+            Self::ShardRouteDecisionsTotal => "pg_kinetic_shard_route_decisions_total",
+            Self::ShardMultiShardRejectionsTotal => {
+                "pg_kinetic_shard_multi_shard_rejections_total"
+            }
+            Self::ShardPrimaryFallbacksTotal => "pg_kinetic_shard_primary_fallbacks_total",
+            Self::RouteMapReloadTotal => "pg_kinetic_route_map_reload_total",
+            Self::RouteMapGeneration => "pg_kinetic_route_map_generation",
+            Self::ShardLifecycleState => "pg_kinetic_shard_lifecycle_state",
+            Self::ShardActiveTransactions => "pg_kinetic_shard_active_transactions",
+            Self::ShardPreparedStatements => "pg_kinetic_shard_prepared_statements",
             Self::ReplicaHealth => "pg_kinetic_replica_health",
             Self::ReplicaLagMs => "pg_kinetic_replica_lag_ms",
             Self::ReplicaReplayLsn => "pg_kinetic_replica_replay_lsn",
@@ -182,6 +200,11 @@ pub enum MetricLabel {
     Reason,
     QueryClass,
     Route,
+    Shard,
+    Strategy,
+    Policy,
+    LifecycleState,
+    ErrorCode,
     Scope,
     Socket,
     Sqlstate,
@@ -209,6 +232,11 @@ impl MetricLabel {
             Self::Reason => "reason",
             Self::QueryClass => "query_class",
             Self::Route => "route",
+            Self::Shard => "shard",
+            Self::Strategy => "strategy",
+            Self::Policy => "policy",
+            Self::LifecycleState => "lifecycle_state",
+            Self::ErrorCode => "error_code",
             Self::Scope => "scope",
             Self::Socket => "socket",
             Self::Sqlstate => "sqlstate",
@@ -265,6 +293,30 @@ const ROUTE_FALLBACK_LABELS: &[MetricLabel] = &[
     MetricLabel::Reason,
     MetricLabel::FallbackPolicy,
 ];
+const SHARD_ROUTE_DECISION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Route,
+    MetricLabel::Shard,
+    MetricLabel::Strategy,
+    MetricLabel::Reason,
+    MetricLabel::Outcome,
+];
+const SHARD_MULTI_SHARD_REJECTION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Route,
+    MetricLabel::Shard,
+    MetricLabel::Policy,
+    MetricLabel::Reason,
+    MetricLabel::Outcome,
+];
+const SHARD_PRIMARY_FALLBACK_LABELS: &[MetricLabel] = &[
+    MetricLabel::Route,
+    MetricLabel::Shard,
+    MetricLabel::Policy,
+    MetricLabel::Outcome,
+];
+const ROUTE_MAP_RELOAD_LABELS: &[MetricLabel] = &[MetricLabel::Outcome, MetricLabel::ErrorCode];
+const SHARD_LIFECYCLE_LABELS: &[MetricLabel] =
+    &[MetricLabel::Shard, MetricLabel::LifecycleState];
+const SHARD_COUNT_LABELS: &[MetricLabel] = &[MetricLabel::Shard];
 const ROUTE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Outcome];
 const ROUTE_SCOPE_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Scope];
 const TRIGGER_ACTION_OUTCOME_LABELS: &[MetricLabel] = &[
@@ -394,6 +446,70 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Routing fallbacks by route, reason, and fallback policy",
         ROUTE_FALLBACK_LABELS,
         "Fallback reasons and policies stay aligned with routing enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_route_decisions_total",
+        MetricKind::Counter,
+        "1",
+        "Shard routing decisions by route, bucketed shard, strategy, reason, and outcome",
+        SHARD_ROUTE_DECISION_LABELS,
+        "Shard labels are bucketed to stay low cardinality and strategy / reason stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_multi_shard_rejections_total",
+        MetricKind::Counter,
+        "1",
+        "Shard multi-shard rejections by route, bucketed shard, policy, reason, and outcome",
+        SHARD_MULTI_SHARD_REJECTION_LABELS,
+        "Shard labels are bucketed and policy / reason / outcome stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_primary_fallbacks_total",
+        MetricKind::Counter,
+        "1",
+        "Shard primary fallbacks by route, bucketed shard, policy, and outcome",
+        SHARD_PRIMARY_FALLBACK_LABELS,
+        "Shard labels are bucketed and policy / outcome stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_route_map_reload_total",
+        MetricKind::Counter,
+        "1",
+        "Route map reload outcomes by outcome and error code",
+        ROUTE_MAP_RELOAD_LABELS,
+        "Outcome and error code stay aligned with reload results.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_route_map_generation",
+        MetricKind::Gauge,
+        "1",
+        "Current route map generation",
+        NO_LABELS,
+        "Single gauge without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_lifecycle_state",
+        MetricKind::Gauge,
+        "1",
+        "Shard lifecycle state series by bucketed shard and lifecycle state",
+        SHARD_LIFECYCLE_LABELS,
+        "Shard labels are bucketed and lifecycle_state stays bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_active_transactions",
+        MetricKind::Gauge,
+        "1",
+        "Active transactions by bucketed shard",
+        SHARD_COUNT_LABELS,
+        "Shard labels are bucketed to avoid tenant identifiers.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_shard_prepared_statements",
+        MetricKind::Gauge,
+        "1",
+        "Prepared statements by bucketed shard",
+        SHARD_COUNT_LABELS,
+        "Shard labels are bucketed to avoid tenant identifiers.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_replica_health",
@@ -569,17 +685,27 @@ impl LabelPolicy {
     pub const QUERY_CLASS: &'static str = "query_class";
     pub const REASON: &'static str = "reason";
     pub const FALLBACK_POLICY: &'static str = "fallback_policy";
+    pub const SHARD: &'static str = "shard";
+    pub const STRATEGY: &'static str = "strategy";
+    pub const POLICY: &'static str = "policy";
+    pub const LIFECYCLE_STATE: &'static str = "lifecycle_state";
+    pub const ERROR_CODE: &'static str = "error_code";
     pub const HEALTH: &'static str = "health";
     pub const LAG_STATE: &'static str = "lag_state";
-    pub const ALLOWED_LABELS: [&'static str; 13] = [
+    pub const ALLOWED_LABELS: [&'static str; 18] = [
         Self::PHASE,
         Self::OUTCOME,
         Self::ENDPOINT,
         Self::ROUTE,
+        Self::SHARD,
+        Self::STRATEGY,
+        Self::POLICY,
         Self::TARGET_ROLE,
         Self::QUERY_CLASS,
         Self::REASON,
         Self::FALLBACK_POLICY,
+        Self::LIFECYCLE_STATE,
+        Self::ERROR_CODE,
         Self::HEALTH,
         Self::LAG_STATE,
         Self::VIEW,
