@@ -2,6 +2,7 @@ use pg_kinetic_core::{
     lsn::PgLsn,
     routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
     session::TransactionState,
+    sharding::{ShardRouteDecision, ShardRouteReason},
     sql_classify::{classify_sql, extract_routing_hint},
     virtual_session::ReadAfterWriteState,
 };
@@ -89,6 +90,26 @@ impl ReadRoutingPlanner {
     #[must_use]
     pub fn choose_routing_target(&self, context: RoutingContext<'_>) -> RoutingTarget {
         choose_routing_target(self, context)
+    }
+
+    #[must_use]
+    pub const fn read_routing_mode(&self) -> ReadRoutingMode {
+        self.read_routing_mode
+    }
+
+    #[must_use]
+    pub const fn fallback_policy(&self) -> FallbackPolicy {
+        self.fallback_policy
+    }
+
+    #[must_use]
+    pub const fn freshness_policy(&self) -> FreshnessPolicy {
+        self.freshness_policy
+    }
+
+    #[must_use]
+    pub const fn max_replica_lag_ms(&self) -> u64 {
+        self.max_replica_lag_ms
     }
 }
 
@@ -439,5 +460,63 @@ fn requires_replica_lag(policy: FreshnessPolicy) -> bool {
     matches!(
         policy,
         FreshnessPolicy::MaxReplicaLag | FreshnessPolicy::SessionWriteLsnAndMaxLag
+    )
+}
+
+#[must_use]
+pub fn bridge_shard_route_decision(
+    decision: &ShardRouteDecision,
+    sql: &str,
+    planner: &ReadRoutingPlanner,
+) -> pg_kinetic_core::routing::RoutingDecision {
+    let query_class = classify_sql(sql);
+    let routing_hint = extract_routing_hint(sql);
+    let target_role = decision
+        .route()
+        .map(|route| route.target().backend_role())
+        .unwrap_or(pg_kinetic_core::routing::BackendRole::Unknown);
+
+    let reason = match decision.reason() {
+        ShardRouteReason::AdminOverride => match target_role {
+            pg_kinetic_core::routing::BackendRole::Primary => {
+                pg_kinetic_core::routing::RoutingReason::ReadOnlyQuery
+            }
+            pg_kinetic_core::routing::BackendRole::Replica => {
+                pg_kinetic_core::routing::RoutingReason::ReadCandidateQuery
+            }
+            pg_kinetic_core::routing::BackendRole::Unknown => {
+                pg_kinetic_core::routing::RoutingReason::UnknownQuery
+            }
+        },
+        ShardRouteReason::HashMatch
+        | ShardRouteReason::RangeMatch
+        | ShardRouteReason::ListMatch => match target_role {
+            pg_kinetic_core::routing::BackendRole::Primary => {
+                pg_kinetic_core::routing::RoutingReason::ReadOnlyQuery
+            }
+            pg_kinetic_core::routing::BackendRole::Replica => {
+                pg_kinetic_core::routing::RoutingReason::ReadCandidateQuery
+            }
+            pg_kinetic_core::routing::BackendRole::Unknown => {
+                pg_kinetic_core::routing::RoutingReason::UnknownQuery
+            }
+        },
+        ShardRouteReason::MultiShardRejected | ShardRouteReason::ValidationFailed => {
+            pg_kinetic_core::routing::RoutingReason::FallbackReject
+        }
+        ShardRouteReason::NoMatch => match planner.fallback_policy() {
+            FallbackPolicy::Primary => pg_kinetic_core::routing::RoutingReason::FallbackPrimary,
+            FallbackPolicy::Reject => pg_kinetic_core::routing::RoutingReason::FallbackReject,
+            FallbackPolicy::Wait => pg_kinetic_core::routing::RoutingReason::FallbackWait,
+        },
+    };
+
+    pg_kinetic_core::routing::RoutingDecision::new(
+        target_role,
+        query_class,
+        routing_hint,
+        reason,
+        planner.fallback_policy(),
+        planner.freshness_policy(),
     )
 }

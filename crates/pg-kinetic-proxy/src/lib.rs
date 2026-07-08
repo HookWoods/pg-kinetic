@@ -9,6 +9,7 @@ pub mod pool;
 pub mod proxy;
 pub mod reload;
 pub mod routing;
+pub mod sharding;
 pub mod snapshot;
 pub mod socket;
 pub mod telemetry;
