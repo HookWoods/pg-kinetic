@@ -857,10 +857,8 @@ async fn execute_probe_query(
 
         while let Some(frame) = parse_backend_frame(&mut buffer)? {
             match frame.tag {
-                tag if tag == u8::from(BackendTag::DataRow) => {
-                    if row_value.is_none() {
-                        row_value = parse_probe_row(&frame.payload)?;
-                    }
+                tag if tag == u8::from(BackendTag::DataRow) && row_value.is_none() => {
+                    row_value = parse_probe_row(&frame.payload)?;
                 }
                 tag if tag == u8::from(BackendTag::ErrorResponse) => {
                     anyhow::bail!("endpoint returned error during probe");

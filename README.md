@@ -58,6 +58,7 @@ Windows:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\read-routing.ps1
 ```
 
 Unix:
@@ -258,4 +259,5 @@ docker compose -f bench/compose.yml up -d --build postgres pgbouncer pgdog pg-ki
 PGPASSWORD=postgres psql -h 127.0.0.1 -p 58432 -U postgres -d pgkinetic -c "select count(*) from accounts;"
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\psql.ps1 -Port 58432
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\read-routing.ps1
 ```

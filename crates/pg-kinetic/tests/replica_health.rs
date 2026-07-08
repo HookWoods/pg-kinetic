@@ -307,11 +307,10 @@ async fn handle_probe_connection(mut stream: TcpStream, plan: ProbePlan) {
                     if let Some(query) = parse_simple_query(&frame).expect("parse simple query") {
                         let normalized = query.trim().to_ascii_lowercase();
                         match normalized.as_str() {
-                            "select 1" => {
-                                if stream.write_all(&ready_for_query()).await.is_err() {
-                                    return;
-                                }
-                            }
+                            "select 1" => match stream.write_all(&ready_for_query()).await {
+                                Ok(()) => {}
+                                Err(_) => return,
+                            },
                             "select pg_is_in_recovery()" => {
                                 if stream.write_all(&data_row(response)).await.is_err() {
                                     return;

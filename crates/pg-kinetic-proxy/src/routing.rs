@@ -242,9 +242,7 @@ pub fn choose_routing_target(
         return primary_for_query_class(query_class);
     }
 
-    if routing_hint == RoutingHint::Primary
-        && planner.read_routing_mode != ReadRoutingMode::RequireReplica
-    {
+    if routing_hint == RoutingHint::Primary {
         return RoutingTarget::Primary {
             reason: RoutingReason::PrimaryHint,
         };

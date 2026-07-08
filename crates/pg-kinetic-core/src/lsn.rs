@@ -181,9 +181,7 @@ fn parse_hex_u32(
     overflow_error: LsnParseError,
 ) -> Result<u32, LsnParseError> {
     let mut value = 0u32;
-    let mut digits = 0usize;
-
-    for byte in input.bytes() {
+    for (digits, byte) in input.bytes().enumerate() {
         if digits == 8 {
             return Err(overflow_error);
         }
@@ -199,7 +197,6 @@ fn parse_hex_u32(
             .checked_mul(16)
             .and_then(|current| current.checked_add(digit))
             .ok_or(overflow_error)?;
-        digits += 1;
     }
 
     Ok(value)

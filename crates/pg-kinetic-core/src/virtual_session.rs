@@ -44,17 +44,12 @@ pub enum TransactionState {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReadAfterWriteState {
+    #[default]
     Disabled,
     Required(PgLsn),
     Unknown,
-}
-
-impl Default for ReadAfterWriteState {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

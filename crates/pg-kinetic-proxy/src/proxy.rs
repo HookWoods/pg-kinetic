@@ -511,27 +511,27 @@ async fn handle_client(
         }
     }
 
-    let mut backend = match checkout_backend(
-        &route_pools,
-        route_key(
+    let mut backend = match checkout_backend(CheckoutBackendRequest {
+        route_pools: &route_pools,
+        route: route_key(
             &route_database,
             &route_user,
             route_application_name.as_deref(),
             client_addr,
         ),
-        RoutingTarget::Primary {
+        target: RoutingTarget::Primary {
             reason: RoutingReason::Off,
         },
-        "checkout backend for startup",
-        CheckoutMode::AllowConnect,
+        context: "checkout backend for startup",
+        mode: CheckoutMode::AllowConnect,
         session_id,
         debug_sampler,
-        phase_recorder.as_ref(),
-        &snapshot_store,
-        &startup_packet,
-        ReadAfterWriteState::Disabled,
-        false,
-    )
+        phase_recorder: phase_recorder.as_ref(),
+        snapshot_store: &snapshot_store,
+        startup_packet: &startup_packet,
+        read_after_write_state: ReadAfterWriteState::Disabled,
+        record_snapshot: false,
+    })
     .await
     {
         Ok(backend) => backend,
@@ -662,52 +662,41 @@ async fn handle_client(
                         route_application_name.as_deref(),
                         client_addr,
                     );
-                    let checkout_target = select_checkout_target(
-                        &routing_planner,
-                        &route_pools,
-                        &snapshot_store,
-                        route_read_routing_mode,
-                        route_fallback_policy,
-                        &session,
-                        &prepared,
-                        &frames,
-                    );
+                    let selection = ReadRoutingSelection {
+                        planner: &routing_planner,
+                        route_pools: &route_pools,
+                        snapshot_store: &snapshot_store,
+                        read_routing_mode: route_read_routing_mode,
+                        fallback_policy: route_fallback_policy,
+                        session: &session,
+                        prepared: &prepared,
+                        frames: &frames,
+                    };
+                    let checkout_target = select_checkout_target(&selection);
                     let checkout_target = if matches!(
                         checkout_target,
                         RoutingTarget::Wait {
                             reason: RoutingReason::FallbackWait,
                         }
                     ) {
-                        wait_for_checkout_target(
-                            &route,
-                            &routing_planner,
-                            &route_pools,
-                            &snapshot_store,
-                            route_read_routing_mode,
-                            route_fallback_policy,
-                            &session,
-                            &prepared,
-                            &frames,
-                            read_after_write_timeout,
-                        )
-                        .await
+                        wait_for_checkout_target(&route, &selection, read_after_write_timeout).await
                     } else {
                         checkout_target
                     };
-                    match checkout_backend(
-                        &route_pools,
+                    match checkout_backend(CheckoutBackendRequest {
+                        route_pools: &route_pools,
                         route,
-                        checkout_target,
-                        "checkout backend for cycle",
-                        CheckoutMode::AllowConnect,
+                        target: checkout_target,
+                        context: "checkout backend for cycle",
+                        mode: CheckoutMode::AllowConnect,
                         session_id,
                         debug_sampler,
-                        phase_recorder.as_ref(),
-                        &snapshot_store,
-                        &startup_packet,
-                        session.read_after_write_state(),
-                        true,
-                    )
+                        phase_recorder: phase_recorder.as_ref(),
+                        snapshot_store: &snapshot_store,
+                        startup_packet: &startup_packet,
+                        read_after_write_state: session.read_after_write_state(),
+                        record_snapshot: true,
+                    })
                     .await
                     {
                         Ok(backend) => backend,
@@ -1072,60 +1061,79 @@ async fn handle_client(
     }
 }
 
-async fn checkout_backend(
-    route_pools: &Arc<RoutePools>,
+struct CheckoutBackendRequest<'a> {
+    route_pools: &'a Arc<RoutePools>,
     route: RouteKey,
     target: RoutingTarget,
     context: &'static str,
     mode: CheckoutMode,
     session_id: u64,
     debug_sampler: DebugSampler,
-    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
-    snapshot_store: &SnapshotStore,
-    startup_packet: &[u8],
+    phase_recorder: &'a dyn telemetry::PhaseTimingRecorder,
+    snapshot_store: &'a SnapshotStore,
+    startup_packet: &'a [u8],
     read_after_write_state: ReadAfterWriteState,
     record_snapshot: bool,
+}
+
+async fn checkout_backend(
+    request: CheckoutBackendRequest<'_>,
 ) -> Result<PooledBackend, CheckoutFailure> {
-    let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, phase_recorder);
+    let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, request.phase_recorder);
     let started = Instant::now();
-    if record_snapshot {
-        let target_role = target.clone().target_role().map(|role| role.as_str());
-        let target_reason = target.clone().reason();
-        let freshness_outcome = route_checkout_freshness_outcome(&target, read_after_write_state);
+    if request.record_snapshot {
+        let target_role = request
+            .target
+            .clone()
+            .target_role()
+            .map(|role| role.as_str());
+        let target_reason = request.target.clone().reason();
+        let freshness_outcome =
+            route_checkout_freshness_outcome(&request.target, request.read_after_write_state);
         if let Some(freshness_outcome) = freshness_outcome {
             metrics::record_read_after_write(freshness_outcome);
         }
-        snapshot_store.set_route_checkout_snapshot(RouteCheckoutSnapshot::new(
-            route.clone(),
-            target.clone(),
-            freshness_outcome,
-        ));
+        request
+            .snapshot_store
+            .set_route_checkout_snapshot(RouteCheckoutSnapshot::new(
+                request.route.clone(),
+                request.target.clone(),
+                freshness_outcome,
+            ));
         tracing::debug!(
-            route_key = ?route,
-            checkout_mode = %checkout_mode_label(mode),
+            route_key = ?request.route,
+            checkout_mode = %checkout_mode_label(request.mode),
             target_role = ?target_role,
             reason = %target_reason.as_str(),
             "route checkout decision"
         );
     }
 
-    let pool_mode = match mode {
+    let pool_mode = match request.mode {
         CheckoutMode::AllowConnect => PoolCheckoutMode::AllowConnect,
     };
-    if matches!(target, RoutingTarget::Wait { .. }) {
+    if matches!(request.target, RoutingTarget::Wait { .. }) {
         telemetry::emit_debug_sample(
-            &debug_sampler,
-            DebugSample::overload_rejected(session_id, route.clone(), checkout_mode_label(mode)),
+            &request.debug_sampler,
+            DebugSample::overload_rejected(
+                request.session_id,
+                request.route.clone(),
+                checkout_mode_label(request.mode),
+            ),
         );
         timer.finish(MetricOutcome::Rejected);
         return Err(CheckoutFailure::Overload(
             "backend checkout is waiting for a replica",
         ));
     }
-    if matches!(target, RoutingTarget::Reject { .. }) {
+    if matches!(request.target, RoutingTarget::Reject { .. }) {
         telemetry::emit_debug_sample(
-            &debug_sampler,
-            DebugSample::overload_rejected(session_id, route.clone(), checkout_mode_label(mode)),
+            &request.debug_sampler,
+            DebugSample::overload_rejected(
+                request.session_id,
+                request.route.clone(),
+                checkout_mode_label(request.mode),
+            ),
         );
         timer.finish(MetricOutcome::Rejected);
         return Err(CheckoutFailure::Postgres {
@@ -1134,8 +1142,9 @@ async fn checkout_backend(
         });
     }
 
-    let backend_result = route_pools
-        .checkout_target(route.clone(), &target, pool_mode)
+    let backend_result = request
+        .route_pools
+        .checkout_target(request.route.clone(), &request.target, pool_mode)
         .await;
     let mut backend = match backend_result {
         Ok(backend) => backend,
@@ -1143,11 +1152,11 @@ async fn checkout_backend(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
         )) => {
             telemetry::emit_debug_sample(
-                &debug_sampler,
+                &request.debug_sampler,
                 DebugSample::overload_rejected(
-                    session_id,
-                    route.clone(),
-                    checkout_mode_label(mode),
+                    request.session_id,
+                    request.route.clone(),
+                    checkout_mode_label(request.mode),
                 ),
             );
             timer.finish(MetricOutcome::Rejected);
@@ -1157,11 +1166,11 @@ async fn checkout_backend(
             pg_kinetic_core::backpressure::BackpressureError::Timeout,
         )) => {
             telemetry::emit_debug_sample(
-                &debug_sampler,
+                &request.debug_sampler,
                 DebugSample::overload_rejected(
-                    session_id,
-                    route.clone(),
-                    checkout_mode_label(mode),
+                    request.session_id,
+                    request.route.clone(),
+                    checkout_mode_label(request.mode),
                 ),
             );
             timer.finish(MetricOutcome::Timeout);
@@ -1171,11 +1180,11 @@ async fn checkout_backend(
             pg_kinetic_core::backpressure::BackpressureError::Closed,
         )) => {
             telemetry::emit_debug_sample(
-                &debug_sampler,
+                &request.debug_sampler,
                 DebugSample::backend_checkout(
-                    session_id,
-                    route.clone(),
-                    checkout_mode_label(mode),
+                    request.session_id,
+                    request.route.clone(),
+                    checkout_mode_label(request.mode),
                     MetricOutcome::Canceled,
                     started.elapsed(),
                 ),
@@ -1185,32 +1194,32 @@ async fn checkout_backend(
         }
         Err(crate::pool::PoolError::Connect(error)) => {
             telemetry::emit_debug_sample(
-                &debug_sampler,
+                &request.debug_sampler,
                 DebugSample::backend_checkout(
-                    session_id,
-                    route.clone(),
-                    checkout_mode_label(mode),
+                    request.session_id,
+                    request.route.clone(),
+                    checkout_mode_label(request.mode),
                     MetricOutcome::Error,
                     started.elapsed(),
                 ),
             );
             timer.finish(MetricOutcome::Error);
-            return Err(CheckoutFailure::Fatal(error.context(context)));
+            return Err(CheckoutFailure::Fatal(error.context(request.context)));
         }
     };
 
-    if record_snapshot && backend.requires_startup() {
-        bootstrap_backend(&mut backend, startup_packet)
+    if request.record_snapshot && backend.requires_startup() {
+        bootstrap_backend(&mut backend, request.startup_packet)
             .await
             .map_err(CheckoutFailure::Fatal)?;
     }
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
     telemetry::emit_debug_sample(
-        &debug_sampler,
+        &request.debug_sampler,
         DebugSample::backend_checkout(
-            session_id,
-            route.clone(),
-            checkout_mode_label(mode),
+            request.session_id,
+            request.route.clone(),
+            checkout_mode_label(request.mode),
             MetricOutcome::Ok,
             started.elapsed(),
         ),
@@ -1274,17 +1283,19 @@ fn route_key(
     )
 }
 
-fn select_checkout_target(
-    planner: &ReadRoutingPlanner,
-    route_pools: &RoutePools,
-    snapshot_store: &SnapshotStore,
+struct ReadRoutingSelection<'a> {
+    planner: &'a ReadRoutingPlanner,
+    route_pools: &'a RoutePools,
+    snapshot_store: &'a SnapshotStore,
     read_routing_mode: ReadRoutingMode,
     fallback_policy: FallbackPolicy,
-    session: &VirtualSession,
-    prepared: &PreparedCatalog,
-    frames: &[FrontendFrame],
-) -> RoutingTarget {
-    match read_routing_mode {
+    session: &'a VirtualSession,
+    prepared: &'a PreparedCatalog,
+    frames: &'a [FrontendFrame],
+}
+
+fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget {
+    match selection.read_routing_mode {
         ReadRoutingMode::Off => {
             return RoutingTarget::Primary {
                 reason: RoutingReason::Off,
@@ -1298,15 +1309,20 @@ fn select_checkout_target(
         ReadRoutingMode::PreferReplica | ReadRoutingMode::RequireReplica => {}
     }
 
-    if let Some(transaction_role) = session.current_transaction_target_role() {
-        let reason = session
+    if let Some(transaction_role) = selection.session.current_transaction_target_role() {
+        let reason = selection
+            .session
             .current_transaction_route_reason()
             .map(routing_reason_from_core)
             .unwrap_or(RoutingReason::TransactionControl);
         return match transaction_role {
             BackendRole::Primary => RoutingTarget::Primary { reason },
             BackendRole::Replica => {
-                if let Some(replica) = route_pools.selector().select(route_pools.replicas()) {
+                if let Some(replica) = selection
+                    .route_pools
+                    .selector()
+                    .select(selection.route_pools.replicas())
+                {
                     RoutingTarget::Replica {
                         candidate: ReplicaCandidate::new(
                             replica.id(),
@@ -1317,7 +1333,7 @@ fn select_checkout_target(
                         reason,
                     }
                 } else {
-                    fallback_target(read_routing_mode, fallback_policy)
+                    fallback_target(selection.read_routing_mode, selection.fallback_policy)
                 }
             }
             BackendRole::Unknown => RoutingTarget::Primary {
@@ -1326,14 +1342,14 @@ fn select_checkout_target(
         };
     }
 
-    let sql = routing_sql_for_frames(prepared, frames);
-    let health = build_route_health_snapshot(route_pools, snapshot_store);
+    let sql = routing_sql_for_frames(selection.prepared, selection.frames);
+    let health = build_route_health_snapshot(selection.route_pools, selection.snapshot_store);
     choose_routing_target(
-        planner,
+        selection.planner,
         RoutingContext::new(
             sql.as_ref(),
             TransactionState::Idle,
-            session.read_after_write_state(),
+            selection.session.read_after_write_state(),
             &health,
         ),
     )
@@ -1441,12 +1457,18 @@ fn routing_sql_for_frames<'a>(
             }
         }
 
-        if let Some(describe_target) = parse_describe_target(frame).ok().flatten() {
-            if let DescribeTarget::Statement(statement_name) = describe_target {
-                if let Some(statement) = prepared.get(&statement_name) {
-                    return Cow::Borrowed(statement.query.as_str());
-                }
-            }
+        if let Some(statement) =
+            parse_describe_target(frame)
+                .ok()
+                .flatten()
+                .and_then(|describe_target| match describe_target {
+                    DescribeTarget::Statement(statement_name) => prepared
+                        .get(&statement_name)
+                        .map(|statement| statement.query.as_str()),
+                    _ => None,
+                })
+        {
+            return Cow::Borrowed(statement);
         }
     }
 
@@ -1494,27 +1516,11 @@ fn checkout_mode_label(mode: CheckoutMode) -> &'static str {
 
 async fn wait_for_checkout_target(
     route: &RouteKey,
-    planner: &ReadRoutingPlanner,
-    route_pools: &RoutePools,
-    snapshot_store: &SnapshotStore,
-    read_routing_mode: ReadRoutingMode,
-    fallback_policy: FallbackPolicy,
-    session: &VirtualSession,
-    prepared: &PreparedCatalog,
-    frames: &[FrontendFrame],
+    selection: &ReadRoutingSelection<'_>,
     wait_timeout: Duration,
 ) -> RoutingTarget {
     let started = Instant::now();
-    let mut checkout_target = select_checkout_target(
-        planner,
-        route_pools,
-        snapshot_store,
-        read_routing_mode,
-        fallback_policy,
-        session,
-        prepared,
-        frames,
-    );
+    let mut checkout_target = select_checkout_target(selection);
     let mut waited = false;
 
     while matches!(
@@ -1532,16 +1538,7 @@ async fn wait_for_checkout_target(
         }
 
         tokio::time::sleep(sleep_for).await;
-        checkout_target = select_checkout_target(
-            planner,
-            route_pools,
-            snapshot_store,
-            read_routing_mode,
-            fallback_policy,
-            session,
-            prepared,
-            frames,
-        );
+        checkout_target = select_checkout_target(selection);
     }
 
     let timed_out = matches!(
@@ -1564,7 +1561,7 @@ async fn wait_for_checkout_target(
     }
 
     if timed_out {
-        fallback_target(read_routing_mode, FallbackPolicy::Primary)
+        fallback_target(selection.read_routing_mode, FallbackPolicy::Primary)
     } else {
         checkout_target
     }
@@ -2582,10 +2579,8 @@ async fn probe_read_after_write_requirement(
 
             while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
                 match frame.tag {
-                    tag if tag == u8::from(BackendTag::DataRow) => {
-                        if probe_lsn.is_none() {
-                            probe_lsn = parse_read_after_write_lsn(&frame.payload)?;
-                        }
+                    tag if tag == u8::from(BackendTag::DataRow) && probe_lsn.is_none() => {
+                        probe_lsn = parse_read_after_write_lsn(&frame.payload)?;
                     }
                     tag if tag == u8::from(BackendTag::ErrorResponse) => {
                         anyhow::bail!("backend returned error during read-after-write probe");

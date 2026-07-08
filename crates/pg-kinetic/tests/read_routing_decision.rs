@@ -218,6 +218,34 @@ fn explicit_primary_hint_sends_query_to_primary() {
 }
 
 #[test]
+fn explicit_primary_hint_overrides_require_replica_mode() {
+    let planner = planner(
+        ReadRoutingMode::RequireReplica,
+        FallbackPolicy::Reject,
+        FreshnessPolicy::SessionWriteLsn,
+        1_000,
+    );
+    let health = snapshot(vec![replica(
+        1,
+        true,
+        Some(PgLsn::from_parts(1, 10)),
+        Some(5),
+    )]);
+
+    let target = choose_routing_target(
+        &planner,
+        context(
+            "/* pg-kinetic: primary */ SELECT 1",
+            TransactionState::Idle,
+            Some(PgLsn::from_parts(1, 1)),
+            &health,
+        ),
+    );
+
+    assert_primary(target, RoutingReason::PrimaryHint);
+}
+
+#[test]
 fn explicit_replica_hint_routes_eligible_query_to_replica_when_freshness_permits() {
     let planner = planner(
         ReadRoutingMode::PreferReplica,

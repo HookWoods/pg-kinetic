@@ -1,0 +1,54 @@
+param(
+    [string]$HostName = "127.0.0.1",
+    [int]$Port = 58432,
+    [string]$User = "postgres",
+    [string]$Database = "pgkinetic",
+    [string]$Password = "postgres"
+)
+
+$ErrorActionPreference = "Stop"
+$env:PGPASSWORD = $Password
+
+if (-not (Get-Command psql -ErrorAction SilentlyContinue)) {
+    throw "psql is required on PATH for read routing smoke"
+}
+
+function Invoke-PgScalar {
+    param([string]$Sql)
+
+    $output = (& psql `
+        -X `
+        -v ON_ERROR_STOP=1 `
+        -h $HostName `
+        -p $Port `
+        -U $User `
+        -d $Database `
+        -Atq `
+        -c $Sql) -join "`n"
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "psql failed with exit code $LASTEXITCODE for SQL: $Sql"
+    }
+
+    return $output.Trim()
+}
+
+function Assert-CountTwo {
+    param(
+        [string]$Name,
+        [string]$Sql
+    )
+
+    $result = Invoke-PgScalar $Sql
+    if ($result -ne "2") {
+        throw "$Name expected account count 2, got '$result'"
+    }
+}
+
+Assert-CountTwo "primary hint" "/* pg-kinetic: primary */ select count(*) from accounts;"
+Assert-CountTwo "replica hint" "/* pg-kinetic: replica */ select count(*) from accounts;"
+Assert-CountTwo "stale-ok hint" "/* pg-kinetic: stale-ok */ select count(*) from accounts;"
+Assert-CountTwo "strict-fresh hint" "/* pg-kinetic: strict-fresh */ select count(*) from accounts;"
+Assert-CountTwo "read-only transaction" "begin read only; select count(*) from accounts; commit;"
+
+Write-Host "read routing smoke passed on ${HostName}:${Port}"
