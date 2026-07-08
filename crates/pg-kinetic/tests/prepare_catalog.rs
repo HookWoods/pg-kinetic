@@ -1,5 +1,6 @@
 use pg_kinetic::{
     prepare::{InvalidationScope, PreparedCatalog, PreparedStatement, PreparedStatementSnapshot},
+    session::PreparedShardSummary,
     wire::sqlstate::SqlState,
 };
 
@@ -51,6 +52,8 @@ fn can_store_statement_snapshot() {
         backend_name: "pgk_99_1".to_string(),
         query: "select 1".to_string(),
         parameter_type_oids: vec![],
+        route_map_generation_id: 0,
+        shard_summary: PreparedShardSummary::Deferred,
     };
 
     assert_eq!(snapshot.client_name, "stmt1");

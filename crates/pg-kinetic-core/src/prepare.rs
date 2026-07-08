@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use crate::{session::PreparedShardSummary, sharding::ShardId};
 use pg_kinetic_wire::sqlstate::SqlState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +16,8 @@ pub struct PreparedStatement {
     pub backend_name: String,
     pub query: String,
     pub parameter_type_oids: Vec<i32>,
+    pub route_map_generation_id: u64,
+    pub shard_summary: PreparedShardSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,12 +29,18 @@ pub struct PreparedStatementSnapshot {
     pub invalidation_count: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MaterializedStatement {
+    shard_id: Option<ShardId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedCatalog {
     session_id: u64,
     next_statement_id: u64,
+    route_map_generation_id: u64,
     statements: HashMap<String, PreparedStatement>,
-    materialized: HashMap<u64, HashSet<String>>,
+    materialized: HashMap<u64, HashMap<String, MaterializedStatement>>,
     invalidation_counts: HashMap<String, u64>,
 }
 
@@ -41,10 +50,26 @@ impl PreparedCatalog {
         Self {
             session_id,
             next_statement_id: 1,
+            route_map_generation_id: 0,
             statements: HashMap::new(),
             materialized: HashMap::new(),
             invalidation_counts: HashMap::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn route_map_generation_id(&self) -> u64 {
+        self.route_map_generation_id
+    }
+
+    pub fn set_route_map_generation_id(&mut self, route_map_generation_id: u64) {
+        if self.route_map_generation_id == route_map_generation_id {
+            return;
+        }
+
+        self.route_map_generation_id = route_map_generation_id;
+        self.materialized.clear();
+        self.invalidation_counts.clear();
     }
 
     pub fn upsert(
@@ -78,6 +103,12 @@ impl PreparedCatalog {
                 backend_name,
                 query: query.into(),
                 parameter_type_oids,
+                route_map_generation_id: self.route_map_generation_id,
+                shard_summary: if client_name.is_empty() {
+                    PreparedShardSummary::CurrentShard
+                } else {
+                    PreparedShardSummary::Deferred
+                },
             },
         );
 
@@ -91,6 +122,12 @@ impl PreparedCatalog {
         self.statements.get(client_name)
     }
 
+    #[must_use]
+    pub fn get_for_current_route_map(&self, client_name: &str) -> Option<&PreparedStatement> {
+        self.get(client_name)
+            .filter(|statement| self.is_current_route_map(statement))
+    }
+
     pub fn remove(&mut self, client_name: &str) -> Option<PreparedStatement> {
         let removed = self.statements.remove(client_name)?;
         self.remove_materialized_statement(&removed.backend_name);
@@ -100,22 +137,32 @@ impl PreparedCatalog {
 
     #[must_use]
     pub fn is_materialized(&self, backend_id: u64, statement: &PreparedStatement) -> bool {
-        statement.backend_name.is_empty()
-            || self
-                .materialized
-                .get(&backend_id)
-                .is_some_and(|names| names.contains(&statement.backend_name))
+        if !self.is_current_route_map(statement) {
+            return false;
+        }
+
+        if statement.backend_name.is_empty() {
+            return true;
+        }
+
+        let statement_shard_id = statement.shard_summary.shard_id();
+        self.materialized
+            .get(&backend_id)
+            .and_then(|names| names.get(&statement.backend_name))
+            .is_some_and(|materialized| materialized.shard_id.as_ref() == statement_shard_id)
     }
 
     pub fn mark_materialized(&mut self, backend_id: u64, statement: &PreparedStatement) {
-        if statement.backend_name.is_empty() {
+        if statement.backend_name.is_empty() || !self.is_current_route_map(statement) {
             return;
         }
 
-        self.materialized
-            .entry(backend_id)
-            .or_default()
-            .insert(statement.backend_name.clone());
+        self.materialized.entry(backend_id).or_default().insert(
+            statement.backend_name.clone(),
+            MaterializedStatement {
+                shard_id: statement.shard_summary.shard_id().cloned(),
+            },
+        );
     }
 
     pub fn invalidate_for_sqlstate(
@@ -126,7 +173,7 @@ impl PreparedCatalog {
         match sqlstate {
             SqlState::InvalidSqlStatementName => {
                 if let Some(names) = self.materialized.remove(&backend_id) {
-                    for backend_name in names {
+                    for backend_name in names.into_keys() {
                         self.increment_invalidation_count(&backend_name);
                     }
                 }
@@ -138,7 +185,7 @@ impl PreparedCatalog {
                 let backend_names: Vec<String> = self
                     .materialized
                     .values()
-                    .flat_map(|names| names.iter().cloned())
+                    .flat_map(|names| names.keys().cloned())
                     .collect();
                 for backend_name in backend_names {
                     self.increment_invalidation_count(&backend_name);
@@ -183,9 +230,16 @@ impl PreparedCatalog {
             return 0;
         }
 
+        let statement_shard_id = statement.shard_summary.shard_id();
         self.materialized
             .values()
-            .filter(|names| names.contains(&statement.backend_name))
+            .filter(|names| {
+                names
+                    .get(&statement.backend_name)
+                    .is_some_and(|materialized| {
+                        materialized.shard_id.as_ref() == statement_shard_id
+                    })
+            })
             .count()
     }
 
@@ -194,8 +248,17 @@ impl PreparedCatalog {
             return;
         }
 
-        for names in self.materialized.values_mut() {
-            names.remove(backend_name);
+        let backend_ids: Vec<u64> = self
+            .materialized
+            .iter_mut()
+            .filter_map(|(backend_id, names)| {
+                names.remove(backend_name);
+                names.is_empty().then_some(*backend_id)
+            })
+            .collect();
+
+        for backend_id in backend_ids {
+            self.materialized.remove(&backend_id);
         }
     }
 
@@ -208,5 +271,9 @@ impl PreparedCatalog {
             .invalidation_counts
             .entry(backend_name.to_owned())
             .or_default() += 1;
+    }
+
+    fn is_current_route_map(&self, statement: &PreparedStatement) -> bool {
+        statement.route_map_generation_id == self.route_map_generation_id
     }
 }

@@ -1460,7 +1460,7 @@ fn routing_sql_for_frames<'a>(
         }
 
         if let Some(statement_name) = parse_bind_statement_name(frame).ok().flatten() {
-            if let Some(statement) = prepared.get(&statement_name) {
+            if let Some(statement) = prepared.get_for_current_route_map(&statement_name) {
                 return Cow::Borrowed(statement.query.as_str());
             }
         }
@@ -1471,7 +1471,7 @@ fn routing_sql_for_frames<'a>(
                 .flatten()
                 .and_then(|describe_target| match describe_target {
                     DescribeTarget::Statement(statement_name) => prepared
-                        .get(&statement_name)
+                        .get_for_current_route_map(&statement_name)
                         .map(|statement| statement.query.as_str()),
                     _ => None,
                 })
@@ -2308,7 +2308,7 @@ fn prepare_frame_for_backend(
 
     if let Some(statement_name) = parse_bind_statement_name(&frame)? {
         let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
-        if let Some(statement) = prepared.get(&statement_name).cloned() {
+        if let Some(statement) = prepared.get_for_current_route_map(&statement_name).cloned() {
             metrics::increment_prepared_event(PreparedEvent::Bind);
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
@@ -2334,7 +2334,7 @@ fn prepare_frame_for_backend(
 
     if let Some(DescribeTarget::Statement(statement_name)) = parse_describe_target(&frame)? {
         let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
-        if let Some(statement) = prepared.get(&statement_name).cloned() {
+        if let Some(statement) = prepared.get_for_current_route_map(&statement_name).cloned() {
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
                 prelude.push(build_parse_frame(

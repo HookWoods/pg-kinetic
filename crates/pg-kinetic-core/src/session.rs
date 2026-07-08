@@ -34,6 +34,33 @@ pub enum TransactionShardDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedShardSummary {
+    CurrentShard,
+    Deferred,
+    Shard(ShardId),
+}
+
+impl PreparedShardSummary {
+    #[must_use]
+    pub const fn is_current_shard(&self) -> bool {
+        matches!(self, Self::CurrentShard)
+    }
+
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+
+    #[must_use]
+    pub fn shard_id(&self) -> Option<&ShardId> {
+        match self {
+            Self::Shard(shard_id) => Some(shard_id),
+            Self::CurrentShard | Self::Deferred => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionShardState {
     current_shard_id: ShardId,
     current_shard_route_reason: RoutingReason,
