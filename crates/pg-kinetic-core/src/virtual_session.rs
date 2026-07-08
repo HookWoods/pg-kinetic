@@ -3,7 +3,11 @@ use std::collections::BTreeMap;
 use crate::{
     lsn::PgLsn,
     routing::{BackendRole, RoutingReason},
-    session::{ReadRoutingTransactionState, TransactionAccessMode},
+    session::{
+        ReadRoutingTransactionState, TransactionAccessMode, TransactionShardDecision,
+        TransactionShardState,
+    },
+    sharding::{MultiShardPolicy, ShardId},
     sql::{SetScope, SqlCommand},
     sql_classify::classify_sql,
 };
@@ -56,6 +60,7 @@ pub enum ReadAfterWriteState {
 pub struct VirtualSession {
     transaction: TransactionState,
     read_routing_transaction: Option<ReadRoutingTransactionState>,
+    transaction_shard: Option<TransactionShardState>,
     read_after_write: ReadAfterWriteState,
     settings: BTreeMap<String, String>,
     has_unsafe_session_state: bool,
@@ -118,6 +123,90 @@ impl VirtualSession {
 
         if matches!(classify_sql(sql), crate::routing::QueryClass::Write) {
             self.mark_transaction_write();
+        }
+    }
+
+    pub fn transaction_shard_state(&self) -> Option<&TransactionShardState> {
+        self.transaction_shard.as_ref()
+    }
+
+    pub fn current_transaction_shard_id(&self) -> Option<&ShardId> {
+        self.transaction_shard
+            .as_ref()
+            .map(TransactionShardState::current_shard_id)
+    }
+
+    pub fn current_transaction_shard_route_reason(&self) -> Option<RoutingReason> {
+        self.transaction_shard
+            .as_ref()
+            .map(TransactionShardState::current_shard_route_reason)
+    }
+
+    pub fn transaction_cross_shard_violation(&self) -> bool {
+        self.transaction_shard
+            .as_ref()
+            .is_some_and(TransactionShardState::cross_shard_violation)
+    }
+
+    pub fn set_transaction_shard_affinity(
+        &mut self,
+        current_shard_id: ShardId,
+        current_shard_route_reason: RoutingReason,
+    ) {
+        self.transaction_shard = Some(TransactionShardState::new(
+            current_shard_id,
+            current_shard_route_reason,
+        ));
+    }
+
+    pub fn mark_transaction_cross_shard_violation(&mut self) {
+        if let Some(transaction_shard) = self.transaction_shard.as_mut() {
+            transaction_shard.mark_cross_shard_violation();
+        }
+    }
+
+    pub fn clear_transaction_shard_affinity(&mut self) {
+        self.transaction_shard = None;
+    }
+
+    pub fn apply_transaction_shard_affinity(
+        &mut self,
+        current_shard_id: Option<ShardId>,
+        current_shard_route_reason: RoutingReason,
+        multi_shard_policy: MultiShardPolicy,
+    ) -> TransactionShardDecision {
+        if self.transaction != TransactionState::InTransaction {
+            return TransactionShardDecision::Accepted;
+        }
+
+        let Some(current_shard_id) = current_shard_id else {
+            let _ = multi_shard_policy;
+            return TransactionShardDecision::FollowMultiShardPolicy;
+        };
+
+        match self.transaction_shard.as_mut() {
+            None => {
+                self.transaction_shard = Some(TransactionShardState::new(
+                    current_shard_id,
+                    current_shard_route_reason,
+                ));
+                TransactionShardDecision::Accepted
+            }
+            Some(transaction_shard)
+                if transaction_shard.current_shard_id() == &current_shard_id =>
+            {
+                if transaction_shard.current_shard_route_reason() == RoutingReason::UnknownQuery
+                    && current_shard_route_reason != RoutingReason::UnknownQuery
+                {
+                    transaction_shard.set_current_shard_route_reason(current_shard_route_reason);
+                }
+                TransactionShardDecision::Accepted
+            }
+            Some(transaction_shard) => {
+                transaction_shard.mark_cross_shard_violation();
+                let _ = multi_shard_policy;
+                TransactionShardDecision::Rejected
+            }
         }
     }
 
@@ -248,6 +337,7 @@ impl VirtualSession {
     fn end_transaction(&mut self) {
         self.transaction = TransactionState::Idle;
         self.read_routing_transaction = None;
+        self.transaction_shard = None;
     }
 
     fn set_transaction_access_mode(&mut self, access_mode: TransactionAccessMode) {
@@ -263,6 +353,7 @@ impl VirtualSession {
     fn clear_all(&mut self) {
         self.transaction = TransactionState::Idle;
         self.read_routing_transaction = None;
+        self.transaction_shard = None;
         self.read_after_write = ReadAfterWriteState::Disabled;
         self.settings.clear();
         self.has_unsafe_session_state = false;

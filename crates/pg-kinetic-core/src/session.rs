@@ -1,5 +1,6 @@
 use crate::{
     routing::{BackendRole, QueryClass, RoutingReason},
+    sharding::{MultiShardPolicy, ShardId},
     sql_classify::classify_sql,
 };
 
@@ -23,6 +24,54 @@ pub enum TransactionState {
 pub enum TransactionAccessMode {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionShardDecision {
+    Accepted,
+    Rejected,
+    FollowMultiShardPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionShardState {
+    current_shard_id: ShardId,
+    current_shard_route_reason: RoutingReason,
+    cross_shard_violation: bool,
+}
+
+impl TransactionShardState {
+    #[must_use]
+    pub fn new(current_shard_id: ShardId, current_shard_route_reason: RoutingReason) -> Self {
+        Self {
+            current_shard_id,
+            current_shard_route_reason,
+            cross_shard_violation: false,
+        }
+    }
+
+    #[must_use]
+    pub fn current_shard_id(&self) -> &ShardId {
+        &self.current_shard_id
+    }
+
+    #[must_use]
+    pub const fn current_shard_route_reason(&self) -> RoutingReason {
+        self.current_shard_route_reason
+    }
+
+    #[must_use]
+    pub const fn cross_shard_violation(&self) -> bool {
+        self.cross_shard_violation
+    }
+
+    pub fn set_current_shard_route_reason(&mut self, current_shard_route_reason: RoutingReason) {
+        self.current_shard_route_reason = current_shard_route_reason;
+    }
+
+    pub fn mark_cross_shard_violation(&mut self) {
+        self.cross_shard_violation = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +160,7 @@ pub enum PinReason {
 pub struct SessionState {
     pub transaction: TransactionState,
     read_routing_transaction: Option<ReadRoutingTransactionState>,
+    transaction_shard: Option<TransactionShardState>,
     pin_reason: Option<PinReason>,
     in_extended_cycle: bool,
 }
@@ -176,6 +226,94 @@ impl SessionState {
             .map(ReadRoutingTransactionState::route_reason)
     }
 
+    #[must_use]
+    pub fn transaction_shard_state(&self) -> Option<&TransactionShardState> {
+        self.transaction_shard.as_ref()
+    }
+
+    #[must_use]
+    pub fn current_transaction_shard_id(&self) -> Option<&ShardId> {
+        self.transaction_shard
+            .as_ref()
+            .map(TransactionShardState::current_shard_id)
+    }
+
+    #[must_use]
+    pub fn current_transaction_shard_route_reason(&self) -> Option<RoutingReason> {
+        self.transaction_shard
+            .as_ref()
+            .map(TransactionShardState::current_shard_route_reason)
+    }
+
+    #[must_use]
+    pub fn transaction_cross_shard_violation(&self) -> bool {
+        self.transaction_shard
+            .as_ref()
+            .is_some_and(TransactionShardState::cross_shard_violation)
+    }
+
+    pub fn set_transaction_shard_affinity(
+        &mut self,
+        current_shard_id: ShardId,
+        current_shard_route_reason: RoutingReason,
+    ) {
+        self.transaction_shard = Some(TransactionShardState::new(
+            current_shard_id,
+            current_shard_route_reason,
+        ));
+    }
+
+    pub fn mark_transaction_cross_shard_violation(&mut self) {
+        if let Some(transaction_shard) = self.transaction_shard.as_mut() {
+            transaction_shard.mark_cross_shard_violation();
+        }
+    }
+
+    pub fn clear_transaction_shard_affinity(&mut self) {
+        self.transaction_shard = None;
+    }
+
+    pub fn apply_transaction_shard_affinity(
+        &mut self,
+        current_shard_id: Option<ShardId>,
+        current_shard_route_reason: RoutingReason,
+        multi_shard_policy: MultiShardPolicy,
+    ) -> TransactionShardDecision {
+        if self.transaction != TransactionState::InTransaction {
+            return TransactionShardDecision::Accepted;
+        }
+
+        let Some(current_shard_id) = current_shard_id else {
+            let _ = multi_shard_policy;
+            return TransactionShardDecision::FollowMultiShardPolicy;
+        };
+
+        match self.transaction_shard.as_mut() {
+            None => {
+                self.transaction_shard = Some(TransactionShardState::new(
+                    current_shard_id,
+                    current_shard_route_reason,
+                ));
+                TransactionShardDecision::Accepted
+            }
+            Some(transaction_shard)
+                if transaction_shard.current_shard_id() == &current_shard_id =>
+            {
+                if transaction_shard.current_shard_route_reason() == RoutingReason::UnknownQuery
+                    && current_shard_route_reason != RoutingReason::UnknownQuery
+                {
+                    transaction_shard.set_current_shard_route_reason(current_shard_route_reason);
+                }
+                TransactionShardDecision::Accepted
+            }
+            Some(transaction_shard) => {
+                transaction_shard.mark_cross_shard_violation();
+                let _ = multi_shard_policy;
+                TransactionShardDecision::Rejected
+            }
+        }
+    }
+
     fn apply_simple_query(&mut self, sql: &str) {
         let normalized = normalize_sql(sql);
         match normalized.as_str() {
@@ -223,6 +361,7 @@ impl SessionState {
     fn end_transaction(&mut self) {
         self.transaction = TransactionState::Idle;
         self.read_routing_transaction = None;
+        self.transaction_shard = None;
         if matches!(
             self.pin_reason,
             Some(PinReason::OpenTransaction | PinReason::FailedTransaction)

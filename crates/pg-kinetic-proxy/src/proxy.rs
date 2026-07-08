@@ -55,6 +55,8 @@ use pg_kinetic_core::{
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
     session::TransactionState,
+    shard_extract::{extract_shard_hint, ShardHint},
+    sharding::{MultiShardPolicy, ShardId},
     sql::{classify, SetScope, SqlCommand},
     virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
 };
@@ -1309,6 +1311,12 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
         ReadRoutingMode::PreferReplica | ReadRoutingMode::RequireReplica => {}
     }
 
+    if selection.session.transaction_cross_shard_violation() {
+        return RoutingTarget::Reject {
+            reason: RoutingReason::FallbackReject,
+        };
+    }
+
     if let Some(transaction_role) = selection.session.current_transaction_target_role() {
         let reason = selection
             .session
@@ -2458,7 +2466,45 @@ fn update_transaction_state_from_sql(session: &mut VirtualSession, sql: &str) ->
             .is_some_and(|state| state.primary_forced());
 
     session.apply_transaction_sql(sql);
+    update_transaction_shard_state_from_sql(session, sql);
     committed_write_transaction
+}
+
+fn update_transaction_shard_state_from_sql(session: &mut VirtualSession, sql: &str) {
+    if session.read_routing_transaction_state().is_none() {
+        return;
+    }
+
+    let Some(shard_id) = transaction_shard_id_from_sql(sql) else {
+        if session.transaction_shard_state().is_some() {
+            session.mark_transaction_cross_shard_violation();
+        }
+        return;
+    };
+
+    let route_reason = session
+        .current_transaction_route_reason()
+        .unwrap_or(CoreRoutingReason::UnknownQuery);
+    let decision = session.apply_transaction_shard_affinity(
+        Some(shard_id),
+        route_reason,
+        MultiShardPolicy::Reject,
+    );
+    if matches!(
+        decision,
+        pg_kinetic_core::session::TransactionShardDecision::Rejected
+    ) {
+        session.mark_transaction_cross_shard_violation();
+    }
+}
+
+fn transaction_shard_id_from_sql(sql: &str) -> Option<ShardId> {
+    match extract_shard_hint(sql) {
+        ShardHint::Shard(value) | ShardHint::Tenant(value) | ShardHint::Route(value) => {
+            ShardId::new(value.as_ref()).ok()
+        }
+        ShardHint::None | ShardHint::Unknown => None,
+    }
 }
 
 fn update_virtual_session_from_frame(
