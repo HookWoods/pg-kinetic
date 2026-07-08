@@ -7,6 +7,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kinetic_core::{
     cleanup::CleanupAction,
     constants::{MetricName, PreparedEvent},
+    lsn::FreshnessStatus,
     observability::{
         metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
         MetricOutcome, ProtocolPhase,
@@ -180,6 +181,14 @@ pub fn increment_buffer_limit(kind: &'static str) {
     .increment(1);
 }
 
+pub fn record_read_after_write(outcome: FreshnessStatus) {
+    metrics_crate::counter!(
+        MetricName::ReadAfterWriteTotal.as_str(),
+        "outcome" => freshness_outcome_label(outcome)
+    )
+    .increment(1);
+}
+
 pub fn record_tls_handshake<M: MetricLabelValue>(scope: TlsScope, mode: M) {
     metrics_crate::counter!(
         OperationalMetricName::TlsHandshakesTotal.as_str(),
@@ -285,6 +294,16 @@ fn describe_metric(descriptor: &MetricDescriptor) {
         MetricKind::Histogram => {
             metrics_crate::describe_histogram!(descriptor.name, descriptor.description);
         }
+    }
+}
+
+fn freshness_outcome_label(outcome: FreshnessStatus) -> &'static str {
+    match outcome {
+        FreshnessStatus::Satisfied => "satisfied",
+        FreshnessStatus::Waiting => "waiting",
+        FreshnessStatus::Stale => "stale",
+        FreshnessStatus::Unknown => "unknown",
+        FreshnessStatus::Unavailable => "unavailable",
     }
 }
 

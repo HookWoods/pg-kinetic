@@ -1,8 +1,9 @@
 use pg_kinetic_core::{
-    lsn::{FreshnessRequirement, PgLsn},
+    lsn::PgLsn,
     routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
     session::TransactionState,
     sql_classify::{classify_sql, extract_routing_hint},
+    virtual_session::ReadAfterWriteState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +96,7 @@ impl ReadRoutingPlanner {
 pub struct RoutingContext<'a> {
     pub sql: &'a str,
     pub transaction_state: TransactionState,
-    pub session_write_lsn: Option<PgLsn>,
+    pub read_after_write_state: ReadAfterWriteState,
     pub health: &'a RouteHealthSnapshot,
 }
 
@@ -104,13 +105,13 @@ impl<'a> RoutingContext<'a> {
     pub const fn new(
         sql: &'a str,
         transaction_state: TransactionState,
-        session_write_lsn: Option<PgLsn>,
+        read_after_write_state: ReadAfterWriteState,
         health: &'a RouteHealthSnapshot,
     ) -> Self {
         Self {
             sql,
             transaction_state,
-            session_write_lsn,
+            read_after_write_state,
             health,
         }
     }
@@ -249,9 +250,19 @@ pub fn choose_routing_target(
 
     let effective_freshness_policy =
         effective_freshness_policy(planner.freshness_policy, routing_hint);
+
+    if routing_hint == RoutingHint::StrictFresh
+        && matches!(
+            context.read_after_write_state,
+            ReadAfterWriteState::Disabled
+        )
+    {
+        return fallback_target(planner.fallback_policy);
+    }
+
     let safe_replica = select_safe_replica(
         context.health,
-        context.session_write_lsn,
+        context.read_after_write_state,
         planner.max_replica_lag_ms,
         effective_freshness_policy,
     );
@@ -269,13 +280,36 @@ pub fn choose_routing_target(
         };
     }
 
-    if !context
+    let any_healthy = context
         .health
         .replicas
         .iter()
-        .any(|candidate| candidate.healthy)
-    {
+        .any(|candidate| candidate.healthy);
+    if !any_healthy {
         return fallback_target(planner.fallback_policy);
+    }
+
+    if requires_session_write_lsn(effective_freshness_policy)
+        && !matches!(
+            context.read_after_write_state,
+            ReadAfterWriteState::Disabled
+        )
+    {
+        let reason = match context.read_after_write_state {
+            ReadAfterWriteState::Unknown => RoutingReason::FreshnessRequired,
+            ReadAfterWriteState::Required(_) => RoutingReason::ReplicaStale,
+            ReadAfterWriteState::Disabled => RoutingReason::FallbackPrimary,
+        };
+
+        return match planner.fallback_policy {
+            FallbackPolicy::Primary => RoutingTarget::Primary {
+                reason: RoutingReason::FallbackPrimary,
+            },
+            FallbackPolicy::Reject => RoutingTarget::Reject { reason },
+            FallbackPolicy::Wait => RoutingTarget::Wait {
+                reason: RoutingReason::FallbackWait,
+            },
+        };
     }
 
     fallback_target(planner.fallback_policy)
@@ -321,7 +355,7 @@ fn fallback_target(fallback_policy: FallbackPolicy) -> RoutingTarget {
 
 fn select_safe_replica(
     health: &RouteHealthSnapshot,
-    session_write_lsn: Option<PgLsn>,
+    read_after_write_state: ReadAfterWriteState,
     max_replica_lag_ms: u64,
     freshness_policy: FreshnessPolicy,
 ) -> Option<ReplicaCandidate> {
@@ -333,7 +367,7 @@ fn select_safe_replica(
             replica_satisfies_freshness(
                 candidate,
                 freshness_policy,
-                session_write_lsn,
+                read_after_write_state,
                 max_replica_lag_ms,
             )
         })
@@ -348,22 +382,24 @@ fn select_safe_replica(
 fn replica_satisfies_freshness(
     candidate: &ReplicaCandidate,
     freshness_policy: FreshnessPolicy,
-    session_write_lsn: Option<PgLsn>,
+    read_after_write_state: ReadAfterWriteState,
     max_replica_lag_ms: u64,
 ) -> bool {
     let effective_policy = freshness_policy;
 
     if requires_session_write_lsn(effective_policy) {
-        let Some(required_session_write_lsn) = session_write_lsn else {
-            return false;
+        match read_after_write_state {
+            ReadAfterWriteState::Disabled => {}
+            ReadAfterWriteState::Unknown => return false,
+            ReadAfterWriteState::Required(required_session_write_lsn) => {
+                let Some(replay_lsn) = candidate.replay_lsn else {
+                    return false;
+                };
+                if replay_lsn < required_session_write_lsn {
+                    return false;
+                }
+            }
         };
-        let Some(replay_lsn) = candidate.replay_lsn else {
-            return false;
-        };
-        let requirement = FreshnessRequirement::session_write_lsn(required_session_write_lsn);
-        if !requirement.is_satisfied_by(replay_lsn) {
-            return false;
-        }
     }
 
     if requires_replica_lag(effective_policy) {
@@ -385,7 +421,6 @@ fn effective_freshness_policy(
     match routing_hint {
         RoutingHint::StrictFresh => FreshnessPolicy::SessionWriteLsnAndMaxLag,
         RoutingHint::StaleOk => match configured_policy {
-            FreshnessPolicy::SessionWriteLsn => FreshnessPolicy::None,
             FreshnessPolicy::SessionWriteLsnAndMaxLag => FreshnessPolicy::MaxReplicaLag,
             other => other,
         },

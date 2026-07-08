@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Context;
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -41,11 +41,13 @@ use crate::{
     tls,
 };
 use pg_kinetic_core::routing::{
-    BackendRole, FallbackPolicy, ReadRoutingMode, RoutingReason as CoreRoutingReason,
+    BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode,
+    RoutingReason as CoreRoutingReason,
 };
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::{MetricName, PreparedEvent},
+    lsn::{FreshnessStatus, PgLsn},
     observability::{MetricOutcome, ProtocolPhase},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
@@ -54,7 +56,7 @@ use pg_kinetic_core::{
     session::PinReason as SessionPinReason,
     session::TransactionState,
     sql::{classify, SetScope, SqlCommand},
-    virtual_session::{PinReason, VirtualSession},
+    virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
 };
 use pg_kinetic_wire::{
     backend::{build_error_response, parse_backend_frame, BackendFrame, ReadyStatus},
@@ -399,6 +401,12 @@ async fn handle_client(
         .context("missing effective route config")?;
     let route_read_routing_mode = route_config.read_routing.read_routing_mode;
     let route_fallback_policy = route_config.read_routing.fallback_policy;
+    let read_after_write_timeout =
+        Duration::from_millis(route_config.freshness.read_after_write_timeout_ms);
+    let read_after_write_protection_enabled = matches!(
+        route_config.freshness.freshness_policy,
+        FreshnessPolicy::SessionWriteLsn | FreshnessPolicy::SessionWriteLsnAndMaxLag
+    );
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let recovery_snapshot_handle = snapshot_store.recovery_handle();
 
@@ -519,6 +527,7 @@ async fn handle_client(
         phase_recorder.as_ref(),
         &snapshot_store,
         &startup_packet,
+        ReadAfterWriteState::Disabled,
         false,
     )
     .await
@@ -633,20 +642,43 @@ async fn handle_client(
         wait_for_client_activity_after_timeout = false;
         match cycle {
             ClientCycle::Frames(frames) => {
-                update_transaction_state_from_frames(&mut session, &frames)
-                    .context("update transaction state before backend checkout")?;
+                let committed_write_transaction =
+                    update_transaction_state_from_frames(&mut session, &frames)
+                        .context("update transaction state before backend checkout")?;
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
                     let checkout_target = select_checkout_target(
                         &routing_planner,
                         &route_pools,
+                        &snapshot_store,
                         route_read_routing_mode,
                         route_fallback_policy,
                         &session,
                         &prepared,
                         &frames,
                     );
+                    let checkout_target = if matches!(
+                        checkout_target,
+                        RoutingTarget::Wait {
+                            reason: RoutingReason::FallbackWait,
+                        }
+                    ) {
+                        wait_for_checkout_target(
+                            &routing_planner,
+                            &route_pools,
+                            &snapshot_store,
+                            route_read_routing_mode,
+                            route_fallback_policy,
+                            &session,
+                            &prepared,
+                            &frames,
+                            read_after_write_timeout,
+                        )
+                        .await
+                    } else {
+                        checkout_target
+                    };
                     match checkout_backend(
                         &route_pools,
                         route_key(
@@ -663,6 +695,7 @@ async fn handle_client(
                         phase_recorder.as_ref(),
                         &snapshot_store,
                         &startup_packet,
+                        session.read_after_write_state(),
                         true,
                     )
                     .await
@@ -720,6 +753,22 @@ async fn handle_client(
                 match result {
                     Ok(Ok(ForwardOutcome::Ready(status)))
                     | Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(status))) => {
+                        if committed_write_transaction
+                            && read_after_write_protection_enabled
+                            && status == ReadyStatus::Idle
+                        {
+                            let freshness_outcome = probe_read_after_write_requirement(
+                                &mut backend,
+                                read_after_write_timeout,
+                                qos.max_backend_buffer_bytes,
+                            )
+                            .await;
+                            match freshness_outcome {
+                                Ok(lsn) => session.set_read_after_write_required(lsn),
+                                Err(_) => session.set_read_after_write_unknown(),
+                            }
+                        }
+
                         telemetry::emit_debug_sample(
                             &debug_sampler,
                             DebugSample::query_complete(
@@ -1014,6 +1063,7 @@ async fn checkout_backend(
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
     snapshot_store: &SnapshotStore,
     startup_packet: &[u8],
+    read_after_write_state: ReadAfterWriteState,
     record_snapshot: bool,
 ) -> Result<PooledBackend, CheckoutFailure> {
     let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, phase_recorder);
@@ -1021,8 +1071,15 @@ async fn checkout_backend(
     if record_snapshot {
         let target_role = target.clone().target_role().map(|role| role.as_str());
         let target_reason = target.clone().reason();
-        snapshot_store
-            .set_route_checkout_snapshot(RouteCheckoutSnapshot::new(route.clone(), target.clone()));
+        let freshness_outcome = route_checkout_freshness_outcome(&target, read_after_write_state);
+        if let Some(freshness_outcome) = freshness_outcome {
+            metrics::record_read_after_write(freshness_outcome);
+        }
+        snapshot_store.set_route_checkout_snapshot(RouteCheckoutSnapshot::new(
+            route.clone(),
+            target.clone(),
+            freshness_outcome,
+        ));
         tracing::debug!(
             route_key = ?route,
             checkout_mode = %checkout_mode_label(mode),
@@ -1191,6 +1248,7 @@ fn route_key(
 fn select_checkout_target(
     planner: &ReadRoutingPlanner,
     route_pools: &RoutePools,
+    snapshot_store: &SnapshotStore,
     read_routing_mode: ReadRoutingMode,
     fallback_policy: FallbackPolicy,
     session: &VirtualSession,
@@ -1240,10 +1298,15 @@ fn select_checkout_target(
     }
 
     let sql = routing_sql_for_frames(prepared, frames);
-    let health = build_route_health_snapshot(route_pools);
+    let health = build_route_health_snapshot(route_pools, snapshot_store);
     choose_routing_target(
         planner,
-        RoutingContext::new(sql.as_ref(), TransactionState::Idle, None, &health),
+        RoutingContext::new(
+            sql.as_ref(),
+            TransactionState::Idle,
+            session.read_after_write_state(),
+            &health,
+        ),
     )
 }
 
@@ -1292,12 +1355,28 @@ fn routing_reason_from_core(reason: CoreRoutingReason) -> RoutingReason {
     }
 }
 
-fn build_route_health_snapshot(route_pools: &RoutePools) -> RouteHealthSnapshot {
+fn build_route_health_snapshot(
+    route_pools: &RoutePools,
+    snapshot_store: &SnapshotStore,
+) -> RouteHealthSnapshot {
+    let replica_health_snapshots = snapshot_store.replica_health_snapshots();
     RouteHealthSnapshot::new(
         route_pools
             .replicas()
             .iter()
-            .map(|replica| ReplicaCandidate::new(replica.id(), replica.is_healthy(), None, None))
+            .map(|replica| {
+                let replica_health = replica_health_snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.endpoint_id == replica.id());
+                let replay_lsn = replica_health.and_then(|snapshot| snapshot.replay_lsn);
+                let lag_ms = replica_health.and_then(|snapshot| {
+                    snapshot
+                        .lag_duration
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                });
+
+                ReplicaCandidate::new(replica.id(), replica.is_healthy(), replay_lsn, lag_ms)
+            })
             .collect(),
     )
 }
@@ -1333,10 +1412,95 @@ fn routing_sql_for_frames<'a>(
     Cow::Borrowed("")
 }
 
+fn route_checkout_freshness_outcome(
+    target: &RoutingTarget,
+    read_after_write_state: ReadAfterWriteState,
+) -> Option<FreshnessStatus> {
+    match target {
+        RoutingTarget::Replica { .. } => Some(FreshnessStatus::Satisfied),
+        RoutingTarget::Wait { reason } => match reason {
+            RoutingReason::FallbackWait => Some(match read_after_write_state {
+                ReadAfterWriteState::Unknown => FreshnessStatus::Unknown,
+                ReadAfterWriteState::Required(_) => FreshnessStatus::Waiting,
+                ReadAfterWriteState::Disabled => FreshnessStatus::Unavailable,
+            }),
+            _ => None,
+        },
+        RoutingTarget::Reject { reason } => Some(match reason {
+            RoutingReason::ReplicaStale => FreshnessStatus::Stale,
+            RoutingReason::FreshnessRequired => FreshnessStatus::Unknown,
+            RoutingReason::ReplicaUnavailable | RoutingReason::FallbackReject => {
+                FreshnessStatus::Unavailable
+            }
+            _ => FreshnessStatus::Unknown,
+        }),
+        RoutingTarget::Primary { reason } => match reason {
+            RoutingReason::FallbackPrimary => match read_after_write_state {
+                ReadAfterWriteState::Disabled => None,
+                ReadAfterWriteState::Required(_) => Some(FreshnessStatus::Stale),
+                ReadAfterWriteState::Unknown => Some(FreshnessStatus::Unknown),
+            },
+            _ => None,
+        },
+    }
+}
+
 fn checkout_mode_label(mode: CheckoutMode) -> &'static str {
     match mode {
         CheckoutMode::AllowConnect => "allow_connect",
     }
+}
+
+async fn wait_for_checkout_target(
+    planner: &ReadRoutingPlanner,
+    route_pools: &RoutePools,
+    snapshot_store: &SnapshotStore,
+    read_routing_mode: ReadRoutingMode,
+    fallback_policy: FallbackPolicy,
+    session: &VirtualSession,
+    prepared: &PreparedCatalog,
+    frames: &[FrontendFrame],
+    wait_timeout: Duration,
+) -> RoutingTarget {
+    let started = Instant::now();
+    let mut checkout_target = select_checkout_target(
+        planner,
+        route_pools,
+        snapshot_store,
+        read_routing_mode,
+        fallback_policy,
+        session,
+        prepared,
+        frames,
+    );
+
+    while matches!(
+        checkout_target,
+        RoutingTarget::Wait {
+            reason: RoutingReason::FallbackWait,
+        }
+    ) && started.elapsed() < wait_timeout
+    {
+        let remaining = wait_timeout.saturating_sub(started.elapsed());
+        let sleep_for = remaining.min(Duration::from_millis(25));
+        if sleep_for.is_zero() {
+            break;
+        }
+
+        tokio::time::sleep(sleep_for).await;
+        checkout_target = select_checkout_target(
+            planner,
+            route_pools,
+            snapshot_store,
+            read_routing_mode,
+            fallback_policy,
+            session,
+            prepared,
+            frames,
+        );
+    }
+
+    checkout_target
 }
 
 fn build_route_pools(
@@ -2207,23 +2371,30 @@ fn sync_frame() -> FrontendFrame {
 fn update_transaction_state_from_frames(
     session: &mut VirtualSession,
     frames: &[FrontendFrame],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let mut committed_write_transaction = false;
     for frame in frames {
         if let Some(query) = parse_simple_query(frame)? {
-            update_transaction_state_from_sql(session, query);
+            committed_write_transaction |= update_transaction_state_from_sql(session, query);
             continue;
         }
 
         if let Some(parse) = parse_parse_message(frame)? {
-            update_transaction_state_from_sql(session, &parse.query);
+            committed_write_transaction |= update_transaction_state_from_sql(session, &parse.query);
         }
     }
 
-    Ok(())
+    Ok(committed_write_transaction)
 }
 
-fn update_transaction_state_from_sql(session: &mut VirtualSession, sql: &str) {
+fn update_transaction_state_from_sql(session: &mut VirtualSession, sql: &str) -> bool {
+    let committed_write_transaction = matches!(classify(sql), SqlCommand::Commit)
+        && session
+            .read_routing_transaction_state()
+            .is_some_and(|state| state.primary_forced());
+
     session.apply_transaction_sql(sql);
+    committed_write_transaction
 }
 
 fn update_virtual_session_from_frame(
@@ -2304,6 +2475,101 @@ async fn execute_simple_query(
         "unexpected backend status after {sql}: {status:?}"
     );
     Ok(())
+}
+
+async fn probe_read_after_write_requirement(
+    backend: &mut PooledBackend,
+    probe_timeout: Duration,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<PgLsn> {
+    match timeout(probe_timeout, async {
+        let frame = simple_query_frame("SELECT pg_current_wal_lsn()");
+        backend
+            .backend_mut()
+            .stream_mut()
+            .write_all(&encode_frontend_frame(&frame))
+            .await
+            .context("write read-after-write probe")?;
+
+        let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+        let mut probe_lsn = None;
+
+        loop {
+            if backend_buffer.len() >= max_backend_buffer_bytes {
+                return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+            }
+
+            let read = backend
+                .backend_mut()
+                .stream_mut()
+                .read_buf(&mut backend_buffer)
+                .await
+                .context("read read-after-write probe response")?;
+            if read == 0 {
+                anyhow::bail!("backend disconnected during read-after-write probe");
+            }
+
+            if backend_buffer.len() > max_backend_buffer_bytes {
+                return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+            }
+
+            while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+                match frame.tag {
+                    tag if tag == u8::from(BackendTag::DataRow) => {
+                        if probe_lsn.is_none() {
+                            probe_lsn = parse_read_after_write_lsn(&frame.payload)?;
+                        }
+                    }
+                    tag if tag == u8::from(BackendTag::ErrorResponse) => {
+                        anyhow::bail!("backend returned error during read-after-write probe");
+                    }
+                    tag if tag == u8::from(BackendTag::ReadyForQuery) => {
+                        return probe_lsn.context("read-after-write probe returned no LSN");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("read-after-write probe timed out"),
+    }
+}
+
+fn parse_read_after_write_lsn(payload: &[u8]) -> anyhow::Result<Option<PgLsn>> {
+    let mut payload = payload;
+    if payload.remaining() < 2 {
+        return Ok(None);
+    }
+
+    let columns = payload.get_i16();
+    if columns <= 0 {
+        return Ok(None);
+    }
+
+    if payload.remaining() < 4 {
+        return Ok(None);
+    }
+
+    let length = payload.get_i32();
+    if length < 0 {
+        return Ok(None);
+    }
+
+    let length = length as usize;
+    if payload.remaining() < length {
+        return Ok(None);
+    }
+
+    let mut value = vec![0_u8; length];
+    payload.copy_to_slice(&mut value);
+    let value = std::str::from_utf8(&value).context("read-after-write probe row is not utf8")?;
+    value
+        .parse::<PgLsn>()
+        .map(Some)
+        .context("parse read-after-write LSN")
 }
 
 async fn await_ready_status(

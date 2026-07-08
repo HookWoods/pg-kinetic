@@ -7,7 +7,7 @@ use std::{
 
 use pg_kinetic_core::{
     ha::{HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome},
-    lsn::PgLsn,
+    lsn::{FreshnessStatus, PgLsn},
     observability::MetricOutcome,
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
@@ -245,14 +245,20 @@ impl RouteSnapshot {
 pub struct RouteCheckoutSnapshot {
     pub route_key: RouteKey,
     pub decision: RoutingTarget,
+    pub freshness_outcome: Option<FreshnessStatus>,
 }
 
 impl RouteCheckoutSnapshot {
     #[must_use]
-    pub fn new(route_key: RouteKey, decision: RoutingTarget) -> Self {
+    pub fn new(
+        route_key: RouteKey,
+        decision: RoutingTarget,
+        freshness_outcome: Option<FreshnessStatus>,
+    ) -> Self {
         Self {
             route_key,
             decision,
+            freshness_outcome,
         }
     }
 }

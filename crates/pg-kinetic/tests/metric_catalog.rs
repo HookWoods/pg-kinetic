@@ -61,6 +61,13 @@ fn metric_catalog_is_complete_and_stable() {
             "SQLSTATE is a normalized error code",
         ),
         (
+            "pg_kinetic_read_after_write_total",
+            MetricKind::Counter,
+            "1",
+            &["outcome"][..],
+            "freshness states",
+        ),
+        (
             "pg_kinetic_backpressure_events_total",
             MetricKind::Counter,
             "1",

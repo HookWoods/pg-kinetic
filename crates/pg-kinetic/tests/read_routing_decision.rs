@@ -19,6 +19,7 @@ use pg_kinetic_core::{
     lsn::PgLsn,
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::TransactionState,
+    virtual_session::ReadAfterWriteState,
 };
 use pg_kinetic_proxy::routing::{
     choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,
@@ -65,7 +66,15 @@ fn context<'a>(
     session_write_lsn: Option<PgLsn>,
     health: &'a RouteHealthSnapshot,
 ) -> RoutingContext<'a> {
-    RoutingContext::new(sql, transaction_state, session_write_lsn, health)
+    RoutingContext::new(
+        sql,
+        transaction_state,
+        match session_write_lsn {
+            Some(session_write_lsn) => ReadAfterWriteState::Required(session_write_lsn),
+            None => ReadAfterWriteState::Disabled,
+        },
+        health,
+    )
 }
 
 fn assert_primary(target: RoutingTarget, expected_reason: RoutingReason) {

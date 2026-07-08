@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    lsn::PgLsn,
     routing::{BackendRole, RoutingReason},
     session::{ReadRoutingTransactionState, TransactionAccessMode},
     sql::{SetScope, SqlCommand},
@@ -43,10 +44,24 @@ pub enum TransactionState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadAfterWriteState {
+    Disabled,
+    Required(PgLsn),
+    Unknown,
+}
+
+impl Default for ReadAfterWriteState {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VirtualSession {
     transaction: TransactionState,
     read_routing_transaction: Option<ReadRoutingTransactionState>,
+    read_after_write: ReadAfterWriteState,
     settings: BTreeMap<String, String>,
     has_unsafe_session_state: bool,
     has_temp_table: bool,
@@ -122,6 +137,23 @@ impl VirtualSession {
 
     pub fn mark_unknown_protocol_state(&mut self) {
         self.unknown_protocol_state = true;
+    }
+
+    #[must_use]
+    pub const fn read_after_write_state(&self) -> ReadAfterWriteState {
+        self.read_after_write
+    }
+
+    pub fn set_read_after_write_required(&mut self, lsn: PgLsn) {
+        self.read_after_write = ReadAfterWriteState::Required(lsn);
+    }
+
+    pub fn set_read_after_write_unknown(&mut self) {
+        self.read_after_write = ReadAfterWriteState::Unknown;
+    }
+
+    pub fn clear_read_after_write(&mut self) {
+        self.read_after_write = ReadAfterWriteState::Disabled;
     }
 
     pub fn mark_transaction_write(&mut self) {
@@ -236,6 +268,7 @@ impl VirtualSession {
     fn clear_all(&mut self) {
         self.transaction = TransactionState::Idle;
         self.read_routing_transaction = None;
+        self.read_after_write = ReadAfterWriteState::Disabled;
         self.settings.clear();
         self.has_unsafe_session_state = false;
         self.has_temp_table = false;
