@@ -6,6 +6,7 @@ pub mod ha;
 pub mod lsn;
 pub mod observability;
 pub mod pin;
+pub mod policy;
 pub mod prepare;
 pub mod recovery;
 pub mod route;
