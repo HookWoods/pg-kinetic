@@ -1,9 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
-    collections::VecDeque,
 };
 
 use pg_kinetic_core::{
@@ -23,6 +22,7 @@ use crate::config::{
     AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
 };
 use crate::metrics;
+use crate::policy::{PolicyReloadErrorCode, PolicyReloadResult};
 use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
 
@@ -321,6 +321,26 @@ impl RouteMapReloadSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyReloadSnapshot {
+    pub policy_generation_id: u64,
+    pub success: bool,
+    pub error_code: Option<PolicyReloadErrorCode>,
+    pub error: Option<String>,
+}
+
+impl PolicyReloadSnapshot {
+    #[must_use]
+    pub fn new(policy_generation_id: u64, success: bool) -> Self {
+        Self {
+            policy_generation_id,
+            success,
+            error_code: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardLifecycleSnapshot {
     pub shard_id: ShardId,
     pub lifecycle_state: ShardLifecycleState,
@@ -516,6 +536,7 @@ struct SnapshotStoreInner {
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     route_map_reloads: Vec<RouteMapReloadSnapshot>,
+    policy_reloads: Vec<PolicyReloadSnapshot>,
     policy_audit_events: VecDeque<PolicyAuditEvent>,
     sharding: ShardingConfig,
     shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
@@ -922,6 +943,23 @@ impl SnapshotStore {
             .clone()
     }
 
+    pub fn set_policy_reload_snapshot(&self, snapshot: PolicyReloadSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .policy_reloads
+            .push(snapshot);
+    }
+
+    #[must_use]
+    pub fn policy_reload_snapshots(&self) -> Vec<PolicyReloadSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .policy_reloads
+            .clone()
+    }
+
     pub fn record_policy_audit_event(&self, event: PolicyAuditEvent) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
         if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
@@ -1148,6 +1186,17 @@ impl From<&RouteMapReloadResult> for RouteMapReloadSnapshot {
             success: result.success,
             error_code: result.error_code,
             draining_shard_ids,
+        }
+    }
+}
+
+impl From<&PolicyReloadResult> for PolicyReloadSnapshot {
+    fn from(result: &PolicyReloadResult) -> Self {
+        Self {
+            policy_generation_id: result.policy_generation_id,
+            success: result.success,
+            error_code: result.error_code,
+            error: result.error.clone(),
         }
     }
 }

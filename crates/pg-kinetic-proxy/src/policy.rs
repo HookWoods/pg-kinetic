@@ -1,7 +1,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -174,6 +174,200 @@ impl PolicyRuntime {
     pub fn with_policy_audit_sample_rate(mut self, sample_rate: f64) -> Self {
         self.policy_audit_sample_rate_bits = clamp_sample_rate(sample_rate).to_bits();
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PolicyGeneration(u64);
+
+impl PolicyGeneration {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl From<u64> for PolicyGeneration {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<PolicyGeneration> for u64 {
+    fn from(value: PolicyGeneration) -> Self {
+        value.as_u64()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyReloadErrorCode {
+    InvalidPolicyConfiguration,
+    RouteReferenceMissing,
+    ShardReferenceMissing,
+}
+
+impl PolicyReloadErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPolicyConfiguration => "invalid_policy_configuration",
+            Self::RouteReferenceMissing => "route_reference_missing",
+            Self::ShardReferenceMissing => "shard_reference_missing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyReloadResult {
+    pub success: bool,
+    pub policy_generation_id: u64,
+    pub error_code: Option<PolicyReloadErrorCode>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicySnapshot {
+    pub generation: PolicyGeneration,
+    pub config: PolicyConfig,
+    pub runtime: PolicyRuntime,
+}
+
+impl PolicySnapshot {
+    #[must_use]
+    pub fn new(generation: PolicyGeneration, config: PolicyConfig) -> Self {
+        let runtime = PolicyRuntime::from_config(&config);
+        Self {
+            generation,
+            config,
+            runtime,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyStore {
+    inner: Arc<PolicyStoreInner>,
+}
+
+#[derive(Debug)]
+struct PolicyStoreInner {
+    current: RwLock<Arc<PolicySnapshot>>,
+}
+
+impl Default for PolicyStore {
+    fn default() -> Self {
+        Self::new(PolicyConfig::default())
+    }
+}
+
+impl PolicyStore {
+    #[must_use]
+    pub fn new(config: PolicyConfig) -> Self {
+        Self {
+            inner: Arc::new(PolicyStoreInner {
+                current: RwLock::new(Arc::new(PolicySnapshot::new(
+                    PolicyGeneration::initial(),
+                    config,
+                ))),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<PolicySnapshot> {
+        self.inner
+            .current
+            .read()
+            .expect("policy store poisoned")
+            .clone()
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> PolicyGeneration {
+        self.snapshot().generation
+    }
+
+    #[must_use]
+    pub fn config(&self) -> PolicyConfig {
+        self.snapshot().config.clone()
+    }
+
+    #[must_use]
+    pub fn runtime(&self) -> PolicyRuntime {
+        self.snapshot().runtime.clone()
+    }
+
+    #[must_use]
+    pub fn policy_mode(&self) -> PolicyMode {
+        self.runtime().policy_mode()
+    }
+
+    #[must_use]
+    pub fn reload<R, S>(
+        &self,
+        next_config: &PolicyConfig,
+        active_routes: R,
+        sharding_enabled: bool,
+        active_shards: S,
+    ) -> PolicyReloadResult
+    where
+        R: IntoIterator,
+        R::Item: AsRef<str>,
+        S: IntoIterator,
+        S::Item: AsRef<str>,
+    {
+        let mut current_snapshot = self
+            .inner
+            .current
+            .write()
+            .expect("policy store poisoned");
+        let current_generation = current_snapshot.generation;
+
+        if let Err(error) =
+            next_config.validate_with_context(active_routes, sharding_enabled, active_shards)
+        {
+            return PolicyReloadResult {
+                success: false,
+                policy_generation_id: current_generation.as_u64(),
+                error_code: Some(policy_reload_error_code(&error)),
+                error: Some(error),
+            };
+        }
+
+        let next_generation = current_generation.next();
+        *current_snapshot = Arc::new(PolicySnapshot::new(next_generation, next_config.clone()));
+
+        PolicyReloadResult {
+            success: true,
+            policy_generation_id: next_generation.as_u64(),
+            error_code: None,
+            error: None,
+        }
+    }
+}
+
+fn policy_reload_error_code(error: &str) -> PolicyReloadErrorCode {
+    if error.contains("route override target") {
+        PolicyReloadErrorCode::RouteReferenceMissing
+    } else if error.contains("shard override target") {
+        PolicyReloadErrorCode::ShardReferenceMissing
+    } else {
+        PolicyReloadErrorCode::InvalidPolicyConfiguration
     }
 }
 

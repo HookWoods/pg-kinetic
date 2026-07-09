@@ -10,9 +10,10 @@ use toml::Value;
 
 use crate::{
     auth,
-    config::{ClientTlsMode, Config, ReloadConfig},
+    config::{ClientTlsMode, Config, PolicyConfig, ReloadConfig},
+    policy::{PolicyReloadResult, PolicyStore},
     sharding::RouteMapReloadResult,
-    snapshot::{RouteMapReloadSnapshot, SnapshotStore},
+    snapshot::{PolicyReloadSnapshot, RouteMapReloadSnapshot, SnapshotStore},
     tls,
 };
 use pg_kinetic_core::secrets::UserStore;
@@ -26,6 +27,10 @@ pub enum ReloadDecision {
 
 pub fn record_route_map_reload(snapshot_store: &SnapshotStore, result: &RouteMapReloadResult) {
     snapshot_store.set_route_map_reload_snapshot(RouteMapReloadSnapshot::from(result));
+}
+
+pub fn record_policy_reload(snapshot_store: &SnapshotStore, result: &PolicyReloadResult) {
+    snapshot_store.set_policy_reload_snapshot(PolicyReloadSnapshot::from(result));
 }
 
 pub fn load_effective_config(base: &Config) -> anyhow::Result<Config> {
@@ -78,6 +83,27 @@ pub async fn reload_once(
     validate_runtime_assets(&next_config)?;
     *active_config.write().await = next_config;
     Ok(ReloadDecision::Applied)
+}
+
+pub fn reload_policy_once<R, S>(
+    policy_store: &PolicyStore,
+    next_policy: &PolicyConfig,
+    active_routes: R,
+    sharding_enabled: bool,
+    active_shards: S,
+    snapshot_store: Option<&SnapshotStore>,
+) -> PolicyReloadResult
+where
+    R: IntoIterator,
+    R::Item: AsRef<str>,
+    S: IntoIterator,
+    S::Item: AsRef<str>,
+{
+    let result = policy_store.reload(next_policy, active_routes, sharding_enabled, active_shards);
+    if let Some(snapshot_store) = snapshot_store {
+        record_policy_reload(snapshot_store, &result);
+    }
+    result
 }
 
 pub async fn spawn_reload_loop(
