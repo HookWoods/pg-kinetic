@@ -2,6 +2,8 @@
 
 pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are named once and labeled with bounded enums or route identity only.
 
+For policy behavior, pair the routing and sharding metrics below with [docs/policy.md](policy.md) and the admin views in [docs/admin.md](admin.md).
+
 ## Connection And Prepared Cache
 
 | Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
@@ -46,6 +48,14 @@ pg-kinetic exports a low-cardinality Prometheus catalog. Metric families are nam
 | `pg_kinetic_shard_lifecycle_state` | gauge | `shard`, `lifecycle_state` | `1` | Bucketed shard labels and a bounded lifecycle enum. | A nonzero `draining` or `readonly` series should line up with a planned migration. |
 | `pg_kinetic_shard_active_transactions` | gauge | `shard` | `1` | Bucketed shard labels. | Nonzero values on a shard being removed mean migration safety is not settled yet. |
 | `pg_kinetic_shard_prepared_statements` | gauge | `shard` | `1` | Bucketed shard labels. | Nonzero values tell you prepared work still needs to be cleaned up before a move. |
+
+## Policy And Reloads
+
+| Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
+| --- | --- | --- | --- | --- | --- |
+| `pg_kinetic_route_map_reload_total` | counter | `outcome`, `error_code` | `1` | Bounded by reload outcome and reload error code. | Use rejected reloads to spot scope conflicts, missing targets, or safety blockers before policy changes reach traffic. |
+| `pg_kinetic_route_map_generation` | gauge | none | `1` | Single series. | A higher generation means a newer route-map snapshot is live. |
+| `pg_kinetic_config_reload_total` | counter | `outcome` | `1` | Bounded by reload outcome. | Use this to see whether live policy or routing config changes were accepted. |
 
 ## Pinning And Recovery
 

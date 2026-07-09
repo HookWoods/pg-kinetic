@@ -3,6 +3,8 @@
 pg-kinetic exposes a separate PostgreSQL-compatible admin listener for operational reads.
 Enable it by setting `admin_addr`. When that address is unset, the admin plane stays off.
 
+For routing and policy guidance, see [docs/policy.md](policy.md).
+
 ## Connection Behavior
 
 - `admin_require_tls` forces TLS on the admin socket.
@@ -54,5 +56,6 @@ Unset optional fields render as `<none>`.
 - Use `SHOW POOLS` and `SHOW BACKPRESSURE` together to see whether a queue is forming because the pool is full or because a specific route is overloaded.
 - Use `SHOW CLIENTS`, `SHOW SERVERS`, and `SHOW ROUTES` together to understand how read traffic is flowing, whether replicas are healthy, and which policy is active.
 - Use `SHOW ROUTE MAPS`, `SHOW SHARDS`, and `SHOW MIGRATIONS` together to see how shard scopes, lifecycle state, and migration safety line up.
+- Use `SHOW ROUTE MAPS` and `SHOW MIGRATIONS` with the policy guide to confirm that any route or shard override is still within the intended safety envelope.
 - Use `SHOW PINNING` and `SHOW RECOVERY` together to distinguish long-lived state from recovery churn.
 - Use `SHOW SETTINGS` and `SHOW LIMITS` to verify the live configuration after a reload or before a support investigation.

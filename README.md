@@ -13,6 +13,7 @@ The first milestone focuses on:
 
 - [Admin reference](docs/admin.md)
 - [Metrics catalog](docs/metrics.md)
+- [Policy guide](docs/policy.md)
 - [Read routing guide](docs/read-routing.md)
 - [Sharding guide](docs/sharding.md)
 
@@ -224,6 +225,8 @@ Usernames are case-sensitive by default.
 Set `config_file` to load a TOML config, and enable `reload_enabled` to keep checking it every `config_reload_interval_ms`.
 
 Safe reloads apply QoS, timeout, socket, TLS certificate material, and user-store updates. Listener addresses, backend addresses, and auth mode changes are rejected and leave the active config in place.
+
+Routing policy and shard override behavior are documented in [docs/policy.md](docs/policy.md), alongside the reload and audit expectations for rule changes.
 
 Shutdown uses graceful drain: the proxy stops accepting new clients, lets active clients finish within `drain_timeout_ms`, and then closes out any remaining work.
 
