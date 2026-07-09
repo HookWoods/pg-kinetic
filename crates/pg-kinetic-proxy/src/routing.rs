@@ -1,5 +1,6 @@
 use pg_kinetic_core::{
     lsn::PgLsn,
+    policy::PolicyAction,
     routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
     session::TransactionState,
     sharding::{ShardRouteDecision, ShardRouteReason},
@@ -31,6 +32,11 @@ pub enum RoutingReason {
     FallbackPrimary,
     FallbackReject,
     FallbackWait,
+    PolicyDenied,
+    PolicyRequirePrimary,
+    PolicyRequireReplica,
+    PolicyRouteOverride,
+    PolicyShardOverride,
 }
 
 impl RoutingReason {
@@ -59,6 +65,11 @@ impl RoutingReason {
             Self::FallbackPrimary => "fallback_primary",
             Self::FallbackReject => "fallback_reject",
             Self::FallbackWait => "fallback_wait",
+            Self::PolicyDenied => "policy_denied",
+            Self::PolicyRequirePrimary => "policy_require_primary",
+            Self::PolicyRequireReplica => "policy_require_replica",
+            Self::PolicyRouteOverride => "policy_route_override",
+            Self::PolicyShardOverride => "policy_shard_override",
         }
     }
 }
@@ -196,17 +207,17 @@ pub enum RoutingTarget {
 
 impl RoutingTarget {
     #[must_use]
-    pub const fn reason(self) -> RoutingReason {
+    pub const fn reason(&self) -> RoutingReason {
         match self {
             Self::Primary { reason }
             | Self::Replica { reason, .. }
             | Self::Wait { reason }
-            | Self::Reject { reason } => reason,
+            | Self::Reject { reason } => *reason,
         }
     }
 
     #[must_use]
-    pub const fn target_role(self) -> Option<pg_kinetic_core::routing::BackendRole> {
+    pub const fn target_role(&self) -> Option<pg_kinetic_core::routing::BackendRole> {
         match self {
             Self::Primary { .. } => Some(pg_kinetic_core::routing::BackendRole::Primary),
             Self::Replica { .. } => Some(pg_kinetic_core::routing::BackendRole::Replica),
@@ -215,9 +226,9 @@ impl RoutingTarget {
     }
 
     #[must_use]
-    pub fn replica(self) -> Option<ReplicaCandidate> {
+    pub fn replica(&self) -> Option<ReplicaCandidate> {
         match self {
-            Self::Replica { candidate, .. } => Some(candidate),
+            Self::Replica { candidate, .. } => Some(candidate.clone()),
             Self::Primary { .. } | Self::Wait { .. } | Self::Reject { .. } => None,
         }
     }
@@ -336,6 +347,63 @@ pub fn choose_routing_target(
     fallback_target(planner.fallback_policy)
 }
 
+#[must_use]
+pub fn policy_denied_target() -> RoutingTarget {
+    RoutingTarget::Reject {
+        reason: RoutingReason::PolicyDenied,
+    }
+}
+
+#[must_use]
+pub fn apply_policy_action_to_routing_target(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    current_target: Option<RoutingTarget>,
+    action: Option<&PolicyAction>,
+) -> RoutingTarget {
+    let routing_context = context.clone();
+    let current_target =
+        current_target.unwrap_or_else(|| choose_routing_target(planner, routing_context));
+
+    match action {
+        None | Some(PolicyAction::Allow) => current_target,
+        Some(PolicyAction::Deny { .. }) => policy_denied_target(),
+        Some(PolicyAction::RequirePrimary) => RoutingTarget::Primary {
+            reason: RoutingReason::PolicyRequirePrimary,
+        },
+        Some(PolicyAction::RequireReplica) => {
+            let replica_planner = ReadRoutingPlanner::new(
+                ReadRoutingMode::RequireReplica,
+                planner.fallback_policy(),
+                planner.freshness_policy(),
+                planner.max_replica_lag_ms(),
+            );
+            match choose_routing_target(&replica_planner, context) {
+                RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica {
+                    candidate,
+                    reason: RoutingReason::PolicyRequireReplica,
+                },
+                RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. } => {
+                    RoutingTarget::Reject {
+                        reason: RoutingReason::PolicyRequireReplica,
+                    }
+                }
+                RoutingTarget::Primary { .. } => RoutingTarget::Primary {
+                    reason: RoutingReason::PolicyRequireReplica,
+                },
+            }
+        }
+        Some(PolicyAction::RouteOverride { .. }) => map_routing_target_reason(
+            current_target,
+            RoutingReason::PolicyRouteOverride,
+        ),
+        Some(PolicyAction::ShardOverride { .. }) => map_routing_target_reason(
+            current_target,
+            RoutingReason::PolicyShardOverride,
+        ),
+    }
+}
+
 fn primary_for_query_class(query_class: QueryClass) -> RoutingTarget {
     let reason = match query_class {
         QueryClass::Write => RoutingReason::WriteQuery,
@@ -371,6 +439,18 @@ fn fallback_target(fallback_policy: FallbackPolicy) -> RoutingTarget {
         FallbackPolicy::Wait => RoutingTarget::Wait {
             reason: RoutingReason::FallbackWait,
         },
+    }
+}
+
+fn map_routing_target_reason(
+    target: RoutingTarget,
+    reason: RoutingReason,
+) -> RoutingTarget {
+    match target {
+        RoutingTarget::Primary { .. } => RoutingTarget::Primary { reason },
+        RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica { candidate, reason },
+        RoutingTarget::Wait { .. } => RoutingTarget::Wait { reason },
+        RoutingTarget::Reject { .. } => RoutingTarget::Reject { reason },
     }
 }
 

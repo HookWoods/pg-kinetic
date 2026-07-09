@@ -51,6 +51,7 @@ use pg_kinetic_core::{
     observability::{MetricOutcome, ProtocolPhase},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
+    policy::{PolicyAction, POLICY_DENY_SQLSTATE},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
@@ -1084,24 +1085,24 @@ async fn checkout_backend(
     let timer = PhaseTimer::start(ProtocolPhase::BackendCheckout, request.phase_recorder);
     let started = Instant::now();
     if request.record_snapshot {
-        let target_role = request
-            .target
+        let checkout_snapshot = route_checkout_snapshot_for_target(
+            request.route.clone(),
+            request.target.clone(),
+            request.read_after_write_state,
+        );
+        let target_role = checkout_snapshot
+            .decision
             .clone()
             .target_role()
             .map(|role| role.as_str());
-        let target_reason = request.target.clone().reason();
-        let freshness_outcome =
-            route_checkout_freshness_outcome(&request.target, request.read_after_write_state);
+        let target_reason = checkout_snapshot.decision.clone().reason();
+        let freshness_outcome = checkout_snapshot.freshness_outcome;
         if let Some(freshness_outcome) = freshness_outcome {
             metrics::record_read_after_write(freshness_outcome);
         }
         request
             .snapshot_store
-            .set_route_checkout_snapshot(RouteCheckoutSnapshot::new(
-                request.route.clone(),
-                request.target.clone(),
-                freshness_outcome,
-            ));
+            .set_route_checkout_snapshot(checkout_snapshot);
         tracing::debug!(
             route_key = ?request.route,
             checkout_mode = %checkout_mode_label(request.mode),
@@ -1129,6 +1130,8 @@ async fn checkout_backend(
         ));
     }
     if matches!(request.target, RoutingTarget::Reject { .. }) {
+        let (sqlstate, message) = checkout_postgres_error_for_target(&request.target)
+            .unwrap_or((CANNOT_CONNECT_NOW_SQLSTATE, REPLICA_UNAVAILABLE_MESSAGE));
         telemetry::emit_debug_sample(
             &request.debug_sampler,
             DebugSample::overload_rejected(
@@ -1139,8 +1142,8 @@ async fn checkout_backend(
         );
         timer.finish(MetricOutcome::Rejected);
         return Err(CheckoutFailure::Postgres {
-            sqlstate: CANNOT_CONNECT_NOW_SQLSTATE,
-            message: REPLICA_UNAVAILABLE_MESSAGE,
+            sqlstate,
+            message,
         });
     }
 
@@ -1246,6 +1249,88 @@ enum CheckoutFailure {
     Fatal(anyhow::Error),
 }
 
+#[must_use]
+pub fn apply_policy_before_routing_target(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    action: Option<&PolicyAction>,
+) -> RoutingTarget {
+    crate::routing::apply_policy_action_to_routing_target(planner, context, None, action)
+}
+
+#[must_use]
+pub fn apply_policy_after_routing_target(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    current_target: RoutingTarget,
+    action: Option<&PolicyAction>,
+) -> RoutingTarget {
+    crate::routing::apply_policy_action_to_routing_target(
+        planner,
+        context,
+        Some(current_target),
+        action,
+    )
+}
+
+#[must_use]
+pub fn apply_policy_before_checkout_target(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    current_target: RoutingTarget,
+    action: Option<&PolicyAction>,
+) -> RoutingTarget {
+    apply_policy_after_routing_target(planner, context, current_target, action)
+}
+
+#[must_use]
+pub fn checkout_postgres_error_for_target(
+    target: &RoutingTarget,
+) -> Option<(&'static str, &'static str)> {
+    match target {
+        RoutingTarget::Reject {
+            reason: RoutingReason::PolicyDenied,
+        } => Some((POLICY_DENY_SQLSTATE, "policy denied")),
+        RoutingTarget::Reject { .. } => {
+            Some((CANNOT_CONNECT_NOW_SQLSTATE, REPLICA_UNAVAILABLE_MESSAGE))
+        }
+        RoutingTarget::Wait { .. } | RoutingTarget::Primary { .. } | RoutingTarget::Replica { .. } => {
+            None
+        }
+    }
+}
+
+#[must_use]
+pub fn route_checkout_snapshot_for_target(
+    route_key: RouteKey,
+    target: RoutingTarget,
+    read_after_write_state: ReadAfterWriteState,
+) -> RouteCheckoutSnapshot {
+    RouteCheckoutSnapshot::new(
+        route_key,
+        target.clone(),
+        route_checkout_freshness_outcome(&target, read_after_write_state),
+    )
+}
+
+#[must_use]
+pub fn checkout_debug_fields(
+    target: &RoutingTarget,
+    checkout_mode: &'static str,
+) -> Vec<(String, String)> {
+    let target_role = target.target_role().map(|role| role.as_str().to_owned());
+    let reason = target.reason().as_str().to_owned();
+
+    vec![
+        (String::from("checkout_mode"), checkout_mode.to_owned()),
+        (
+            String::from("target_role"),
+            target_role.unwrap_or_else(|| String::from("unknown")),
+        ),
+        (String::from("reason"), reason),
+    ]
+}
+
 fn startup_route_key(startup_packet: &[u8]) -> anyhow::Result<(String, String, Option<String>)> {
     let startup = parse_startup_packet(startup_packet).context("parse startup packet")?;
     let StartupPacket::Startup { parameters, .. } = startup else {
@@ -1297,24 +1382,47 @@ struct ReadRoutingSelection<'a> {
 }
 
 fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget {
+    let sql = routing_sql_for_frames(selection.prepared, selection.frames);
+    let health = build_route_health_snapshot(selection.route_pools, selection.snapshot_store);
+    let routing_context = RoutingContext::new(
+        sql.as_ref(),
+        TransactionState::Idle,
+        selection.session.read_after_write_state(),
+        &health,
+    );
+
+    let policy_before_routing_target =
+        apply_policy_before_routing_target(selection.planner, routing_context.clone(), None);
+    if matches!(
+        policy_before_routing_target,
+        RoutingTarget::Reject {
+            reason: RoutingReason::PolicyDenied,
+        }
+    ) {
+        return policy_before_routing_target;
+    }
+
     match selection.read_routing_mode {
         ReadRoutingMode::Off => {
-            return RoutingTarget::Primary {
+            let target = RoutingTarget::Primary {
                 reason: RoutingReason::Off,
             };
+            return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
         }
         ReadRoutingMode::PrimaryOnly => {
-            return RoutingTarget::Primary {
+            let target = RoutingTarget::Primary {
                 reason: RoutingReason::PrimaryOnlyMode,
             };
+            return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
         }
         ReadRoutingMode::PreferReplica | ReadRoutingMode::RequireReplica => {}
     }
 
     if selection.session.transaction_cross_shard_violation() {
-        return RoutingTarget::Reject {
+        let target = RoutingTarget::Reject {
             reason: RoutingReason::FallbackReject,
         };
+        return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
     }
 
     if let Some(transaction_role) = selection.session.current_transaction_target_role() {
@@ -1323,7 +1431,7 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
             .current_transaction_route_reason()
             .map(routing_reason_from_core)
             .unwrap_or(RoutingReason::TransactionControl);
-        return match transaction_role {
+        let target = match transaction_role {
             BackendRole::Primary => RoutingTarget::Primary { reason },
             BackendRole::Replica => {
                 if let Some(replica) = selection
@@ -1348,19 +1456,26 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
                 reason: RoutingReason::UnknownQuery,
             },
         };
+        let target = apply_policy_after_routing_target(
+            selection.planner,
+            routing_context.clone(),
+            target,
+            None,
+        );
+        return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
     }
 
-    let sql = routing_sql_for_frames(selection.prepared, selection.frames);
-    let health = build_route_health_snapshot(selection.route_pools, selection.snapshot_store);
-    choose_routing_target(
+    let target = choose_routing_target(
         selection.planner,
-        RoutingContext::new(
-            sql.as_ref(),
-            TransactionState::Idle,
-            selection.session.read_after_write_state(),
-            &health,
-        ),
-    )
+        routing_context.clone(),
+    );
+    let target = apply_policy_after_routing_target(
+        selection.planner,
+        routing_context.clone(),
+        target,
+        None,
+    );
+    apply_policy_before_checkout_target(selection.planner, routing_context, target, None)
 }
 
 fn fallback_target(
@@ -1500,6 +1615,7 @@ fn route_checkout_freshness_outcome(
         RoutingTarget::Reject { reason } => Some(match reason {
             RoutingReason::ReplicaStale => FreshnessStatus::Stale,
             RoutingReason::FreshnessRequired => FreshnessStatus::Unknown,
+            RoutingReason::PolicyDenied => FreshnessStatus::Unavailable,
             RoutingReason::ReplicaUnavailable
             | RoutingReason::FallbackReject
             | RoutingReason::RequireReplicaMode => FreshnessStatus::Unavailable,

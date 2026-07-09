@@ -7,6 +7,7 @@ use std::{
 };
 
 use pg_kinetic_core::{
+    policy::PolicyAction,
     route::{QueryClass, RouteKey},
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::TransactionState,
@@ -26,7 +27,7 @@ use crate::config::{
 };
 use crate::routing::{
     bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, ReplicaCandidate,
-    RouteHealthSnapshot, RoutingContext, RoutingTarget,
+    RouteHealthSnapshot, RoutingContext, RoutingReason, RoutingTarget,
 };
 use crate::{reload, snapshot::SnapshotStore};
 
@@ -795,6 +796,62 @@ pub fn apply_multi_shard_policy(policy: FallbackPolicy) -> RoutingTarget {
 }
 
 #[must_use]
+pub fn apply_policy_action_to_sharded_routing_target(
+    planner: &ShardRoutingPlanner,
+    context: ShardRoutingContext<'_>,
+    current_target: RoutingTarget,
+    action: Option<&PolicyAction>,
+) -> RoutingTarget {
+    match action {
+        None | Some(PolicyAction::Allow) => current_target,
+        Some(PolicyAction::Deny { .. }) => RoutingTarget::Reject {
+            reason: RoutingReason::PolicyDenied,
+        },
+        Some(PolicyAction::RequirePrimary) => RoutingTarget::Primary {
+            reason: RoutingReason::PolicyRequirePrimary,
+        },
+        Some(PolicyAction::RequireReplica) => {
+            let replica_target = choose_routing_target(
+                &ReadRoutingPlanner::new(
+                    ReadRoutingMode::RequireReplica,
+                    planner.read_routing.fallback_policy(),
+                    planner.read_routing.freshness_policy(),
+                    planner.read_routing.max_replica_lag_ms(),
+                ),
+                RoutingContext::new(
+                    context.sql,
+                    context.transaction_state,
+                    context.read_after_write_state,
+                    context.health,
+                ),
+            );
+            match replica_target {
+                RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica {
+                    candidate,
+                    reason: RoutingReason::PolicyRequireReplica,
+                },
+                RoutingTarget::Primary { .. } => RoutingTarget::Primary {
+                    reason: RoutingReason::PolicyRequireReplica,
+                },
+                RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. } => {
+                    RoutingTarget::Reject {
+                        reason: RoutingReason::PolicyRequireReplica,
+                    }
+                }
+            }
+        }
+        Some(PolicyAction::RouteOverride { .. }) => map_policy_routing_reason(
+            current_target,
+            RoutingReason::PolicyRouteOverride,
+        ),
+        Some(PolicyAction::ShardOverride { .. }) => map_policy_routing_reason(
+            current_target,
+            RoutingReason::PolicyShardOverride,
+        ),
+    }
+}
+
+#[must_use]
 pub fn choose_sharded_routing_target(
     planner: &ShardRoutingPlanner,
     context: ShardRoutingContext<'_>,
@@ -934,6 +991,15 @@ fn choose_shard_route(
         });
 
     ShardRouteDecision::new(selected_route, reason, route_map.policy())
+}
+
+fn map_policy_routing_reason(target: RoutingTarget, reason: RoutingReason) -> RoutingTarget {
+    match target {
+        RoutingTarget::Primary { .. } => RoutingTarget::Primary { reason },
+        RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica { candidate, reason },
+        RoutingTarget::Wait { .. } => RoutingTarget::Wait { reason },
+        RoutingTarget::Reject { .. } => RoutingTarget::Reject { reason },
+    }
 }
 
 fn select_route_for_shard_id<'a>(
