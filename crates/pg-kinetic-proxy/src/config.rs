@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::HashSet, fmt, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -6,6 +6,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
     recovery::RecoveryMode,
+    policy::{
+        PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId,
+    },
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
@@ -569,6 +572,253 @@ impl ShardTargetConfig {
             Self::Primary { shard_id } | Self::Replicas { shard_id } => shard_id,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Parser, Serialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_MODE",
+        value_parser = parse_policy_mode,
+        default_value = "disabled"
+    )]
+    #[serde(
+        default = "default_policy_mode",
+        deserialize_with = "deserialize_policy_mode",
+        serialize_with = "serialize_policy_mode"
+    )]
+    pub policy_mode: PolicyMode,
+
+    #[serde(default)]
+    #[arg(skip)]
+    pub policy_files: Vec<PolicyFileConfig>,
+
+    #[serde(default)]
+    #[arg(skip)]
+    pub inline_rules: Vec<InlinePolicyConfig>,
+
+    #[serde(default, flatten)]
+    #[command(flatten)]
+    pub policy_audit: PolicyAuditConfig,
+
+    #[serde(default, flatten)]
+    #[command(flatten)]
+    pub policy_wasm: PolicyWasmConfig,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_EVAL_TIMEOUT_MS",
+        default_value_t = default_policy_eval_timeout_ms()
+    )]
+    #[serde(default = "default_policy_eval_timeout_ms")]
+    pub policy_eval_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_MAX_CONTEXT_BYTES",
+        default_value_t = default_policy_max_context_bytes()
+    )]
+    #[serde(default = "default_policy_max_context_bytes")]
+    pub policy_max_context_bytes: usize,
+}
+
+impl PolicyConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_internal()
+    }
+
+    pub fn validate_routes<R>(&self, existing_routes: R) -> Result<(), String>
+    where
+        R: IntoIterator,
+        R::Item: AsRef<str>,
+    {
+        self.validate_with_context(existing_routes, false, std::iter::empty::<&str>())
+    }
+
+    pub fn validate_shards<S>(
+        &self,
+        sharding_enabled: bool,
+        existing_shards: S,
+    ) -> Result<(), String>
+    where
+        S: IntoIterator,
+        S::Item: AsRef<str>,
+    {
+        self.validate_with_context(std::iter::empty::<&str>(), sharding_enabled, existing_shards)
+    }
+
+    pub fn validate_with_context<R, S>(
+        &self,
+        existing_routes: R,
+        sharding_enabled: bool,
+        existing_shards: S,
+    ) -> Result<(), String>
+    where
+        R: IntoIterator,
+        R::Item: AsRef<str>,
+        S: IntoIterator,
+        S::Item: AsRef<str>,
+    {
+        self.validate_internal()?;
+
+        let existing_routes = existing_routes
+            .into_iter()
+            .map(|route| route.as_ref().to_owned())
+            .collect::<HashSet<_>>();
+        let existing_shards = existing_shards
+            .into_iter()
+            .map(|shard| shard.as_ref().to_owned())
+            .collect::<HashSet<_>>();
+
+        for inline_rule in &self.inline_rules {
+            match &inline_rule.action {
+                InlinePolicyActionConfig::RouteOverride { target_id } => {
+                    if !existing_routes.contains(target_id.as_str()) {
+                        return Err(format!(
+                            "route override target '{}' does not reference an existing route",
+                            target_id.as_str()
+                        ));
+                    }
+                }
+                InlinePolicyActionConfig::ShardOverride { target_id } if sharding_enabled => {
+                    if !existing_shards.contains(target_id.as_str()) {
+                        return Err(format!(
+                            "shard override target '{}' does not reference an existing shard",
+                            target_id.as_str()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_internal(&self) -> Result<(), String> {
+        for inline_rule in &self.inline_rules {
+            match &inline_rule.action {
+                InlinePolicyActionConfig::Deny { reason } if reason.trim().is_empty() => {
+                    return Err(String::from("deny action requires a reason"));
+                }
+                InlinePolicyActionConfig::Wasm { .. }
+                    if !self.policy_wasm.policy_wasm_enabled =>
+                {
+                    return Err(String::from(
+                        "wasm policies require policy_wasm_enabled to be true",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            policy_mode: default_policy_mode(),
+            policy_files: Vec::new(),
+            inline_rules: Vec::new(),
+            policy_audit: PolicyAuditConfig::default(),
+            policy_wasm: PolicyWasmConfig::default(),
+            policy_eval_timeout_ms: default_policy_eval_timeout_ms(),
+            policy_max_context_bytes: default_policy_max_context_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyFileConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InlinePolicyConfig {
+    #[serde(
+        default = "default_policy_id",
+        deserialize_with = "deserialize_policy_id",
+        serialize_with = "serialize_policy_id"
+    )]
+    pub policy_id: PolicyId,
+
+    #[serde(
+        default = "default_policy_hook_point",
+        deserialize_with = "deserialize_policy_hook_point",
+        serialize_with = "serialize_policy_hook_point"
+    )]
+    pub hook_point: PolicyHookPoint,
+
+    #[serde(flatten)]
+    pub action: InlinePolicyActionConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InlinePolicyActionConfig {
+    Allow,
+    Deny { reason: String },
+    RequirePrimary,
+    RequireReplica,
+    RouteOverride {
+        #[serde(
+            deserialize_with = "deserialize_policy_route_target_id",
+            serialize_with = "serialize_policy_route_target_id"
+        )]
+        target_id: PolicyRouteTargetId,
+    },
+    ShardOverride {
+        #[serde(
+            deserialize_with = "deserialize_policy_shard_target_id",
+            serialize_with = "serialize_policy_shard_target_id"
+        )]
+        target_id: PolicyShardTargetId,
+    },
+    Wasm { module_path: PathBuf },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct PolicyAuditConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_AUDIT_ENABLED",
+        default_value_t = true
+    )]
+    #[serde(default = "default_policy_audit_enabled")]
+    pub policy_audit_enabled: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_AUDIT_SAMPLE_RATE",
+        default_value_t = 1.0
+    )]
+    #[serde(default = "default_policy_audit_sample_rate")]
+    pub policy_audit_sample_rate: f64,
+}
+
+impl Default for PolicyAuditConfig {
+    fn default() -> Self {
+        Self {
+            policy_audit_enabled: default_policy_audit_enabled(),
+            policy_audit_sample_rate: default_policy_audit_sample_rate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct PolicyWasmConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_POLICY_WASM_ENABLED",
+        default_value_t = false
+    )]
+    #[serde(default)]
+    pub policy_wasm_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -1259,6 +1509,142 @@ fn parse_freshness_policy(value: &str) -> Result<FreshnessPolicy, String> {
         "session_write_lsn_and_max_lag" => Ok(FreshnessPolicy::SessionWriteLsnAndMaxLag),
         other => Err(format!("invalid freshness policy '{other}'")),
     }
+}
+
+fn default_policy_mode() -> PolicyMode {
+    PolicyMode::Disabled
+}
+
+fn default_policy_audit_enabled() -> bool {
+    true
+}
+
+fn default_policy_audit_sample_rate() -> f64 {
+    1.0
+}
+
+fn default_policy_eval_timeout_ms() -> u64 {
+    5
+}
+
+fn default_policy_max_context_bytes() -> usize {
+    8_192
+}
+
+fn default_policy_id() -> PolicyId {
+    PolicyId::new("policy").expect("valid default policy id")
+}
+
+fn default_policy_hook_point() -> PolicyHookPoint {
+    PolicyHookPoint::BeforeRouting
+}
+
+fn deserialize_policy_mode<'de, D>(deserializer: D) -> Result<PolicyMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_policy_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_policy_mode<S>(mode: &PolicyMode, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
+}
+
+fn parse_policy_mode(value: &str) -> Result<PolicyMode, String> {
+    match value {
+        "disabled" => Ok(PolicyMode::Disabled),
+        "enforce" => Ok(PolicyMode::Enforce),
+        "dry_run" => Ok(PolicyMode::DryRun),
+        other => Err(format!("invalid policy mode '{other}'")),
+    }
+}
+
+fn deserialize_policy_hook_point<'de, D>(deserializer: D) -> Result<PolicyHookPoint, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_policy_hook_point(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_policy_hook_point<S>(
+    hook_point: &PolicyHookPoint,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(hook_point.as_str())
+}
+
+fn parse_policy_hook_point(value: &str) -> Result<PolicyHookPoint, String> {
+    match value {
+        "before_routing" => Ok(PolicyHookPoint::BeforeRouting),
+        "after_routing" => Ok(PolicyHookPoint::AfterRouting),
+        "before_checkout" => Ok(PolicyHookPoint::BeforeCheckout),
+        other => Err(format!("invalid policy hook point '{other}'")),
+    }
+}
+
+fn deserialize_policy_id<'de, D>(deserializer: D) -> Result<PolicyId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    PolicyId::from_str(&value).map_err(|error| serde::de::Error::custom(error.to_string()))
+}
+
+fn serialize_policy_id<S>(policy_id: &PolicyId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(policy_id.as_str())
+}
+
+fn deserialize_policy_route_target_id<'de, D>(
+    deserializer: D,
+) -> Result<PolicyRouteTargetId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    PolicyRouteTargetId::from_str(&value)
+        .map_err(|error| serde::de::Error::custom(error.to_string()))
+}
+
+fn serialize_policy_route_target_id<S>(
+    target_id: &PolicyRouteTargetId,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(target_id.as_str())
+}
+
+fn deserialize_policy_shard_target_id<'de, D>(
+    deserializer: D,
+) -> Result<PolicyShardTargetId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    PolicyShardTargetId::from_str(&value)
+        .map_err(|error| serde::de::Error::custom(error.to_string()))
+}
+
+fn serialize_policy_shard_target_id<S>(
+    target_id: &PolicyShardTargetId,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(target_id.as_str())
 }
 
 #[cfg(test)]
