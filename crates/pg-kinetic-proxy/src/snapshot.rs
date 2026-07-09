@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
+    collections::VecDeque,
 };
 
 use pg_kinetic_core::{
@@ -11,6 +12,7 @@ use pg_kinetic_core::{
     observability::MetricOutcome,
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
+    policy::PolicyAuditEvent,
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
@@ -23,6 +25,8 @@ use crate::config::{
 use crate::metrics;
 use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
+
+const POLICY_AUDIT_RING_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -512,6 +516,7 @@ struct SnapshotStoreInner {
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     route_map_reloads: Vec<RouteMapReloadSnapshot>,
+    policy_audit_events: VecDeque<PolicyAuditEvent>,
     sharding: ShardingConfig,
     shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
     shard_migration_safety: Vec<ShardMigrationSafetySnapshot>,
@@ -556,6 +561,11 @@ impl SnapshotStore {
     #[must_use]
     pub fn backpressure_handle(&self) -> BackpressureSnapshotHandle {
         BackpressureSnapshotHandle::new(Arc::clone(&self.inner))
+    }
+
+    #[must_use]
+    pub fn policy_audit_handle(&self) -> PolicyAuditSnapshotHandle {
+        PolicyAuditSnapshotHandle::new(Arc::clone(&self.inner))
     }
 
     pub fn register_client(&self, snapshot: ClientSnapshot) {
@@ -912,6 +922,25 @@ impl SnapshotStore {
             .clone()
     }
 
+    pub fn record_policy_audit_event(&self, event: PolicyAuditEvent) {
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
+            inner.policy_audit_events.pop_front();
+        }
+        inner.policy_audit_events.push_back(event);
+    }
+
+    #[must_use]
+    pub fn policy_audit_events(&self) -> Vec<PolicyAuditEvent> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .policy_audit_events
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn set_sharding_snapshot(&self, snapshot: ShardingConfig) {
         self.inner
             .write()
@@ -1228,6 +1257,25 @@ impl BackpressureSnapshotHandle {
             .entry(route_key.clone())
             .or_insert_with(|| BackpressureSnapshot::new(route_key));
         update(snapshot);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyAuditSnapshotHandle {
+    inner: Arc<RwLock<SnapshotStoreInner>>,
+}
+
+impl PolicyAuditSnapshotHandle {
+    fn new(inner: Arc<RwLock<SnapshotStoreInner>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn record(&self, event: PolicyAuditEvent) {
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
+            inner.policy_audit_events.pop_front();
+        }
+        inner.policy_audit_events.push_back(event);
     }
 }
 

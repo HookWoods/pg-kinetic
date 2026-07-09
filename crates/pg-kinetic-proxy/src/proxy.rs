@@ -51,7 +51,10 @@ use pg_kinetic_core::{
     observability::{MetricOutcome, ProtocolPhase},
     pin::PinnedBackend,
     prepare::{InvalidationScope, PreparedCatalog},
-    policy::{PolicyAction, POLICY_DENY_SQLSTATE},
+    policy::{
+        PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyMode,
+        POLICY_DENY_SQLSTATE,
+    },
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
@@ -79,6 +82,8 @@ use pg_kinetic_wire::{
     startup::{parse_startup_packet, StartupPacket},
 };
 use std::borrow::Cow;
+
+use crate::policy::{PolicyEvalInput, PolicyRuntime};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
@@ -1281,6 +1286,44 @@ pub fn apply_policy_before_checkout_target(
     action: Option<&PolicyAction>,
 ) -> RoutingTarget {
     apply_policy_after_routing_target(planner, context, current_target, action)
+}
+
+#[must_use]
+pub fn apply_policy_action_to_routing_target_with_mode(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    current_target: Option<RoutingTarget>,
+    action: Option<&PolicyAction>,
+    policy_mode: PolicyMode,
+) -> RoutingTarget {
+    let routing_context = context.clone();
+    let current_target =
+        current_target.unwrap_or_else(|| choose_routing_target(planner, routing_context));
+
+    match policy_mode {
+        PolicyMode::Enforce => {
+            crate::routing::apply_policy_action_to_routing_target(
+                planner,
+                context,
+                Some(current_target),
+                action,
+            )
+        }
+        PolicyMode::Disabled | PolicyMode::DryRun => current_target,
+    }
+}
+
+#[must_use]
+pub fn policy_audit_event_from_decision(
+    runtime: &PolicyRuntime,
+    kind: PolicyAuditKind,
+    decision: PolicyDecision,
+    input: &PolicyEvalInput,
+    target: &RoutingTarget,
+) -> PolicyAuditEvent {
+    let mut event = runtime.build_audit_event_from_input(kind, decision, input);
+    event.target_role = target.target_role().map(|role| Arc::from(role.as_str()));
+    event
 }
 
 #[must_use]

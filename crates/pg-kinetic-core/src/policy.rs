@@ -317,6 +317,7 @@ impl Display for PolicyEffect {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PolicyOutcome {
     Applied,
+    DryRun,
     Rejected,
     Skipped,
     Redacted,
@@ -327,6 +328,7 @@ impl PolicyOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Applied => "applied",
+            Self::DryRun => "dry_run",
             Self::Rejected => "rejected",
             Self::Skipped => "skipped",
             Self::Redacted => "redacted",
@@ -392,6 +394,29 @@ impl PolicyAction {
     #[must_use]
     pub fn shard_override(target_id: PolicyShardTargetId) -> Self {
         Self::ShardOverride { target_id }
+    }
+
+    #[must_use]
+    pub fn audit_reason(&self, outcome: PolicyOutcome) -> Arc<str> {
+        let reason = match outcome {
+            PolicyOutcome::DryRun => match self {
+                Self::Allow => "would_allow",
+                Self::Deny { .. } => "would_deny",
+                Self::RequirePrimary => "would_require_primary",
+                Self::RequireReplica => "would_require_replica",
+                Self::RouteOverride { .. } | Self::ShardOverride { .. } => "would_override",
+            },
+            _ => match self {
+                Self::Allow => "allow",
+                Self::Deny { reason, .. } => reason.as_str(),
+                Self::RequirePrimary => "require_primary",
+                Self::RequireReplica => "require_replica",
+                Self::RouteOverride { .. } => "route_override",
+                Self::ShardOverride { .. } => "shard_override",
+            },
+        };
+
+        Arc::from(reason)
     }
 
     #[must_use]
@@ -630,21 +655,52 @@ impl Display for PolicyAuditKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyAuditEvent {
     pub kind: PolicyAuditKind,
+    pub policy_id: PolicyId,
+    pub policy_version: PolicyVersion,
+    pub hook_point: PolicyHookPoint,
+    pub action: PolicyAction,
+    pub outcome: PolicyOutcome,
+    pub reason: Option<Arc<str>>,
+    pub route: Option<Arc<str>>,
+    pub shard: Option<Arc<str>>,
+    pub target_role: Option<Arc<str>>,
     pub decision: PolicyDecision,
     pub context: PolicyContext,
 }
 
 impl PolicyAuditEvent {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         kind: PolicyAuditKind,
         decision: PolicyDecision,
         context: PolicyContext,
     ) -> Self {
+        let reason = Some(decision.action.audit_reason(decision.outcome));
+        let route = context_field_value(&context, "route");
+        let shard = context_field_value(&context, "shard");
+        let target_role = context_field_value(&context, "backend_role");
+
         Self {
             kind,
+            policy_id: decision.policy_id.clone(),
+            policy_version: decision.policy_version,
+            hook_point: decision.hook_point,
+            action: decision.action.clone(),
+            outcome: decision.outcome,
+            reason,
+            route,
+            shard,
+            target_role,
             decision,
             context,
         }
     }
+}
+
+fn context_field_value(context: &PolicyContext, field_name: &str) -> Option<Arc<str>> {
+    context
+        .fields()
+        .iter()
+        .find(|field| field.name() == field_name)
+        .map(|field| Arc::from(field.rendered_value()))
 }

@@ -1,21 +1,34 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use pg_kinetic_core::{
     lsn::FreshnessStatus,
-    policy::{PolicyContext, PolicyContextField},
+    policy::{
+        PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField, PolicyDecision,
+        PolicyMode,
+    },
     routing::{BackendRole, QueryClass, RoutingDecision},
     session::TransactionAccessMode,
     sharding::ShardRouteDecision,
 };
 
 use crate::config::PolicyConfig;
+use crate::snapshot::SnapshotStore;
 
 const REDACTED_VALUE: &str = "<redacted>";
+const POLICY_AUDIT_METRIC_NAME: &str = "pg_kinetic_policy_audit_total";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyRuntime {
     policy_eval_timeout: Duration,
     policy_max_context_bytes: usize,
+    policy_mode: PolicyMode,
+    policy_audit_enabled: bool,
+    policy_audit_sample_rate_bits: u64,
 }
 
 impl PolicyRuntime {
@@ -24,6 +37,9 @@ impl PolicyRuntime {
         Self {
             policy_eval_timeout,
             policy_max_context_bytes,
+            policy_mode: PolicyMode::Disabled,
+            policy_audit_enabled: true,
+            policy_audit_sample_rate_bits: 1.0f64.to_bits(),
         }
     }
 
@@ -33,6 +49,9 @@ impl PolicyRuntime {
             Duration::from_millis(config.policy_eval_timeout_ms),
             config.policy_max_context_bytes,
         )
+        .with_policy_mode(config.policy_mode)
+        .with_policy_audit_enabled(config.policy_audit.policy_audit_enabled)
+        .with_policy_audit_sample_rate(config.policy_audit.policy_audit_sample_rate)
     }
 
     #[must_use]
@@ -46,8 +65,115 @@ impl PolicyRuntime {
     }
 
     #[must_use]
+    pub const fn policy_mode(&self) -> PolicyMode {
+        self.policy_mode
+    }
+
+    #[must_use]
+    pub const fn policy_audit_enabled(&self) -> bool {
+        self.policy_audit_enabled
+    }
+
+    #[must_use]
+    pub fn policy_audit_sample_rate(&self) -> f64 {
+        f64::from_bits(self.policy_audit_sample_rate_bits)
+    }
+
+    #[must_use]
     pub fn context_builder(&self) -> PolicyContextBuilder {
         PolicyContextBuilder::new(self.policy_max_context_bytes)
+    }
+
+    #[must_use]
+    pub fn build_audit_event(
+        &self,
+        kind: PolicyAuditKind,
+        decision: PolicyDecision,
+        context: PolicyContext,
+    ) -> PolicyAuditEvent {
+        PolicyAuditEvent::new(kind, decision, context)
+    }
+
+    #[must_use]
+    pub fn build_audit_event_from_input(
+        &self,
+        kind: PolicyAuditKind,
+        decision: PolicyDecision,
+        input: &PolicyEvalInput,
+    ) -> PolicyAuditEvent {
+        let context = self.context_builder().build(input).context;
+        self.build_audit_event(kind, decision, context)
+    }
+
+    #[must_use]
+    pub fn should_sample_audit_event(&self, event: &PolicyAuditEvent) -> bool {
+        if !self.policy_audit_enabled {
+            return false;
+        }
+
+        let sample_rate = self.policy_audit_sample_rate();
+        if sample_rate <= 0.0 {
+            return false;
+        }
+        if sample_rate >= 1.0 {
+            return true;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        event.kind.as_str().hash(&mut hasher);
+        event.policy_id.as_str().hash(&mut hasher);
+        event.policy_version.as_u64().hash(&mut hasher);
+        event.hook_point.as_str().hash(&mut hasher);
+        event.action.as_str().hash(&mut hasher);
+        event.outcome.as_str().hash(&mut hasher);
+        event.reason.as_deref().unwrap_or_default().hash(&mut hasher);
+        event.route.as_deref().unwrap_or_default().hash(&mut hasher);
+        event.shard.as_deref().unwrap_or_default().hash(&mut hasher);
+        event.target_role.as_deref().unwrap_or_default().hash(&mut hasher);
+
+        let sample = (hasher.finish() as f64) / (u64::MAX as f64);
+        sample < sample_rate
+    }
+
+    #[must_use]
+    pub fn record_audit_event(
+        &self,
+        snapshot_store: &SnapshotStore,
+        event: &PolicyAuditEvent,
+    ) -> bool {
+        if !self.should_sample_audit_event(event) {
+            return false;
+        }
+
+        snapshot_store.record_policy_audit_event(event.clone());
+        metrics_crate::counter!(
+            POLICY_AUDIT_METRIC_NAME,
+            "policy" => event.policy_id.as_str().to_string(),
+            "action" => event.action.as_str().to_string(),
+            "hook" => event.hook_point.as_str().to_string(),
+            "outcome" => event.outcome.as_str().to_string(),
+            "reason" => event.reason.as_deref().unwrap_or_default().to_string(),
+        )
+        .increment(1);
+        true
+    }
+
+    #[must_use]
+    pub fn with_policy_mode(mut self, policy_mode: PolicyMode) -> Self {
+        self.policy_mode = policy_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_policy_audit_enabled(mut self, policy_audit_enabled: bool) -> Self {
+        self.policy_audit_enabled = policy_audit_enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_policy_audit_sample_rate(mut self, sample_rate: f64) -> Self {
+        self.policy_audit_sample_rate_bits = clamp_sample_rate(sample_rate).to_bits();
+        self
     }
 }
 
@@ -326,5 +452,13 @@ fn freshness_state_label(state: FreshnessStatus) -> &'static str {
         FreshnessStatus::Stale => "stale",
         FreshnessStatus::Unknown => "unknown",
         FreshnessStatus::Unavailable => "unavailable",
+    }
+}
+
+fn clamp_sample_rate(sample_rate: f64) -> f64 {
+    if sample_rate.is_nan() {
+        0.0
+    } else {
+        sample_rate.clamp(0.0, 1.0)
     }
 }
