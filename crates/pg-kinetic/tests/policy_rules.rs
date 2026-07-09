@@ -3,7 +3,9 @@ use std::{sync::Arc, time::Duration};
 use pg_kinetic::core::{
     lsn::FreshnessStatus,
     policy::{
-        PolicyDecisionReason, PolicyHookPoint, PolicyRouteTargetId, PolicyShardTargetId,
+        PolicyContext, PolicyDecisionReason, PolicyHookPoint, PolicyId, PolicyOutcome,
+        PolicyPluginAbiVersion, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
+        PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
     },
     policy_rule::{
         PolicyRule, PolicyRuleAction, PolicyRuleContext, PolicyRuleMatch, PolicyRuleSet,
@@ -382,6 +384,96 @@ fn redacted_policy_context_rendering_is_stable() {
     assert_eq!(first.context, second.context);
     assert_eq!(first.rendered_context, second.rendered_context);
     assert_eq!(format!("{}", first.context), first.rendered_context);
+}
+
+#[test]
+fn plugin_input_and_output_schema_versions_are_versioned() {
+    let policy_id = PolicyId::new("plugin-policy").expect("policy id");
+    let policy_version = PolicyVersion::new(1).expect("policy version");
+    let hook_point = PolicyHookPoint::BeforeRouting;
+
+    let input = PolicyPluginInput::new(
+        PolicyPluginAbiVersion::current().as_u16(),
+        policy_id.clone(),
+        policy_version,
+        hook_point,
+        PolicyContext::default(),
+        false,
+        false,
+        false,
+    )
+    .expect("plugin input");
+    let output = PolicyPluginOutput::new(
+        PolicyPluginAbiVersion::current().as_u16(),
+        policy_id,
+        policy_version,
+        hook_point,
+        PolicyPluginAction::allow(),
+        PolicyOutcome::Applied,
+    )
+    .expect("plugin output");
+
+    assert_eq!(input.abi_version, PolicyPluginAbiVersion::current());
+    assert_eq!(output.abi_version, PolicyPluginAbiVersion::current());
+}
+
+#[test]
+fn unknown_plugin_schema_version_is_rejected() {
+    let policy_id = PolicyId::new("plugin-policy").expect("policy id");
+    let policy_version = PolicyVersion::new(1).expect("policy version");
+    let hook_point = PolicyHookPoint::BeforeRouting;
+
+    let input_error = PolicyPluginInput::new(
+        2,
+        policy_id.clone(),
+        policy_version,
+        hook_point,
+        PolicyContext::default(),
+        false,
+        false,
+        false,
+    )
+    .expect_err("unknown plugin input schema version is rejected");
+    assert_eq!(input_error.code().as_str(), "unknown_abi_version");
+    assert_eq!(input_error.outcome(), PolicyOutcome::Rejected);
+
+    let output_error = PolicyPluginOutput::new(
+        2,
+        policy_id,
+        policy_version,
+        hook_point,
+        PolicyPluginAction::allow(),
+        PolicyOutcome::Applied,
+    )
+    .expect_err("unknown plugin output schema version is rejected");
+    assert_eq!(output_error.code().as_str(), "unknown_abi_version");
+    assert_eq!(output_error.outcome(), PolicyOutcome::Rejected);
+}
+
+#[test]
+fn plugin_errors_map_to_stable_policy_outcomes() {
+    let unsupported_action = PolicyPluginError::unsupported_action("mirror");
+    let timeout = PolicyPluginError::evaluation_timeout(
+        Duration::from_millis(12),
+        Duration::from_millis(5),
+    );
+
+    assert_eq!(unsupported_action.outcome(), PolicyOutcome::Rejected);
+    assert_eq!(timeout.outcome(), PolicyOutcome::Skipped);
+    assert_eq!(PolicyPluginError::input_too_large(32, 16).outcome(), PolicyOutcome::Skipped);
+    assert_eq!(PolicyPluginError::output_too_large(32, 16).outcome(), PolicyOutcome::Skipped);
+}
+
+#[test]
+fn plugin_evaluation_timeout_maps_to_a_stable_outcome() {
+    let timeout = PolicyPluginError::evaluation_timeout(
+        Duration::from_millis(50),
+        Duration::from_millis(5),
+    );
+
+    assert_eq!(timeout.code().as_str(), "evaluation_timeout");
+    assert_eq!(timeout.outcome(), PolicyOutcome::Skipped);
+    assert!(timeout.to_string().contains("policy plugin evaluation exceeded"));
 }
 
 fn sample_policy_eval_input() -> PolicyEvalInput {

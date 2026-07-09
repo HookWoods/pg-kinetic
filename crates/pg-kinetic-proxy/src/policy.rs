@@ -11,7 +11,8 @@ use pg_kinetic_core::{
     lsn::FreshnessStatus,
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField,
-        PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome, PolicyVersion,
+        PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome, PolicyPluginAction,
+        PolicyPluginError, PolicyPluginInput, PolicyPluginOutput, PolicyVersion,
     },
     routing::{BackendRole, QueryClass, RoutingDecision},
     session::TransactionAccessMode,
@@ -84,6 +85,15 @@ impl PolicyRuntime {
     #[must_use]
     pub fn context_builder(&self) -> PolicyContextBuilder {
         PolicyContextBuilder::new(self.policy_max_context_bytes)
+    }
+
+    #[must_use]
+    pub fn plugin_host_limits(&self) -> PolicyPluginHostLimits {
+        PolicyPluginHostLimits::new(
+            self.policy_max_context_bytes,
+            self.policy_max_context_bytes,
+            self.policy_eval_timeout,
+        )
     }
 
     #[must_use]
@@ -176,6 +186,158 @@ impl PolicyRuntime {
     pub fn with_policy_audit_sample_rate(mut self, sample_rate: f64) -> Self {
         self.policy_audit_sample_rate_bits = clamp_sample_rate(sample_rate).to_bits();
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyPluginHostLimits {
+    max_input_bytes: usize,
+    max_output_bytes: usize,
+    max_evaluation_duration: Duration,
+}
+
+impl PolicyPluginHostLimits {
+    #[must_use]
+    pub const fn new(
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+        max_evaluation_duration: Duration,
+    ) -> Self {
+        Self {
+            max_input_bytes,
+            max_output_bytes,
+            max_evaluation_duration,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_input_bytes(&self) -> usize {
+        self.max_input_bytes
+    }
+
+    #[must_use]
+    pub const fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
+    }
+
+    #[must_use]
+    pub const fn max_evaluation_duration(&self) -> Duration {
+        self.max_evaluation_duration
+    }
+
+    #[must_use]
+    pub const fn filesystem_access_allowed(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn network_access_allowed(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn secret_access_allowed(&self) -> bool {
+        false
+    }
+
+    pub fn validate_input(&self, input: &PolicyPluginInput) -> Result<(), PolicyPluginError> {
+        if input.rendered_len_bytes() > self.max_input_bytes {
+            return Err(PolicyPluginError::input_too_large(
+                input.rendered_len_bytes(),
+                self.max_input_bytes,
+            ));
+        }
+
+        if input.requested_filesystem_access {
+            return Err(PolicyPluginError::filesystem_access_denied());
+        }
+        if input.requested_network_access {
+            return Err(PolicyPluginError::network_access_denied());
+        }
+        if input.requested_secret_access {
+            return Err(PolicyPluginError::secret_access_denied());
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_output(&self, output: &PolicyPluginOutput) -> Result<(), PolicyPluginError> {
+        if output.rendered_len_bytes() > self.max_output_bytes {
+            return Err(PolicyPluginError::output_too_large(
+                output.rendered_len_bytes(),
+                self.max_output_bytes,
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_evaluation_duration(
+        &self,
+        elapsed: Duration,
+    ) -> Result<(), PolicyPluginError> {
+        if elapsed > self.max_evaluation_duration {
+            return Err(PolicyPluginError::evaluation_timeout(
+                elapsed,
+                self.max_evaluation_duration,
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_output_like_declarative_policy_output<R, S>(
+        &self,
+        output: &PolicyPluginOutput,
+        active_routes: R,
+        sharding_enabled: bool,
+        active_shards: S,
+    ) -> Result<(), PolicyPluginError>
+    where
+        R: IntoIterator,
+        R::Item: AsRef<str>,
+        S: IntoIterator,
+        S::Item: AsRef<str>,
+    {
+        self.validate_output(output)?;
+
+        let action = policy_plugin_action_to_inline_action(&output.action)?;
+        let mut policy = PolicyConfig::default();
+        policy.inline_rules = vec![InlinePolicyConfig {
+            policy_id: output.policy_id.clone(),
+            hook_point: output.hook_point,
+            action,
+        }];
+
+        policy
+            .validate_with_context(active_routes, sharding_enabled, active_shards)
+            .map_err(PolicyPluginError::output_validation_failed)
+    }
+}
+
+fn policy_plugin_action_to_inline_action(
+    action: &PolicyPluginAction,
+) -> Result<InlinePolicyActionConfig, PolicyPluginError> {
+    match action {
+        PolicyPluginAction::Allow => Ok(InlinePolicyActionConfig::Allow),
+        PolicyPluginAction::Deny { reason } => Ok(InlinePolicyActionConfig::Deny {
+            reason: reason.to_string(),
+        }),
+        PolicyPluginAction::RequirePrimary => Ok(InlinePolicyActionConfig::RequirePrimary),
+        PolicyPluginAction::RequireReplica => Ok(InlinePolicyActionConfig::RequireReplica),
+        PolicyPluginAction::RouteOverride { target_id } => {
+            Ok(InlinePolicyActionConfig::RouteOverride {
+                target_id: target_id.clone(),
+            })
+        }
+        PolicyPluginAction::ShardOverride { target_id } => {
+            Ok(InlinePolicyActionConfig::ShardOverride {
+                target_id: target_id.clone(),
+            })
+        }
+        PolicyPluginAction::Unsupported { name } => Err(PolicyPluginError::unsupported_action(
+            name.clone(),
+        )),
     }
 }
 

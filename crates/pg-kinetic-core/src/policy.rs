@@ -1,4 +1,4 @@
-use std::{fmt, fmt::Display, str::FromStr, sync::Arc, time::Duration};
+use std::{convert::TryFrom, fmt, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -231,6 +231,352 @@ impl PolicyMode {
 impl Display for PolicyMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PolicyPluginAbiVersion {
+    V1,
+}
+
+impl PolicyPluginAbiVersion {
+    #[must_use]
+    pub const fn current() -> Self {
+        Self::V1
+    }
+
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        match self {
+            Self::V1 => 1,
+        }
+    }
+}
+
+impl Display for PolicyPluginAbiVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.as_u16())
+    }
+}
+
+impl std::convert::TryFrom<u16> for PolicyPluginAbiVersion {
+    type Error = PolicyPluginError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::V1),
+            other => Err(PolicyPluginError::unknown_abi_version(other)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyPluginInput {
+    pub abi_version: PolicyPluginAbiVersion,
+    pub policy_id: PolicyId,
+    pub policy_version: PolicyVersion,
+    pub hook_point: PolicyHookPoint,
+    pub context: PolicyContext,
+    pub requested_filesystem_access: bool,
+    pub requested_network_access: bool,
+    pub requested_secret_access: bool,
+}
+
+impl PolicyPluginInput {
+    #[must_use]
+    pub fn new(
+        abi_version: u16,
+        policy_id: PolicyId,
+        policy_version: PolicyVersion,
+        hook_point: PolicyHookPoint,
+        context: PolicyContext,
+        requested_filesystem_access: bool,
+        requested_network_access: bool,
+        requested_secret_access: bool,
+    ) -> Result<Self, PolicyPluginError> {
+        Ok(Self {
+            abi_version: PolicyPluginAbiVersion::try_from(abi_version)?,
+            policy_id,
+            policy_version,
+            hook_point,
+            context,
+            requested_filesystem_access,
+            requested_network_access,
+            requested_secret_access,
+        })
+    }
+
+    #[must_use]
+    pub fn rendered_len_bytes(&self) -> usize {
+        self.abi_version.as_u16().to_string().len()
+            + self.policy_id.as_str().len()
+            + self.policy_version.as_u64().to_string().len()
+            + self.hook_point.as_str().len()
+            + self.context.rendered_len_bytes()
+            + 3
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyPluginAction {
+    Allow,
+    Deny { reason: Arc<str> },
+    RequirePrimary,
+    RequireReplica,
+    RouteOverride { target_id: PolicyRouteTargetId },
+    ShardOverride { target_id: PolicyShardTargetId },
+    Unsupported { name: Arc<str> },
+}
+
+impl PolicyPluginAction {
+    #[must_use]
+    pub const fn allow() -> Self {
+        Self::Allow
+    }
+
+    #[must_use]
+    pub fn deny(reason: impl Into<Arc<str>>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn require_primary() -> Self {
+        Self::RequirePrimary
+    }
+
+    #[must_use]
+    pub const fn require_replica() -> Self {
+        Self::RequireReplica
+    }
+
+    #[must_use]
+    pub fn route_override(target_id: PolicyRouteTargetId) -> Self {
+        Self::RouteOverride { target_id }
+    }
+
+    #[must_use]
+    pub fn shard_override(target_id: PolicyShardTargetId) -> Self {
+        Self::ShardOverride { target_id }
+    }
+
+    #[must_use]
+    pub fn unsupported(name: impl Into<Arc<str>>) -> Self {
+        Self::Unsupported { name: name.into() }
+    }
+
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny { .. } => "deny",
+            Self::RequirePrimary => "require_primary",
+            Self::RequireReplica => "require_replica",
+            Self::RouteOverride { .. } => "route_override",
+            Self::ShardOverride { .. } => "shard_override",
+            Self::Unsupported { name } => name,
+        }
+    }
+
+    #[must_use]
+    pub fn rendered_len_bytes(&self) -> usize {
+        match self {
+            Self::Allow | Self::RequirePrimary | Self::RequireReplica => self.as_str().len(),
+            Self::Deny { reason } => self.as_str().len() + reason.len(),
+            Self::RouteOverride { target_id } => self.as_str().len() + target_id.as_str().len(),
+            Self::ShardOverride { target_id } => self.as_str().len() + target_id.as_str().len(),
+            Self::Unsupported { name } => name.len(),
+        }
+    }
+}
+
+impl Display for PolicyPluginAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyPluginOutput {
+    pub abi_version: PolicyPluginAbiVersion,
+    pub policy_id: PolicyId,
+    pub policy_version: PolicyVersion,
+    pub hook_point: PolicyHookPoint,
+    pub action: PolicyPluginAction,
+    pub outcome: PolicyOutcome,
+}
+
+impl PolicyPluginOutput {
+    #[must_use]
+    pub fn new(
+        abi_version: u16,
+        policy_id: PolicyId,
+        policy_version: PolicyVersion,
+        hook_point: PolicyHookPoint,
+        action: PolicyPluginAction,
+        outcome: PolicyOutcome,
+    ) -> Result<Self, PolicyPluginError> {
+        Ok(Self {
+            abi_version: PolicyPluginAbiVersion::try_from(abi_version)?,
+            policy_id,
+            policy_version,
+            hook_point,
+            action,
+            outcome,
+        })
+    }
+
+    #[must_use]
+    pub fn rendered_len_bytes(&self) -> usize {
+        self.abi_version.as_u16().to_string().len()
+            + self.policy_id.as_str().len()
+            + self.policy_version.as_u64().to_string().len()
+            + self.hook_point.as_str().len()
+            + self.action.rendered_len_bytes()
+            + self.outcome.as_str().len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{message}")]
+pub struct PolicyPluginError {
+    code: PolicyPluginErrorCode,
+    message: String,
+}
+
+impl PolicyPluginError {
+    #[must_use]
+    fn new(code: PolicyPluginErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> PolicyPluginErrorCode {
+        self.code
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> PolicyOutcome {
+        match self.code {
+            PolicyPluginErrorCode::UnknownAbiVersion
+            | PolicyPluginErrorCode::UnsupportedAction
+            | PolicyPluginErrorCode::OutputValidationFailed => PolicyOutcome::Rejected,
+            PolicyPluginErrorCode::InputTooLarge
+            | PolicyPluginErrorCode::OutputTooLarge
+            | PolicyPluginErrorCode::EvaluationTimeout
+            | PolicyPluginErrorCode::FilesystemAccessDenied
+            | PolicyPluginErrorCode::NetworkAccessDenied
+            | PolicyPluginErrorCode::SecretAccessDenied => PolicyOutcome::Skipped,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown_abi_version(version: u16) -> Self {
+        Self::new(
+            PolicyPluginErrorCode::UnknownAbiVersion,
+            format!("unknown policy plugin ABI version {version}"),
+        )
+    }
+
+    #[must_use]
+    pub fn input_too_large(bytes: usize, max_bytes: usize) -> Self {
+        Self::new(
+            PolicyPluginErrorCode::InputTooLarge,
+            format!("policy plugin input exceeds {max_bytes} bytes (got {bytes})"),
+        )
+    }
+
+    #[must_use]
+    pub fn output_too_large(bytes: usize, max_bytes: usize) -> Self {
+        Self::new(
+            PolicyPluginErrorCode::OutputTooLarge,
+            format!("policy plugin output exceeds {max_bytes} bytes (got {bytes})"),
+        )
+    }
+
+    #[must_use]
+    pub fn evaluation_timeout(elapsed: Duration, max_duration: Duration) -> Self {
+        Self::new(
+            PolicyPluginErrorCode::EvaluationTimeout,
+            format!("policy plugin evaluation exceeded {max_duration:?} (elapsed {elapsed:?})"),
+        )
+    }
+
+    #[must_use]
+    pub fn filesystem_access_denied() -> Self {
+        Self::new(
+            PolicyPluginErrorCode::FilesystemAccessDenied,
+            "policy plugin filesystem access is not allowed",
+        )
+    }
+
+    #[must_use]
+    pub fn network_access_denied() -> Self {
+        Self::new(
+            PolicyPluginErrorCode::NetworkAccessDenied,
+            "policy plugin network access is not allowed",
+        )
+    }
+
+    #[must_use]
+    pub fn secret_access_denied() -> Self {
+        Self::new(
+            PolicyPluginErrorCode::SecretAccessDenied,
+            "policy plugin secret access is not allowed",
+        )
+    }
+
+    #[must_use]
+    pub fn unsupported_action(action: impl Into<Arc<str>>) -> Self {
+        let action = action.into();
+        Self::new(
+            PolicyPluginErrorCode::UnsupportedAction,
+            format!("policy plugin action '{action}' is not supported"),
+        )
+    }
+
+    #[must_use]
+    pub fn output_validation_failed(message: impl Into<String>) -> Self {
+        Self::new(PolicyPluginErrorCode::OutputValidationFailed, message)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PolicyPluginErrorCode {
+    UnknownAbiVersion,
+    InputTooLarge,
+    OutputTooLarge,
+    EvaluationTimeout,
+    FilesystemAccessDenied,
+    NetworkAccessDenied,
+    SecretAccessDenied,
+    UnsupportedAction,
+    OutputValidationFailed,
+}
+
+impl PolicyPluginErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownAbiVersion => "unknown_abi_version",
+            Self::InputTooLarge => "input_too_large",
+            Self::OutputTooLarge => "output_too_large",
+            Self::EvaluationTimeout => "evaluation_timeout",
+            Self::FilesystemAccessDenied => "filesystem_access_denied",
+            Self::NetworkAccessDenied => "network_access_denied",
+            Self::SecretAccessDenied => "secret_access_denied",
+            Self::UnsupportedAction => "unsupported_action",
+            Self::OutputValidationFailed => "output_validation_failed",
+        }
     }
 }
 

@@ -1,8 +1,14 @@
+use std::time::Duration;
+
 use pg_kinetic::{
     config::PolicyConfig,
     core::{
         lsn::{FreshnessStatus, PgLsn},
-        policy::{PolicyAction, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
+        policy::{
+            PolicyAction, PolicyContext, PolicyContextField, PolicyHookPoint, PolicyId,
+            PolicyMode, PolicyOutcome, PolicyPluginAction, PolicyPluginInput,
+            PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
+        },
         route::{QueryClass, RouteKey},
         routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
         session::TransactionState,
@@ -22,6 +28,7 @@ use pg_kinetic::{
             apply_policy_action_to_sharded_routing_target, ShardRoutingContext, ShardRoutingPlanner,
             ShardRouteMapStore,
         },
+        policy::PolicyPluginHostLimits,
     },
 };
 
@@ -282,6 +289,132 @@ fn policy_overrides_do_not_bypass_health_checks() {
             reason: RoutingReason::PolicyShardOverride,
         }
     ));
+}
+
+#[test]
+fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
+    let runtime = pg_kinetic::proxy_runtime::policy::PolicyRuntime::new(
+        Duration::from_millis(5),
+        16,
+    );
+    let limits = runtime.plugin_host_limits();
+
+    assert_eq!(limits.max_input_bytes(), 16);
+    assert_eq!(limits.max_output_bytes(), 16);
+    assert_eq!(limits.max_evaluation_duration(), Duration::from_millis(5));
+    assert!(!limits.filesystem_access_allowed());
+    assert!(!limits.network_access_allowed());
+    assert!(!limits.secret_access_allowed());
+
+    let oversized_input = PolicyPluginInput::new(
+        1,
+        PolicyId::new("plugin-policy").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyHookPoint::BeforeRouting,
+        PolicyContext::new(vec![PolicyContextField::public("database", "appdb")]),
+        false,
+        false,
+        false,
+    )
+    .expect("plugin input");
+    let input_error = limits
+        .validate_input(&oversized_input)
+        .expect_err("oversized input is rejected");
+    assert_eq!(input_error.code().as_str(), "input_too_large");
+    assert_eq!(input_error.outcome(), PolicyOutcome::Skipped);
+
+    let private_limits = PolicyPluginHostLimits::new(
+        256,
+        256,
+        Duration::from_millis(5),
+    );
+    let private_input = PolicyPluginInput::new(
+        1,
+        PolicyId::new("plugin-policy").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyHookPoint::BeforeRouting,
+        PolicyContext::default(),
+        true,
+        true,
+        true,
+    )
+    .expect("plugin input");
+    let private_error = private_limits
+        .validate_input(&private_input)
+        .expect_err("private access is rejected");
+    assert_eq!(private_error.code().as_str(), "filesystem_access_denied");
+    assert_eq!(private_error.outcome(), PolicyOutcome::Skipped);
+
+    let oversized_output = PolicyPluginOutput::new(
+        1,
+        PolicyId::new("plugin-policy").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyHookPoint::BeforeRouting,
+        PolicyPluginAction::allow(),
+        PolicyOutcome::Applied,
+    )
+    .expect("plugin output");
+    let output_error = limits
+        .validate_output(&oversized_output)
+        .expect_err("oversized output is rejected");
+    assert_eq!(output_error.code().as_str(), "output_too_large");
+    assert_eq!(output_error.outcome(), PolicyOutcome::Skipped);
+
+    let timeout_error = limits
+        .validate_evaluation_duration(Duration::from_millis(50))
+        .expect_err("slow evaluation is rejected");
+    assert_eq!(timeout_error.code().as_str(), "evaluation_timeout");
+    assert_eq!(timeout_error.outcome(), PolicyOutcome::Skipped);
+}
+
+#[test]
+fn plugin_output_is_validated_like_declarative_policy_output() {
+    let limits = PolicyPluginHostLimits::new(
+        8_192,
+        8_192,
+        Duration::from_millis(5),
+    );
+    let route_override = PolicyPluginOutput::new(
+        1,
+        PolicyId::new("route-fallback").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyHookPoint::AfterRouting,
+        PolicyPluginAction::route_override(
+            PolicyRouteTargetId::new("route-1").expect("valid route target"),
+        ),
+        PolicyOutcome::Applied,
+    )
+    .expect("plugin output");
+    let route_error = limits
+        .validate_output_like_declarative_policy_output(
+            &route_override,
+            ["route-0"],
+            false,
+            std::iter::empty::<&str>(),
+        )
+        .expect_err("missing route is rejected");
+    assert_eq!(route_error.code().as_str(), "output_validation_failed");
+    assert_eq!(route_error.outcome(), PolicyOutcome::Rejected);
+
+    let unsupported = PolicyPluginOutput::new(
+        1,
+        PolicyId::new("unsupported-action").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyHookPoint::BeforeRouting,
+        PolicyPluginAction::unsupported("mirror"),
+        PolicyOutcome::Applied,
+    )
+    .expect("plugin output");
+    let unsupported_error = limits
+        .validate_output_like_declarative_policy_output(
+            &unsupported,
+            ["route-0"],
+            false,
+            std::iter::empty::<&str>(),
+        )
+        .expect_err("unsupported actions are rejected");
+    assert_eq!(unsupported_error.code().as_str(), "unsupported_action");
+    assert_eq!(unsupported_error.outcome(), PolicyOutcome::Rejected);
 }
 
 #[test]
