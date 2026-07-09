@@ -1,9 +1,14 @@
 use std::time::Duration;
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use pg_kinetic::config::{InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig, PolicyWasmConfig};
-use pg_kinetic::core::{
-    policy::{PolicyAction, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyPluginError},
+use pg_kinetic::config::{
+    InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig, PolicyWasmConfig,
+};
+use pg_kinetic::core::policy::{
+    PolicyAction, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyPluginError,
 };
 use pg_kinetic::proxy_runtime::policy::PolicyRuntime;
 
@@ -66,7 +71,9 @@ fn sample_policy_input() -> PolicyEvalInput {
         password: Some(Arc::from("swordfish")),
         bind_values: vec![Arc::from("alpha=1"), Arc::from("beta=2")],
         tls_certificate_body: Some(Arc::from("-----BEGIN CERTIFICATE-----")),
-        raw_sql_text: Some(Arc::from("SELECT * FROM secrets WHERE token = 'top-secret'")),
+        raw_sql_text: Some(Arc::from(
+            "SELECT * FROM secrets WHERE token = 'top-secret'",
+        )),
         secrets: vec![Arc::from("top-secret")],
     }
 }
@@ -99,10 +106,8 @@ fn policy_failure_mode_defaults_follow_policy_mode() {
 
 #[test]
 fn policy_failure_mode_maps_timeout_and_engine_errors_to_configured_fallbacks() {
-    let timeout_error = PolicyPluginError::evaluation_timeout(
-        Duration::from_millis(12),
-        Duration::from_millis(5),
-    );
+    let timeout_error =
+        PolicyPluginError::evaluation_timeout(Duration::from_millis(12), Duration::from_millis(5));
     let engine_error = PolicyPluginError::output_validation_failed("policy engine exploded");
 
     let fail_closed_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
@@ -158,7 +163,9 @@ fn enabling_wasm_requires_feature_support() {
     );
     let config = wasm_policy_config(module_path, true);
 
-    let error = config.validate().expect_err("feature-gated wasm policies are rejected");
+    let error = config
+        .validate()
+        .expect_err("feature-gated wasm policies are rejected");
     assert!(error.contains("policy-wasm"));
 }
 
@@ -182,7 +189,10 @@ fn enabling_wasm_requires_explicit_config() {
     let error = disabled_config
         .validate()
         .expect_err("wasm policies remain opt-in at the config layer");
-    assert_eq!(error, "wasm policies require policy_wasm_enabled to be true");
+    assert_eq!(
+        error,
+        "wasm policies require policy_wasm_enabled to be true"
+    );
 
     let enabled_config = wasm_policy_config(module_path, true);
     enabled_config
@@ -207,7 +217,9 @@ fn module_load_validates_abi_version() {
     );
     let config = wasm_policy_config(module_path, true);
 
-    let error = config.validate().expect_err("invalid abi version is rejected");
+    let error = config
+        .validate()
+        .expect_err("invalid abi version is rejected");
     assert!(error.contains("ABI version"));
 }
 
@@ -276,7 +288,9 @@ fn invalid_module_output_is_rejected() {
     let error = runtime
         .evaluate_wasm_policy(&rule, &sample_policy_input())
         .expect_err("invalid wasm output is rejected");
-    assert!(error.to_string().contains("invalid wasm policy action code"));
+    assert!(error
+        .to_string()
+        .contains("invalid wasm policy action code"));
 }
 
 #[cfg(feature = "policy-wasm")]
@@ -302,8 +316,14 @@ fn deny_action_from_wasm_is_enforced_in_enforce_mode() {
     let decision = runtime
         .evaluate_wasm_policy(&rule, &sample_policy_input())
         .expect("deny policy evaluates");
-    assert!(matches!(decision.action, pg_kinetic::core::policy::PolicyAction::Deny { .. }));
-    assert_eq!(decision.outcome, pg_kinetic::core::policy::PolicyOutcome::Applied);
+    assert!(matches!(
+        decision.action,
+        pg_kinetic::core::policy::PolicyAction::Deny { .. }
+    ));
+    assert_eq!(
+        decision.outcome,
+        pg_kinetic::core::policy::PolicyOutcome::Applied
+    );
 }
 
 #[cfg(feature = "policy-wasm")]
@@ -329,8 +349,14 @@ fn deny_action_from_wasm_is_dry_run_only_in_dry_run_mode() {
     let decision = runtime
         .evaluate_wasm_policy(&rule, &sample_policy_input())
         .expect("deny policy evaluates");
-    assert!(matches!(decision.action, pg_kinetic::core::policy::PolicyAction::Deny { .. }));
-    assert_eq!(decision.outcome, pg_kinetic::core::policy::PolicyOutcome::DryRun);
+    assert!(matches!(
+        decision.action,
+        pg_kinetic::core::policy::PolicyAction::Deny { .. }
+    ));
+    assert_eq!(
+        decision.outcome,
+        pg_kinetic::core::policy::PolicyOutcome::DryRun
+    );
 }
 
 #[cfg(feature = "policy-wasm")]
@@ -375,7 +401,7 @@ fn wasm_policy_cannot_access_filesystem_network_secrets_or_raw_sql_text() {
     assert!(!rendered_context.contains("top-secret"));
     assert!(!rendered_context.contains("SELECT * FROM secrets"));
     assert!(rendered_context.contains("<redacted>"));
-    assert!(!plugin_input.requested_filesystem_access);
-    assert!(!plugin_input.requested_network_access);
-    assert!(!plugin_input.requested_secret_access);
+    assert!(!plugin_input.requested_access.filesystem);
+    assert!(!plugin_input.requested_access.network);
+    assert!(!plugin_input.requested_access.secret);
 }

@@ -841,14 +841,12 @@ pub fn apply_policy_action_to_sharded_routing_target(
                 }
             }
         }
-        Some(PolicyAction::RouteOverride { .. }) => map_policy_routing_reason(
-            current_target,
-            RoutingReason::PolicyRouteOverride,
-        ),
-        Some(PolicyAction::ShardOverride { .. }) => map_policy_routing_reason(
-            current_target,
-            RoutingReason::PolicyShardOverride,
-        ),
+        Some(PolicyAction::RouteOverride { .. }) => {
+            map_policy_routing_reason(current_target, RoutingReason::PolicyRouteOverride)
+        }
+        Some(PolicyAction::ShardOverride { .. }) => {
+            map_policy_routing_reason(current_target, RoutingReason::PolicyShardOverride)
+        }
     };
 
     ensure_routing_target_is_safe(

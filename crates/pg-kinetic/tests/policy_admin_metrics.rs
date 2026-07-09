@@ -3,28 +3,27 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
-        Mutex,
-        OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
 
 use bytes::{BufMut, BytesMut};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use pg_kinetic::{
     config::{
         AuthConfig, AuthFailureMessageMode, AuthMode, BackendTlsMode, CapacityConfig,
-        ClientTlsMode, Config, ConnectionConfig, DrainConfig, HealthConfig, InlinePolicyActionConfig,
-        InlinePolicyConfig, ObservabilityConfig, PerformanceConfig, PolicyConfig, QosConfig,
-        ReloadConfig, SocketConfig, TlsConfig,
+        ClientTlsMode, Config, ConnectionConfig, DrainConfig, HealthConfig,
+        InlinePolicyActionConfig, InlinePolicyConfig, ObservabilityConfig, PerformanceConfig,
+        PolicyConfig, QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     core::{
+        lsn::FreshnessStatus,
         policy::{
             PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyHookPoint,
             PolicyId, PolicyMode, PolicyOutcome, PolicyVersion,
         },
         routing::BackendRole,
-        lsn::FreshnessStatus,
         routing::QueryClass,
         session::TransactionAccessMode,
     },
@@ -38,7 +37,6 @@ use pg_kinetic::{
         protocol::ProtocolVersion,
     },
 };
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -68,7 +66,9 @@ async fn show_policies_exposes_status_reload_details_and_bounded_history() {
     snapshot_store.set_policy_reload_snapshot(PolicyReloadSnapshot {
         policy_generation_id: 7,
         success: false,
-        error_code: Some(pg_kinetic::proxy_runtime::policy::PolicyReloadErrorCode::RouteReferenceMissing),
+        error_code: Some(
+            pg_kinetic::proxy_runtime::policy::PolicyReloadErrorCode::RouteReferenceMissing,
+        ),
         error: Some(String::from(
             "route override target 'route-9' does not reference an existing route",
         )),
@@ -584,7 +584,11 @@ fn assert_admin_table_response(
     let data_rows = data_rows(frames);
     let expected_rows = expected_rows
         .iter()
-        .map(|row| row.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>())
+        .map(|row| {
+            row.iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert_eq!(data_rows, expected_rows);
     assert!(frames.iter().any(|frame| frame.tag == b'C'));
@@ -596,8 +600,15 @@ fn assert_admin_table_columns(frames: &[BackendFrame], expected_columns: &[&str]
         .iter()
         .filter(|frame| frame.tag == b'T')
         .collect::<Vec<_>>();
-    assert_eq!(row_description_frames.len(), 1, "expected one row description");
-    assert_eq!(row_description_columns(row_description_frames[0]), expected_columns);
+    assert_eq!(
+        row_description_frames.len(),
+        1,
+        "expected one row description"
+    );
+    assert_eq!(
+        row_description_columns(row_description_frames[0]),
+        expected_columns
+    );
 }
 
 fn row_description_columns(frame: &BackendFrame) -> Vec<String> {
@@ -705,7 +716,9 @@ async fn read_until_ready(stream: &mut TcpStream) -> Vec<BackendFrame> {
 }
 
 async fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind free port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind free port");
     let addr = listener.local_addr().expect("free port");
     drop(listener);
     addr

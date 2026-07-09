@@ -9,8 +9,8 @@ use pg_kinetic_core::{
     ha::{HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome},
     lsn::{FreshnessStatus, PgLsn},
     observability::MetricOutcome,
-    prepare::PreparedStatementSnapshot,
     policy::{PolicyAuditEvent, PolicyMode},
+    prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
@@ -1406,7 +1406,10 @@ fn record_policy_event(inner: &mut SnapshotStoreInner, event: PolicyAuditEvent) 
     }
     inner.policy_audit_events.push_back(event.clone());
 
-    if matches!(event.kind, pg_kinetic_core::policy::PolicyAuditKind::Decision) {
+    if matches!(
+        event.kind,
+        pg_kinetic_core::policy::PolicyAuditKind::Decision
+    ) {
         if inner.policy_decisions.len() == POLICY_DECISION_RING_CAPACITY {
             inner.policy_decisions.pop_front();
         }

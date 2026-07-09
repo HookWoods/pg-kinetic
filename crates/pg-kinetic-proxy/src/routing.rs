@@ -393,14 +393,12 @@ pub fn apply_policy_action_to_routing_target(
                 },
             }
         }
-        Some(PolicyAction::RouteOverride { .. }) => map_routing_target_reason(
-            current_target,
-            RoutingReason::PolicyRouteOverride,
-        ),
-        Some(PolicyAction::ShardOverride { .. }) => map_routing_target_reason(
-            current_target,
-            RoutingReason::PolicyShardOverride,
-        ),
+        Some(PolicyAction::RouteOverride { .. }) => {
+            map_routing_target_reason(current_target, RoutingReason::PolicyRouteOverride)
+        }
+        Some(PolicyAction::ShardOverride { .. }) => {
+            map_routing_target_reason(current_target, RoutingReason::PolicyShardOverride)
+        }
     };
 
     ensure_policy_action_target_is_safe(planner, routing_context, target)
@@ -444,10 +442,7 @@ fn fallback_target(fallback_policy: FallbackPolicy) -> RoutingTarget {
     }
 }
 
-fn map_routing_target_reason(
-    target: RoutingTarget,
-    reason: RoutingReason,
-) -> RoutingTarget {
+fn map_routing_target_reason(target: RoutingTarget, reason: RoutingReason) -> RoutingTarget {
     match target {
         RoutingTarget::Primary { .. } => RoutingTarget::Primary { reason },
         RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica { candidate, reason },
@@ -462,17 +457,15 @@ pub(crate) fn ensure_policy_action_target_is_safe(
     target: RoutingTarget,
 ) -> RoutingTarget {
     match target {
-        RoutingTarget::Replica {
-            candidate,
-            reason,
-        } if candidate.healthy
-            && !candidate.split_brain
-            && replica_satisfies_freshness(
-                &candidate,
-                planner.freshness_policy,
-                context.read_after_write_state,
-                planner.max_replica_lag_ms(),
-            ) =>
+        RoutingTarget::Replica { candidate, reason }
+            if candidate.healthy
+                && !candidate.split_brain
+                && replica_satisfies_freshness(
+                    &candidate,
+                    planner.freshness_policy,
+                    context.read_after_write_state,
+                    planner.max_replica_lag_ms(),
+                ) =>
         {
             RoutingTarget::Replica { candidate, reason }
         }

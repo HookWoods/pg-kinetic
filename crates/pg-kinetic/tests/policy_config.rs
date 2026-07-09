@@ -185,9 +185,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is after unix epoch")
         .as_nanos();
-    let module_path = std::env::temp_dir().join(format!(
-        "pg-kinetic-policy-config-{unique_suffix}.wat"
-    ));
+    let module_path =
+        std::env::temp_dir().join(format!("pg-kinetic-policy-config-{unique_suffix}.wat"));
     let module_path_string = module_path.display().to_string().replace('\\', "\\\\");
     std::fs::write(
         &module_path,
@@ -203,9 +202,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
     )
     .expect("write wasm module");
 
-    let disabled_document = toml::from_str::<PolicyDocument>(
-        &format!(
-            r#"
+    let disabled_document = toml::from_str::<PolicyDocument>(&format!(
+        r#"
         [policy]
         policy_mode = "enforce"
 
@@ -215,9 +213,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         kind = "wasm"
         module_path = "{}"
         "#,
-            module_path_string
-        ),
-    )
+        module_path_string
+    ))
     .expect("policy config parses");
 
     let error = disabled_document
@@ -229,9 +226,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         "wasm policies require policy_wasm_enabled to be true"
     );
 
-    let enabled_document = toml::from_str::<PolicyDocument>(
-        &format!(
-            r#"
+    let enabled_document = toml::from_str::<PolicyDocument>(&format!(
+        r#"
         [policy]
         policy_mode = "enforce"
         policy_wasm_enabled = true
@@ -242,9 +238,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         kind = "wasm"
         module_path = "{}"
         "#,
-            module_path_string
-        ),
-    )
+        module_path_string
+    ))
     .expect("policy config parses");
 
     #[cfg(feature = "policy-wasm")]
@@ -269,8 +264,7 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
 #[test]
 fn secret_values_are_not_exposed_through_debug_admin_settings_snapshots() {
     let mut config = pg_kinetic::config::Config::default();
-    config.auth.backend_password_env_var_name =
-        Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
+    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
 
     let snapshot = SettingsSnapshot::from_config(&config);
     let debug = format!("{snapshot:?}");

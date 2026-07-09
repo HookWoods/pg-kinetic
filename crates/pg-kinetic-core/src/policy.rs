@@ -69,7 +69,6 @@ impl PolicyValidationErrorCode {
 pub struct PolicyId(Arc<str>);
 
 impl PolicyId {
-    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, PolicyValidationError> {
         let value = validate_non_empty(
             value.into(),
@@ -103,7 +102,6 @@ impl FromStr for PolicyId {
 pub struct PolicyVersion(u64);
 
 impl PolicyVersion {
-    #[must_use]
     pub fn new(value: u64) -> Result<Self, PolicyValidationError> {
         if value == 0 {
             Err(PolicyValidationError::new(
@@ -145,7 +143,6 @@ impl FromStr for PolicyVersion {
 pub struct PolicyRouteTargetId(Arc<str>);
 
 impl PolicyRouteTargetId {
-    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, PolicyValidationError> {
         let value = validate_non_empty(
             value.into(),
@@ -179,7 +176,6 @@ impl FromStr for PolicyRouteTargetId {
 pub struct PolicyShardTargetId(Arc<str>);
 
 impl PolicyShardTargetId {
-    #[must_use]
     pub fn new(value: impl Into<Arc<str>>) -> Result<Self, PolicyValidationError> {
         let value = validate_non_empty(
             value.into(),
@@ -312,28 +308,50 @@ impl std::convert::TryFrom<u16> for PolicyPluginAbiVersion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyPluginAccessRequest {
+    pub filesystem: bool,
+    pub network: bool,
+    pub secret: bool,
+}
+
+impl PolicyPluginAccessRequest {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            filesystem: false,
+            network: false,
+            secret: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn new(filesystem: bool, network: bool, secret: bool) -> Self {
+        Self {
+            filesystem,
+            network,
+            secret,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyPluginInput {
     pub abi_version: PolicyPluginAbiVersion,
     pub policy_id: PolicyId,
     pub policy_version: PolicyVersion,
     pub hook_point: PolicyHookPoint,
     pub context: PolicyContext,
-    pub requested_filesystem_access: bool,
-    pub requested_network_access: bool,
-    pub requested_secret_access: bool,
+    pub requested_access: PolicyPluginAccessRequest,
 }
 
 impl PolicyPluginInput {
-    #[must_use]
     pub fn new(
         abi_version: u16,
         policy_id: PolicyId,
         policy_version: PolicyVersion,
         hook_point: PolicyHookPoint,
         context: PolicyContext,
-        requested_filesystem_access: bool,
-        requested_network_access: bool,
-        requested_secret_access: bool,
+        requested_access: PolicyPluginAccessRequest,
     ) -> Result<Self, PolicyPluginError> {
         Ok(Self {
             abi_version: PolicyPluginAbiVersion::try_from(abi_version)?,
@@ -341,9 +359,7 @@ impl PolicyPluginInput {
             policy_version,
             hook_point,
             context,
-            requested_filesystem_access,
-            requested_network_access,
-            requested_secret_access,
+            requested_access,
         })
     }
 
@@ -454,7 +470,6 @@ pub struct PolicyPluginOutput {
 }
 
 impl PolicyPluginOutput {
-    #[must_use]
     pub fn new(
         abi_version: u16,
         policy_id: PolicyId,
@@ -1057,11 +1072,7 @@ pub struct PolicyAuditEvent {
 
 impl PolicyAuditEvent {
     #[must_use]
-    pub fn new(
-        kind: PolicyAuditKind,
-        decision: PolicyDecision,
-        context: PolicyContext,
-    ) -> Self {
+    pub fn new(kind: PolicyAuditKind, decision: PolicyDecision, context: PolicyContext) -> Self {
         let reason = Some(decision.action.audit_reason(decision.outcome));
         let route = context_field_value(&context, "route");
         let shard = context_field_value(&context, "shard");

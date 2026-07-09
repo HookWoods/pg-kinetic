@@ -20,11 +20,11 @@ use crate::{
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
-        BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
-        PolicyReloadSnapshot, PolicyStatusSnapshot, PreparedSnapshot, RecoverySnapshot,
-        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RoutePolicySnapshot,
-        RouteSnapshot, ServerSnapshot, SettingsSnapshot, ShardLifecycleSnapshot,
-        ShardMigrationSafetySnapshot, SnapshotStore,
+        BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot,
+        PolicyReloadSnapshot, PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot,
+        RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
+        RoutePolicySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
+        ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -678,7 +678,9 @@ fn policies_table(
                 status.source,
                 status.enabled.to_string(),
                 policy_reload_outcome_label(last_reload),
-                optional_text(last_reload.and_then(|snapshot| snapshot.error_code.map(|code| code.as_str()))),
+                optional_text(
+                    last_reload.and_then(|snapshot| snapshot.error_code.map(|code| code.as_str())),
+                ),
             ])]
         })
         .unwrap_or_default();

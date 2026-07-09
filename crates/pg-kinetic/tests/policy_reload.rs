@@ -5,7 +5,7 @@ use pg_kinetic::{
     core::policy::PolicyMode,
     proxy_runtime::{
         policy::{PolicyReloadErrorCode, PolicyStore},
-        reload::{reload_policy_once, record_policy_reload},
+        reload::{record_policy_reload, reload_policy_once},
         snapshot::SnapshotStore,
     },
 };
@@ -84,12 +84,20 @@ target_id = "route-1"
 "#,
     );
 
-    let result = store.reload(&invalid_policy, ["route-0"], false, std::iter::empty::<&str>());
+    let result = store.reload(
+        &invalid_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
     let after = store.snapshot();
 
     assert!(!result.success);
     assert_eq!(result.policy_generation_id, 0);
-    assert_eq!(result.error_code, Some(PolicyReloadErrorCode::RouteReferenceMissing));
+    assert_eq!(
+        result.error_code,
+        Some(PolicyReloadErrorCode::RouteReferenceMissing)
+    );
     assert!(result
         .error
         .as_deref()
@@ -126,8 +134,18 @@ kind = "allow"
 "#,
     );
 
-    let first = store.reload(&first_policy, ["route-0"], false, std::iter::empty::<&str>());
-    let second = store.reload(&second_policy, ["route-0"], false, std::iter::empty::<&str>());
+    let first = store.reload(
+        &first_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
+    let second = store.reload(
+        &second_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
 
     assert!(first.success);
     assert!(second.success);
@@ -164,7 +182,12 @@ target_id = "tenant-a"
 "#,
     );
 
-    let route_error = store.reload(&route_policy, ["route-0"], false, std::iter::empty::<&str>());
+    let route_error = store.reload(
+        &route_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
     let shard_error = store.reload(&shard_policy, ["route-0"], true, ["tenant-b"]);
 
     assert_eq!(
@@ -193,7 +216,12 @@ target_id = "route-0"
 "#,
     );
 
-    let result = store.reload(&disabled_policy, ["route-0"], false, std::iter::empty::<&str>());
+    let result = store.reload(
+        &disabled_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
 
     assert!(result.success);
     assert_eq!(store.runtime().policy_mode(), PolicyMode::Disabled);
@@ -216,7 +244,12 @@ target_id = "route-0"
 "#,
     );
 
-    let result = store.reload(&dry_run_policy, ["route-0"], false, std::iter::empty::<&str>());
+    let result = store.reload(
+        &dry_run_policy,
+        ["route-0"],
+        false,
+        std::iter::empty::<&str>(),
+    );
 
     assert!(result.success);
     assert_eq!(store.runtime().policy_mode(), PolicyMode::DryRun);

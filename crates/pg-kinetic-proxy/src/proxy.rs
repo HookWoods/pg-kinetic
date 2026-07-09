@@ -50,11 +50,11 @@ use pg_kinetic_core::{
     lsn::{FreshnessStatus, PgLsn},
     observability::{MetricOutcome, ProtocolPhase},
     pin::PinnedBackend,
-    prepare::{InvalidationScope, PreparedCatalog},
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyMode,
         POLICY_DENY_SQLSTATE,
     },
+    prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     session::PinReason as SessionPinReason,
@@ -1146,10 +1146,7 @@ async fn checkout_backend(
             ),
         );
         timer.finish(MetricOutcome::Rejected);
-        return Err(CheckoutFailure::Postgres {
-            sqlstate,
-            message,
-        });
+        return Err(CheckoutFailure::Postgres { sqlstate, message });
     }
 
     let backend_result = request
@@ -1301,14 +1298,12 @@ pub fn apply_policy_action_to_routing_target_with_mode(
         current_target.unwrap_or_else(|| choose_routing_target(planner, routing_context));
 
     match policy_mode {
-        PolicyMode::Enforce => {
-            crate::routing::apply_policy_action_to_routing_target(
-                planner,
-                context,
-                Some(current_target),
-                action,
-            )
-        }
+        PolicyMode::Enforce => crate::routing::apply_policy_action_to_routing_target(
+            planner,
+            context,
+            Some(current_target),
+            action,
+        ),
         PolicyMode::Disabled | PolicyMode::DryRun => current_target,
     }
 }
@@ -1337,9 +1332,9 @@ pub fn checkout_postgres_error_for_target(
         RoutingTarget::Reject { .. } => {
             Some((CANNOT_CONNECT_NOW_SQLSTATE, REPLICA_UNAVAILABLE_MESSAGE))
         }
-        RoutingTarget::Wait { .. } | RoutingTarget::Primary { .. } | RoutingTarget::Replica { .. } => {
-            None
-        }
+        RoutingTarget::Wait { .. }
+        | RoutingTarget::Primary { .. }
+        | RoutingTarget::Replica { .. } => None,
     }
 }
 
@@ -1450,13 +1445,23 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
             let target = RoutingTarget::Primary {
                 reason: RoutingReason::Off,
             };
-            return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
+            return apply_policy_before_checkout_target(
+                selection.planner,
+                routing_context,
+                target,
+                None,
+            );
         }
         ReadRoutingMode::PrimaryOnly => {
             let target = RoutingTarget::Primary {
                 reason: RoutingReason::PrimaryOnlyMode,
             };
-            return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
+            return apply_policy_before_checkout_target(
+                selection.planner,
+                routing_context,
+                target,
+                None,
+            );
         }
         ReadRoutingMode::PreferReplica | ReadRoutingMode::RequireReplica => {}
     }
@@ -1465,7 +1470,12 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
         let target = RoutingTarget::Reject {
             reason: RoutingReason::FallbackReject,
         };
-        return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
+        return apply_policy_before_checkout_target(
+            selection.planner,
+            routing_context,
+            target,
+            None,
+        );
     }
 
     if let Some(transaction_role) = selection.session.current_transaction_target_role() {
@@ -1505,19 +1515,17 @@ fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget
             target,
             None,
         );
-        return apply_policy_before_checkout_target(selection.planner, routing_context, target, None);
+        return apply_policy_before_checkout_target(
+            selection.planner,
+            routing_context,
+            target,
+            None,
+        );
     }
 
-    let target = choose_routing_target(
-        selection.planner,
-        routing_context.clone(),
-    );
-    let target = apply_policy_after_routing_target(
-        selection.planner,
-        routing_context.clone(),
-        target,
-        None,
-    );
+    let target = choose_routing_target(selection.planner, routing_context.clone());
+    let target =
+        apply_policy_after_routing_target(selection.planner, routing_context.clone(), target, None);
     apply_policy_before_checkout_target(selection.planner, routing_context, target, None)
 }
 

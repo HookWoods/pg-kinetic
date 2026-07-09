@@ -514,7 +514,7 @@ pub fn record_policy_decision(mode: PolicyMode, event: &PolicyAuditEvent) {
             "hook" => event.hook_point.metric_label(),
             "action" => event.action.as_str(),
         )
-    .increment(1);
+        .increment(1);
     }
 
     if let PolicyAction::Deny { reason, .. } = &event.action {

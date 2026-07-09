@@ -4,17 +4,22 @@ use pg_kinetic::core::{
     lsn::FreshnessStatus,
     policy::{
         PolicyAction, PolicyAuditKind, PolicyContext, PolicyDecision, PolicyDecisionReason,
-        PolicyHookPoint, PolicyId, PolicyOutcome, PolicyPluginAbiVersion, PolicyPluginAction,
-        PolicyPluginError, PolicyPluginInput, PolicyPluginOutput, PolicyRouteTargetId,
-        PolicyShardTargetId, PolicyVersion,
+        PolicyHookPoint, PolicyId, PolicyOutcome, PolicyPluginAbiVersion,
+        PolicyPluginAccessRequest, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
+        PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
     },
     policy_rule::{
         PolicyRule, PolicyRuleAction, PolicyRuleContext, PolicyRuleMatch, PolicyRuleSet,
     },
     route::{QueryClass as RouteQueryClass, RouteKey},
-    routing::{BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass, RoutingDecision, RoutingHint, RoutingReason},
+    routing::{
+        BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass, RoutingDecision, RoutingHint,
+        RoutingReason,
+    },
     session::TransactionAccessMode,
-    sharding::{MultiShardPolicy, ShardId, ShardRoute, ShardRouteDecision, ShardRouteReason, ShardTarget},
+    sharding::{
+        MultiShardPolicy, ShardId, ShardRoute, ShardRouteDecision, ShardRouteReason, ShardTarget,
+    },
 };
 use pg_kinetic::proxy_runtime::policy::{PolicyEvalInput, PolicyRuntime};
 
@@ -360,8 +365,12 @@ fn policy_context_excludes_sensitive_material() {
     assert!(!output.rendered_context.contains("swordfish"));
     assert!(!output.rendered_context.contains("alpha=1"));
     assert!(!output.rendered_context.contains("BEGIN SELECT 1"));
-    assert!(!output.rendered_context.contains("-----BEGIN CERTIFICATE-----"));
-    assert!(output.rendered_context.contains("sensitive_inputs=<redacted>"));
+    assert!(!output
+        .rendered_context
+        .contains("-----BEGIN CERTIFICATE-----"));
+    assert!(output
+        .rendered_context
+        .contains("sensitive_inputs=<redacted>"));
 }
 
 #[test]
@@ -434,9 +443,7 @@ fn plugin_input_and_output_schema_versions_are_versioned() {
         policy_version,
         hook_point,
         PolicyContext::default(),
-        false,
-        false,
-        false,
+        PolicyPluginAccessRequest::none(),
     )
     .expect("plugin input");
     let output = PolicyPluginOutput::new(
@@ -465,9 +472,7 @@ fn unknown_plugin_schema_version_is_rejected() {
         policy_version,
         hook_point,
         PolicyContext::default(),
-        false,
-        false,
-        false,
+        PolicyPluginAccessRequest::none(),
     )
     .expect_err("unknown plugin input schema version is rejected");
     assert_eq!(input_error.code().as_str(), "unknown_abi_version");
@@ -489,27 +494,31 @@ fn unknown_plugin_schema_version_is_rejected() {
 #[test]
 fn plugin_errors_map_to_stable_policy_outcomes() {
     let unsupported_action = PolicyPluginError::unsupported_action("mirror");
-    let timeout = PolicyPluginError::evaluation_timeout(
-        Duration::from_millis(12),
-        Duration::from_millis(5),
-    );
+    let timeout =
+        PolicyPluginError::evaluation_timeout(Duration::from_millis(12), Duration::from_millis(5));
 
     assert_eq!(unsupported_action.outcome(), PolicyOutcome::Rejected);
     assert_eq!(timeout.outcome(), PolicyOutcome::Skipped);
-    assert_eq!(PolicyPluginError::input_too_large(32, 16).outcome(), PolicyOutcome::Skipped);
-    assert_eq!(PolicyPluginError::output_too_large(32, 16).outcome(), PolicyOutcome::Skipped);
+    assert_eq!(
+        PolicyPluginError::input_too_large(32, 16).outcome(),
+        PolicyOutcome::Skipped
+    );
+    assert_eq!(
+        PolicyPluginError::output_too_large(32, 16).outcome(),
+        PolicyOutcome::Skipped
+    );
 }
 
 #[test]
 fn plugin_evaluation_timeout_maps_to_a_stable_outcome() {
-    let timeout = PolicyPluginError::evaluation_timeout(
-        Duration::from_millis(50),
-        Duration::from_millis(5),
-    );
+    let timeout =
+        PolicyPluginError::evaluation_timeout(Duration::from_millis(50), Duration::from_millis(5));
 
     assert_eq!(timeout.code().as_str(), "evaluation_timeout");
     assert_eq!(timeout.outcome(), PolicyOutcome::Skipped);
-    assert!(timeout.to_string().contains("policy plugin evaluation exceeded"));
+    assert!(timeout
+        .to_string()
+        .contains("policy plugin evaluation exceeded"));
 }
 
 fn sample_policy_eval_input() -> PolicyEvalInput {
@@ -566,8 +575,14 @@ fn large_policy_eval_input() -> PolicyEvalInput {
     let mut input = sample_policy_eval_input();
     input.database = Arc::from("database-with-an-intentionally-long-name-to-exercise-truncation");
     input.user = Arc::from("reporting-user-with-an-intentionally-long-name-to-exercise-truncation");
-    input.application_name = Some(Arc::from("application-name-with-an-intentionally-long-name-to-exercise-truncation"));
-    input.route = Some(Arc::from("route-name-with-an-intentionally-long-name-to-exercise-truncation"));
-    input.shard = Some(Arc::from("shard-name-with-an-intentionally-long-name-to-exercise-truncation"));
+    input.application_name = Some(Arc::from(
+        "application-name-with-an-intentionally-long-name-to-exercise-truncation",
+    ));
+    input.route = Some(Arc::from(
+        "route-name-with-an-intentionally-long-name-to-exercise-truncation",
+    ));
+    input.shard = Some(Arc::from(
+        "shard-name-with-an-intentionally-long-name-to-exercise-truncation",
+    ));
     input
 }

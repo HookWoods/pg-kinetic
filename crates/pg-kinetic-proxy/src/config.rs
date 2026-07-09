@@ -1,14 +1,14 @@
-use std::{collections::HashSet, fmt, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::HashSet, fmt, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
+};
 
 use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
+    policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
     recovery::RecoveryMode,
-    policy::{
-        PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId,
-    },
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
@@ -648,7 +648,11 @@ impl PolicyConfig {
         S: IntoIterator,
         S::Item: AsRef<str>,
     {
-        self.validate_with_context(std::iter::empty::<&str>(), sharding_enabled, existing_shards)
+        self.validate_with_context(
+            std::iter::empty::<&str>(),
+            sharding_enabled,
+            existing_shards,
+        )
     }
 
     pub fn validate_with_context<R, S>(
@@ -676,21 +680,21 @@ impl PolicyConfig {
 
         for inline_rule in &self.inline_rules {
             match &inline_rule.action {
-                InlinePolicyActionConfig::RouteOverride { target_id } => {
-                    if !existing_routes.contains(target_id.as_str()) {
-                        return Err(format!(
-                            "route override target '{}' does not reference an existing route",
-                            target_id.as_str()
-                        ));
-                    }
+                InlinePolicyActionConfig::RouteOverride { target_id }
+                    if !existing_routes.contains(target_id.as_str()) =>
+                {
+                    return Err(format!(
+                        "route override target '{}' does not reference an existing route",
+                        target_id.as_str()
+                    ));
                 }
-                InlinePolicyActionConfig::ShardOverride { target_id } if sharding_enabled => {
-                    if !existing_shards.contains(target_id.as_str()) {
-                        return Err(format!(
-                            "shard override target '{}' does not reference an existing shard",
-                            target_id.as_str()
-                        ));
-                    }
+                InlinePolicyActionConfig::ShardOverride { target_id }
+                    if sharding_enabled && !existing_shards.contains(target_id.as_str()) =>
+                {
+                    return Err(format!(
+                        "shard override target '{}' does not reference an existing shard",
+                        target_id.as_str()
+                    ));
                 }
                 _ => {}
             }
@@ -705,9 +709,7 @@ impl PolicyConfig {
                 InlinePolicyActionConfig::Deny { reason } if reason.trim().is_empty() => {
                     return Err(String::from("deny action requires a reason"));
                 }
-                InlinePolicyActionConfig::Wasm { .. }
-                    if !self.policy_wasm.policy_wasm_enabled =>
-                {
+                InlinePolicyActionConfig::Wasm { .. } if !self.policy_wasm.policy_wasm_enabled => {
                     return Err(String::from(
                         "wasm policies require policy_wasm_enabled to be true",
                     ));
@@ -715,12 +717,14 @@ impl PolicyConfig {
                 InlinePolicyActionConfig::Wasm { module_path } => {
                     #[cfg(feature = "policy-wasm")]
                     {
-                        WasmPolicyEvaluator::validate_module_path(module_path).map_err(|error| {
-                            format!(
-                                "wasm policy module {} failed validation: {error}",
-                                module_path.display()
-                            )
-                        })?;
+                        WasmPolicyEvaluator::validate_module_path(module_path).map_err(
+                            |error| {
+                                format!(
+                                    "wasm policy module {} failed validation: {error}",
+                                    module_path.display()
+                                )
+                            },
+                        )?;
                     }
 
                     #[cfg(not(feature = "policy-wasm"))]
@@ -782,7 +786,9 @@ pub struct InlinePolicyConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InlinePolicyActionConfig {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
     RequirePrimary,
     RequireReplica,
     RouteOverride {
@@ -799,17 +805,15 @@ pub enum InlinePolicyActionConfig {
         )]
         target_id: PolicyShardTargetId,
     },
-    Wasm { module_path: PathBuf },
+    Wasm {
+        module_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct PolicyAuditConfig {
-    #[arg(
-        long,
-        env = "PG_KINETIC_POLICY_AUDIT_ENABLED",
-        default_value_t = true
-    )]
+    #[arg(long, env = "PG_KINETIC_POLICY_AUDIT_ENABLED", default_value_t = true)]
     #[serde(default = "default_policy_audit_enabled")]
     pub policy_audit_enabled: bool,
 
@@ -834,11 +838,7 @@ impl Default for PolicyAuditConfig {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct PolicyWasmConfig {
-    #[arg(
-        long,
-        env = "PG_KINETIC_POLICY_WASM_ENABLED",
-        default_value_t = false
-    )]
+    #[arg(long, env = "PG_KINETIC_POLICY_WASM_ENABLED", default_value_t = false)]
     #[serde(default)]
     pub policy_wasm_enabled: bool,
 }

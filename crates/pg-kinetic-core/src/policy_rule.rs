@@ -22,37 +22,6 @@ pub struct PolicyRuleContext {
     pub policy_tags: Vec<Arc<str>>,
 }
 
-impl PolicyRuleContext {
-    #[must_use]
-    pub fn new(
-        database: impl Into<Arc<str>>,
-        user: impl Into<Arc<str>>,
-        application_name: Option<Arc<str>>,
-        route: Option<Arc<str>>,
-        shard: Option<Arc<str>>,
-        backend_role: BackendRole,
-        query_class: QueryClass,
-        hook_point: PolicyHookPoint,
-        read_only_transaction: bool,
-        has_shard_key: bool,
-        policy_tags: impl Into<Vec<Arc<str>>>,
-    ) -> Self {
-        Self {
-            database: database.into(),
-            user: user.into(),
-            application_name: application_name.map(Into::into),
-            route: route.map(Into::into),
-            shard: shard.map(Into::into),
-            backend_role,
-            query_class,
-            hook_point,
-            read_only_transaction,
-            has_shard_key,
-            policy_tags: policy_tags.into(),
-        }
-    }
-}
-
 impl Default for PolicyRuleContext {
     fn default() -> Self {
         Self {
@@ -185,7 +154,10 @@ impl PolicyRuleMatch {
     pub fn matches(&self, context: &PolicyRuleContext) -> bool {
         matches_text_field(&self.databases, context.database.as_ref())
             && matches_text_field(&self.users, context.user.as_ref())
-            && matches_optional_text_field(&self.application_names, context.application_name.as_deref())
+            && matches_optional_text_field(
+                &self.application_names,
+                context.application_name.as_deref(),
+            )
             && matches_optional_text_field(&self.routes, context.route.as_deref())
             && matches_optional_text_field(&self.shards, context.shard.as_deref())
             && matches_one_of(&self.backend_roles, context.backend_role)
@@ -303,14 +275,18 @@ impl PolicyRuleAction {
             Self::RequirePrimary { terminal, .. } => Self::RequirePrimary { audit, terminal },
             Self::RequireReplica { terminal, .. } => Self::RequireReplica { audit, terminal },
             Self::RouteOverride {
-                target_id, terminal, ..
+                target_id,
+                terminal,
+                ..
             } => Self::RouteOverride {
                 target_id,
                 audit,
                 terminal,
             },
             Self::ShardOverride {
-                target_id, terminal, ..
+                target_id,
+                terminal,
+                ..
             } => Self::ShardOverride {
                 target_id,
                 audit,
@@ -323,9 +299,7 @@ impl PolicyRuleAction {
     pub fn with_terminal(self, terminal: bool) -> Self {
         match self {
             Self::Allow { audit, .. } => Self::Allow { audit, terminal },
-            Self::Deny {
-                reason, audit, ..
-            } => Self::Deny {
+            Self::Deny { reason, audit, .. } => Self::Deny {
                 reason,
                 audit,
                 terminal,
@@ -440,7 +414,7 @@ impl PolicyRuleSet {
     }
 
     pub fn validate(&self) -> Result<(), PolicyRuleValidationError> {
-        PolicyRuleValidator::default().validate(self)
+        PolicyRuleValidator.validate(self)
     }
 
     #[must_use]
@@ -513,7 +487,10 @@ impl PolicyRuleValidator {
                 return Err(PolicyRuleValidationError::EmptyRuleId);
             }
 
-            if seen_rule_ids.iter().any(|seen| seen.as_ref() == rule.id.as_ref()) {
+            if seen_rule_ids
+                .iter()
+                .any(|seen| seen.as_ref() == rule.id.as_ref())
+            {
                 return Err(PolicyRuleValidationError::DuplicateRuleId {
                     rule_id: rule.id.clone(),
                 });
@@ -528,7 +505,9 @@ impl PolicyRuleValidator {
 
     fn validate_rule(&self, rule: &PolicyRule) -> Result<(), PolicyRuleValidationError> {
         if rule.matches.is_empty() {
-            return Err(PolicyRuleValidationError::EmptyMatch { rule_id: rule.id.clone() });
+            return Err(PolicyRuleValidationError::EmptyMatch {
+                rule_id: rule.id.clone(),
+            });
         }
 
         validate_text_values(&rule.id, "database", &rule.matches.databases)?;
@@ -594,11 +573,11 @@ fn matches_optional_text_field(values: &[Arc<str>], actual: Option<&str>) -> boo
     }
 }
 
-fn matches_one_of<T: PartialEq>(values: &[T], actual: T) -> bool
+fn matches_one_of<T>(values: &[T], actual: T) -> bool
 where
-    T: Copy,
+    T: Copy + PartialEq,
 {
-    values.is_empty() || values.iter().any(|value| *value == actual)
+    values.is_empty() || values.contains(&actual)
 }
 
 fn matches_optional_bool(expected: Option<bool>, actual: bool) -> bool {

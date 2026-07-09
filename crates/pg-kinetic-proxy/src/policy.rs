@@ -1,11 +1,11 @@
+#[cfg(feature = "policy-wasm")]
+use std::time::Instant;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     sync::{Arc, RwLock},
     time::Duration,
 };
-#[cfg(feature = "policy-wasm")]
-use std::time::Instant;
 
 use thiserror::Error;
 
@@ -13,9 +13,9 @@ use pg_kinetic_core::{
     lsn::FreshnessStatus,
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField,
-        PolicyDecision, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyMode,
-        PolicyOutcome, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
-        PolicyPluginOutput, PolicyVersion,
+        PolicyDecision, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome,
+        PolicyPluginAction, PolicyPluginError, PolicyPluginInput, PolicyPluginOutput,
+        PolicyVersion,
     },
     routing::{BackendRole, QueryClass, RoutingDecision},
     session::TransactionAccessMode,
@@ -160,10 +160,18 @@ impl PolicyRuntime {
         event.hook_point.as_str().hash(&mut hasher);
         event.action.as_str().hash(&mut hasher);
         event.outcome.as_str().hash(&mut hasher);
-        event.reason.as_deref().unwrap_or_default().hash(&mut hasher);
+        event
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .hash(&mut hasher);
         event.route.as_deref().unwrap_or_default().hash(&mut hasher);
         event.shard.as_deref().unwrap_or_default().hash(&mut hasher);
-        event.target_role.as_deref().unwrap_or_default().hash(&mut hasher);
+        event
+            .target_role
+            .as_deref()
+            .unwrap_or_default()
+            .hash(&mut hasher);
 
         let sample = (hasher.finish() as f64) / (u64::MAX as f64);
         sample < sample_rate
@@ -336,13 +344,13 @@ impl PolicyPluginHostLimits {
             ));
         }
 
-        if input.requested_filesystem_access {
+        if input.requested_access.filesystem {
             return Err(PolicyPluginError::filesystem_access_denied());
         }
-        if input.requested_network_access {
+        if input.requested_access.network {
             return Err(PolicyPluginError::network_access_denied());
         }
-        if input.requested_secret_access {
+        if input.requested_access.secret {
             return Err(PolicyPluginError::secret_access_denied());
         }
 
@@ -360,10 +368,7 @@ impl PolicyPluginHostLimits {
         Ok(())
     }
 
-    pub fn validate_evaluation_duration(
-        &self,
-        elapsed: Duration,
-    ) -> Result<(), PolicyPluginError> {
+    pub fn validate_evaluation_duration(&self, elapsed: Duration) -> Result<(), PolicyPluginError> {
         if elapsed > self.max_evaluation_duration {
             return Err(PolicyPluginError::evaluation_timeout(
                 elapsed,
@@ -390,12 +395,14 @@ impl PolicyPluginHostLimits {
         self.validate_output(output)?;
 
         let action = policy_plugin_action_to_inline_action(&output.action)?;
-        let mut policy = PolicyConfig::default();
-        policy.inline_rules = vec![InlinePolicyConfig {
-            policy_id: output.policy_id.clone(),
-            hook_point: output.hook_point,
-            action,
-        }];
+        let policy = PolicyConfig {
+            inline_rules: vec![InlinePolicyConfig {
+                policy_id: output.policy_id.clone(),
+                hook_point: output.hook_point,
+                action,
+            }],
+            ..PolicyConfig::default()
+        };
 
         policy
             .validate_with_context(active_routes, sharding_enabled, active_shards)
@@ -423,9 +430,9 @@ fn policy_plugin_action_to_inline_action(
                 target_id: target_id.clone(),
             })
         }
-        PolicyPluginAction::Unsupported { name } => Err(PolicyPluginError::unsupported_action(
-            name.clone(),
-        )),
+        PolicyPluginAction::Unsupported { name } => {
+            Err(PolicyPluginError::unsupported_action(name.clone()))
+        }
     }
 }
 
@@ -536,7 +543,6 @@ impl PolicyPreviewError {
     }
 }
 
-#[must_use]
 pub fn preview_policy(
     policy: &PolicyConfig,
     sharding_enabled: bool,
@@ -579,7 +585,8 @@ pub fn preview_policy(
         PolicyHookPoint::BeforeRouting,
         Duration::from_millis(0),
     );
-    let audit_event = runtime.build_audit_event_from_input(PolicyAuditKind::Decision, decision, input);
+    let audit_event =
+        runtime.build_audit_event_from_input(PolicyAuditKind::Decision, decision, input);
     crate::metrics::record_policy_decision(PolicyMode::DryRun, &audit_event);
 
     Ok(PolicyPreviewEvaluation {
@@ -590,10 +597,10 @@ pub fn preview_policy(
     })
 }
 
-fn select_preview_rule<'a>(
-    rules: &'a [InlinePolicyConfig],
+fn select_preview_rule(
+    rules: &[InlinePolicyConfig],
     hook_point: PolicyHookPoint,
-) -> Option<&'a InlinePolicyConfig> {
+) -> Option<&InlinePolicyConfig> {
     rules.iter().find(|rule| rule.hook_point == hook_point)
 }
 
@@ -727,11 +734,7 @@ impl PolicyStore {
         S: IntoIterator,
         S::Item: AsRef<str>,
     {
-        let mut current_snapshot = self
-            .inner
-            .current
-            .write()
-            .expect("policy store poisoned");
+        let mut current_snapshot = self.inner.current.write().expect("policy store poisoned");
         let current_generation = current_snapshot.generation;
         let policy_source = policy_source_label(next_config);
 
@@ -988,7 +991,8 @@ fn fit_context_fields(
 
     while rendered_fields_len_bytes(&fields) > max_bytes {
         let last_index = fields.len() - 1;
-        let available_bytes = max_bytes.saturating_sub(rendered_prefix_len_bytes(&fields, last_index));
+        let available_bytes =
+            max_bytes.saturating_sub(rendered_prefix_len_bytes(&fields, last_index));
         let field_name = fields[last_index].name().to_owned();
         let field_name_len = field_name.len() + 1;
         if available_bytes <= field_name_len {

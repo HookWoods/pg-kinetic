@@ -5,8 +5,8 @@ use pg_kinetic::{
     core::{
         lsn::{FreshnessStatus, PgLsn},
         policy::{
-            PolicyAction, PolicyContext, PolicyContextField, PolicyHookPoint, PolicyId,
-            PolicyMode, PolicyOutcome, PolicyPluginAction, PolicyPluginInput,
+            PolicyAction, PolicyContext, PolicyContextField, PolicyHookPoint, PolicyId, PolicyMode,
+            PolicyOutcome, PolicyPluginAccessRequest, PolicyPluginAction, PolicyPluginInput,
             PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
         },
         route::{QueryClass, RouteKey},
@@ -16,19 +16,19 @@ use pg_kinetic::{
     },
     proxy::{
         apply_policy_after_routing_target, apply_policy_before_checkout_target,
-        apply_policy_before_routing_target, checkout_debug_fields, checkout_postgres_error_for_target,
-        route_checkout_snapshot_for_target,
+        apply_policy_before_routing_target, checkout_debug_fields,
+        checkout_postgres_error_for_target, route_checkout_snapshot_for_target,
     },
     proxy_runtime::{
+        policy::PolicyPluginHostLimits,
         routing::{
             choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,
             RoutingContext, RoutingReason, RoutingTarget,
         },
         sharding::{
-            apply_policy_action_to_sharded_routing_target, ShardRoutingContext, ShardRoutingPlanner,
-            ShardRouteMapStore,
+            apply_policy_action_to_sharded_routing_target, ShardRouteMapStore, ShardRoutingContext,
+            ShardRoutingPlanner,
         },
-        policy::PolicyPluginHostLimits,
     },
 };
 
@@ -359,10 +359,8 @@ fn policy_actions_do_not_bypass_pinning_or_recovery_safety() {
 
 #[test]
 fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
-    let runtime = pg_kinetic::proxy_runtime::policy::PolicyRuntime::new(
-        Duration::from_millis(5),
-        16,
-    );
+    let runtime =
+        pg_kinetic::proxy_runtime::policy::PolicyRuntime::new(Duration::from_millis(5), 16);
     let limits = runtime.plugin_host_limits();
 
     assert_eq!(limits.max_input_bytes(), 16);
@@ -378,9 +376,7 @@ fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
         PolicyVersion::new(1).expect("policy version"),
         PolicyHookPoint::BeforeRouting,
         PolicyContext::new(vec![PolicyContextField::public("database", "appdb")]),
-        false,
-        false,
-        false,
+        PolicyPluginAccessRequest::none(),
     )
     .expect("plugin input");
     let input_error = limits
@@ -389,20 +385,14 @@ fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
     assert_eq!(input_error.code().as_str(), "input_too_large");
     assert_eq!(input_error.outcome(), PolicyOutcome::Skipped);
 
-    let private_limits = PolicyPluginHostLimits::new(
-        256,
-        256,
-        Duration::from_millis(5),
-    );
+    let private_limits = PolicyPluginHostLimits::new(256, 256, Duration::from_millis(5));
     let private_input = PolicyPluginInput::new(
         1,
         PolicyId::new("plugin-policy").expect("policy id"),
         PolicyVersion::new(1).expect("policy version"),
         PolicyHookPoint::BeforeRouting,
         PolicyContext::default(),
-        true,
-        true,
-        true,
+        PolicyPluginAccessRequest::new(true, true, true),
     )
     .expect("plugin input");
     let private_error = private_limits
@@ -435,11 +425,7 @@ fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
 
 #[test]
 fn plugin_output_is_validated_like_declarative_policy_output() {
-    let limits = PolicyPluginHostLimits::new(
-        8_192,
-        8_192,
-        Duration::from_millis(5),
-    );
+    let limits = PolicyPluginHostLimits::new(8_192, 8_192, Duration::from_millis(5));
     let route_override = PolicyPluginOutput::new(
         1,
         PolicyId::new("route-fallback").expect("policy id"),
@@ -499,13 +485,16 @@ fn policy_decision_reason_appears_in_snapshots_and_debug_traces() {
     let debug_fields = checkout_debug_fields(&denied_target, "allow_connect");
 
     assert_eq!(snapshot.decision.reason(), RoutingReason::PolicyDenied);
-    assert_eq!(snapshot.freshness_outcome, Some(FreshnessStatus::Unavailable));
+    assert_eq!(
+        snapshot.freshness_outcome,
+        Some(FreshnessStatus::Unavailable)
+    );
     assert!(debug_fields.iter().any(|(name, value)| {
         name == "reason" && value == RoutingReason::PolicyDenied.as_str()
     }));
-    assert!(debug_fields.iter().any(|(name, value)| {
-        name == "target_role" && value == "unknown"
-    }));
+    assert!(debug_fields
+        .iter()
+        .any(|(name, value)| { name == "target_role" && value == "unknown" }));
 }
 
 #[derive(serde::Deserialize)]
@@ -541,11 +530,7 @@ fn sample_routing_context<'a>() -> RoutingContext<'a> {
 }
 
 fn sample_shard_planner() -> ShardRoutingPlanner {
-    ShardRoutingPlanner::new(
-        sample_planner(),
-        true,
-        ShardRouteMapStore::new(Vec::new()),
-    )
+    ShardRoutingPlanner::new(sample_planner(), true, ShardRouteMapStore::new(Vec::new()))
 }
 
 fn sample_shard_context<'a>() -> ShardRoutingContext<'a> {
@@ -578,11 +563,5 @@ fn sample_lsn() -> PgLsn {
 }
 
 fn sample_route_key() -> RouteKey {
-    RouteKey::new(
-        "appdb",
-        "reporter",
-        Some("psql"),
-        None,
-        QueryClass::Read,
-    )
+    RouteKey::new("appdb", "reporter", Some("psql"), None, QueryClass::Read)
 }

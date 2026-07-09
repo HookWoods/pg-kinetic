@@ -7,8 +7,8 @@ use std::{
 
 use pg_kinetic_core::policy::{
     PolicyAction, PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome,
-    PolicyPluginAbiVersion, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
-    PolicyPluginOutput, PolicyVersion,
+    PolicyPluginAbiVersion, PolicyPluginAccessRequest, PolicyPluginAction, PolicyPluginError,
+    PolicyPluginInput, PolicyPluginOutput, PolicyVersion,
 };
 use wasmi::{Config, Engine, ExternType, Instance, Linker, Memory, Module, Store, TrapCode};
 
@@ -89,9 +89,7 @@ impl WasmPolicyEvaluator {
             policy_version,
             hook_point,
             context.context,
-            false,
-            false,
-            false,
+            PolicyPluginAccessRequest::none(),
         )
     }
 
@@ -103,18 +101,17 @@ impl WasmPolicyEvaluator {
         input: &PolicyEvalInput,
         policy_mode: PolicyMode,
     ) -> Result<PolicyDecision, PolicyPluginError> {
-        let plugin_input = self.build_plugin_input(
-            policy_id.clone(),
-            policy_version,
-            hook_point,
-            input,
-        )?;
+        let plugin_input =
+            self.build_plugin_input(policy_id.clone(), policy_version, hook_point, input)?;
         self.host_limits.validate_input(&plugin_input)?;
 
         let rendered_context = plugin_input.context.to_string();
         let started_at = Instant::now();
         let mut store = Store::new(&self.engine, ());
-        store.set_fuel(fuel_budget_for_duration(self.host_limits.max_evaluation_duration()))
+        store
+            .set_fuel(fuel_budget_for_duration(
+                self.host_limits.max_evaluation_duration(),
+            ))
             .map_err(|error| map_wasm_error(error, self.host_limits.max_evaluation_duration()))?;
 
         let linker = Linker::new(&self.engine);
@@ -267,13 +264,11 @@ fn call_policy_action_code(
 
 fn exported_memory(instance: &Instance, store: &Store<()>) -> Result<Memory, PolicyPluginError> {
     match instance.get_export(store, MEMORY_EXPORT) {
-        Some(export) => export
-            .into_memory()
-            .ok_or_else(|| {
-                PolicyPluginError::output_validation_failed(
-                    "wasm policy memory export must be linear memory",
-                )
-            }),
+        Some(export) => export.into_memory().ok_or_else(|| {
+            PolicyPluginError::output_validation_failed(
+                "wasm policy memory export must be linear memory",
+            )
+        }),
         None => Err(PolicyPluginError::output_validation_failed(
             "wasm policy module must export linear memory",
         )),

@@ -3,13 +3,11 @@ use std::{fs, path::PathBuf, process, sync::Arc};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
-use pg_kinetic::route::{QueryClass, RouteKey};
 use pg_kinetic::core::{
-    lsn::FreshnessStatus,
-    policy::PolicyAction,
-    routing::QueryClass as RoutingQueryClass,
+    lsn::FreshnessStatus, policy::PolicyAction, routing::QueryClass as RoutingQueryClass,
     session::TransactionAccessMode,
 };
+use pg_kinetic::route::{QueryClass, RouteKey};
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
@@ -131,7 +129,11 @@ fn run_policy_preview(_config: Config, args: PolicyPreviewArgs) -> anyhow::Resul
         Err(error) => {
             println!(
                 "{}",
-                render_policy_preview_error(&route, Some(&shard), &PolicyPreviewError::new("config_load_failed", error.to_string()))
+                render_policy_preview_error(
+                    &route,
+                    Some(&shard),
+                    &PolicyPreviewError::new("config_load_failed", error.to_string())
+                )
             );
             process::exit(1);
         }
@@ -145,10 +147,17 @@ fn run_policy_preview(_config: Config, args: PolicyPreviewArgs) -> anyhow::Resul
         &shard,
         query_class,
     );
-    let preview = match preview_policy(&preview_file.policy, preview_file.sharding.sharding_enabled, &input) {
+    let preview = match preview_policy(
+        &preview_file.policy,
+        preview_file.sharding.sharding_enabled,
+        &input,
+    ) {
         Ok(preview) => preview,
         Err(error) => {
-            println!("{}", render_policy_preview_error(&route, Some(&shard), &error));
+            println!(
+                "{}",
+                render_policy_preview_error(&route, Some(&shard), &error)
+            );
             process::exit(1);
         }
     };
@@ -281,9 +290,10 @@ fn adjusted_preview_targets(
             original_shard.map(ToOwned::to_owned),
         ),
         PolicyAction::Deny { .. } => (None, None),
-        PolicyAction::RouteOverride { target_id } => {
-            (Some(target_id.as_str().to_owned()), original_shard.map(ToOwned::to_owned))
-        }
+        PolicyAction::RouteOverride { target_id } => (
+            Some(target_id.as_str().to_owned()),
+            original_shard.map(ToOwned::to_owned),
+        ),
         PolicyAction::ShardOverride { target_id } => (
             Some(original_route.to_owned()),
             Some(target_id.as_str().to_owned()),
@@ -305,7 +315,7 @@ fn load_route_preview_config(path: &PathBuf) -> Result<RoutePreviewFileConfig, R
             format!("read {}: {error}", path.display()),
         )
     })?;
-        toml::from_str(&contents).map_err(|error| {
+    toml::from_str(&contents).map_err(|error| {
         RoutePreviewError::new(
             "config_load_failed",
             format!("parse {}: {error}", path.display()),
@@ -313,7 +323,9 @@ fn load_route_preview_config(path: &PathBuf) -> Result<RoutePreviewFileConfig, R
     })
 }
 
-fn load_policy_preview_config(path: &PathBuf) -> Result<PolicyPreviewFileConfig, PolicyPreviewError> {
+fn load_policy_preview_config(
+    path: &PathBuf,
+) -> Result<PolicyPreviewFileConfig, PolicyPreviewError> {
     let contents = fs::read_to_string(path).map_err(|error| {
         PolicyPreviewError::new(
             "config_load_failed",
