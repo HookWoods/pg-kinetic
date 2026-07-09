@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 
+[features]
+default = []
+policy-wasm = ["pg-kinetic-proxy/policy-wasm"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }

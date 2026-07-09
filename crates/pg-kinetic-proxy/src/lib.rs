@@ -8,6 +8,8 @@ pub mod metrics;
 pub mod pool;
 pub mod proxy;
 pub mod policy;
+#[cfg(feature = "policy-wasm")]
+pub mod policy_wasm;
 pub mod reload;
 pub mod routing;
 pub mod sharding;

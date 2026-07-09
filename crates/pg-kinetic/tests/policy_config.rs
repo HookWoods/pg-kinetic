@@ -181,8 +181,31 @@ fn shard_override_action_must_reference_an_existing_shard_when_sharding_is_enabl
 
 #[test]
 fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
-    let disabled_document = toml::from_str::<PolicyDocument>(
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_nanos();
+    let module_path = std::env::temp_dir().join(format!(
+        "pg-kinetic-policy-config-{unique_suffix}.wat"
+    ));
+    let module_path_string = module_path.display().to_string().replace('\\', "\\\\");
+    std::fs::write(
+        &module_path,
         r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "pg_kinetic_policy_abi_version") (result i32)
+            i32.const 1)
+          (func (export "pg_kinetic_policy_evaluate") (param i32 i32) (result i32)
+            i32.const 0)
+        )
+        "#,
+    )
+    .expect("write wasm module");
+
+    let disabled_document = toml::from_str::<PolicyDocument>(
+        &format!(
+            r#"
         [policy]
         policy_mode = "enforce"
 
@@ -190,8 +213,10 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         policy_id = "wasm-rule"
         hook_point = "before_checkout"
         kind = "wasm"
-        module_path = "policies/wasm/policy.wasm"
+        module_path = "{}"
         "#,
+            module_path_string
+        ),
     )
     .expect("policy config parses");
 
@@ -205,7 +230,8 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
     );
 
     let enabled_document = toml::from_str::<PolicyDocument>(
-        r#"
+        &format!(
+            r#"
         [policy]
         policy_mode = "enforce"
         policy_wasm_enabled = true
@@ -214,15 +240,30 @@ fn wasm_policies_are_rejected_unless_policy_wasm_is_enabled() {
         policy_id = "wasm-rule"
         hook_point = "before_checkout"
         kind = "wasm"
-        module_path = "policies/wasm/policy.wasm"
+        module_path = "{}"
         "#,
+            module_path_string
+        ),
     )
     .expect("policy config parses");
 
+    #[cfg(feature = "policy-wasm")]
     enabled_document
         .policy
         .validate()
         .expect("enabled wasm policies are accepted");
+
+    #[cfg(not(feature = "policy-wasm"))]
+    {
+        let error = enabled_document
+            .policy
+            .validate()
+            .expect_err("feature-gated wasm policies are rejected");
+        assert_eq!(
+            error,
+            "wasm policies require the crate feature 'policy-wasm' to be enabled"
+        );
+    }
 }
 
 #[test]

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 readme.workspace = true
 
+[features]
+default = []
+policy-wasm = ["dep:wasmi"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -30,6 +34,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing-opentelemetry = "0.33"
 tracing = "0.1"
+wasmi = { version = "1.1.0", default-features = false, features = ["std", "wat"], optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

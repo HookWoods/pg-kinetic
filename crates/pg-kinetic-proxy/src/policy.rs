@@ -20,6 +20,8 @@ use pg_kinetic_core::{
 };
 
 use crate::config::{InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig};
+#[cfg(feature = "policy-wasm")]
+use crate::policy_wasm::WasmPolicyEvaluator;
 use crate::snapshot::SnapshotStore;
 
 const REDACTED_VALUE: &str = "<redacted>";
@@ -32,6 +34,7 @@ pub struct PolicyRuntime {
     policy_mode: PolicyMode,
     policy_audit_enabled: bool,
     policy_audit_sample_rate_bits: u64,
+    policy_wasm_enabled: bool,
 }
 
 impl PolicyRuntime {
@@ -43,6 +46,7 @@ impl PolicyRuntime {
             policy_mode: PolicyMode::Disabled,
             policy_audit_enabled: true,
             policy_audit_sample_rate_bits: 1.0f64.to_bits(),
+            policy_wasm_enabled: false,
         }
     }
 
@@ -55,6 +59,7 @@ impl PolicyRuntime {
         .with_policy_mode(config.policy_mode)
         .with_policy_audit_enabled(config.policy_audit.policy_audit_enabled)
         .with_policy_audit_sample_rate(config.policy_audit.policy_audit_sample_rate)
+        .with_policy_wasm_enabled(config.policy_wasm.policy_wasm_enabled)
     }
 
     #[must_use]
@@ -75,6 +80,11 @@ impl PolicyRuntime {
     #[must_use]
     pub const fn policy_audit_enabled(&self) -> bool {
         self.policy_audit_enabled
+    }
+
+    #[must_use]
+    pub const fn policy_wasm_enabled(&self) -> bool {
+        self.policy_wasm_enabled
     }
 
     #[must_use]
@@ -186,6 +196,43 @@ impl PolicyRuntime {
     pub fn with_policy_audit_sample_rate(mut self, sample_rate: f64) -> Self {
         self.policy_audit_sample_rate_bits = clamp_sample_rate(sample_rate).to_bits();
         self
+    }
+
+    #[must_use]
+    pub fn with_policy_wasm_enabled(mut self, policy_wasm_enabled: bool) -> Self {
+        self.policy_wasm_enabled = policy_wasm_enabled;
+        self
+    }
+
+    #[cfg(feature = "policy-wasm")]
+    pub fn evaluate_wasm_policy(
+        &self,
+        rule: &InlinePolicyConfig,
+        input: &PolicyEvalInput,
+    ) -> Result<PolicyDecision, PolicyPluginError> {
+        if !self.policy_wasm_enabled {
+            return Err(PolicyPluginError::output_validation_failed(
+                "wasm policies require policy_wasm_enabled to be true",
+            ));
+        }
+
+        let module_path = match &rule.action {
+            InlinePolicyActionConfig::Wasm { module_path } => module_path,
+            _ => {
+                return Err(PolicyPluginError::output_validation_failed(
+                    "inline rule is not a wasm policy",
+                ));
+            }
+        };
+
+        let evaluator = WasmPolicyEvaluator::load(module_path, self.plugin_host_limits())?;
+        evaluator.evaluate(
+            rule.policy_id.clone(),
+            PolicyVersion::new(1).expect("valid wasm policy version"),
+            rule.hook_point,
+            input,
+            self.policy_mode,
+        )
     }
 }
 

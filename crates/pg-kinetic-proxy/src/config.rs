@@ -17,6 +17,9 @@ use pg_kinetic_core::{
     sharding::ShardId,
 };
 
+#[cfg(feature = "policy-wasm")]
+use crate::policy_wasm::WasmPolicyEvaluator;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -708,6 +711,25 @@ impl PolicyConfig {
                     return Err(String::from(
                         "wasm policies require policy_wasm_enabled to be true",
                     ));
+                }
+                InlinePolicyActionConfig::Wasm { module_path } => {
+                    #[cfg(feature = "policy-wasm")]
+                    {
+                        WasmPolicyEvaluator::validate_module_path(module_path).map_err(|error| {
+                            format!(
+                                "wasm policy module {} failed validation: {error}",
+                                module_path.display()
+                            )
+                        })?;
+                    }
+
+                    #[cfg(not(feature = "policy-wasm"))]
+                    {
+                        let _ = module_path;
+                        return Err(String::from(
+                            "wasm policies require the crate feature 'policy-wasm' to be enabled",
+                        ));
+                    }
                 }
                 _ => {}
             }
