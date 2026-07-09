@@ -85,6 +85,15 @@ pub enum MetricName {
     ShardMultiShardRejectionsTotal,
     ShardPrimaryFallbacksTotal,
     RouteMapReloadTotal,
+    PolicyDecisionsTotal,
+    PolicyEvalDurationMs,
+    PolicyDeniesTotal,
+    PolicyDryRunTotal,
+    PolicyReloadTotal,
+    PolicyActive,
+    PolicyAuditEventsTotal,
+    PolicyWasmEvalTotal,
+    PolicyWasmEvalDurationMs,
     RouteMapGeneration,
     ShardLifecycleState,
     ShardActiveTransactions,
@@ -122,6 +131,15 @@ impl MetricName {
             Self::ShardMultiShardRejectionsTotal => "pg_kinetic_shard_multi_shard_rejections_total",
             Self::ShardPrimaryFallbacksTotal => "pg_kinetic_shard_primary_fallbacks_total",
             Self::RouteMapReloadTotal => "pg_kinetic_route_map_reload_total",
+            Self::PolicyDecisionsTotal => "pg_kinetic_policy_decisions_total",
+            Self::PolicyEvalDurationMs => "pg_kinetic_policy_eval_duration_ms",
+            Self::PolicyDeniesTotal => "pg_kinetic_policy_denies_total",
+            Self::PolicyDryRunTotal => "pg_kinetic_policy_dry_run_total",
+            Self::PolicyReloadTotal => "pg_kinetic_policy_reload_total",
+            Self::PolicyActive => "pg_kinetic_policy_active",
+            Self::PolicyAuditEventsTotal => "pg_kinetic_policy_audit_events_total",
+            Self::PolicyWasmEvalTotal => "pg_kinetic_policy_wasm_eval_total",
+            Self::PolicyWasmEvalDurationMs => "pg_kinetic_policy_wasm_eval_duration_ms",
             Self::RouteMapGeneration => "pg_kinetic_route_map_generation",
             Self::ShardLifecycleState => "pg_kinetic_shard_lifecycle_state",
             Self::ShardActiveTransactions => "pg_kinetic_shard_active_transactions",
@@ -187,6 +205,7 @@ pub enum MetricLabel {
     Action,
     Event,
     Endpoint,
+    Hook,
     Kind,
     LagState,
     FallbackPolicy,
@@ -198,6 +217,7 @@ pub enum MetricLabel {
     Reason,
     QueryClass,
     Route,
+    Source,
     Shard,
     Strategy,
     Policy,
@@ -219,6 +239,7 @@ impl MetricLabel {
             Self::Action => "action",
             Self::Event => "event",
             Self::Endpoint => "endpoint",
+            Self::Hook => "hook",
             Self::Kind => "kind",
             Self::LagState => "lag_state",
             Self::FallbackPolicy => "fallback_policy",
@@ -230,6 +251,7 @@ impl MetricLabel {
             Self::Reason => "reason",
             Self::QueryClass => "query_class",
             Self::Route => "route",
+            Self::Source => "source",
             Self::Shard => "shard",
             Self::Strategy => "strategy",
             Self::Policy => "policy",
@@ -312,6 +334,54 @@ const SHARD_PRIMARY_FALLBACK_LABELS: &[MetricLabel] = &[
     MetricLabel::Outcome,
 ];
 const ROUTE_MAP_RELOAD_LABELS: &[MetricLabel] = &[MetricLabel::Outcome, MetricLabel::ErrorCode];
+const POLICY_DECISION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Policy,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Action,
+    MetricLabel::Outcome,
+];
+const POLICY_EVAL_DURATION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Policy,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Outcome,
+];
+const POLICY_DENY_LABELS: &[MetricLabel] = &[MetricLabel::Policy, MetricLabel::Reason];
+const POLICY_DRY_RUN_LABELS: &[MetricLabel] = &[
+    MetricLabel::Policy,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Action,
+];
+const POLICY_RELOAD_LABELS: &[MetricLabel] = &[
+    MetricLabel::Source,
+    MetricLabel::Mode,
+    MetricLabel::Outcome,
+    MetricLabel::ErrorCode,
+];
+const POLICY_ACTIVE_LABELS: &[MetricLabel] = &[MetricLabel::Source, MetricLabel::Mode];
+const POLICY_AUDIT_EVENT_LABELS: &[MetricLabel] = &[
+    MetricLabel::Policy,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Action,
+    MetricLabel::Outcome,
+    MetricLabel::Reason,
+];
+const POLICY_WASM_EVAL_LABELS: &[MetricLabel] = &[
+    MetricLabel::Source,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Outcome,
+    MetricLabel::ErrorCode,
+];
+const POLICY_WASM_EVAL_DURATION_LABELS: &[MetricLabel] = &[
+    MetricLabel::Source,
+    MetricLabel::Mode,
+    MetricLabel::Hook,
+    MetricLabel::Outcome,
+];
 const SHARD_LIFECYCLE_LABELS: &[MetricLabel] = &[MetricLabel::Shard, MetricLabel::LifecycleState];
 const SHARD_COUNT_LABELS: &[MetricLabel] = &[MetricLabel::Shard];
 const ROUTE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Outcome];
@@ -475,6 +545,78 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Route map reload outcomes by outcome and error code",
         ROUTE_MAP_RELOAD_LABELS,
         "Outcome and error code stay aligned with reload results.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_decisions_total",
+        MetricKind::Counter,
+        "1",
+        "Policy decisions by policy, mode, hook, action, and outcome",
+        POLICY_DECISION_LABELS,
+        "Policy ids are admin-defined and mode / hook / action / outcome stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_eval_duration_ms",
+        MetricKind::Histogram,
+        "ms",
+        "Policy evaluation duration in milliseconds by policy, mode, hook, and outcome",
+        POLICY_EVAL_DURATION_LABELS,
+        "Policy ids are admin-defined and mode / hook / outcome stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_denies_total",
+        MetricKind::Counter,
+        "1",
+        "Policy denies by policy and reason code",
+        POLICY_DENY_LABELS,
+        "Policy ids are admin-defined and deny reasons stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_dry_run_total",
+        MetricKind::Counter,
+        "1",
+        "Policy dry-run would-have actions by policy, mode, hook, and action",
+        POLICY_DRY_RUN_LABELS,
+        "Policy ids are admin-defined and dry-run labels stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_reload_total",
+        MetricKind::Counter,
+        "1",
+        "Policy reload outcomes by source, mode, outcome, and error code",
+        POLICY_RELOAD_LABELS,
+        "Source, mode, outcome, and error code all stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_active",
+        MetricKind::Gauge,
+        "1",
+        "Active policy series by source and mode",
+        POLICY_ACTIVE_LABELS,
+        "Source and mode stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_audit_events_total",
+        MetricKind::Counter,
+        "1",
+        "Policy audit events by policy, mode, hook, action, outcome, and reason",
+        POLICY_AUDIT_EVENT_LABELS,
+        "Policy ids are admin-defined and audit labels stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_wasm_eval_total",
+        MetricKind::Counter,
+        "1",
+        "WASM policy evaluations by source, mode, hook, outcome, and error code",
+        POLICY_WASM_EVAL_LABELS,
+        "Source, mode, hook, outcome, and error code stay bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_policy_wasm_eval_duration_ms",
+        MetricKind::Histogram,
+        "ms",
+        "WASM policy evaluation duration in milliseconds by source, mode, hook, and outcome",
+        POLICY_WASM_EVAL_DURATION_LABELS,
+        "Source, mode, hook, and outcome stay bounded.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_route_map_generation",
@@ -678,6 +820,8 @@ impl LabelPolicy {
     pub const VIEW: &'static str = "view";
     pub const STATE: &'static str = "state";
     pub const EVENT: &'static str = "event";
+    pub const HOOK: &'static str = "hook";
+    pub const SOURCE: &'static str = "source";
     pub const TARGET_ROLE: &'static str = "target_role";
     pub const QUERY_CLASS: &'static str = "query_class";
     pub const REASON: &'static str = "reason";
@@ -689,7 +833,7 @@ impl LabelPolicy {
     pub const ERROR_CODE: &'static str = "error_code";
     pub const HEALTH: &'static str = "health";
     pub const LAG_STATE: &'static str = "lag_state";
-    pub const ALLOWED_LABELS: [&'static str; 18] = [
+    pub const ALLOWED_LABELS: [&'static str; 20] = [
         Self::PHASE,
         Self::OUTCOME,
         Self::ENDPOINT,
@@ -697,6 +841,8 @@ impl LabelPolicy {
         Self::SHARD,
         Self::STRATEGY,
         Self::POLICY,
+        Self::HOOK,
+        Self::SOURCE,
         Self::TARGET_ROLE,
         Self::QUERY_CLASS,
         Self::REASON,

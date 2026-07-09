@@ -1,8 +1,11 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
+        Mutex,
+        OnceLock,
     },
     time::Duration,
 };
@@ -11,8 +14,9 @@ use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{
         AuthConfig, AuthFailureMessageMode, AuthMode, BackendTlsMode, CapacityConfig,
-        ClientTlsMode, Config, ConnectionConfig, DrainConfig, HealthConfig, ObservabilityConfig,
-        PerformanceConfig, QosConfig, ReloadConfig, SocketConfig, TlsConfig,
+        ClientTlsMode, Config, ConnectionConfig, DrainConfig, HealthConfig, InlinePolicyActionConfig,
+        InlinePolicyConfig, ObservabilityConfig, PerformanceConfig, PolicyConfig, QosConfig,
+        ReloadConfig, SocketConfig, TlsConfig,
     },
     core::{
         policy::{
@@ -26,7 +30,7 @@ use pg_kinetic::{
     },
     proxy::Proxy,
     proxy_runtime::{
-        policy::PolicyRuntime,
+        policy::{preview_policy, PolicyRuntime, PolicyStore},
         snapshot::{PolicyReloadSnapshot, PolicyStatusSnapshot, SnapshotStore},
     },
     wire::{
@@ -34,6 +38,7 @@ use pg_kinetic::{
         protocol::ProtocolVersion,
     },
 };
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -225,6 +230,192 @@ async fn disabled_policy_mode_shows_no_active_evaluator() {
 
     run_handle.abort();
     let _ = run_handle.await;
+}
+
+#[test]
+fn policy_metrics_use_bounded_labels() {
+    let _guard = metrics_lock().lock().expect("metrics lock");
+    let recorder = install_metrics_recorder();
+    recorder.clear();
+
+    let snapshot_store = SnapshotStore::default();
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 8_192)
+        .with_policy_mode(PolicyMode::Enforce)
+        .with_policy_audit_enabled(true)
+        .with_policy_audit_sample_rate(1.0);
+    let input = sample_policy_input();
+
+    let decision_event = policy_event(
+        &runtime,
+        PolicyAuditKind::Decision,
+        17,
+        PolicyOutcome::Rejected,
+        &input,
+    );
+    assert!(runtime.record_audit_event(&snapshot_store, &decision_event));
+
+    let validation_event = policy_event(
+        &runtime,
+        PolicyAuditKind::Validation,
+        18,
+        PolicyOutcome::Rejected,
+        &input,
+    );
+    assert!(runtime.record_audit_event(&snapshot_store, &validation_event));
+
+    let preview_config = PolicyConfig {
+        policy_mode: PolicyMode::Enforce,
+        inline_rules: vec![InlinePolicyConfig {
+            policy_id: PolicyId::new("route-fallback").expect("policy id"),
+            hook_point: PolicyHookPoint::BeforeRouting,
+            action: InlinePolicyActionConfig::Deny {
+                reason: String::from("policy denied"),
+            },
+        }],
+        ..PolicyConfig::default()
+    };
+    let preview = preview_policy(&preview_config, false, &input).expect("preview policy");
+    assert_eq!(preview.policy_mode, PolicyMode::Enforce);
+
+    let reload_store = PolicyStore::new(PolicyConfig::default());
+    let reload_result = reload_store.reload(
+        &PolicyConfig {
+            policy_mode: PolicyMode::Enforce,
+            inline_rules: vec![InlinePolicyConfig {
+                policy_id: PolicyId::new("route-fallback").expect("policy id"),
+                hook_point: PolicyHookPoint::BeforeRouting,
+                action: InlinePolicyActionConfig::RouteOverride {
+                    target_id: pg_kinetic::core::policy::PolicyRouteTargetId::new("missing-route")
+                        .expect("target id"),
+                },
+            }],
+            ..PolicyConfig::default()
+        },
+        std::iter::empty::<&str>(),
+        false,
+        std::iter::empty::<&str>(),
+    );
+    assert!(!reload_result.success);
+
+    #[cfg(feature = "policy-wasm")]
+    {
+        let module_path = wasm_module_path(
+            "policy-metrics",
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "pg_kinetic_policy_abi_version") (result i32)
+                i32.const 1)
+              (func (export "pg_kinetic_policy_evaluate") (param i32 i32) (result i32)
+                i32.const 0)
+            )
+            "#,
+        );
+        let wasm_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+            .with_policy_mode(PolicyMode::Enforce)
+            .with_policy_wasm_enabled(true);
+        let wasm_rule = InlinePolicyConfig {
+            policy_id: PolicyId::new("wasm-rule").expect("policy id"),
+            hook_point: PolicyHookPoint::BeforeCheckout,
+            action: InlinePolicyActionConfig::Wasm { module_path },
+        };
+        let wasm_input = sample_policy_input();
+        let wasm_decision = wasm_runtime
+            .evaluate_wasm_policy(&wasm_rule, &wasm_input)
+            .expect("wasm policy evaluation");
+        assert_eq!(wasm_decision.outcome, PolicyOutcome::Applied);
+    }
+
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_decisions_total",
+        &[
+            ("policy", "route-fallback"),
+            ("mode", "enforce"),
+            ("hook", "before_routing"),
+            ("action", "deny"),
+            ("outcome", "rejected"),
+        ]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_eval_duration_ms",
+        &[
+            ("policy", "route-fallback"),
+            ("mode", "enforce"),
+            ("hook", "before_routing"),
+            ("outcome", "rejected"),
+        ]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_denies_total",
+        &[("policy", "route-fallback"), ("reason", "policy_denied")]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_dry_run_total",
+        &[
+            ("policy", "route-fallback"),
+            ("mode", "dry_run"),
+            ("hook", "before_routing"),
+            ("action", "deny"),
+        ]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_reload_total",
+        &[
+            ("source", "inline"),
+            ("mode", "enforce"),
+            ("outcome", "success"),
+            ("error_code", "none"),
+        ]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_reload_total",
+        &[
+            ("source", "inline"),
+            ("mode", "enforce"),
+            ("outcome", "failure"),
+            ("error_code", "route_reference_missing"),
+        ]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_active",
+        &[("source", "inline"), ("mode", "enforce")]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_policy_audit_events_total",
+        &[
+            ("policy", "route-fallback"),
+            ("mode", "enforce"),
+            ("hook", "before_routing"),
+            ("action", "deny"),
+            ("outcome", "rejected"),
+            ("reason", "policy_denied"),
+        ]
+    ));
+
+    #[cfg(feature = "policy-wasm")]
+    {
+        assert!(recorder.has_metric(
+            "pg_kinetic_policy_wasm_eval_total",
+            &[
+                ("source", "wasm"),
+                ("mode", "enforce"),
+                ("hook", "before_checkout"),
+                ("outcome", "applied"),
+                ("error_code", "none"),
+            ]
+        ));
+        assert!(recorder.has_metric(
+            "pg_kinetic_policy_wasm_eval_duration_ms",
+            &[
+                ("source", "wasm"),
+                ("mode", "enforce"),
+                ("hook", "before_checkout"),
+                ("outcome", "applied"),
+            ]
+        ));
+    }
+
+    assert_no_sensitive_metric_labels(&recorder);
 }
 
 async fn spawn_proxy(config: Config) -> (tokio::task::JoinHandle<()>, SocketAddr, SnapshotStore) {
@@ -518,4 +709,133 @@ async fn free_port() -> SocketAddr {
     let addr = listener.local_addr().expect("free port");
     drop(listener);
     addr
+}
+
+fn install_metrics_recorder() -> Arc<TestRecorder> {
+    METRICS_RECORDER
+        .get_or_init(|| {
+            let recorder = Arc::new(TestRecorder::default());
+            ::metrics::set_global_recorder(recorder.clone()).expect("install metrics recorder");
+            recorder
+        })
+        .clone()
+}
+
+fn metrics_lock() -> &'static Mutex<()> {
+    METRICS_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn assert_no_sensitive_metric_labels(recorder: &TestRecorder) {
+    let forbidden = [
+        "SELECT * FROM users",
+        "secret-bind-1",
+        "topsecret",
+        "-----BEGIN CERTIFICATE-----",
+        "127.0.0.1",
+        "tenant-a",
+        "tenant-b",
+        "tenant-c",
+        "missing-route",
+    ];
+
+    for signature in recorder.signatures() {
+        let lowered = signature.to_ascii_lowercase();
+        for needle in forbidden {
+            assert!(
+                !lowered.contains(&needle.to_ascii_lowercase()),
+                "unexpected sensitive label content in {signature}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "policy-wasm")]
+fn wasm_module_path(label: &str, source: &str) -> std::path::PathBuf {
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("pg-kinetic-{label}-{unique_suffix}.wat"));
+    std::fs::write(&path, source).expect("write wasm module");
+    path
+}
+
+static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
+static METRICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct TestRecorder {
+    registrations: Mutex<HashSet<String>>,
+}
+
+impl TestRecorder {
+    fn clear(&self) {
+        self.registrations.lock().expect("lock recorder").clear();
+    }
+
+    fn has_metric(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .contains(&metric_signature(name, labels))
+    }
+
+    fn signatures(&self) -> Vec<String> {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+impl Recorder for TestRecorder {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Counter::noop()
+    }
+
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Gauge::noop()
+    }
+
+    fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .insert(metric_signature_from_key(key));
+        Histogram::noop()
+    }
+}
+
+fn metric_signature_from_key(key: &Key) -> String {
+    let labels = key
+        .labels()
+        .map(|label| format!("{}={}", label.key(), label.value()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}|{}", key.name(), labels)
+}
+
+fn metric_signature(name: &str, labels: &[(&str, &str)]) -> String {
+    let labels = labels
+        .iter()
+        .map(|(label_key, label_value)| format!("{label_key}={label_value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}|{labels}")
 }

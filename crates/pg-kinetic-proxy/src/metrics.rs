@@ -18,6 +18,10 @@ use pg_kinetic_core::{
         metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
         MetricOutcome, ProtocolPhase,
     },
+    policy::{
+        PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecisionReason, PolicyHookPoint,
+        PolicyMode, PolicyOutcome,
+    },
     route::{QueryClass as RouteQueryClass, RouteKey},
     routing::{BackendRole, FallbackPolicy},
     security::{AuthMode, BackendTlsMode, ClientTlsMode, DrainState, HealthStatus},
@@ -461,6 +465,125 @@ pub fn record_config_reload(outcome: ReloadOutcome) {
     .increment(1);
 }
 
+pub fn record_policy_audit_event(mode: PolicyMode, event: &PolicyAuditEvent) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::PolicyAuditEventsTotal.as_str(),
+        "policy" => event.policy_id.as_str().to_string(),
+        "mode" => mode.metric_label(),
+        "hook" => event.hook_point.metric_label(),
+        "action" => event.action.as_str(),
+        "outcome" => event.outcome.metric_label(),
+        "reason" => event
+            .reason
+            .as_deref()
+            .unwrap_or("none")
+            .to_string(),
+    )
+    .increment(1);
+
+    if matches!(event.kind, PolicyAuditKind::Decision) {
+        record_policy_decision(mode, event);
+    }
+}
+
+pub fn record_policy_decision(mode: PolicyMode, event: &PolicyAuditEvent) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::PolicyDecisionsTotal.as_str(),
+        "policy" => event.policy_id.as_str().to_string(),
+        "mode" => mode.metric_label(),
+        "hook" => event.hook_point.metric_label(),
+        "action" => event.action.as_str(),
+        "outcome" => event.outcome.metric_label(),
+    )
+    .increment(1);
+
+    metrics_crate::histogram!(
+        ObservabilityMetricName::PolicyEvalDurationMs.as_str(),
+        "policy" => event.policy_id.as_str().to_string(),
+        "mode" => mode.metric_label(),
+        "hook" => event.hook_point.metric_label(),
+        "outcome" => event.outcome.metric_label(),
+    )
+    .record(event.decision.latency.as_secs_f64() * 1_000.0);
+
+    if matches!(event.outcome, PolicyOutcome::DryRun) {
+        metrics_crate::counter!(
+            ObservabilityMetricName::PolicyDryRunTotal.as_str(),
+            "policy" => event.policy_id.as_str().to_string(),
+            "mode" => mode.metric_label(),
+            "hook" => event.hook_point.metric_label(),
+            "action" => event.action.as_str(),
+        )
+    .increment(1);
+    }
+
+    if let PolicyAction::Deny { reason, .. } = &event.action {
+        metrics_crate::counter!(
+            ObservabilityMetricName::PolicyDeniesTotal.as_str(),
+            "policy" => event.policy_id.as_str().to_string(),
+            "reason" => reason.metric_label(),
+        )
+        .increment(1);
+    }
+}
+
+pub fn record_policy_reload(
+    source: &'static str,
+    mode: PolicyMode,
+    success: bool,
+    error_code: Option<&'static str>,
+) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::PolicyReloadTotal.as_str(),
+        "source" => source,
+        "mode" => mode.metric_label(),
+        "outcome" => if success { "success" } else { "failure" },
+        "error_code" => error_code.unwrap_or("none"),
+    )
+    .increment(1);
+
+    if success {
+        record_policy_active(source, mode);
+    }
+}
+
+pub fn record_policy_active(source: &'static str, mode: PolicyMode) {
+    metrics_crate::gauge!(
+        ObservabilityMetricName::PolicyActive.as_str(),
+        "source" => source,
+        "mode" => mode.metric_label(),
+    )
+    .set(1.0);
+}
+
+pub fn record_policy_wasm_eval(
+    source: &'static str,
+    mode: PolicyMode,
+    hook: PolicyHookPoint,
+    outcome: PolicyOutcome,
+    error_code: Option<&'static str>,
+    duration: Duration,
+) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::PolicyWasmEvalTotal.as_str(),
+        "source" => source,
+        "mode" => mode.metric_label(),
+        "hook" => hook.metric_label(),
+        "outcome" => outcome.metric_label(),
+        "error_code" => error_code.unwrap_or("none"),
+    )
+    .increment(1);
+
+    metrics_crate::histogram!(
+        ObservabilityMetricName::PolicyWasmEvalDurationMs.as_str(),
+        "source" => source,
+        "mode" => mode.metric_label(),
+        "hook" => hook.metric_label(),
+        "outcome" => outcome.metric_label(),
+    )
+    .record(duration.as_secs_f64() * 1_000.0);
+}
+
 pub fn record_drain_state(state: DrainState) {
     for candidate in [
         DrainState::Accepting,
@@ -654,6 +777,36 @@ impl MetricLabelValue for BackendTlsMode {
 }
 
 impl MetricLabelValue for AuthMode {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabelValue for PolicyMode {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabelValue for PolicyHookPoint {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabelValue for PolicyAction {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabelValue for PolicyOutcome {
+    fn metric_label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MetricLabelValue for PolicyDecisionReason {
     fn metric_label(self) -> &'static str {
         self.as_str()
     }

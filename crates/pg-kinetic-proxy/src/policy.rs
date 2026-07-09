@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
+#[cfg(feature = "policy-wasm")]
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -25,7 +27,6 @@ use crate::policy_wasm::WasmPolicyEvaluator;
 use crate::snapshot::SnapshotStore;
 
 const REDACTED_VALUE: &str = "<redacted>";
-const POLICY_AUDIT_METRIC_NAME: &str = "pg_kinetic_policy_audit_total";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyRuntime {
@@ -168,15 +169,7 @@ impl PolicyRuntime {
         }
 
         snapshot_store.record_policy_audit_event(event.clone());
-        metrics_crate::counter!(
-            POLICY_AUDIT_METRIC_NAME,
-            "policy" => event.policy_id.as_str().to_string(),
-            "action" => event.action.as_str().to_string(),
-            "hook" => event.hook_point.as_str().to_string(),
-            "outcome" => event.outcome.as_str().to_string(),
-            "reason" => event.reason.as_deref().unwrap_or_default().to_string(),
-        )
-        .increment(1);
+        crate::metrics::record_policy_audit_event(self.policy_mode, event);
         true
     }
 
@@ -226,13 +219,36 @@ impl PolicyRuntime {
         };
 
         let evaluator = WasmPolicyEvaluator::load(module_path, self.plugin_host_limits())?;
-        evaluator.evaluate(
+        let started_at = Instant::now();
+        let result = evaluator.evaluate(
             rule.policy_id.clone(),
             PolicyVersion::new(1).expect("valid wasm policy version"),
             rule.hook_point,
             input,
             self.policy_mode,
-        )
+        );
+        let elapsed = started_at.elapsed();
+
+        match &result {
+            Ok(decision) => crate::metrics::record_policy_wasm_eval(
+                "wasm",
+                self.policy_mode,
+                rule.hook_point,
+                decision.outcome,
+                None,
+                elapsed,
+            ),
+            Err(error) => crate::metrics::record_policy_wasm_eval(
+                "wasm",
+                self.policy_mode,
+                rule.hook_point,
+                error.outcome(),
+                Some(error.code().as_str()),
+                elapsed,
+            ),
+        }
+
+        result
     }
 }
 
@@ -539,6 +555,7 @@ pub fn preview_policy(
         Duration::from_millis(0),
     );
     let audit_event = runtime.build_audit_event_from_input(PolicyAuditKind::Decision, decision, input);
+    crate::metrics::record_policy_decision(PolicyMode::DryRun, &audit_event);
 
     Ok(PolicyPreviewEvaluation {
         policy_mode: runtime.policy_mode(),
@@ -691,27 +708,37 @@ impl PolicyStore {
             .write()
             .expect("policy store poisoned");
         let current_generation = current_snapshot.generation;
+        let policy_source = policy_source_label(next_config);
 
         if let Err(error) =
             next_config.validate_with_context(active_routes, sharding_enabled, active_shards)
         {
-            return PolicyReloadResult {
+            let result = PolicyReloadResult {
                 success: false,
                 policy_generation_id: current_generation.as_u64(),
                 error_code: Some(policy_reload_error_code(&error)),
                 error: Some(error),
             };
+            crate::metrics::record_policy_reload(
+                policy_source,
+                next_config.policy_mode,
+                false,
+                result.error_code.as_ref().map(|code| code.as_str()),
+            );
+            return result;
         }
 
         let next_generation = current_generation.next();
         *current_snapshot = Arc::new(PolicySnapshot::new(next_generation, next_config.clone()));
 
-        PolicyReloadResult {
+        let result = PolicyReloadResult {
             success: true,
             policy_generation_id: next_generation.as_u64(),
             error_code: None,
             error: None,
-        }
+        };
+        crate::metrics::record_policy_reload(policy_source, next_config.policy_mode, true, None);
+        result
     }
 }
 
@@ -722,6 +749,23 @@ fn policy_reload_error_code(error: &str) -> PolicyReloadErrorCode {
         PolicyReloadErrorCode::ShardReferenceMissing
     } else {
         PolicyReloadErrorCode::InvalidPolicyConfiguration
+    }
+}
+
+fn policy_source_label(config: &PolicyConfig) -> &'static str {
+    let has_inline_rules = !config.inline_rules.is_empty();
+    let has_policy_files = !config.policy_files.is_empty();
+    let has_wasm_rules = config
+        .inline_rules
+        .iter()
+        .any(|rule| matches!(rule.action, InlinePolicyActionConfig::Wasm { .. }));
+
+    match (has_policy_files, has_wasm_rules, has_inline_rules) {
+        (false, false, false) => "disabled",
+        (true, false, false) => "file",
+        (false, true, false) => "wasm",
+        (false, false, true) => "inline",
+        _ => "mixed",
     }
 }
 
