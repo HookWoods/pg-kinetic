@@ -5,18 +5,20 @@ use std::{
     time::Duration,
 };
 
+use thiserror::Error;
+
 use pg_kinetic_core::{
     lsn::FreshnessStatus,
     policy::{
-        PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField, PolicyDecision,
-        PolicyMode,
+        PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField,
+        PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome, PolicyVersion,
     },
     routing::{BackendRole, QueryClass, RoutingDecision},
     session::TransactionAccessMode,
     sharding::ShardRouteDecision,
 };
 
-use crate::config::PolicyConfig;
+use crate::config::{InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig};
 use crate::snapshot::SnapshotStore;
 
 const REDACTED_VALUE: &str = "<redacted>";
@@ -257,6 +259,149 @@ impl PolicySnapshot {
             runtime,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyPreviewEvaluation {
+    pub policy_mode: PolicyMode,
+    pub action: PolicyAction,
+    pub deny_reason: Option<Arc<str>>,
+    pub audit_event: PolicyAuditEvent,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{message}")]
+pub struct PolicyPreviewError {
+    pub code: String,
+    pub message: String,
+}
+
+impl PolicyPreviewError {
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[must_use]
+pub fn preview_policy(
+    policy: &PolicyConfig,
+    sharding_enabled: bool,
+    input: &PolicyEvalInput,
+) -> Result<PolicyPreviewEvaluation, PolicyPreviewError> {
+    let policy_store = PolicyStore::new(policy.clone());
+    let validation_result = policy_store.reload(
+        policy,
+        synthetic_routes(&policy.inline_rules, input),
+        sharding_enabled,
+        synthetic_shards(&policy.inline_rules, input),
+    );
+    if !validation_result.success {
+        return Err(PolicyPreviewError::new(
+            validation_result
+                .error_code
+                .map(|code| code.as_str())
+                .unwrap_or("invalid_policy_configuration"),
+            validation_result
+                .error
+                .unwrap_or_else(|| String::from("policy validation failed")),
+        ));
+    }
+
+    let runtime = policy_store.runtime();
+    let selected_rule = select_preview_rule(&policy.inline_rules, PolicyHookPoint::BeforeRouting);
+    let (action, deny_reason, policy_id) = match selected_rule {
+        Some(rule) => preview_action_from_rule(rule)?,
+        None => (
+            PolicyAction::allow(),
+            None,
+            PolicyId::new("policy-preview").expect("preview policy id"),
+        ),
+    };
+    let decision = PolicyDecision::new(
+        policy_id,
+        PolicyVersion::new(1).expect("preview policy version"),
+        action.clone(),
+        PolicyOutcome::DryRun,
+        PolicyHookPoint::BeforeRouting,
+        Duration::from_millis(0),
+    );
+    let audit_event = runtime.build_audit_event_from_input(PolicyAuditKind::Decision, decision, input);
+
+    Ok(PolicyPreviewEvaluation {
+        policy_mode: runtime.policy_mode(),
+        action,
+        deny_reason,
+        audit_event,
+    })
+}
+
+fn select_preview_rule<'a>(
+    rules: &'a [InlinePolicyConfig],
+    hook_point: PolicyHookPoint,
+) -> Option<&'a InlinePolicyConfig> {
+    rules.iter().find(|rule| rule.hook_point == hook_point)
+}
+
+fn preview_action_from_rule(
+    rule: &InlinePolicyConfig,
+) -> Result<(PolicyAction, Option<Arc<str>>, PolicyId), PolicyPreviewError> {
+    let policy_id = rule.policy_id.clone();
+    let action = match &rule.action {
+        InlinePolicyActionConfig::Allow => PolicyAction::allow(),
+        InlinePolicyActionConfig::Deny { reason } => {
+            let deny_reason = Arc::from(reason.as_str());
+            return Ok((PolicyAction::deny(), Some(deny_reason), policy_id));
+        }
+        InlinePolicyActionConfig::RequirePrimary => PolicyAction::require_primary(),
+        InlinePolicyActionConfig::RequireReplica => PolicyAction::require_replica(),
+        InlinePolicyActionConfig::RouteOverride { target_id } => {
+            PolicyAction::route_override(target_id.clone())
+        }
+        InlinePolicyActionConfig::ShardOverride { target_id } => {
+            PolicyAction::shard_override(target_id.clone())
+        }
+        InlinePolicyActionConfig::Wasm { module_path } => {
+            return Err(PolicyPreviewError::new(
+                "invalid_policy_configuration",
+                format!(
+                    "policy preview does not support wasm policy module {}",
+                    module_path.display()
+                ),
+            ));
+        }
+    };
+
+    Ok((action, None, policy_id))
+}
+
+fn synthetic_routes(rules: &[InlinePolicyConfig], input: &PolicyEvalInput) -> Vec<Arc<str>> {
+    let mut routes = Vec::new();
+    if let Some(route) = input.route.as_ref() {
+        routes.push(route.clone());
+    }
+    for rule in rules {
+        if let InlinePolicyActionConfig::RouteOverride { target_id } = &rule.action {
+            routes.push(Arc::from(target_id.as_str()));
+        }
+    }
+    routes
+}
+
+fn synthetic_shards(rules: &[InlinePolicyConfig], input: &PolicyEvalInput) -> Vec<Arc<str>> {
+    let mut shards = Vec::new();
+    if let Some(shard) = input.shard.as_ref() {
+        shards.push(shard.clone());
+    }
+    for rule in rules {
+        if let InlinePolicyActionConfig::ShardOverride { target_id } = &rule.action {
+            shards.push(Arc::from(target_id.as_str()));
+        }
+    }
+    shards
 }
 
 #[derive(Clone, Debug)]

@@ -1,9 +1,16 @@
-use std::{fs, path::PathBuf, process};
+use std::{fs, path::PathBuf, process, sync::Arc};
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
 use pg_kinetic::route::{QueryClass, RouteKey};
+use pg_kinetic::core::{
+    lsn::FreshnessStatus,
+    policy::PolicyAction,
+    routing::QueryClass as RoutingQueryClass,
+    session::TransactionAccessMode,
+};
+use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -21,6 +28,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     RoutePreview(RoutePreviewArgs),
+    PolicyPreview(PolicyPreviewArgs),
 }
 
 #[derive(Debug, Args)]
@@ -41,8 +49,47 @@ struct RoutePreviewArgs {
     application_name: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct PolicyPreviewArgs {
+    #[arg(long)]
+    config: PathBuf,
+
+    #[arg(long)]
+    database: String,
+
+    #[arg(long)]
+    user: String,
+
+    #[arg(long)]
+    route: String,
+
+    #[arg(long)]
+    shard: String,
+
+    #[arg(long, value_parser = parse_routing_query_class)]
+    query_class: RoutingQueryClass,
+
+    #[arg(long)]
+    application_name: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Json,
+}
+
 #[derive(Debug, Deserialize)]
 struct RoutePreviewFileConfig {
+    sharding: pg_kinetic::config::ShardingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyPreviewFileConfig {
+    policy: pg_kinetic::config::PolicyConfig,
+    #[serde(default)]
     sharding: pg_kinetic::config::ShardingConfig,
 }
 
@@ -53,8 +100,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli { config, command } = cli;
 
-    if let Some(Command::RoutePreview(args)) = command {
-        return run_route_preview(config, args);
+    match command {
+        Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
+        Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
+        None => {}
     }
 
     tokio::runtime::Builder::new_multi_thread()
@@ -63,6 +112,57 @@ fn main() -> anyhow::Result<()> {
         .context("build tokio runtime")?
         .block_on(pg_kinetic::run(config))
         .context("pg-kinetic runtime failed")
+}
+
+fn run_policy_preview(_config: Config, args: PolicyPreviewArgs) -> anyhow::Result<()> {
+    let PolicyPreviewArgs {
+        config: preview_config_path,
+        database,
+        user,
+        route,
+        shard,
+        query_class,
+        application_name,
+        format,
+    } = args;
+
+    let preview_file = match load_policy_preview_config(&preview_config_path) {
+        Ok(file) => file,
+        Err(error) => {
+            println!(
+                "{}",
+                render_policy_preview_error(&route, Some(&shard), &PolicyPreviewError::new("config_load_failed", error.to_string()))
+            );
+            process::exit(1);
+        }
+    };
+
+    let input = build_policy_preview_input(
+        &database,
+        &user,
+        application_name.as_deref(),
+        &route,
+        &shard,
+        query_class,
+    );
+    let preview = match preview_policy(&preview_file.policy, preview_file.sharding.sharding_enabled, &input) {
+        Ok(preview) => preview,
+        Err(error) => {
+            println!("{}", render_policy_preview_error(&route, Some(&shard), &error));
+            process::exit(1);
+        }
+    };
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                render_policy_preview_success(&route, Some(&shard), &preview)
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn run_route_preview(_config: Config, args: RoutePreviewArgs) -> anyhow::Result<()> {
@@ -96,6 +196,108 @@ fn run_route_preview(_config: Config, args: RoutePreviewArgs) -> anyhow::Result<
     }
 }
 
+fn build_policy_preview_input(
+    database: &str,
+    user: &str,
+    application_name: Option<&str>,
+    route: &str,
+    shard: &str,
+    query_class: RoutingQueryClass,
+) -> pg_kinetic_proxy::policy::PolicyEvalInput {
+    let backend_role = query_class.target_role();
+    let transaction_mode = match query_class {
+        RoutingQueryClass::ReadOnly | RoutingQueryClass::ReadCandidate => {
+            TransactionAccessMode::ReadOnly
+        }
+        _ => TransactionAccessMode::ReadWrite,
+    };
+
+    pg_kinetic_proxy::policy::PolicyEvalInput {
+        database: Arc::from(database),
+        user: Arc::from(user),
+        application_name: application_name.map(Arc::from),
+        route: Some(Arc::from(route)),
+        shard: Some(Arc::from(shard)),
+        backend_role,
+        query_class,
+        transaction_mode,
+        freshness_state: FreshnessStatus::Unknown,
+        routing_decision: None,
+        shard_route_decision: None,
+        password: Some(Arc::from("preview-password")),
+        bind_values: vec![Arc::from("preview-bind-value")],
+        tls_certificate_body: Some(Arc::from("-----BEGIN CERTIFICATE----- preview")),
+        raw_sql_text: Some(Arc::from("SELECT preview_secret")),
+        secrets: vec![Arc::from("preview-secret-token")],
+    }
+}
+
+fn render_policy_preview_success(
+    original_route: &str,
+    original_shard: Option<&str>,
+    preview: &PolicyPreviewEvaluation,
+) -> String {
+    let (policy_adjusted_route, policy_adjusted_shard) =
+        adjusted_preview_targets(original_route, original_shard, &preview.action);
+
+    format!(
+        "{{\"ok\":true,\"policy_mode\":{},\"original_route\":{},\"policy_adjusted_route\":{},\"original_shard\":{},\"policy_adjusted_shard\":{},\"action\":{},\"dry_run_outcome\":{},\"dry_run_reason\":{},\"deny_reason\":{},\"sqlstate\":{},\"context\":{}}}",
+        json_string(preview.policy_mode.as_str()),
+        json_string(original_route),
+        json_option(policy_adjusted_route.as_deref()),
+        json_option(original_shard),
+        json_option(policy_adjusted_shard.as_deref()),
+        json_string(preview.action.as_str()),
+        json_string(preview.audit_event.outcome.as_str()),
+        json_option(preview.audit_event.reason.as_deref()),
+        json_option(preview.deny_reason.as_deref()),
+        json_option(policy_sqlstate(&preview.action)),
+        json_string(&preview.audit_event.context.to_string())
+    )
+}
+
+fn render_policy_preview_error(
+    original_route: &str,
+    original_shard: Option<&str>,
+    error: &PolicyPreviewError,
+) -> String {
+    format!(
+        "{{\"ok\":false,\"policy_mode\":null,\"original_route\":{},\"policy_adjusted_route\":null,\"original_shard\":{},\"policy_adjusted_shard\":null,\"action\":null,\"dry_run_outcome\":null,\"dry_run_reason\":null,\"deny_reason\":null,\"sqlstate\":null,\"context\":null,\"error\":{{\"code\":{},\"message\":{}}}}}",
+        json_string(original_route),
+        json_option(original_shard),
+        json_string(&error.code),
+        json_string(&error.message)
+    )
+}
+
+fn adjusted_preview_targets(
+    original_route: &str,
+    original_shard: Option<&str>,
+    action: &PolicyAction,
+) -> (Option<String>, Option<String>) {
+    match action {
+        PolicyAction::Allow | PolicyAction::RequirePrimary | PolicyAction::RequireReplica => (
+            Some(original_route.to_owned()),
+            original_shard.map(ToOwned::to_owned),
+        ),
+        PolicyAction::Deny { .. } => (None, None),
+        PolicyAction::RouteOverride { target_id } => {
+            (Some(target_id.as_str().to_owned()), original_shard.map(ToOwned::to_owned))
+        }
+        PolicyAction::ShardOverride { target_id } => (
+            Some(original_route.to_owned()),
+            Some(target_id.as_str().to_owned()),
+        ),
+    }
+}
+
+fn policy_sqlstate(action: &PolicyAction) -> Option<&'static str> {
+    match action {
+        PolicyAction::Deny { sqlstate, .. } => Some(*sqlstate),
+        _ => None,
+    }
+}
+
 fn load_route_preview_config(path: &PathBuf) -> Result<RoutePreviewFileConfig, RoutePreviewError> {
     let contents = fs::read_to_string(path).map_err(|error| {
         RoutePreviewError::new(
@@ -103,8 +305,23 @@ fn load_route_preview_config(path: &PathBuf) -> Result<RoutePreviewFileConfig, R
             format!("read {}: {error}", path.display()),
         )
     })?;
-    toml::from_str(&contents).map_err(|error| {
+        toml::from_str(&contents).map_err(|error| {
         RoutePreviewError::new(
+            "config_load_failed",
+            format!("parse {}: {error}", path.display()),
+        )
+    })
+}
+
+fn load_policy_preview_config(path: &PathBuf) -> Result<PolicyPreviewFileConfig, PolicyPreviewError> {
+    let contents = fs::read_to_string(path).map_err(|error| {
+        PolicyPreviewError::new(
+            "config_load_failed",
+            format!("read {}: {error}", path.display()),
+        )
+    })?;
+    toml::from_str(&contents).map_err(|error| {
+        PolicyPreviewError::new(
             "config_load_failed",
             format!("parse {}: {error}", path.display()),
         )
@@ -163,4 +380,19 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn parse_routing_query_class(value: &str) -> Result<RoutingQueryClass, String> {
+    match value {
+        "write" => Ok(RoutingQueryClass::Write),
+        "read_only" => Ok(RoutingQueryClass::ReadOnly),
+        "read_candidate" => Ok(RoutingQueryClass::ReadCandidate),
+        "transaction_control" => Ok(RoutingQueryClass::TransactionControl),
+        "session_mutation" => Ok(RoutingQueryClass::SessionMutation),
+        "copy" => Ok(RoutingQueryClass::Copy),
+        "unknown" => Ok(RoutingQueryClass::Unknown),
+        _ => Err(format!(
+            "invalid query class '{value}', expected one of: write, read_only, read_candidate, transaction_control, session_mutation, copy, unknown"
+        )),
+    }
 }
