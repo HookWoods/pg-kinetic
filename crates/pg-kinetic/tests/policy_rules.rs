@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use pg_kinetic::core::{
+    lsn::FreshnessStatus,
     policy::{
         PolicyDecisionReason, PolicyHookPoint, PolicyRouteTargetId, PolicyShardTargetId,
     },
     policy_rule::{
         PolicyRule, PolicyRuleAction, PolicyRuleContext, PolicyRuleMatch, PolicyRuleSet,
     },
-    routing::{BackendRole, QueryClass},
+    route::{QueryClass as RouteQueryClass, RouteKey},
+    routing::{BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass, RoutingDecision, RoutingHint, RoutingReason},
+    session::TransactionAccessMode,
+    sharding::{MultiShardPolicy, ShardId, ShardRoute, ShardRouteDecision, ShardRouteReason, ShardTarget},
 };
+use pg_kinetic::proxy_runtime::policy::{PolicyEvalInput, PolicyRuntime};
 
 #[test]
 fn rule_matches_supported_policy_fields() {
@@ -316,4 +321,125 @@ fn policy_rules_cannot_match_raw_sql_text_by_default() {
         error.to_string(),
         "raw sql text matches are not supported by policy rules"
     );
+}
+
+#[test]
+fn policy_context_includes_routing_dimensions_and_safe_labels() {
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 8_192);
+    let output = runtime.context_builder().build(&sample_policy_eval_input());
+
+    let field_names = output
+        .context
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .collect::<Vec<_>>();
+
+    assert!(field_names.contains(&"database"));
+    assert!(field_names.contains(&"user"));
+    assert!(field_names.contains(&"application_name"));
+    assert!(field_names.contains(&"route"));
+    assert!(field_names.contains(&"shard"));
+    assert!(field_names.contains(&"backend_role"));
+    assert!(field_names.contains(&"query_class"));
+    assert!(field_names.contains(&"transaction_mode"));
+    assert!(field_names.contains(&"freshness_state"));
+    assert!(field_names.contains(&"route_key"));
+    assert!(field_names.contains(&"routing_reason"));
+    assert!(field_names.contains(&"shard_route_reason"));
+}
+
+#[test]
+fn policy_context_excludes_sensitive_material() {
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 8_192);
+    let output = runtime.context_builder().build(&sample_policy_eval_input());
+
+    assert!(!output.rendered_context.contains("swordfish"));
+    assert!(!output.rendered_context.contains("alpha=1"));
+    assert!(!output.rendered_context.contains("BEGIN SELECT 1"));
+    assert!(!output.rendered_context.contains("-----BEGIN CERTIFICATE-----"));
+    assert!(output.rendered_context.contains("sensitive_inputs=<redacted>"));
+}
+
+#[test]
+fn policy_context_size_is_bounded() {
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 160);
+    let output = runtime.context_builder().build(&large_policy_eval_input());
+
+    assert!(output.context.rendered_len_bytes() <= 160);
+    assert!(output.rendered_context_bytes <= 160);
+    assert!(output.truncated);
+}
+
+#[test]
+fn redacted_policy_context_rendering_is_stable() {
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 8_192);
+    let input = sample_policy_eval_input();
+
+    let first = runtime.context_builder().build(&input);
+    let second = runtime.context_builder().build(&input);
+
+    assert_eq!(first.context, second.context);
+    assert_eq!(first.rendered_context, second.rendered_context);
+    assert_eq!(format!("{}", first.context), first.rendered_context);
+}
+
+fn sample_policy_eval_input() -> PolicyEvalInput {
+    let route_key = RouteKey::new(
+        "appdb",
+        "reporter",
+        Some("psql"),
+        None,
+        RouteQueryClass::Read,
+    );
+    let routing_decision = RoutingDecision::new(
+        BackendRole::Replica,
+        QueryClass::ReadOnly,
+        RoutingHint::StrictFresh,
+        RoutingReason::ReadOnlyQuery,
+        FallbackPolicy::Primary,
+        FreshnessPolicy::SessionWriteLsn,
+    );
+    let shard_route = ShardRoute::new(
+        ShardTarget::new(
+            route_key.clone(),
+            BackendRole::Replica,
+            ShardId::new("tenant-a").expect("valid shard id"),
+        ),
+        ShardRouteReason::HashMatch,
+    );
+    let shard_route_decision = ShardRouteDecision::new(
+        Some(shard_route),
+        ShardRouteReason::HashMatch,
+        MultiShardPolicy::FirstMatch,
+    );
+
+    PolicyEvalInput {
+        database: Arc::from("appdb"),
+        user: Arc::from("reporter"),
+        application_name: Some(Arc::from("psql")),
+        route: Some(Arc::from("read-route")),
+        shard: Some(Arc::from("tenant-a")),
+        backend_role: BackendRole::Replica,
+        query_class: QueryClass::ReadOnly,
+        transaction_mode: TransactionAccessMode::ReadOnly,
+        freshness_state: FreshnessStatus::Waiting,
+        routing_decision: Some(routing_decision),
+        shard_route_decision: Some(shard_route_decision),
+        password: Some(Arc::from("swordfish")),
+        bind_values: vec![Arc::from("alpha=1"), Arc::from("beta=2")],
+        tls_certificate_body: Some(Arc::from("-----BEGIN CERTIFICATE-----")),
+        raw_sql_text: Some(Arc::from("BEGIN SELECT 1")),
+        secrets: vec![Arc::from("super-secret-token")],
+    }
+}
+
+fn large_policy_eval_input() -> PolicyEvalInput {
+    let mut input = sample_policy_eval_input();
+    input.database = Arc::from("database-with-an-intentionally-long-name-to-exercise-truncation");
+    input.user = Arc::from("reporting-user-with-an-intentionally-long-name-to-exercise-truncation");
+    input.application_name = Some(Arc::from("application-name-with-an-intentionally-long-name-to-exercise-truncation"));
+    input.route = Some(Arc::from("route-name-with-an-intentionally-long-name-to-exercise-truncation"));
+    input.shard = Some(Arc::from("shard-name-with-an-intentionally-long-name-to-exercise-truncation"));
+    input
 }

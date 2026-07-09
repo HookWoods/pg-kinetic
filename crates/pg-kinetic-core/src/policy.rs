@@ -505,6 +505,19 @@ impl PolicyContextField {
     }
 
     #[must_use]
+    pub fn rendered_value(&self) -> &str {
+        match self {
+            Self::Public { value, .. } => value,
+            Self::Secret { .. } => REDACTED_VALUE,
+        }
+    }
+
+    #[must_use]
+    pub fn rendered_len_bytes(&self) -> usize {
+        self.name().len() + 1 + self.rendered_value().len()
+    }
+
+    #[must_use]
     pub const fn is_secret(&self) -> bool {
         matches!(self, Self::Secret { .. })
     }
@@ -527,6 +540,12 @@ impl fmt::Debug for PolicyContextField {
     }
 }
 
+impl Display for PolicyContextField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}={}", self.name(), self.rendered_value())
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PolicyContext {
     fields: Vec<PolicyContextField>,
@@ -545,8 +564,40 @@ impl PolicyContext {
         &self.fields
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
     pub fn push_field(&mut self, field: PolicyContextField) {
         self.fields.push(field);
+    }
+
+    #[must_use]
+    pub fn rendered_len_bytes(&self) -> usize {
+        match self.fields.split_first() {
+            Some((first, rest)) => {
+                first.rendered_len_bytes()
+                    + rest
+                        .iter()
+                        .map(PolicyContextField::rendered_len_bytes)
+                        .sum::<usize>()
+                    + rest.len() * 2
+            }
+            None => 0,
+        }
+    }
+}
+
+impl Display for PolicyContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, field) in self.fields.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{field}")?;
+        }
+        Ok(())
     }
 }
 

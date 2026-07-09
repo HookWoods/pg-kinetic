@@ -7,6 +7,7 @@ pub mod health;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;
+pub mod policy;
 pub mod reload;
 pub mod routing;
 pub mod sharding;
