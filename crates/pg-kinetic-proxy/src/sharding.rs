@@ -26,8 +26,9 @@ use crate::config::{
     ShardTargetConfig, ShardingConfig,
 };
 use crate::routing::{
-    bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, ReplicaCandidate,
-    RouteHealthSnapshot, RoutingContext, RoutingReason, RoutingTarget,
+    bridge_shard_route_decision, choose_routing_target,
+    ensure_policy_action_target_is_safe as ensure_routing_target_is_safe, ReadRoutingPlanner,
+    ReplicaCandidate, RouteHealthSnapshot, RoutingContext, RoutingReason, RoutingTarget,
 };
 use crate::{reload, snapshot::SnapshotStore};
 
@@ -802,7 +803,7 @@ pub fn apply_policy_action_to_sharded_routing_target(
     current_target: RoutingTarget,
     action: Option<&PolicyAction>,
 ) -> RoutingTarget {
-    match action {
+    let target = match action {
         None | Some(PolicyAction::Allow) => current_target,
         Some(PolicyAction::Deny { .. }) => RoutingTarget::Reject {
             reason: RoutingReason::PolicyDenied,
@@ -848,7 +849,18 @@ pub fn apply_policy_action_to_sharded_routing_target(
             current_target,
             RoutingReason::PolicyShardOverride,
         ),
-    }
+    };
+
+    ensure_routing_target_is_safe(
+        &planner.read_routing,
+        RoutingContext::new(
+            context.sql,
+            context.transaction_state,
+            context.read_after_write_state,
+            context.health,
+        ),
+        target,
+    )
 }
 
 #[must_use]

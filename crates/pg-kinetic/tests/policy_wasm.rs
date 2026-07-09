@@ -1,11 +1,9 @@
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
-
-#[cfg(feature = "policy-wasm")]
 use std::time::Duration;
+use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 use pg_kinetic::config::{InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig, PolicyWasmConfig};
 use pg_kinetic::core::{
-    policy::{PolicyHookPoint, PolicyId},
+    policy::{PolicyAction, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyPluginError},
 };
 use pg_kinetic::proxy_runtime::policy::PolicyRuntime;
 
@@ -80,6 +78,67 @@ fn wasm_policy_support_is_disabled_by_default() {
 
     assert!(!config.policy_wasm.policy_wasm_enabled);
     assert!(!runtime.policy_wasm_enabled());
+}
+
+#[test]
+fn policy_failure_mode_defaults_follow_policy_mode() {
+    let enforce_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce);
+    let dry_run_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::DryRun);
+
+    assert_eq!(
+        enforce_runtime.policy_failure_mode(),
+        PolicyFailureMode::FailClosed
+    );
+    assert_eq!(
+        dry_run_runtime.policy_failure_mode(),
+        PolicyFailureMode::DisablePolicy
+    );
+}
+
+#[test]
+fn policy_failure_mode_maps_timeout_and_engine_errors_to_configured_fallbacks() {
+    let timeout_error = PolicyPluginError::evaluation_timeout(
+        Duration::from_millis(12),
+        Duration::from_millis(5),
+    );
+    let engine_error = PolicyPluginError::output_validation_failed("policy engine exploded");
+
+    let fail_closed_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce);
+    assert_eq!(
+        fail_closed_runtime.policy_failure_action_for_error(&timeout_error),
+        Some(PolicyAction::deny())
+    );
+    assert_eq!(
+        fail_closed_runtime.policy_failure_action_for_error(&engine_error),
+        Some(PolicyAction::deny())
+    );
+
+    let fail_open_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce)
+        .with_policy_failure_mode(PolicyFailureMode::FailOpen);
+    assert_eq!(
+        fail_open_runtime.policy_failure_action_for_error(&timeout_error),
+        Some(PolicyAction::allow())
+    );
+    assert_eq!(
+        fail_open_runtime.policy_failure_action_for_error(&engine_error),
+        Some(PolicyAction::allow())
+    );
+
+    let disable_policy_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
+        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::DryRun)
+        .with_policy_failure_mode(PolicyFailureMode::DisablePolicy);
+    assert_eq!(
+        disable_policy_runtime.policy_failure_action_for_error(&timeout_error),
+        None
+    );
+    assert_eq!(
+        disable_policy_runtime.policy_failure_action_for_error(&engine_error),
+        None
+    );
 }
 
 #[cfg(not(feature = "policy-wasm"))]

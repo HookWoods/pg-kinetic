@@ -292,6 +292,72 @@ fn policy_overrides_do_not_bypass_health_checks() {
 }
 
 #[test]
+fn policy_actions_do_not_bypass_pinning_or_recovery_safety() {
+    let planner = sample_planner();
+    let pinned_health = RouteHealthSnapshot::new(vec![healthy_replica_candidate(
+        11,
+        Some(sample_lsn()),
+        Some(10),
+    )]);
+    let pinned_context = RoutingContext::new(
+        "SELECT 1",
+        TransactionState::InTransaction,
+        ReadAfterWriteState::Disabled,
+        &pinned_health,
+    );
+    let pinned_target = choose_routing_target(&planner, pinned_context.clone());
+    assert!(matches!(
+        pinned_target,
+        RoutingTarget::Primary {
+            reason: RoutingReason::InTransaction,
+        }
+    ));
+    let pinned_result = apply_policy_after_routing_target(
+        &planner,
+        pinned_context,
+        pinned_target,
+        Some(&PolicyAction::require_replica()),
+    );
+    assert!(matches!(
+        pinned_result,
+        RoutingTarget::Primary {
+            reason: RoutingReason::PolicyRequireReplica,
+        }
+    ));
+
+    let recovery_health = RouteHealthSnapshot::new(vec![healthy_replica_candidate(
+        12,
+        Some(sample_lsn()),
+        Some(10),
+    )]);
+    let recovery_context = RoutingContext::new(
+        "SELECT 1",
+        TransactionState::FailedTransaction,
+        ReadAfterWriteState::Required(sample_lsn()),
+        &recovery_health,
+    );
+    let recovery_target = choose_routing_target(&planner, recovery_context.clone());
+    assert!(matches!(
+        recovery_target,
+        RoutingTarget::Primary {
+            reason: RoutingReason::FailedTransaction,
+        }
+    ));
+    let recovery_result = apply_policy_before_checkout_target(
+        &planner,
+        recovery_context,
+        recovery_target,
+        Some(&PolicyAction::require_replica()),
+    );
+    assert!(matches!(
+        recovery_result,
+        RoutingTarget::Primary {
+            reason: RoutingReason::PolicyRequireReplica,
+        }
+    ));
+}
+
+#[test]
 fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
     let runtime = pg_kinetic::proxy_runtime::policy::PolicyRuntime::new(
         Duration::from_millis(5),

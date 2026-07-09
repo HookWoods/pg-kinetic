@@ -235,6 +235,47 @@ impl Display for PolicyMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PolicyFailureMode {
+    FailClosed,
+    FailOpen,
+    DisablePolicy,
+}
+
+impl PolicyFailureMode {
+    #[must_use]
+    pub const fn default_for_policy_mode(policy_mode: PolicyMode) -> Self {
+        match policy_mode {
+            PolicyMode::Enforce => Self::FailClosed,
+            PolicyMode::Disabled | PolicyMode::DryRun => Self::DisablePolicy,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::FailOpen => "fail_open",
+            Self::DisablePolicy => "disable_policy",
+        }
+    }
+
+    #[must_use]
+    pub const fn fallback_action(self) -> Option<PolicyAction> {
+        match self {
+            Self::FailClosed => Some(PolicyAction::deny()),
+            Self::FailOpen => Some(PolicyAction::allow()),
+            Self::DisablePolicy => None,
+        }
+    }
+}
+
+impl Display for PolicyFailureMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PolicyPluginAbiVersion {
     V1,
 }

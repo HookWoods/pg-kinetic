@@ -363,9 +363,9 @@ pub fn apply_policy_action_to_routing_target(
 ) -> RoutingTarget {
     let routing_context = context.clone();
     let current_target =
-        current_target.unwrap_or_else(|| choose_routing_target(planner, routing_context));
+        current_target.unwrap_or_else(|| choose_routing_target(planner, routing_context.clone()));
 
-    match action {
+    let target = match action {
         None | Some(PolicyAction::Allow) => current_target,
         Some(PolicyAction::Deny { .. }) => policy_denied_target(),
         Some(PolicyAction::RequirePrimary) => RoutingTarget::Primary {
@@ -378,7 +378,7 @@ pub fn apply_policy_action_to_routing_target(
                 planner.freshness_policy(),
                 planner.max_replica_lag_ms(),
             );
-            match choose_routing_target(&replica_planner, context) {
+            match choose_routing_target(&replica_planner, routing_context.clone()) {
                 RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica {
                     candidate,
                     reason: RoutingReason::PolicyRequireReplica,
@@ -401,7 +401,9 @@ pub fn apply_policy_action_to_routing_target(
             current_target,
             RoutingReason::PolicyShardOverride,
         ),
-    }
+    };
+
+    ensure_policy_action_target_is_safe(planner, routing_context, target)
 }
 
 fn primary_for_query_class(query_class: QueryClass) -> RoutingTarget {
@@ -451,6 +453,31 @@ fn map_routing_target_reason(
         RoutingTarget::Replica { candidate, .. } => RoutingTarget::Replica { candidate, reason },
         RoutingTarget::Wait { .. } => RoutingTarget::Wait { reason },
         RoutingTarget::Reject { .. } => RoutingTarget::Reject { reason },
+    }
+}
+
+pub(crate) fn ensure_policy_action_target_is_safe(
+    planner: &ReadRoutingPlanner,
+    context: RoutingContext<'_>,
+    target: RoutingTarget,
+) -> RoutingTarget {
+    match target {
+        RoutingTarget::Replica {
+            candidate,
+            reason,
+        } if candidate.healthy
+            && !candidate.split_brain
+            && replica_satisfies_freshness(
+                &candidate,
+                planner.freshness_policy,
+                context.read_after_write_state,
+                planner.max_replica_lag_ms(),
+            ) =>
+        {
+            RoutingTarget::Replica { candidate, reason }
+        }
+        RoutingTarget::Replica { .. } => choose_routing_target(planner, context),
+        other => other,
     }
 }
 

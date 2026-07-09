@@ -13,8 +13,9 @@ use pg_kinetic_core::{
     lsn::FreshnessStatus,
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField,
-        PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode, PolicyOutcome, PolicyPluginAction,
-        PolicyPluginError, PolicyPluginInput, PolicyPluginOutput, PolicyVersion,
+        PolicyDecision, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyMode,
+        PolicyOutcome, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
+        PolicyPluginOutput, PolicyVersion,
     },
     routing::{BackendRole, QueryClass, RoutingDecision},
     session::TransactionAccessMode,
@@ -33,6 +34,7 @@ pub struct PolicyRuntime {
     policy_eval_timeout: Duration,
     policy_max_context_bytes: usize,
     policy_mode: PolicyMode,
+    policy_failure_mode: Option<PolicyFailureMode>,
     policy_audit_enabled: bool,
     policy_audit_sample_rate_bits: u64,
     policy_wasm_enabled: bool,
@@ -45,6 +47,7 @@ impl PolicyRuntime {
             policy_eval_timeout,
             policy_max_context_bytes,
             policy_mode: PolicyMode::Disabled,
+            policy_failure_mode: None,
             policy_audit_enabled: true,
             policy_audit_sample_rate_bits: 1.0f64.to_bits(),
             policy_wasm_enabled: false,
@@ -76,6 +79,14 @@ impl PolicyRuntime {
     #[must_use]
     pub const fn policy_mode(&self) -> PolicyMode {
         self.policy_mode
+    }
+
+    #[must_use]
+    pub const fn policy_failure_mode(&self) -> PolicyFailureMode {
+        match self.policy_failure_mode {
+            Some(mode) => mode,
+            None => PolicyFailureMode::default_for_policy_mode(self.policy_mode),
+        }
     }
 
     #[must_use]
@@ -177,6 +188,20 @@ impl PolicyRuntime {
     pub fn with_policy_mode(mut self, policy_mode: PolicyMode) -> Self {
         self.policy_mode = policy_mode;
         self
+    }
+
+    #[must_use]
+    pub fn with_policy_failure_mode(mut self, policy_failure_mode: PolicyFailureMode) -> Self {
+        self.policy_failure_mode = Some(policy_failure_mode);
+        self
+    }
+
+    #[must_use]
+    pub fn policy_failure_action_for_error(
+        &self,
+        _error: &PolicyPluginError,
+    ) -> Option<PolicyAction> {
+        self.policy_failure_mode().fallback_action()
     }
 
     #[must_use]

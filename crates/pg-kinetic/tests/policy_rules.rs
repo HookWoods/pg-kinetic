@@ -3,9 +3,10 @@ use std::{sync::Arc, time::Duration};
 use pg_kinetic::core::{
     lsn::FreshnessStatus,
     policy::{
-        PolicyContext, PolicyDecisionReason, PolicyHookPoint, PolicyId, PolicyOutcome,
-        PolicyPluginAbiVersion, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
-        PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
+        PolicyAction, PolicyAuditKind, PolicyContext, PolicyDecision, PolicyDecisionReason,
+        PolicyHookPoint, PolicyId, PolicyOutcome, PolicyPluginAbiVersion, PolicyPluginAction,
+        PolicyPluginError, PolicyPluginInput, PolicyPluginOutput, PolicyRouteTargetId,
+        PolicyShardTargetId, PolicyVersion,
     },
     policy_rule::{
         PolicyRule, PolicyRuleAction, PolicyRuleContext, PolicyRuleMatch, PolicyRuleSet,
@@ -361,6 +362,41 @@ fn policy_context_excludes_sensitive_material() {
     assert!(!output.rendered_context.contains("BEGIN SELECT 1"));
     assert!(!output.rendered_context.contains("-----BEGIN CERTIFICATE-----"));
     assert!(output.rendered_context.contains("sensitive_inputs=<redacted>"));
+}
+
+#[test]
+fn policy_audit_events_redact_sensitive_material() {
+    let runtime = PolicyRuntime::new(Duration::from_millis(5), 8_192);
+    let decision = PolicyDecision::new(
+        PolicyId::new("audit-policy").expect("policy id"),
+        PolicyVersion::new(1).expect("policy version"),
+        PolicyAction::deny(),
+        PolicyOutcome::DryRun,
+        PolicyHookPoint::BeforeRouting,
+        Duration::from_millis(0),
+    );
+    let event = runtime.build_audit_event_from_input(
+        PolicyAuditKind::Decision,
+        decision,
+        &sample_policy_eval_input(),
+    );
+
+    let rendered = format!("{event:?}");
+    for forbidden in [
+        "swordfish",
+        "alpha=1",
+        "beta=2",
+        "BEGIN CERTIFICATE",
+        "top-secret",
+        "BEGIN SELECT 1",
+        "super-secret-token",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "audit event leaked sensitive payload: {forbidden}"
+        );
+    }
+    assert!(rendered.contains("<redacted>"));
 }
 
 #[test]
