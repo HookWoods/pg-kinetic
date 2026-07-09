@@ -21,9 +21,10 @@ use crate::{
     reload,
     snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
-        PreparedSnapshot, RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
-        RouteMapReloadSnapshot, RoutePolicySnapshot, RouteSnapshot, ServerSnapshot,
-        SettingsSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+        PolicyReloadSnapshot, PolicyStatusSnapshot, PreparedSnapshot, RecoverySnapshot,
+        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RoutePolicySnapshot,
+        RouteSnapshot, ServerSnapshot, SettingsSnapshot, ShardLifecycleSnapshot,
+        ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -398,6 +399,16 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
         AdminView::Backpressure => {
             backpressure_table(&state.snapshot_store.backpressure_snapshots())
         }
+        AdminView::Policies => policies_table(
+            state.snapshot_store.policy_status_snapshot(),
+            &state.snapshot_store.policy_reload_snapshots(),
+        ),
+        AdminView::PolicyDecisions => {
+            policy_audit_table(&state.snapshot_store.policy_decision_events(), false)
+        }
+        AdminView::PolicyAudit => {
+            policy_audit_table(&state.snapshot_store.policy_audit_events(), true)
+        }
         AdminView::Routes => routes_table(
             latest_route_map_generation(&state.snapshot_store.route_map_reload_snapshots()),
             sharding_snapshot.sharding_enabled,
@@ -640,6 +651,93 @@ fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
                 ])
             })
             .collect(),
+    )
+}
+
+fn policies_table(
+    status: Option<PolicyStatusSnapshot>,
+    reloads: &[PolicyReloadSnapshot],
+) -> AdminTable {
+    let columns = &[
+        ("policy_id", AdminColumnType::Text),
+        ("policy_version", AdminColumnType::Int8),
+        ("policy_mode", AdminColumnType::Text),
+        ("source", AdminColumnType::Text),
+        ("enabled", AdminColumnType::Bool),
+        ("last_reload_outcome", AdminColumnType::Text),
+        ("error_code", AdminColumnType::Text),
+    ];
+
+    let rows = status
+        .map(|status| {
+            let last_reload = reloads.last();
+            vec![AdminRow::new(vec![
+                status.policy_id,
+                status.policy_version.to_string(),
+                status.policy_mode.as_str().to_string(),
+                status.source,
+                status.enabled.to_string(),
+                policy_reload_outcome_label(last_reload),
+                optional_text(last_reload.and_then(|snapshot| snapshot.error_code.map(|code| code.as_str()))),
+            ])]
+        })
+        .unwrap_or_default();
+
+    admin_table(AdminView::Policies, columns, rows)
+}
+
+fn policy_audit_table(
+    events: &[pg_kinetic_core::policy::PolicyAuditEvent],
+    include_kind: bool,
+) -> AdminTable {
+    let mut column_specs = Vec::new();
+    if include_kind {
+        column_specs.push(("kind", AdminColumnType::Text));
+    }
+    column_specs.extend_from_slice(&[
+        ("policy_id", AdminColumnType::Text),
+        ("policy_version", AdminColumnType::Int8),
+        ("hook_point", AdminColumnType::Text),
+        ("action", AdminColumnType::Text),
+        ("outcome", AdminColumnType::Text),
+        ("reason", AdminColumnType::Text),
+        ("route", AdminColumnType::Text),
+        ("shard", AdminColumnType::Text),
+        ("target_role", AdminColumnType::Text),
+        ("context", AdminColumnType::Text),
+    ]);
+
+    let rows = events
+        .iter()
+        .map(|event| {
+            let mut values = Vec::new();
+            if include_kind {
+                values.push(event.kind.as_str().to_string());
+            }
+            values.extend_from_slice(&[
+                event.policy_id.as_str().to_string(),
+                event.policy_version.as_u64().to_string(),
+                event.hook_point.as_str().to_string(),
+                event.action.as_str().to_string(),
+                event.outcome.as_str().to_string(),
+                optional_text(event.reason.as_deref()),
+                optional_text(event.route.as_deref()),
+                optional_text(event.shard.as_deref()),
+                optional_text(event.target_role.as_deref()),
+                event.context.to_string(),
+            ]);
+            AdminRow::new(values)
+        })
+        .collect();
+
+    admin_table(
+        if include_kind {
+            AdminView::PolicyAudit
+        } else {
+            AdminView::PolicyDecisions
+        },
+        column_specs.as_slice(),
+        rows,
     )
 }
 
@@ -997,6 +1095,14 @@ fn admin_wire_type(column_type: AdminColumnType) -> AdminWireType {
 
 fn optional_text(value: Option<&str>) -> String {
     value.map_or_else(|| String::from("<none>"), str::to_owned)
+}
+
+fn policy_reload_outcome_label(snapshot: Option<&PolicyReloadSnapshot>) -> String {
+    match snapshot {
+        Some(snapshot) if snapshot.success => String::from("success"),
+        Some(_) => String::from("failure"),
+        None => String::from("<none>"),
+    }
 }
 
 fn optional_route_key(value: Option<&RouteKey>) -> String {

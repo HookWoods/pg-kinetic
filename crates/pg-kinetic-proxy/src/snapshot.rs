@@ -10,8 +10,8 @@ use pg_kinetic_core::{
     lsn::{FreshnessStatus, PgLsn},
     observability::MetricOutcome,
     prepare::PreparedStatementSnapshot,
+    policy::{PolicyAuditEvent, PolicyMode},
     recovery::{RecoveryAction, RecoveryTrigger},
-    policy::PolicyAuditEvent,
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     session::PinReason,
@@ -27,6 +27,7 @@ use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
 
 const POLICY_AUDIT_RING_CAPACITY: usize = 128;
+const POLICY_DECISION_RING_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -341,6 +342,33 @@ impl PolicyReloadSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyStatusSnapshot {
+    pub policy_id: String,
+    pub policy_version: u64,
+    pub policy_mode: PolicyMode,
+    pub source: String,
+    pub enabled: bool,
+}
+
+impl PolicyStatusSnapshot {
+    #[must_use]
+    pub fn new(
+        policy_id: impl Into<String>,
+        policy_version: u64,
+        policy_mode: PolicyMode,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy_id: policy_id.into(),
+            policy_version,
+            enabled: !matches!(policy_mode, PolicyMode::Disabled),
+            policy_mode,
+            source: source.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardLifecycleSnapshot {
     pub shard_id: ShardId,
     pub lifecycle_state: ShardLifecycleState,
@@ -537,6 +565,8 @@ struct SnapshotStoreInner {
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
     route_map_reloads: Vec<RouteMapReloadSnapshot>,
     policy_reloads: Vec<PolicyReloadSnapshot>,
+    policy_status: Option<PolicyStatusSnapshot>,
+    policy_decisions: VecDeque<PolicyAuditEvent>,
     policy_audit_events: VecDeque<PolicyAuditEvent>,
     sharding: ShardingConfig,
     shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
@@ -960,12 +990,25 @@ impl SnapshotStore {
             .clone()
     }
 
+    pub fn set_policy_status_snapshot(&self, snapshot: PolicyStatusSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .policy_status = Some(snapshot);
+    }
+
+    #[must_use]
+    pub fn policy_status_snapshot(&self) -> Option<PolicyStatusSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .policy_status
+            .clone()
+    }
+
     pub fn record_policy_audit_event(&self, event: PolicyAuditEvent) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
-            inner.policy_audit_events.pop_front();
-        }
-        inner.policy_audit_events.push_back(event);
+        record_policy_event(&mut inner, event);
     }
 
     #[must_use]
@@ -974,6 +1017,17 @@ impl SnapshotStore {
             .read()
             .expect("snapshot store poisoned")
             .policy_audit_events
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn policy_decision_events(&self) -> Vec<PolicyAuditEvent> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .policy_decisions
             .iter()
             .cloned()
             .collect()
@@ -1321,10 +1375,7 @@ impl PolicyAuditSnapshotHandle {
 
     pub fn record(&self, event: PolicyAuditEvent) {
         let mut inner = self.inner.write().expect("snapshot store poisoned");
-        if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
-            inner.policy_audit_events.pop_front();
-        }
-        inner.policy_audit_events.push_back(event);
+        record_policy_event(&mut inner, event);
     }
 }
 
@@ -1347,6 +1398,20 @@ where
 
 trait RouteSnapshotView {
     fn route_sort_key(&self) -> (String, String, Option<String>, String, String);
+}
+
+fn record_policy_event(inner: &mut SnapshotStoreInner, event: PolicyAuditEvent) {
+    if inner.policy_audit_events.len() == POLICY_AUDIT_RING_CAPACITY {
+        inner.policy_audit_events.pop_front();
+    }
+    inner.policy_audit_events.push_back(event.clone());
+
+    if matches!(event.kind, pg_kinetic_core::policy::PolicyAuditKind::Decision) {
+        if inner.policy_decisions.len() == POLICY_DECISION_RING_CAPACITY {
+            inner.policy_decisions.pop_front();
+        }
+        inner.policy_decisions.push_back(event);
+    }
 }
 
 impl RouteSnapshotView for BackpressureSnapshot {
