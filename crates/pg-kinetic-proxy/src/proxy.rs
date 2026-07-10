@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{RwLock, Semaphore},
+    task::JoinSet,
     time::timeout,
 };
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
@@ -24,8 +25,10 @@ use crate::routing::{
 use crate::{
     admin, auth,
     config::{Config, RouteConfig},
-    drain::{DrainController, DrainOutcome},
-    health, metrics,
+    drain::DrainController,
+    health,
+    lifecycle::{wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator},
+    metrics,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
         ReplicaSelectionStrategy, ReplicaSelector, RoutePools,
@@ -57,6 +60,7 @@ use pg_kinetic_core::{
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
+    runtime::ShutdownReason,
     session::PinReason as SessionPinReason,
     session::TransactionState,
     shard_extract::{extract_shard_hint, ShardHint},
@@ -162,7 +166,7 @@ impl ClientConnection {
 pub struct Proxy {
     config: Config,
     client_slots: Arc<Semaphore>,
-    drain: Arc<DrainController>,
+    lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
 }
 
@@ -171,19 +175,30 @@ impl Proxy {
     pub fn new(config: Config) -> Self {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
         let drain = Arc::new(DrainController::new());
+        let lifecycle = LifecycleController::new(
+            drain,
+            config.drain.drain_timeout(),
+            config.runtime.lifecycle.shutdown_grace(),
+            config.runtime.lifecycle.readiness_fail_during_drain,
+        );
         let snapshot_store = SnapshotStore::new();
 
         Self {
             config,
             client_slots,
-            drain,
+            lifecycle,
             snapshot_store,
         }
     }
 
     #[must_use]
     pub fn drain_controller(&self) -> Arc<DrainController> {
-        Arc::clone(&self.drain)
+        self.lifecycle.drain_controller()
+    }
+
+    #[must_use]
+    pub fn lifecycle_controller(&self) -> LifecycleController {
+        self.lifecycle.clone()
     }
 
     #[must_use]
@@ -194,6 +209,14 @@ impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
+        self.lifecycle.configure(
+            effective_config.drain.drain_timeout(),
+            effective_config.runtime.lifecycle.shutdown_grace(),
+            effective_config
+                .runtime
+                .lifecycle
+                .readiness_fail_during_drain,
+        );
         let phase_recorder = telemetry::shared_phase_timing_recorder();
         let debug_sampler =
             DebugSampler::new(effective_config.observability.trace_sampling_ratio());
@@ -212,6 +235,7 @@ impl Proxy {
             &route_config,
             self.snapshot_store.clone(),
         ));
+        self.lifecycle.mark_backend_pools_initialized();
         let routing_planner = ReadRoutingPlanner::new(
             route_config.read_routing.read_routing_mode,
             route_config.read_routing.fallback_policy,
@@ -219,11 +243,18 @@ impl Proxy {
             route_config.freshness.max_replica_lag_ms,
         );
 
+        let listener = TcpListener::bind(effective_config.connection.listen_addr)
+            .await
+            .with_context(|| {
+                format!("bind listener {}", effective_config.connection.listen_addr)
+            })?;
+
+        let drain = self.lifecycle.drain_controller();
         let _health_handle = if let Some(health_addr) = effective_config.health.health_addr {
             Some(
                 health::spawn(
                     health_addr,
-                    Arc::clone(&self.drain),
+                    Arc::clone(&drain),
                     route_config.primary.address,
                     effective_config.tls.clone(),
                     effective_config.socket.clone(),
@@ -240,7 +271,7 @@ impl Proxy {
                 admin::spawn(
                     admin_addr,
                     effective_config.clone(),
-                    Arc::clone(&self.drain),
+                    Arc::clone(&drain),
                     self.snapshot_store.clone(),
                 )
                 .await?,
@@ -248,6 +279,7 @@ impl Proxy {
         } else {
             None
         };
+        self.lifecycle.mark_listeners_initialized();
 
         if effective_config.reload.reload_enabled && effective_config.reload.config_file.is_some() {
             let base_config = self.config.clone();
@@ -258,36 +290,46 @@ impl Proxy {
             });
         }
 
-        let listener = TcpListener::bind(effective_config.connection.listen_addr)
-            .await
-            .with_context(|| {
-                format!("bind listener {}", effective_config.connection.listen_addr)
-            })?;
-
         tracing::info!(listen_addr = %effective_config.connection.listen_addr, "listening");
 
-        let drain_timeout = effective_config.drain.drain_timeout();
-        let mut shutdown = Box::pin(tokio::signal::ctrl_c());
-        let mut drain_start_wait = Box::pin(self.drain.wait_for_drain_start());
+        let mut shutdown = Box::pin(wait_for_shutdown_signal());
+        let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
+        let mut client_tasks = JoinSet::new();
         let mut draining = false;
 
         loop {
             if draining {
-                let mut drain_completion = Box::pin(self.drain.wait_for_completion());
+                let shutdown_coordinator = ShutdownCoordinator::new(self.lifecycle.clone());
+                let coordinator = shutdown_coordinator.clone();
+                let mut shutdown_completion =
+                    Box::pin(async move { coordinator.coordinate().await });
                 loop {
                     tokio::select! {
                         biased;
-                        outcome = &mut drain_completion => {
-                            self.drain.finish_drain();
-                            match outcome {
-                                DrainOutcome::Completed => {
-                                    tracing::info!(active_clients = self.drain.active_clients(), "drain completed");
+                        outcome = &mut shutdown_completion => {
+                            if outcome.forced_sessions() > 0 {
+                                tracing::warn!(
+                                    active_clients = outcome.forced_sessions(),
+                                    "shutdown grace expired; force-closing client sessions"
+                                );
+                                client_tasks.abort_all();
+                                while let Some(result) = client_tasks.join_next().await {
+                                    if let Err(error) = result {
+                                        if !error.is_cancelled() {
+                                            tracing::warn!(error = %error, "client task failed during shutdown");
+                                        }
+                                    }
                                 }
-                                DrainOutcome::TimedOut => {
-                                    tracing::warn!(active_clients = self.drain.active_clients(), "drain timed out");
-                                }
+                            } else {
+                                tracing::info!(active_clients = drain.active_clients(), "drain completed");
                             }
+                            shutdown_coordinator.complete();
                             return Ok(());
+                        }
+                        joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                            if let Some(Err(error)) = joined {
+                                tracing::warn!(error = %error, "client task failed");
+                            }
                         }
                         accept = listener.accept() => {
                             let (client, client_addr) = accept.context("accept draining client")?;
@@ -306,14 +348,21 @@ impl Proxy {
 
             tokio::select! {
                 biased;
-                _ = &mut shutdown => {
-                    if self.drain.begin_drain(drain_timeout) {
+                result = &mut shutdown => {
+                    let reason = result.context("wait for shutdown signal")?;
+                    if self.lifecycle.begin_drain(reason) {
                         tracing::info!("received shutdown signal; beginning drain");
                     }
                     draining = true;
                 }
                 _ = &mut drain_start_wait => {
+                    self.lifecycle.begin_drain(ShutdownReason::AdminRequest);
                     draining = true;
+                }
+                joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    if let Some(Err(error)) = joined {
+                        tracing::warn!(error = %error, "client task failed");
+                    }
                 }
                 accept = listener.accept() => {
                     let (client, client_addr) = accept.context("accept client")?;
@@ -324,7 +373,7 @@ impl Proxy {
                     let client = ClientConnection::new(client);
                     metrics::increment_client_connections();
 
-                    let Some(client_guard) = self.drain.try_enter_client() else {
+                    let Some(client_guard) = self.lifecycle.drain_token().try_enter() else {
                         let mut client = client;
                         reject_client_during_drain(&mut client, phase_recorder.as_ref()).await?;
                         tracing::info!(%client_addr, "rejected client during drain");
@@ -348,7 +397,7 @@ impl Proxy {
                     );
                     let phase_recorder = Arc::clone(&phase_recorder);
 
-                    tokio::spawn(async move {
+                    client_tasks.spawn(async move {
                         let _client_guard = client_guard;
                         let result = handle_client(
                         client,

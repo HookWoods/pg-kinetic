@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 pub mod drain;
 pub mod health;
+pub mod lifecycle;
 pub mod metrics;
 pub mod policy;
 #[cfg(feature = "policy-wasm")]
