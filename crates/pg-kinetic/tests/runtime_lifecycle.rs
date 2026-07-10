@@ -3,8 +3,12 @@ use pg_kinetic_core::runtime::{
     RuntimeEngineStatus, RuntimeLifecycleState, ShutdownReason,
 };
 use pg_kinetic_proxy::{
+    config::LifecycleConfig,
     drain::{DrainController, DrainOutcome},
-    lifecycle::{LifecycleController, ShutdownCoordinator},
+    lifecycle::{
+        KubernetesLifecycle, LifecycleController, PreStopDrainOutcome, ProbeStatus,
+        ShutdownCoordinator,
+    },
 };
 use std::{sync::Arc, time::Duration};
 
@@ -212,4 +216,130 @@ fn lifecycle_updates_observable_snapshots_and_metric_states() {
     assert!(snapshot.listeners_initialized());
     assert!(snapshot.backend_pools_initialized());
     assert_eq!(snapshot.transition_count(), 1);
+}
+
+fn kubernetes_lifecycle(config: LifecycleConfig) -> (LifecycleController, KubernetesLifecycle) {
+    let lifecycle = LifecycleController::new(
+        Arc::new(DrainController::new()),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        config.readiness_fail_during_drain,
+    );
+    let kubernetes = KubernetesLifecycle::new(lifecycle.clone(), &config);
+    (lifecycle, kubernetes)
+}
+
+#[test]
+fn readiness_endpoint_fails_during_drain_when_configured() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_backend_pools_initialized();
+    lifecycle.mark_listeners_initialized();
+
+    assert!(lifecycle.begin_drain(ShutdownReason::AdminRequest));
+    assert_eq!(
+        kubernetes.readiness_probe().status(),
+        ProbeStatus::Unhealthy
+    );
+    assert_eq!(kubernetes.readiness_probe().status_code(), 503);
+}
+
+#[test]
+fn liveness_remains_healthy_during_normal_drain() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_backend_pools_initialized();
+    lifecycle.mark_listeners_initialized();
+
+    assert!(lifecycle.begin_drain(ShutdownReason::PreStopHook));
+    assert_eq!(kubernetes.liveness_probe().status(), ProbeStatus::Healthy);
+    assert_eq!(kubernetes.liveness_probe().status_code(), 200);
+}
+
+#[test]
+fn pre_stop_drain_endpoint_is_idempotent() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_backend_pools_initialized();
+    lifecycle.mark_listeners_initialized();
+
+    assert_eq!(
+        kubernetes.handle_pre_stop("/drain"),
+        PreStopDrainOutcome::DrainStarted
+    );
+    assert_eq!(
+        kubernetes.handle_pre_stop("/drain"),
+        PreStopDrainOutcome::AlreadyDraining
+    );
+    assert_eq!(
+        lifecycle.state().shutdown_reason(),
+        Some(ShutdownReason::PreStopHook)
+    );
+}
+
+#[tokio::test]
+async fn signal_triggers_drain_then_shutdown() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_backend_pools_initialized();
+    lifecycle.mark_listeners_initialized();
+
+    let outcome = kubernetes.shutdown_from_signal().await;
+
+    assert_eq!(outcome.drain_outcome(), DrainOutcome::Completed);
+    assert_eq!(
+        lifecycle.state().lifecycle(),
+        RuntimeLifecycleState::Stopped
+    );
+    assert_eq!(
+        lifecycle.state().shutdown_reason(),
+        Some(ShutdownReason::Signal)
+    );
+}
+
+#[test]
+fn startup_probe_remains_not_ready_until_backend_pools_are_warm() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_listeners_initialized();
+
+    assert_eq!(kubernetes.startup_probe().status(), ProbeStatus::Unhealthy);
+    assert_eq!(
+        kubernetes.readiness_probe().status(),
+        ProbeStatus::Unhealthy
+    );
+
+    lifecycle.mark_backend_pools_initialized();
+
+    assert_eq!(kubernetes.startup_probe().status(), ProbeStatus::Healthy);
+    assert_eq!(kubernetes.readiness_probe().status(), ProbeStatus::Healthy);
+}
+
+#[test]
+fn admin_endpoint_snapshot_reports_lifecycle_state() {
+    let (lifecycle, kubernetes) = kubernetes_lifecycle(LifecycleConfig::default());
+    lifecycle.mark_backend_pools_initialized();
+    lifecycle.mark_listeners_initialized();
+
+    let state = kubernetes.admin_state();
+
+    assert_eq!(state.lifecycle(), RuntimeLifecycleState::Ready);
+    assert_eq!(state.readiness(), ReadinessState::Ready);
+    assert!(state.listeners_initialized());
+    assert!(state.backend_pools_initialized());
+}
+
+#[test]
+fn kubernetes_behavior_is_local_and_controller_free() {
+    let config = LifecycleConfig {
+        pre_stop_drain_endpoint: String::from("/lifecycle/drain"),
+        termination_grace_period_seconds: 90,
+        ..LifecycleConfig::default()
+    };
+    let (_, kubernetes) = kubernetes_lifecycle(config);
+
+    assert_eq!(kubernetes.pre_stop_drain_endpoint(), "/lifecycle/drain");
+    assert_eq!(
+        kubernetes.termination_grace_period(),
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        kubernetes.handle_pre_stop("/wrong-endpoint"),
+        PreStopDrainOutcome::EndpointMismatch
+    );
 }

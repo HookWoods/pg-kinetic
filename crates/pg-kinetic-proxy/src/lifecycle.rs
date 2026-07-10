@@ -11,7 +11,10 @@ use pg_kinetic_core::runtime::{
 };
 use tokio::sync::watch;
 
-use crate::drain::{DrainClientGuard, DrainController, DrainOutcome};
+use crate::{
+    config::LifecycleConfig,
+    drain::{DrainClientGuard, DrainController, DrainOutcome},
+};
 
 const LIFECYCLE_STATE_METRIC: &str = "pg_kinetic_runtime_lifecycle_state";
 const READINESS_STATE_METRIC: &str = "pg_kinetic_runtime_readiness_state";
@@ -74,6 +77,7 @@ impl LifecycleState {
 #[derive(Debug)]
 pub struct ReadinessGate {
     readiness_fail_during_drain: AtomicBool,
+    startup_backend_checks_enabled: AtomicBool,
 }
 
 impl ReadinessGate {
@@ -81,12 +85,29 @@ impl ReadinessGate {
     pub const fn new(readiness_fail_during_drain: bool) -> Self {
         Self {
             readiness_fail_during_drain: AtomicBool::new(readiness_fail_during_drain),
+            startup_backend_checks_enabled: AtomicBool::new(true),
         }
     }
 
     pub fn configure(&self, readiness_fail_during_drain: bool) {
         self.readiness_fail_during_drain
             .store(readiness_fail_during_drain, Ordering::Release);
+    }
+
+    pub fn configure_startup_backend_checks(&self, enabled: bool) {
+        self.startup_backend_checks_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn startup_ready(
+        &self,
+        listeners_initialized: bool,
+        backend_pools_initialized: bool,
+    ) -> bool {
+        listeners_initialized
+            && (!self.startup_backend_checks_enabled.load(Ordering::Acquire)
+                || backend_pools_initialized)
     }
 
     #[must_use]
@@ -97,7 +118,9 @@ impl ReadinessGate {
         backend_pools_initialized: bool,
     ) -> ReadinessState {
         match lifecycle {
-            RuntimeLifecycleState::Ready if listeners_initialized && backend_pools_initialized => {
+            RuntimeLifecycleState::Ready
+                if self.startup_ready(listeners_initialized, backend_pools_initialized) =>
+            {
                 ReadinessState::Ready
             }
             RuntimeLifecycleState::Draining
@@ -227,6 +250,13 @@ impl LifecycleController {
         self.update(|_| {});
     }
 
+    pub fn configure_startup_backend_checks(&self, enabled: bool) {
+        self.inner
+            .readiness_gate
+            .configure_startup_backend_checks(enabled);
+        self.maybe_mark_ready();
+    }
+
     pub fn begin_drain(&self, reason: ShutdownReason) -> bool {
         let drain_grace = *self.inner.drain_grace.lock().expect("drain grace lock");
         let began_drain = self.inner.drain.begin_drain(drain_grace);
@@ -251,11 +281,14 @@ impl LifecycleController {
     }
 
     fn maybe_mark_ready(&self) {
+        let startup_ready = {
+            let state = self.state();
+            self.inner
+                .readiness_gate
+                .startup_ready(state.listeners_initialized, state.backend_pools_initialized)
+        };
         self.update(|state| {
-            if state.lifecycle == RuntimeLifecycleState::Starting
-                && state.listeners_initialized
-                && state.backend_pools_initialized
-            {
+            if state.lifecycle == RuntimeLifecycleState::Starting && startup_ready {
                 let transition = LifecycleTransition::new(
                     RuntimeLifecycleState::Starting,
                     RuntimeLifecycleState::Ready,
@@ -329,6 +362,169 @@ impl LifecycleController {
     fn publish(&self, state: LifecycleState) {
         self.inner.updates.send_replace(state.clone());
         record_lifecycle_metrics(&state);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeStatus {
+    Healthy,
+    Unhealthy,
+}
+
+impl ProbeStatus {
+    #[must_use]
+    pub const fn status_code(self) -> u16 {
+        match self {
+            Self::Healthy => 200,
+            Self::Unhealthy => 503,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleProbe {
+    status: ProbeStatus,
+    lifecycle: RuntimeLifecycleState,
+    readiness: ReadinessState,
+}
+
+impl LifecycleProbe {
+    #[must_use]
+    pub const fn status(&self) -> ProbeStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn status_code(&self) -> u16 {
+        self.status.status_code()
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> RuntimeLifecycleState {
+        self.lifecycle
+    }
+
+    #[must_use]
+    pub const fn readiness(&self) -> ReadinessState {
+        self.readiness
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreStopDrainOutcome {
+    Disabled,
+    EndpointMismatch,
+    DrainStarted,
+    AlreadyDraining,
+}
+
+#[derive(Clone, Debug)]
+pub struct KubernetesLifecycle {
+    lifecycle: LifecycleController,
+    pre_stop_drain_enabled: bool,
+    pre_stop_drain_endpoint: Arc<str>,
+    termination_grace_period: Duration,
+}
+
+impl KubernetesLifecycle {
+    #[must_use]
+    pub fn new(lifecycle: LifecycleController, config: &LifecycleConfig) -> Self {
+        lifecycle
+            .inner
+            .readiness_gate
+            .configure(config.readiness_fail_during_drain);
+        lifecycle.configure_startup_backend_checks(config.startup_backend_checks_enabled);
+        Self {
+            lifecycle,
+            pre_stop_drain_enabled: config.pre_stop_drain_enabled,
+            pre_stop_drain_endpoint: Arc::from(config.pre_stop_drain_endpoint.as_str()),
+            termination_grace_period: config.termination_grace_period(),
+        }
+    }
+
+    #[must_use]
+    pub fn readiness_probe(&self) -> LifecycleProbe {
+        let state = self.lifecycle.state();
+        let status = if matches!(
+            state.readiness(),
+            ReadinessState::Ready | ReadinessState::Draining
+        ) {
+            ProbeStatus::Healthy
+        } else {
+            ProbeStatus::Unhealthy
+        };
+        lifecycle_probe(status, &state)
+    }
+
+    #[must_use]
+    pub fn liveness_probe(&self) -> LifecycleProbe {
+        let state = self.lifecycle.state();
+        let status = if state.lifecycle() == RuntimeLifecycleState::Stopped {
+            ProbeStatus::Unhealthy
+        } else {
+            ProbeStatus::Healthy
+        };
+        lifecycle_probe(status, &state)
+    }
+
+    #[must_use]
+    pub fn startup_probe(&self) -> LifecycleProbe {
+        let state = self.lifecycle.state();
+        let status = if matches!(
+            state.lifecycle(),
+            RuntimeLifecycleState::Ready | RuntimeLifecycleState::Draining
+        ) {
+            ProbeStatus::Healthy
+        } else {
+            ProbeStatus::Unhealthy
+        };
+        lifecycle_probe(status, &state)
+    }
+
+    #[must_use]
+    pub fn handle_pre_stop(&self, endpoint: &str) -> PreStopDrainOutcome {
+        if !self.pre_stop_drain_enabled {
+            return PreStopDrainOutcome::Disabled;
+        }
+        if endpoint != self.pre_stop_drain_endpoint.as_ref() {
+            return PreStopDrainOutcome::EndpointMismatch;
+        }
+        if self.lifecycle.begin_drain(ShutdownReason::PreStopHook) {
+            PreStopDrainOutcome::DrainStarted
+        } else {
+            PreStopDrainOutcome::AlreadyDraining
+        }
+    }
+
+    #[must_use]
+    pub fn admin_state(&self) -> LifecycleState {
+        self.lifecycle.state()
+    }
+
+    #[must_use]
+    pub fn pre_stop_drain_endpoint(&self) -> &str {
+        &self.pre_stop_drain_endpoint
+    }
+
+    #[must_use]
+    pub const fn termination_grace_period(&self) -> Duration {
+        self.termination_grace_period
+    }
+
+    pub async fn shutdown_from_signal(&self) -> ShutdownOutcome {
+        self.lifecycle.begin_drain(ShutdownReason::Signal);
+        let coordinator = ShutdownCoordinator::new(self.lifecycle.clone());
+        let outcome = coordinator.coordinate().await;
+        coordinator.complete();
+        outcome
+    }
+}
+
+fn lifecycle_probe(status: ProbeStatus, state: &LifecycleState) -> LifecycleProbe {
+    LifecycleProbe {
+        status,
+        lifecycle: state.lifecycle(),
+        readiness: state.readiness(),
     }
 }
 

@@ -228,6 +228,28 @@ pub struct LifecycleConfig {
         default_value_t = true
     )]
     pub pre_stop_drain_enabled: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_PRE_STOP_DRAIN_ENDPOINT",
+        default_value = "/drain"
+    )]
+    pub pre_stop_drain_endpoint: String,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_STARTUP_BACKEND_CHECKS_ENABLED",
+        action = clap::ArgAction::Set,
+        default_value_t = true
+    )]
+    pub startup_backend_checks_enabled: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_TERMINATION_GRACE_PERIOD_SECONDS",
+        default_value_t = 65
+    )]
+    pub termination_grace_period_seconds: u64,
 }
 
 impl LifecycleConfig {
@@ -240,6 +262,11 @@ impl LifecycleConfig {
     pub const fn shutdown_grace(&self) -> Duration {
         Duration::from_millis(self.shutdown_grace_ms)
     }
+
+    #[must_use]
+    pub const fn termination_grace_period(&self) -> Duration {
+        Duration::from_secs(self.termination_grace_period_seconds)
+    }
 }
 
 impl Default for LifecycleConfig {
@@ -249,6 +276,9 @@ impl Default for LifecycleConfig {
             shutdown_grace_ms: 30_000,
             readiness_fail_during_drain: true,
             pre_stop_drain_enabled: true,
+            pre_stop_drain_endpoint: String::from("/drain"),
+            startup_backend_checks_enabled: true,
+            termination_grace_period_seconds: 65,
         }
     }
 }
@@ -1979,6 +2009,12 @@ mod tests {
         assert_eq!(config.runtime.lifecycle.shutdown_grace_ms, 30_000);
         assert!(config.runtime.lifecycle.readiness_fail_during_drain);
         assert!(config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert_eq!(config.runtime.lifecycle.pre_stop_drain_endpoint, "/drain");
+        assert!(config.runtime.lifecycle.startup_backend_checks_enabled);
+        assert_eq!(
+            config.runtime.lifecycle.termination_grace_period(),
+            Duration::from_secs(65)
+        );
         assert!(!config.runtime.production.control_plane_enabled);
         assert!(!config.runtime.production.mirroring_enabled);
         assert!(!config.runtime.production.adaptive_enabled);
@@ -2065,6 +2101,9 @@ mod tests {
             shutdown_grace_ms = 3_000
             readiness_fail_during_drain = false
             pre_stop_drain_enabled = false
+            pre_stop_drain_endpoint = "/lifecycle/drain"
+            startup_backend_checks_enabled = false
+            termination_grace_period_seconds = 90
 
             [runtime.node]
             node_id = "proxy-a"
@@ -2094,6 +2133,15 @@ mod tests {
         );
         assert!(!config.runtime.lifecycle.readiness_fail_during_drain);
         assert!(!config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert_eq!(
+            config.runtime.lifecycle.pre_stop_drain_endpoint,
+            "/lifecycle/drain"
+        );
+        assert!(!config.runtime.lifecycle.startup_backend_checks_enabled);
+        assert_eq!(
+            config.runtime.lifecycle.termination_grace_period(),
+            Duration::from_secs(90)
+        );
         assert_eq!(config.runtime.node.node_id.as_str(), "proxy-a");
         assert_eq!(
             config.runtime.engine.runtime_engine,
@@ -2140,6 +2188,11 @@ mod tests {
             "3000",
             "--readiness-fail-during-drain=false",
             "--pre-stop-drain-enabled=false",
+            "--pre-stop-drain-endpoint",
+            "/lifecycle/drain",
+            "--startup-backend-checks-enabled=false",
+            "--termination-grace-period-seconds",
+            "90",
             "--control-plane-enabled",
             "--mirroring-enabled",
             "--adaptive-enabled",
@@ -2152,6 +2205,15 @@ mod tests {
         assert_eq!(config.runtime.lifecycle.shutdown_grace_ms, 3_000);
         assert!(!config.runtime.lifecycle.readiness_fail_during_drain);
         assert!(!config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert_eq!(
+            config.runtime.lifecycle.pre_stop_drain_endpoint,
+            "/lifecycle/drain"
+        );
+        assert!(!config.runtime.lifecycle.startup_backend_checks_enabled);
+        assert_eq!(
+            config.runtime.lifecycle.termination_grace_period_seconds,
+            90
+        );
         assert!(config.runtime.production.control_plane_enabled);
         assert!(config.runtime.production.mirroring_enabled);
         assert!(config.runtime.production.adaptive_enabled);
