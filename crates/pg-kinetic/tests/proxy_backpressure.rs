@@ -337,6 +337,7 @@ async fn spawn_timeout_proxy(scenario: TimeoutScenario) -> (SocketAddr, mpsc::Re
             backend_addr,
         },
         routes: Vec::new(),
+        runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 2,
@@ -605,6 +606,7 @@ async fn spawn_proxy_with_backend_and_qos(
             backend_addr,
         },
         routes: Vec::new(),
+        runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 2,

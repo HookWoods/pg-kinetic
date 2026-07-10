@@ -561,6 +561,7 @@ fn test_config(
             backend_addr,
         },
         routes: Vec::new(),
+        runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 1,

@@ -10,6 +10,7 @@ use pg_kinetic_core::{
     policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
     recovery::RecoveryMode,
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    runtime::{NodeId, RuntimeEngine},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
         ClientTlsMode as CoreClientTlsMode,
@@ -151,6 +152,9 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
 
     #[command(flatten)]
+    pub runtime: RuntimeConfig,
+
+    #[command(flatten)]
     pub capacity: CapacityConfig,
 
     #[command(flatten)]
@@ -182,6 +186,193 @@ pub struct Config {
 
     #[command(flatten)]
     pub socket: SocketConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    #[command(flatten)]
+    pub lifecycle: LifecycleConfig,
+
+    #[command(flatten)]
+    pub node: NodeConfig,
+
+    #[command(flatten)]
+    pub engine: RuntimeEngineConfig,
+
+    #[command(flatten)]
+    pub production: ProductionConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct LifecycleConfig {
+    #[arg(long, env = "PG_KINETIC_STARTUP_GRACE_MS", default_value_t = 30_000)]
+    pub startup_grace_ms: u64,
+
+    #[arg(long, env = "PG_KINETIC_SHUTDOWN_GRACE_MS", default_value_t = 30_000)]
+    pub shutdown_grace_ms: u64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_READINESS_FAIL_DURING_DRAIN",
+        action = clap::ArgAction::Set,
+        default_value_t = true
+    )]
+    pub readiness_fail_during_drain: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_PRE_STOP_DRAIN_ENABLED",
+        action = clap::ArgAction::Set,
+        default_value_t = true
+    )]
+    pub pre_stop_drain_enabled: bool,
+}
+
+impl LifecycleConfig {
+    #[must_use]
+    pub const fn startup_grace(&self) -> Duration {
+        Duration::from_millis(self.startup_grace_ms)
+    }
+
+    #[must_use]
+    pub const fn shutdown_grace(&self) -> Duration {
+        Duration::from_millis(self.shutdown_grace_ms)
+    }
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            startup_grace_ms: 30_000,
+            shutdown_grace_ms: 30_000,
+            readiness_fail_during_drain: true,
+            pre_stop_drain_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct NodeConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_NODE_ID",
+        default_value_t = default_node_id()
+    )]
+    #[serde(
+        default = "default_node_id",
+        deserialize_with = "deserialize_node_id",
+        serialize_with = "serialize_node_id"
+    )]
+    pub node_id: NodeId,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            node_id: default_node_id(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct RuntimeEngineConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_RUNTIME_ENGINE",
+        value_parser = parse_runtime_engine,
+        default_value = "tokio_default"
+    )]
+    #[serde(
+        default = "default_runtime_engine",
+        deserialize_with = "deserialize_runtime_engine",
+        serialize_with = "serialize_runtime_engine"
+    )]
+    pub runtime_engine: RuntimeEngine,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED",
+        default_value_t = false
+    )]
+    pub experimental_runtime_enabled: bool,
+}
+
+impl RuntimeEngineConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.runtime_engine.is_experimental() && !self.experimental_runtime_enabled {
+            return Err(format!(
+                "runtime engine '{}' requires experimental_runtime_enabled = true",
+                self.runtime_engine
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for RuntimeEngineConfig {
+    fn default() -> Self {
+        Self {
+            runtime_engine: RuntimeEngine::TokioDefault,
+            experimental_runtime_enabled: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeEngineConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct RawRuntimeEngineConfig {
+            #[serde(
+                default = "default_runtime_engine",
+                deserialize_with = "deserialize_runtime_engine"
+            )]
+            runtime_engine: RuntimeEngine,
+            experimental_runtime_enabled: bool,
+        }
+
+        impl Default for RawRuntimeEngineConfig {
+            fn default() -> Self {
+                Self {
+                    runtime_engine: default_runtime_engine(),
+                    experimental_runtime_enabled: false,
+                }
+            }
+        }
+
+        let raw = RawRuntimeEngineConfig::deserialize(deserializer)?;
+        let config = Self {
+            runtime_engine: raw.runtime_engine,
+            experimental_runtime_enabled: raw.experimental_runtime_enabled,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct ProductionConfig {
+    #[arg(
+        long,
+        env = "PG_KINETIC_CONTROL_PLANE_ENABLED",
+        default_value_t = false
+    )]
+    pub control_plane_enabled: bool,
+
+    #[arg(long, env = "PG_KINETIC_MIRRORING_ENABLED", default_value_t = false)]
+    pub mirroring_enabled: bool,
+
+    #[arg(long, env = "PG_KINETIC_ADAPTIVE_ENABLED", default_value_t = false)]
+    pub adaptive_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -1148,7 +1339,13 @@ impl Default for ReloadConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct DrainConfig {
-    #[arg(long, env = "PG_KINETIC_DRAIN_TIMEOUT_MS", default_value_t = 30_000)]
+    #[arg(
+        long,
+        visible_alias = "drain-grace-ms",
+        env = "PG_KINETIC_DRAIN_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    #[serde(alias = "drain_grace_ms")]
     pub drain_timeout_ms: u64,
 
     #[arg(long, env = "PG_KINETIC_REJECT_NEW_CLIENTS_DURING_DRAIN")]
@@ -1159,6 +1356,11 @@ impl DrainConfig {
     #[must_use]
     pub const fn drain_timeout(&self) -> Duration {
         Duration::from_millis(self.drain_timeout_ms)
+    }
+
+    #[must_use]
+    pub const fn drain_grace(&self) -> Duration {
+        self.drain_timeout()
     }
 }
 
@@ -1277,7 +1479,7 @@ impl Default for SocketConfig {
 impl Config {
     #[must_use]
     pub fn parse_args() -> Self {
-        Self::parse()
+        Self::try_parse_from_args(std::env::args_os()).unwrap_or_else(|error| error.exit())
     }
 
     pub fn try_parse_from_args<I, T>(args: I) -> clap::error::Result<Self>
@@ -1285,7 +1487,11 @@ impl Config {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        Self::try_parse_from(args)
+        let config = Self::try_parse_from(args)?;
+        config.runtime.engine.validate().map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+        })?;
+        Ok(config)
     }
 
     #[must_use]
@@ -1320,6 +1526,7 @@ impl Config {
             && self.reload == next.reload
             && self.drain == next.drain
             && self.health == next.health
+            && self.runtime == next.runtime
     }
 }
 
@@ -1669,6 +1876,67 @@ where
     serializer.serialize_str(target_id.as_str())
 }
 
+fn default_node_id() -> NodeId {
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| String::from("localhost"));
+    let hostname = hostname
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    NodeId::new(format!("{hostname}-{}", std::process::id())).expect("generated node id is valid")
+}
+
+fn deserialize_node_id<'de, D>(deserializer: D) -> Result<NodeId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    NodeId::from_str(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_node_id<S>(node_id: &NodeId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(node_id.as_str())
+}
+
+const fn default_runtime_engine() -> RuntimeEngine {
+    RuntimeEngine::TokioDefault
+}
+
+fn parse_runtime_engine(value: &str) -> Result<RuntimeEngine, String> {
+    match value {
+        "tokio_default" => Ok(RuntimeEngine::TokioDefault),
+        "tokio_current_thread" => Ok(RuntimeEngine::TokioCurrentThread),
+        "experimental_thread_per_core" => Ok(RuntimeEngine::ExperimentalThreadPerCore),
+        "experimental_io_uring" => Ok(RuntimeEngine::ExperimentalIoUring),
+        _ => Err(format!("unsupported runtime engine '{value}'")),
+    }
+}
+
+fn deserialize_runtime_engine<'de, D>(deserializer: D) -> Result<RuntimeEngine, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_runtime_engine(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_runtime_engine<S>(engine: &RuntimeEngine, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(engine.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1700,6 +1968,20 @@ mod tests {
         assert_eq!(config.capacity.max_backends, 100);
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
         assert_eq!(config.routes.len(), 0);
+        assert!(!config.runtime.node.node_id.as_str().is_empty());
+        assert_eq!(
+            config.runtime.engine.runtime_engine,
+            pg_kinetic_core::runtime::RuntimeEngine::TokioDefault
+        );
+        assert!(!config.runtime.engine.experimental_runtime_enabled);
+        assert_eq!(config.runtime.lifecycle.startup_grace_ms, 30_000);
+        assert_eq!(config.drain.drain_grace(), Duration::from_secs(30));
+        assert_eq!(config.runtime.lifecycle.shutdown_grace_ms, 30_000);
+        assert!(config.runtime.lifecycle.readiness_fail_during_drain);
+        assert!(config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert!(!config.runtime.production.control_plane_enabled);
+        assert!(!config.runtime.production.mirroring_enabled);
+        assert!(!config.runtime.production.adaptive_enabled);
         assert_eq!(
             config.performance.checkout_timeout(),
             Duration::from_secs(1)
@@ -1772,6 +2054,107 @@ mod tests {
         assert_eq!(config.socket.tcp_send_buffer_bytes, None);
         assert_eq!(config.socket.tcp_recv_buffer_bytes, None);
         assert!(!config.socket.strict_socket_option_mode);
+    }
+
+    #[test]
+    fn runtime_config_parses_lifecycle_and_production_settings() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.lifecycle]
+            startup_grace_ms = 1_000
+            shutdown_grace_ms = 3_000
+            readiness_fail_during_drain = false
+            pre_stop_drain_enabled = false
+
+            [runtime.node]
+            node_id = "proxy-a"
+
+            [runtime.engine]
+            runtime_engine = "tokio_current_thread"
+
+            [runtime.production]
+            control_plane_enabled = true
+            mirroring_enabled = true
+            adaptive_enabled = true
+
+            [drain]
+            drain_grace_ms = 2_000
+            "#,
+        )
+        .expect("runtime config parses");
+
+        assert_eq!(
+            config.runtime.lifecycle.startup_grace(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(config.drain.drain_grace(), Duration::from_secs(2));
+        assert_eq!(
+            config.runtime.lifecycle.shutdown_grace(),
+            Duration::from_secs(3)
+        );
+        assert!(!config.runtime.lifecycle.readiness_fail_during_drain);
+        assert!(!config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert_eq!(config.runtime.node.node_id.as_str(), "proxy-a");
+        assert_eq!(
+            config.runtime.engine.runtime_engine,
+            pg_kinetic_core::runtime::RuntimeEngine::TokioCurrentThread
+        );
+        assert!(config.runtime.production.control_plane_enabled);
+        assert!(config.runtime.production.mirroring_enabled);
+        assert!(config.runtime.production.adaptive_enabled);
+    }
+
+    #[test]
+    fn experimental_runtime_engines_require_explicit_config_gate() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "experimental_io_uring"
+            "#,
+        )
+        .expect_err("ungated experimental runtime is rejected");
+        assert!(error.to_string().contains("experimental_runtime_enabled"));
+
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "experimental_thread_per_core"
+            experimental_runtime_enabled = true
+            "#,
+        )
+        .expect("explicitly gated experimental runtime parses");
+        assert!(config.runtime.engine.runtime_engine.is_experimental());
+    }
+
+    #[test]
+    fn runtime_flags_parse_through_the_single_config_tree() {
+        let config = Config::try_parse_from_args([
+            "pg-kinetic",
+            "--node-id",
+            "proxy-b",
+            "--startup-grace-ms",
+            "1000",
+            "--drain-grace-ms",
+            "2000",
+            "--shutdown-grace-ms",
+            "3000",
+            "--readiness-fail-during-drain=false",
+            "--pre-stop-drain-enabled=false",
+            "--control-plane-enabled",
+            "--mirroring-enabled",
+            "--adaptive-enabled",
+        ])
+        .expect("runtime flags parse");
+
+        assert_eq!(config.runtime.node.node_id.as_str(), "proxy-b");
+        assert_eq!(config.runtime.lifecycle.startup_grace_ms, 1_000);
+        assert_eq!(config.drain.drain_timeout_ms, 2_000);
+        assert_eq!(config.runtime.lifecycle.shutdown_grace_ms, 3_000);
+        assert!(!config.runtime.lifecycle.readiness_fail_during_drain);
+        assert!(!config.runtime.lifecycle.pre_stop_drain_enabled);
+        assert!(config.runtime.production.control_plane_enabled);
+        assert!(config.runtime.production.mirroring_enabled);
+        assert!(config.runtime.production.adaptive_enabled);
     }
 
     #[test]

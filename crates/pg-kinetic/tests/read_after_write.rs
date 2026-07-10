@@ -363,6 +363,7 @@ async fn spawn_proxy(
             backend_addr: primary_addr,
         },
         routes: vec![route],
+        runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
             max_backends: 8,
