@@ -8,6 +8,7 @@ readme.workspace = true
 [features]
 default = []
 policy-wasm = ["dep:wasmi"]
+runtime-experiments = []
 
 [dependencies]
 anyhow = "1"

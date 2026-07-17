@@ -14,6 +14,7 @@ pub mod policy;
 pub mod policy_wasm;
 pub mod pool;
 pub mod proxy;
+pub mod runtime_engine;
 pub mod reload;
 pub mod routing;
 pub mod sharding;
