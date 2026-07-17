@@ -20,10 +20,12 @@ use crate::{
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
-        BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot,
-        PolicyReloadSnapshot, PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot,
-        RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
-        RoutePolicySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
+        AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BackpressureSnapshot,
+        BenchmarkRunSnapshot, ClientSnapshot, LimitsSnapshot, MirrorSummarySnapshot,
+        NodeSummaryRole, NodeSummarySnapshot, PinningSnapshot, PolicyReloadSnapshot,
+        PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot, RecoverySnapshot,
+        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
+        RoutePolicySnapshot, RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot,
         ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
@@ -37,6 +39,7 @@ use pg_kinetic_core::{
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     session::PinReason,
+    runtime::{ReadinessState, RuntimeLifecycleState},
     sharding::ShardLifecycleState,
 };
 use pg_kinetic_wire::{
@@ -393,6 +396,26 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.server_snapshots(),
             &state.snapshot_store.replica_health_snapshots(),
         ),
+        AdminView::Runtime => runtime_table(
+            state.snapshot_store.runtime_snapshot(),
+            &state.config,
+        ),
+        AdminView::Nodes => nodes_table(
+            state.snapshot_store.node_snapshots(),
+            state.snapshot_store.runtime_snapshot(),
+        ),
+        AdminView::Mirroring => mirroring_table(
+            state.snapshot_store.mirror_snapshot(),
+            &state.config,
+        ),
+        AdminView::Adaptive => adaptive_table(
+            state.config.runtime.production.adaptive.adaptive_mode.as_str(),
+            &state.config.runtime.production.adaptive.apply,
+            &state.config.runtime.production.adaptive.guardrail,
+            &state.snapshot_store.adaptive_recommendation_snapshots(),
+            &state.snapshot_store.adaptive_outcome_snapshots(),
+        ),
+        AdminView::Benchmarks => benchmarks_table(&state.snapshot_store.benchmark_run_snapshots()),
         AdminView::Prepared => prepared_table(&state.snapshot_store.prepared_snapshot()),
         AdminView::Pinning => pinning_table(&state.snapshot_store.pinning_snapshots()),
         AdminView::Recovery => recovery_table(&state.snapshot_store.recovery_snapshots()),
@@ -548,6 +571,205 @@ fn servers_table(
                 ])
             })
             .collect(),
+    )
+}
+
+fn runtime_table(runtime: Option<RuntimeSnapshot>, config: &Config) -> AdminTable {
+    let runtime = runtime.unwrap_or_else(|| {
+        RuntimeSnapshot::new(
+            config.runtime.node.node_id.clone(),
+            RuntimeLifecycleState::Starting,
+            ReadinessState::NotReady,
+            config.runtime.engine.runtime_engine,
+            Duration::ZERO,
+        )
+    });
+
+    admin_table(
+        AdminView::Runtime,
+        &[
+            ("node_id", AdminColumnType::Text),
+            ("lifecycle_state", AdminColumnType::Text),
+            ("readiness_state", AdminColumnType::Text),
+            ("runtime_engine", AdminColumnType::Text),
+            ("uptime_ms", AdminColumnType::Int8),
+        ],
+        vec![AdminRow::new(vec![
+            runtime.node_id.as_str().to_string(),
+            runtime.lifecycle_state.as_str().to_string(),
+            runtime.readiness_state.as_str().to_string(),
+            runtime.runtime_engine.as_str().to_string(),
+            duration_millis(runtime.uptime),
+        ])],
+    )
+}
+
+fn nodes_table(nodes: Vec<NodeSummarySnapshot>, runtime: Option<RuntimeSnapshot>) -> AdminTable {
+    let rows = if nodes.is_empty() {
+        runtime
+            .map(|runtime| {
+                vec![AdminRow::new(vec![
+                    NodeSummaryRole::Local.as_str().to_string(),
+                    runtime.node_id.as_str().to_string(),
+                    runtime.lifecycle_state.as_str().to_string(),
+                    runtime.readiness_state.as_str().to_string(),
+                    String::from("healthy"),
+                    String::from("0"),
+                    String::from("0"),
+                    duration_millis(runtime.uptime),
+                    String::from("false"),
+                ])]
+            })
+            .unwrap_or_default()
+    } else {
+        nodes
+            .into_iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    snapshot.role.as_str().to_string(),
+                    snapshot.node_id.as_str().to_string(),
+                    snapshot.lifecycle_state.as_str().to_string(),
+                    snapshot.readiness_state.as_str().to_string(),
+                    snapshot.health.as_str().to_string(),
+                    snapshot.route_map_generation.to_string(),
+                    snapshot.policy_generation.to_string(),
+                    duration_millis(snapshot.heartbeat_age),
+                    snapshot.overloaded.to_string(),
+                ])
+            })
+            .collect()
+    };
+
+    admin_table(
+        AdminView::Nodes,
+        &[
+            ("role", AdminColumnType::Text),
+            ("node_id", AdminColumnType::Text),
+            ("lifecycle_state", AdminColumnType::Text),
+            ("readiness_state", AdminColumnType::Text),
+            ("health", AdminColumnType::Text),
+            ("route_map_generation_id", AdminColumnType::Int8),
+            ("policy_generation_id", AdminColumnType::Int8),
+            ("heartbeat_age_ms", AdminColumnType::Int8),
+            ("overloaded", AdminColumnType::Bool),
+        ],
+        rows,
+    )
+}
+
+fn mirroring_table(snapshot: Option<MirrorSummarySnapshot>, _config: &Config) -> AdminTable {
+    let snapshot = snapshot.unwrap_or_else(|| MirrorSummarySnapshot::new(pg_kinetic_core::mirror::MirrorMode::Off, 0.0));
+    admin_table(
+        AdminView::Mirroring,
+        &[
+            ("mode", AdminColumnType::Text),
+            ("sample_rate", AdminColumnType::Float8),
+            ("in_flight", AdminColumnType::Int8),
+            ("dropped", AdminColumnType::Int8),
+            ("timeout_total", AdminColumnType::Int8),
+            ("decisions_total", AdminColumnType::Int8),
+            ("mirrored_total", AdminColumnType::Int8),
+            ("skipped_total", AdminColumnType::Int8),
+            ("rejected_total", AdminColumnType::Int8),
+        ],
+        vec![AdminRow::new(vec![
+            snapshot.mode.as_str().to_string(),
+            format!("{:.3}", snapshot.sample_rate),
+            snapshot.in_flight.to_string(),
+            snapshot.dropped_total.to_string(),
+            snapshot.timed_out_total.to_string(),
+            mirror_decisions_total(&snapshot).to_string(),
+            snapshot.mirrored_total.to_string(),
+            snapshot.skipped_total.to_string(),
+            snapshot.rejected_total.to_string(),
+        ])],
+    )
+}
+
+fn adaptive_table(
+    mode: &'static str,
+    apply: &crate::config::AdaptiveApplyConfig,
+    guardrail: &crate::config::AdaptiveGuardrailConfig,
+    recommendations: &[AdaptiveRecommendationSnapshot],
+    outcomes: &[AdaptiveOutcomeSnapshot],
+) -> AdminTable {
+    let guardrails = adaptive_guardrails_label(mode, apply, guardrail);
+    let recommendation_rows = recommendations
+        .iter()
+        .rev()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcome_rows = outcomes.iter().rev().take(5).cloned().collect::<Vec<_>>();
+    let max_rows = recommendation_rows.len().max(outcome_rows.len()).max(1);
+
+    let rows = (0..max_rows)
+        .map(|index| {
+            let recommendation = recommendation_rows.get(index);
+            let outcome = outcome_rows.get(index);
+            AdminRow::new(vec![
+                mode.to_string(),
+                recommendation_summary(recommendation),
+                apply_status_summary(outcome),
+                guardrails.clone(),
+            ])
+        })
+        .collect();
+
+    admin_table(
+        AdminView::Adaptive,
+        &[
+            ("mode", AdminColumnType::Text),
+            ("latest_recommendation", AdminColumnType::Text),
+            ("apply_status", AdminColumnType::Text),
+            ("guardrails", AdminColumnType::Text),
+        ],
+        rows,
+    )
+}
+
+fn benchmarks_table(runs: &[BenchmarkRunSnapshot]) -> AdminTable {
+    let rows = runs
+        .iter()
+        .rev()
+        .take(8)
+        .flat_map(|run| {
+            run.results.iter().map(move |result| {
+                AdminRow::new(vec![
+                    run.scenario.name().to_string(),
+                    result.target().label().to_string(),
+                    result.target().comparison().as_str().to_string(),
+                    result.driver().as_str().to_string(),
+                    result.duration_ms().to_string(),
+                    benchmark_metric_value(result.metrics().p50_ms()),
+                    benchmark_metric_value(result.metrics().p95_ms()),
+                    benchmark_metric_value(result.metrics().p99_ms()),
+                    benchmark_metric_value(result.metrics().throughput_qps()),
+                    benchmark_metric_value(result.metrics().error_rate()),
+                    result.metrics().cpu_label().to_string(),
+                    result.metrics().memory_label().to_string(),
+                ])
+            })
+        })
+        .collect();
+
+    admin_table(
+        AdminView::Benchmarks,
+        &[
+            ("scenario", AdminColumnType::Text),
+            ("target", AdminColumnType::Text),
+            ("comparison", AdminColumnType::Text),
+            ("driver", AdminColumnType::Text),
+            ("duration_ms", AdminColumnType::Int8),
+            ("p50_ms", AdminColumnType::Float8),
+            ("p95_ms", AdminColumnType::Float8),
+            ("p99_ms", AdminColumnType::Float8),
+            ("throughput_qps", AdminColumnType::Float8),
+            ("error_rate", AdminColumnType::Float8),
+            ("cpu_label", AdminColumnType::Text),
+            ("memory_label", AdminColumnType::Text),
+        ],
+        rows,
     )
 }
 
@@ -1255,4 +1477,68 @@ fn recovery_action_label(action: RecoveryAction) -> &'static str {
         RecoveryAction::RollbackAndDrain => "rollback_and_drain",
         RecoveryAction::Discard => "discard",
     }
+}
+
+fn mirror_decisions_total(snapshot: &MirrorSummarySnapshot) -> u64 {
+    snapshot.dropped_total
+        + snapshot.timed_out_total
+        + snapshot.mirrored_total
+        + snapshot.skipped_total
+        + snapshot.rejected_total
+}
+
+fn recommendation_summary(snapshot: Option<&AdaptiveRecommendationSnapshot>) -> String {
+    let Some(snapshot) = snapshot else {
+        return String::from("<none>");
+    };
+
+    format!(
+        "{}:{}:{:.3}",
+        snapshot.signal.as_str(),
+        snapshot.knob.as_str(),
+        snapshot.confidence
+    )
+}
+
+fn apply_status_summary(snapshot: Option<&AdaptiveOutcomeSnapshot>) -> String {
+    let Some(snapshot) = snapshot else {
+        return String::from("<none>");
+    };
+
+    format!(
+        "{}{}",
+        snapshot.outcome.as_str(),
+        if snapshot.disabled_by_reload {
+            ":disabled"
+        } else {
+            ""
+        }
+    )
+}
+
+fn adaptive_guardrails_label(
+    mode: &str,
+    apply: &crate::config::AdaptiveApplyConfig,
+    guardrail: &crate::config::AdaptiveGuardrailConfig,
+) -> String {
+    let allowlist = if apply.adaptive_apply_allowlist.is_empty() {
+        String::from("<none>")
+    } else {
+        apply
+            .adaptive_apply_allowlist
+            .iter()
+            .map(|knob| knob.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    format!(
+        "mode={mode};apply={};allowlist={allowlist};max_change={}%",
+        apply.adaptive_apply_enabled,
+        guardrail.adaptive_max_change_percent
+    )
+}
+
+fn benchmark_metric_value(value: f64) -> String {
+    format!("{value:.3}")
 }

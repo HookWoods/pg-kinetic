@@ -71,6 +71,10 @@ pub enum MetricName {
     BackpressureEvents,
     PoolCheckoutWaitMs,
     ClientConnectionsTotal,
+    RuntimeLifecycleState,
+    RuntimeReadinessState,
+    RuntimeShutdownTotal,
+    NodeHeartbeatAgeMs,
     PreparedEventsTotal,
     BackendPinTotal,
     BackendCleanupTotal,
@@ -95,6 +99,14 @@ pub enum MetricName {
     PolicyWasmEvalTotal,
     PolicyWasmEvalDurationMs,
     RouteMapGeneration,
+    MirrorDecisionsTotal,
+    MirrorInFlight,
+    MirrorDurationMs,
+    MirrorDroppedTotal,
+    AdaptiveRecommendationsTotal,
+    AdaptiveApplyTotal,
+    BenchmarkRunsTotal,
+    PreflightFindingsTotal,
     ShardLifecycleState,
     ShardActiveTransactions,
     ShardPreparedStatements,
@@ -117,6 +129,10 @@ impl MetricName {
             Self::BackpressureEvents => "pg_kinetic_backpressure_events_total",
             Self::PoolCheckoutWaitMs => "pg_kinetic_pool_checkout_wait_ms",
             Self::ClientConnectionsTotal => "pg_kinetic_client_connections_total",
+            Self::RuntimeLifecycleState => "pg_kinetic_runtime_lifecycle_state",
+            Self::RuntimeReadinessState => "pg_kinetic_runtime_readiness_state",
+            Self::RuntimeShutdownTotal => "pg_kinetic_runtime_shutdown_total",
+            Self::NodeHeartbeatAgeMs => "pg_kinetic_node_heartbeat_age_ms",
             Self::PreparedEventsTotal => "pg_kinetic_prepared_events_total",
             Self::BackendPinTotal => "pg_kinetic_backend_pin_total",
             Self::BackendCleanupTotal => "pg_kinetic_backend_cleanup_total",
@@ -141,6 +157,14 @@ impl MetricName {
             Self::PolicyWasmEvalTotal => "pg_kinetic_policy_wasm_eval_total",
             Self::PolicyWasmEvalDurationMs => "pg_kinetic_policy_wasm_eval_duration_ms",
             Self::RouteMapGeneration => "pg_kinetic_route_map_generation",
+            Self::MirrorDecisionsTotal => "pg_kinetic_mirror_decisions_total",
+            Self::MirrorInFlight => "pg_kinetic_mirror_in_flight",
+            Self::MirrorDurationMs => "pg_kinetic_mirror_duration_ms",
+            Self::MirrorDroppedTotal => "pg_kinetic_mirror_dropped_total",
+            Self::AdaptiveRecommendationsTotal => "pg_kinetic_adaptive_recommendations_total",
+            Self::AdaptiveApplyTotal => "pg_kinetic_adaptive_apply_total",
+            Self::BenchmarkRunsTotal => "pg_kinetic_benchmark_runs_total",
+            Self::PreflightFindingsTotal => "pg_kinetic_preflight_findings_total",
             Self::ShardLifecycleState => "pg_kinetic_shard_lifecycle_state",
             Self::ShardActiveTransactions => "pg_kinetic_shard_active_transactions",
             Self::ShardPreparedStatements => "pg_kinetic_shard_prepared_statements",
@@ -205,6 +229,10 @@ pub enum MetricLabel {
     Action,
     Event,
     Endpoint,
+    Engine,
+    Node,
+    Check,
+    Severity,
     Hook,
     Kind,
     LagState,
@@ -230,6 +258,7 @@ pub enum MetricLabel {
     Status,
     TargetRole,
     Trigger,
+    Target,
 }
 
 impl MetricLabel {
@@ -239,6 +268,10 @@ impl MetricLabel {
             Self::Action => "action",
             Self::Event => "event",
             Self::Endpoint => "endpoint",
+            Self::Engine => "engine",
+            Self::Node => "node",
+            Self::Check => "check",
+            Self::Severity => "severity",
             Self::Hook => "hook",
             Self::Kind => "kind",
             Self::LagState => "lag_state",
@@ -264,6 +297,7 @@ impl MetricLabel {
             Self::Status => "status",
             Self::TargetRole => "target_role",
             Self::Trigger => "trigger",
+            Self::Target => "target",
         }
     }
 }
@@ -425,6 +459,38 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Total accepted client connections",
         NO_LABELS,
         "Single counter without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_runtime_lifecycle_state",
+        MetricKind::Gauge,
+        "1",
+        "Runtime lifecycle state series",
+        STATE_LABELS,
+        "State values stay aligned with runtime lifecycle states.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_runtime_readiness_state",
+        MetricKind::Gauge,
+        "1",
+        "Runtime readiness state series",
+        STATE_LABELS,
+        "State values stay aligned with runtime readiness states.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_runtime_shutdown_total",
+        MetricKind::Counter,
+        "1",
+        "Runtime shutdown counts by reason",
+        &[MetricLabel::Reason],
+        "Reason stays bounded to shutdown causes.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_node_heartbeat_age_ms",
+        MetricKind::Gauge,
+        "ms",
+        "Node heartbeat age in milliseconds",
+        &[MetricLabel::Node],
+        "Node labels remain low cardinality and node ids are stable.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_prepared_events_total",
@@ -627,6 +693,70 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Single gauge without labels.",
     ),
     MetricDescriptor::new(
+        "pg_kinetic_mirror_decisions_total",
+        MetricKind::Counter,
+        "1",
+        "Mirror decisions by mode, target, and outcome",
+        &[MetricLabel::Mode, MetricLabel::Target, MetricLabel::Outcome],
+        "Mode, target, and outcome stay bounded to mirror decisions.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_mirror_in_flight",
+        MetricKind::Gauge,
+        "1",
+        "Current mirror in-flight count by mode and target",
+        &[MetricLabel::Mode, MetricLabel::Target],
+        "Mode and target stay bounded to mirror state.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_mirror_duration_ms",
+        MetricKind::Histogram,
+        "ms",
+        "Mirror task duration in milliseconds",
+        &[MetricLabel::Mode, MetricLabel::Target, MetricLabel::Outcome],
+        "Mode, target, and outcome stay bounded to mirror outcomes.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_mirror_dropped_total",
+        MetricKind::Counter,
+        "1",
+        "Dropped mirror tasks by mode and reason",
+        &[MetricLabel::Mode, MetricLabel::Reason],
+        "Mode and reason stay bounded to mirror drops.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_adaptive_recommendations_total",
+        MetricKind::Counter,
+        "1",
+        "Adaptive recommendations by mode, target, and outcome",
+        &[MetricLabel::Mode, MetricLabel::Target, MetricLabel::Outcome],
+        "Mode, target, and outcome stay bounded to adaptive recommendations.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_adaptive_apply_total",
+        MetricKind::Counter,
+        "1",
+        "Adaptive apply outcomes by mode, target, and outcome",
+        &[MetricLabel::Mode, MetricLabel::Target, MetricLabel::Outcome],
+        "Mode, target, and outcome stay bounded to adaptive apply outcomes.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_benchmark_runs_total",
+        MetricKind::Counter,
+        "1",
+        "Benchmark runs by engine, target, and outcome",
+        &[MetricLabel::Engine, MetricLabel::Target, MetricLabel::Outcome],
+        "Engine, target, and outcome stay bounded to benchmark runs.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_preflight_findings_total",
+        MetricKind::Counter,
+        "1",
+        "Preflight findings by check and severity",
+        &[MetricLabel::Check, MetricLabel::Severity],
+        "Check and severity stay bounded to preflight findings.",
+    ),
+    MetricDescriptor::new(
         "pg_kinetic_shard_lifecycle_state",
         MetricKind::Gauge,
         "1",
@@ -820,6 +950,12 @@ impl LabelPolicy {
     pub const VIEW: &'static str = "view";
     pub const STATE: &'static str = "state";
     pub const EVENT: &'static str = "event";
+    pub const MODE: &'static str = "mode";
+    pub const TARGET: &'static str = "target";
+    pub const ENGINE: &'static str = "engine";
+    pub const NODE: &'static str = "node";
+    pub const CHECK: &'static str = "check";
+    pub const SEVERITY: &'static str = "severity";
     pub const HOOK: &'static str = "hook";
     pub const SOURCE: &'static str = "source";
     pub const TARGET_ROLE: &'static str = "target_role";
@@ -833,7 +969,7 @@ impl LabelPolicy {
     pub const ERROR_CODE: &'static str = "error_code";
     pub const HEALTH: &'static str = "health";
     pub const LAG_STATE: &'static str = "lag_state";
-    pub const ALLOWED_LABELS: [&'static str; 20] = [
+    pub const ALLOWED_LABELS: [&'static str; 26] = [
         Self::PHASE,
         Self::OUTCOME,
         Self::ENDPOINT,
@@ -843,6 +979,12 @@ impl LabelPolicy {
         Self::POLICY,
         Self::HOOK,
         Self::SOURCE,
+        Self::MODE,
+        Self::TARGET,
+        Self::ENGINE,
+        Self::NODE,
+        Self::CHECK,
+        Self::SEVERITY,
         Self::TARGET_ROLE,
         Self::QUERY_CLASS,
         Self::REASON,

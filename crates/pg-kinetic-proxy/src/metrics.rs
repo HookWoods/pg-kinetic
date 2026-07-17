@@ -4,8 +4,10 @@ use std::time::Duration;
 use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
 use crate::sharding::RouteMapReloadErrorCode;
 use crate::snapshot::{
-    PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
-    ServerSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+    AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BenchmarkRunSnapshot,
+    MirrorSummarySnapshot, PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
+    RouteMapReloadSnapshot, RuntimeSnapshot, ServerSnapshot, ShardLifecycleSnapshot,
+    ShardMigrationSafetySnapshot, SnapshotStore,
 };
 use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -18,6 +20,7 @@ use pg_kinetic_core::{
         metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
         MetricOutcome, ProtocolPhase,
     },
+    runtime::{ReadinessState, RuntimeLifecycleState, ShutdownReason},
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecisionReason, PolicyHookPoint,
         PolicyMode, PolicyOutcome,
@@ -57,6 +60,179 @@ pub fn record_pool_checkout(wait_ms: f64, outcome: &'static str) {
         "outcome" => outcome
     )
     .record(wait_ms);
+}
+
+pub fn record_runtime_lifecycle_state(state: RuntimeLifecycleState) {
+    for candidate in [
+        RuntimeLifecycleState::Starting,
+        RuntimeLifecycleState::Ready,
+        RuntimeLifecycleState::Draining,
+        RuntimeLifecycleState::Stopping,
+        RuntimeLifecycleState::Stopped,
+    ] {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::RuntimeLifecycleState.as_str(),
+            "state" => candidate.as_str()
+        )
+        .set(if candidate == state { 1.0 } else { 0.0 });
+    }
+}
+
+pub fn record_runtime_readiness_state(state: ReadinessState) {
+    for candidate in [
+        ReadinessState::Ready,
+        ReadinessState::NotReady,
+        ReadinessState::Draining,
+    ] {
+        metrics_crate::gauge!(
+            ObservabilityMetricName::RuntimeReadinessState.as_str(),
+            "state" => candidate.as_str()
+        )
+        .set(if candidate == state { 1.0 } else { 0.0 });
+    }
+}
+
+pub fn record_runtime_shutdown(reason: ShutdownReason) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::RuntimeShutdownTotal.as_str(),
+        "reason" => reason.as_str()
+    )
+    .increment(1);
+}
+
+pub fn record_runtime_snapshot(snapshot: &RuntimeSnapshot) {
+    record_runtime_lifecycle_state(snapshot.lifecycle_state);
+    record_runtime_readiness_state(snapshot.readiness_state);
+    if let Some(reason) = snapshot.shutdown_reason {
+        record_runtime_shutdown(reason);
+    }
+}
+
+pub fn record_node_heartbeat_age(node: &str, heartbeat_age: Duration) {
+    metrics_crate::gauge!(
+        ObservabilityMetricName::NodeHeartbeatAgeMs.as_str(),
+        "node" => node.to_string()
+    )
+    .set(heartbeat_age.as_secs_f64() * 1_000.0);
+}
+
+pub fn record_mirror_snapshot(snapshot: &MirrorSummarySnapshot) {
+    let target = "mirror";
+    metrics_crate::gauge!(
+        ObservabilityMetricName::MirrorInFlight.as_str(),
+        "mode" => snapshot.mode.as_str(),
+        "target" => target
+    )
+    .set(snapshot.in_flight as f64);
+
+    if snapshot.dropped_total > 0 {
+        metrics_crate::counter!(
+            ObservabilityMetricName::MirrorDroppedTotal.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "reason" => "sampled_out"
+        )
+        .increment(snapshot.dropped_total);
+    }
+
+    if snapshot.timed_out_total > 0 {
+        metrics_crate::counter!(
+            ObservabilityMetricName::MirrorDecisionsTotal.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "target" => target,
+            "outcome" => "timeout"
+        )
+        .increment(snapshot.timed_out_total);
+    }
+
+    if snapshot.mirrored_total > 0 {
+        metrics_crate::counter!(
+            ObservabilityMetricName::MirrorDecisionsTotal.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "target" => target,
+            "outcome" => "mirrored"
+        )
+        .increment(snapshot.mirrored_total);
+    }
+
+    if snapshot.skipped_total > 0 {
+        metrics_crate::counter!(
+            ObservabilityMetricName::MirrorDecisionsTotal.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "target" => target,
+            "outcome" => "skipped"
+        )
+        .increment(snapshot.skipped_total);
+    }
+
+    if snapshot.rejected_total > 0 {
+        metrics_crate::counter!(
+            ObservabilityMetricName::MirrorDecisionsTotal.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "target" => target,
+            "outcome" => "rejected"
+        )
+        .increment(snapshot.rejected_total);
+    }
+
+    if let Some(duration) = snapshot.last_duration {
+        let outcome = if snapshot.mirrored_total > 0 {
+            "mirrored"
+        } else if snapshot.skipped_total > 0 {
+            "skipped"
+        } else if snapshot.rejected_total > 0 {
+            "rejected"
+        } else {
+            "timeout"
+        };
+        metrics_crate::histogram!(
+            ObservabilityMetricName::MirrorDurationMs.as_str(),
+            "mode" => snapshot.mode.as_str(),
+            "target" => target,
+            "outcome" => outcome
+        )
+        .record(duration.as_secs_f64() * 1_000.0);
+    }
+}
+
+pub fn record_adaptive_recommendation(snapshot: &AdaptiveRecommendationSnapshot) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::AdaptiveRecommendationsTotal.as_str(),
+        "mode" => "recommend",
+        "target" => snapshot.knob.as_str(),
+        "outcome" => snapshot.action.as_str()
+    )
+    .increment(1);
+}
+
+pub fn record_adaptive_outcome(snapshot: &AdaptiveOutcomeSnapshot) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::AdaptiveApplyTotal.as_str(),
+        "mode" => "apply",
+        "target" => snapshot.knob.as_str(),
+        "outcome" => snapshot.outcome.as_str()
+    )
+    .increment(1);
+}
+
+pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {
+    for result in &snapshot.results {
+        metrics_crate::counter!(
+            ObservabilityMetricName::BenchmarkRunsTotal.as_str(),
+            "engine" => result.driver().as_str(),
+            "target" => result.target().comparison().as_str(),
+            "outcome" => "ok"
+        )
+        .increment(1);
+    }
+}
+
+pub fn record_preflight_finding(check: &str, severity: &str) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::PreflightFindingsTotal.as_str(),
+        "check" => check.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
 }
 
 pub fn record_protocol_phase_duration(

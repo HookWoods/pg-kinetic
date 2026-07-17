@@ -8,6 +8,9 @@ use std::{
 use pg_kinetic_core::{
     ha::{HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome},
     lsn::{FreshnessStatus, PgLsn},
+    benchmark::{BenchmarkResult, BenchmarkScenario},
+    mirror::MirrorMode,
+    runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
     observability::MetricOutcome,
     policy::{PolicyAuditEvent, PolicyMode},
     prepare::PreparedStatementSnapshot,
@@ -34,6 +37,7 @@ const POLICY_AUDIT_RING_CAPACITY: usize = 128;
 const POLICY_DECISION_RING_CAPACITY: usize = 128;
 const ADAPTIVE_RECOMMENDATION_RING_CAPACITY: usize = 64;
 const ADAPTIVE_OUTCOME_RING_CAPACITY: usize = 64;
+const BENCHMARK_RUN_RING_CAPACITY: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -236,6 +240,135 @@ impl BackpressureSnapshot {
             timed_out: 0,
             canceled: 0,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeSummaryRole {
+    Local,
+    Peer,
+}
+
+impl NodeSummaryRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Peer => "peer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSnapshot {
+    pub node_id: NodeId,
+    pub lifecycle_state: RuntimeLifecycleState,
+    pub readiness_state: ReadinessState,
+    pub runtime_engine: RuntimeEngine,
+    pub uptime: Duration,
+    pub shutdown_reason: Option<ShutdownReason>,
+}
+
+impl RuntimeSnapshot {
+    #[must_use]
+    pub fn new(
+        node_id: NodeId,
+        lifecycle_state: RuntimeLifecycleState,
+        readiness_state: ReadinessState,
+        runtime_engine: RuntimeEngine,
+        uptime: Duration,
+    ) -> Self {
+        Self {
+            node_id,
+            lifecycle_state,
+            readiness_state,
+            runtime_engine,
+            uptime,
+            shutdown_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeSummarySnapshot {
+    pub role: NodeSummaryRole,
+    pub node_id: NodeId,
+    pub lifecycle_state: RuntimeLifecycleState,
+    pub readiness_state: ReadinessState,
+    pub health: pg_kinetic_core::control::PeerHealth,
+    pub route_map_generation: u64,
+    pub policy_generation: u64,
+    pub heartbeat_age: Duration,
+    pub overloaded: bool,
+}
+
+impl NodeSummarySnapshot {
+    #[must_use]
+    pub fn new(
+        role: NodeSummaryRole,
+        node_id: NodeId,
+        lifecycle_state: RuntimeLifecycleState,
+        readiness_state: ReadinessState,
+        health: pg_kinetic_core::control::PeerHealth,
+        route_map_generation: u64,
+        policy_generation: u64,
+        heartbeat_age: Duration,
+        overloaded: bool,
+    ) -> Self {
+        Self {
+            role,
+            node_id,
+            lifecycle_state,
+            readiness_state,
+            health,
+            route_map_generation,
+            policy_generation,
+            heartbeat_age,
+            overloaded,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MirrorSummarySnapshot {
+    pub mode: MirrorMode,
+    pub sample_rate: f64,
+    pub in_flight: usize,
+    pub dropped_total: u64,
+    pub timed_out_total: u64,
+    pub mirrored_total: u64,
+    pub skipped_total: u64,
+    pub rejected_total: u64,
+    pub last_duration: Option<Duration>,
+}
+
+impl MirrorSummarySnapshot {
+    #[must_use]
+    pub fn new(mode: MirrorMode, sample_rate: f64) -> Self {
+        Self {
+            mode,
+            sample_rate,
+            in_flight: 0,
+            dropped_total: 0,
+            timed_out_total: 0,
+            mirrored_total: 0,
+            skipped_total: 0,
+            rejected_total: 0,
+            last_duration: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchmarkRunSnapshot {
+    pub scenario: BenchmarkScenario,
+    pub results: Vec<BenchmarkResult>,
+}
+
+impl BenchmarkRunSnapshot {
+    #[must_use]
+    pub fn new(scenario: BenchmarkScenario, results: Vec<BenchmarkResult>) -> Self {
+        Self { scenario, results }
     }
 }
 
@@ -635,6 +768,10 @@ struct SnapshotStoreInner {
     pinning: BTreeMap<u64, PinningSnapshot>,
     recoveries: Vec<RecoverySnapshot>,
     backpressure: HashMap<RouteKey, BackpressureSnapshot>,
+    runtime: Option<RuntimeSnapshot>,
+    nodes: Vec<NodeSummarySnapshot>,
+    mirror: Option<MirrorSummarySnapshot>,
+    benchmark_runs: VecDeque<BenchmarkRunSnapshot>,
     routes: HashMap<RouteKey, RouteSnapshot>,
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
@@ -696,7 +833,86 @@ impl SnapshotStore {
         PolicyAuditSnapshotHandle::new(Arc::clone(&self.inner))
     }
 
+    pub fn set_runtime_snapshot(&self, snapshot: RuntimeSnapshot) {
+        metrics::record_runtime_snapshot(&snapshot);
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        inner.runtime = Some(snapshot);
+    }
+
+    #[must_use]
+    pub fn runtime_snapshot(&self) -> Option<RuntimeSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .runtime
+            .clone()
+    }
+
+    pub fn set_node_snapshot(&self, snapshot: NodeSummarySnapshot) {
+        metrics::record_node_heartbeat_age(snapshot.node_id.as_str(), snapshot.heartbeat_age);
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if let Some(existing) = inner.nodes.iter_mut().find(|candidate| {
+            candidate.role == snapshot.role && candidate.node_id == snapshot.node_id
+        }) {
+            *existing = snapshot;
+        } else {
+            inner.nodes.push(snapshot);
+        }
+    }
+
+    #[must_use]
+    pub fn node_snapshots(&self) -> Vec<NodeSummarySnapshot> {
+        let mut nodes = self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .nodes
+            .clone();
+        nodes.sort_by(|left, right| {
+            left.role
+                .as_str()
+                .cmp(right.role.as_str())
+                .then_with(|| left.node_id.as_str().cmp(right.node_id.as_str()))
+        });
+        nodes
+    }
+
+    pub fn set_mirror_snapshot(&self, snapshot: MirrorSummarySnapshot) {
+        metrics::record_mirror_snapshot(&snapshot);
+        self.inner.write().expect("snapshot store poisoned").mirror = Some(snapshot);
+    }
+
+    #[must_use]
+    pub fn mirror_snapshot(&self) -> Option<MirrorSummarySnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .mirror
+            .clone()
+    }
+
+    pub fn record_benchmark_run(&self, snapshot: BenchmarkRunSnapshot) {
+        metrics::record_benchmark_run(&snapshot);
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if inner.benchmark_runs.len() == BENCHMARK_RUN_RING_CAPACITY {
+            inner.benchmark_runs.pop_front();
+        }
+        inner.benchmark_runs.push_back(snapshot);
+    }
+
+    #[must_use]
+    pub fn benchmark_run_snapshots(&self) -> Vec<BenchmarkRunSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .benchmark_runs
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn record_adaptive_recommendation(&self, snapshot: AdaptiveRecommendationSnapshot) {
+        metrics::record_adaptive_recommendation(&snapshot);
         let mut inner = self.inner.write().expect("snapshot store poisoned");
         if inner.adaptive_recommendations.len() == ADAPTIVE_RECOMMENDATION_RING_CAPACITY {
             inner.adaptive_recommendations.pop_front();
@@ -716,6 +932,7 @@ impl SnapshotStore {
     }
 
     pub fn record_adaptive_outcome(&self, snapshot: AdaptiveOutcomeSnapshot) {
+        metrics::record_adaptive_outcome(&snapshot);
         let mut inner = self.inner.write().expect("snapshot store poisoned");
         if inner.adaptive_outcomes.len() == ADAPTIVE_OUTCOME_RING_CAPACITY {
             inner.adaptive_outcomes.pop_front();
