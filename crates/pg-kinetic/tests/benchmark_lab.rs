@@ -1,7 +1,8 @@
 use std::{fs, path::PathBuf, process::Command};
 
 use pg_kinetic_core::benchmark::{
-    BenchmarkComparison, BenchmarkDriver, BenchmarkScenario, BenchmarkTarget, BenchmarkWorkloadKind,
+    BenchmarkComparison, BenchmarkDriver, BenchmarkScenario, BenchmarkTarget,
+    BenchmarkValidationError, BenchmarkWorkloadKind,
 };
 use pg_kinetic_proxy::benchmark::validate_benchmark_scenario;
 
@@ -88,8 +89,14 @@ fn scenario_validation_rejects_zero_duration_concurrency_and_target_matrix() {
     assert!(validate_benchmark_scenario(&zero_concurrency).is_err());
     fs::remove_file(zero_concurrency).expect("remove zero concurrency scenario");
 
-    let missing_matrix = write_temporary_scenario("name = \"missing-target-matrix\"\n");
-    assert!(validate_benchmark_scenario(&missing_matrix).is_err());
+    let missing_matrix = write_temporary_scenario(
+        "name = \"missing-target-matrix\"\n[[targets]]\nlabel = \"legacy-target\"\ncomparison = \"pg_kinetic\"\ndsn = \"postgres://bench:benchmark-secret@127.0.0.1:8432/bench\"\n",
+    );
+    assert_eq!(
+        validate_benchmark_scenario(&missing_matrix)
+            .expect_err("legacy targets require target_matrix"),
+        BenchmarkValidationError::MissingTargetMatrix
+    );
     fs::remove_file(missing_matrix).expect("remove missing matrix scenario");
 }
 
@@ -110,6 +117,19 @@ fn scenario_debug_and_report_output_redact_credentials() {
     let debug = format!("{scenario:?}");
     assert!(!debug.contains("benchmark-secret"));
     assert!(debug.contains("<redacted>"));
+
+    let query_credential_target = BenchmarkTarget::new(
+        "query-credentials",
+        BenchmarkComparison::PgKinetic,
+        "postgres://bench:userinfo-secret@127.0.0.1:8432/bench?password=query-secret&application_name=benchmark-lab",
+    )
+    .expect("target with query credentials is valid");
+    let redacted = query_credential_target.redacted_dsn();
+    assert!(!redacted.contains("userinfo-secret"));
+    assert!(!redacted.contains("query-secret"));
+    assert!(redacted.contains("<redacted>@"));
+    assert!(redacted.contains("password=<redacted>"));
+    assert!(redacted.contains("application_name=benchmark-lab"));
 
     let path = scenario_path("simple-query");
     let output = Command::new(binary_path())

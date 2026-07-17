@@ -25,8 +25,6 @@ struct BenchmarkScenarioDocument {
     #[serde(default)]
     target_matrix: Option<BenchmarkScenarioMatrixDocument>,
     #[serde(default)]
-    targets: Vec<BenchmarkTargetDocument>,
-    #[serde(default)]
     connections: Option<BenchmarkConnectionProfileDocument>,
     #[serde(default)]
     features: Option<BenchmarkFeatureToggleSetDocument>,
@@ -108,8 +106,8 @@ pub fn load_benchmark_scenario(path: &Path) -> Result<BenchmarkScenario, Benchma
         .unwrap_or_else(default_warmup_ms);
     let targets = document
         .target_matrix
-        .map(|matrix| matrix.targets)
-        .unwrap_or(document.targets)
+        .ok_or(BenchmarkValidationError::MissingTargetMatrix)?
+        .targets
         .into_iter()
         .map(|target| {
             let comparison = parse_comparison(&target.comparison)?;

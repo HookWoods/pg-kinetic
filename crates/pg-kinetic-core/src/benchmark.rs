@@ -730,6 +730,8 @@ pub enum BenchmarkValidationError {
     EmptyTargetDsn,
     #[error("benchmark scenario must define at least one target")]
     EmptyTargets,
+    #[error("benchmark scenario must define a target matrix")]
+    MissingTargetMatrix,
     #[error("benchmark connection profile field '{field}' must be greater than zero")]
     InvalidConnectionProfile { field: &'static str },
     #[error("benchmark scenario must declare at least one expected metric")]
@@ -762,17 +764,46 @@ fn validate_metric_value(field: &'static str, value: f64) -> Result<(), Benchmar
 }
 
 fn redact_connection_string(value: &str) -> String {
+    let mut redacted = value.to_owned();
     if let Some(scheme_end) = value.find("://") {
         let authority_start = scheme_end + 3;
         if let Some(userinfo_end) = value[authority_start..].find('@') {
             let userinfo_end = authority_start + userinfo_end;
-            let mut redacted = String::with_capacity(value.len());
-            redacted.push_str(&value[..authority_start]);
-            redacted.push_str("<redacted>@");
-            redacted.push_str(&value[userinfo_end + 1..]);
-            return redacted;
+            redacted = format!(
+                "{}<redacted>@{}",
+                &value[..authority_start],
+                &value[userinfo_end + 1..]
+            );
         }
     }
 
-    value.to_owned()
+    redact_query_credentials(&redacted)
+}
+
+fn redact_query_credentials(value: &str) -> String {
+    let Some(query_start) = value.find('?') else {
+        return value.to_owned();
+    };
+    let (query_and_fragment, fragment) = match value[query_start + 1..].find('#') {
+        Some(fragment_start) => {
+            let fragment_start = query_start + 1 + fragment_start;
+            (
+                &value[query_start + 1..fragment_start],
+                &value[fragment_start..],
+            )
+        }
+        None => (&value[query_start + 1..], ""),
+    };
+    let query = query_and_fragment
+        .split('&')
+        .map(|parameter| match parameter.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => {
+                format!("{key}=<redacted>")
+            }
+            _ => parameter.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    format!("{}?{query}{fragment}", &value[..query_start])
 }
