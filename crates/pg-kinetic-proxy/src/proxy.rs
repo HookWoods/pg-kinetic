@@ -29,6 +29,7 @@ use crate::{
     health,
     lifecycle::{wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator},
     metrics,
+    mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
         ReplicaSelectionStrategy, ReplicaSelector, RoutePools,
@@ -230,6 +231,12 @@ impl Proxy {
             .into_iter()
             .next()
             .context("missing effective route config")?;
+        let mirror_dispatcher = Arc::new(MirrorDispatcher::disabled(
+            route_config.primary.address,
+            effective_config.tls.clone(),
+            effective_config.socket.clone(),
+            MirrorOutcomeRecorder::default(),
+        ));
         let route_pools = Arc::new(build_route_pools(
             &effective_config,
             &route_config,
@@ -397,19 +404,22 @@ impl Proxy {
                     );
                     let phase_recorder = Arc::clone(&phase_recorder);
 
+                    let mirror_dispatcher = Arc::clone(&mirror_dispatcher);
+
                     client_tasks.spawn(async move {
                         let _client_guard = client_guard;
                         let result = handle_client(
-                        client,
-                        client_addr,
-                        route_pools,
-                        config_snapshot,
-                        routing_planner,
-                        session_id,
-                        snapshot_store,
-                        client_snapshot_handle,
-                        phase_recorder,
-                        debug_sampler,
+                            client,
+                            client_addr,
+                            route_pools,
+                            config_snapshot,
+                            routing_planner,
+                            session_id,
+                            snapshot_store,
+                            client_snapshot_handle,
+                            phase_recorder,
+                            debug_sampler,
+                            mirror_dispatcher,
                         )
                         .await;
                         drop(permit);
@@ -437,6 +447,7 @@ async fn handle_client(
     client_snapshot_handle: ClientSnapshotHandle,
     phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     debug_sampler: DebugSampler,
+    mirror_dispatcher: Arc<MirrorDispatcher>,
 ) -> anyhow::Result<()> {
     let session_started = Instant::now();
     let _client_snapshot_guard = ClientSnapshotGuard::new(
@@ -474,6 +485,7 @@ async fn handle_client(
     let mut prepared = PreparedCatalog::new(session_id);
     let mut held_backend: Option<PooledBackend> = None;
     let mut wait_for_client_activity_after_timeout = false;
+    let mut mirror_query_id = 0_u64;
 
     let startup_packet = match read_startup_packet(
         &mut client,
@@ -707,39 +719,45 @@ async fn handle_client(
         wait_for_client_activity_after_timeout = false;
         match cycle {
             ClientCycle::Frames(frames) => {
+                let current_query_id = mirror_query_id;
+                mirror_query_id = mirror_query_id.wrapping_add(1);
                 let committed_write_transaction =
                     update_transaction_state_from_frames(&mut session, &frames)
                         .context("update transaction state before backend checkout")?;
+                let route = route_key(
+                    &route_database,
+                    &route_user,
+                    route_application_name.as_deref(),
+                    client_addr,
+                );
+                let selection = ReadRoutingSelection {
+                    planner: &routing_planner,
+                    route_pools: &route_pools,
+                    snapshot_store: &snapshot_store,
+                    read_routing_mode: route_read_routing_mode,
+                    fallback_policy: route_fallback_policy,
+                    session: &session,
+                    prepared: &prepared,
+                    frames: &frames,
+                };
+                let base_checkout_target = select_checkout_target(&selection);
+                let mirror_route_target = base_checkout_target.clone();
+                let backend_reused = held_backend.is_some();
+                let checkout_target = if backend_reused {
+                    base_checkout_target.clone()
+                } else if matches!(
+                    base_checkout_target,
+                    RoutingTarget::Wait {
+                        reason: RoutingReason::FallbackWait,
+                    }
+                ) {
+                    wait_for_checkout_target(&route, &selection, read_after_write_timeout).await
+                } else {
+                    base_checkout_target.clone()
+                };
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
-                    let route = route_key(
-                        &route_database,
-                        &route_user,
-                        route_application_name.as_deref(),
-                        client_addr,
-                    );
-                    let selection = ReadRoutingSelection {
-                        planner: &routing_planner,
-                        route_pools: &route_pools,
-                        snapshot_store: &snapshot_store,
-                        read_routing_mode: route_read_routing_mode,
-                        fallback_policy: route_fallback_policy,
-                        session: &session,
-                        prepared: &prepared,
-                        frames: &frames,
-                    };
-                    let checkout_target = select_checkout_target(&selection);
-                    let checkout_target = if matches!(
-                        checkout_target,
-                        RoutingTarget::Wait {
-                            reason: RoutingReason::FallbackWait,
-                        }
-                    ) {
-                        wait_for_checkout_target(&route, &selection, read_after_write_timeout).await
-                    } else {
-                        checkout_target
-                    };
                     match checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
                         route,
@@ -778,16 +796,45 @@ async fn handle_client(
                     }
                 };
 
-                if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
-                    let replay = replay_frames(&session);
-                    let status =
-                        execute_backend_batch(&mut backend, &replay, qos.max_backend_buffer_bytes)
-                            .await
-                            .context("replay virtual session")?;
+                let replay = if should_replay_session(&session, &pinned_backend, backend.backend_id())
+                {
+                    Some(replay_frames(&session))
+                } else {
+                    None
+                };
+
+                if let Some(replay_frames) = replay.as_ref() {
+                    let status = execute_backend_batch(
+                        &mut backend,
+                        replay_frames,
+                        qos.max_backend_buffer_bytes,
+                    )
+                    .await
+                    .context("replay virtual session")?;
                     anyhow::ensure!(
                         status == ReadyStatus::Idle,
                         "unexpected replay status: {status:?}"
                     );
+                }
+
+                if mirror_dispatcher.classifier().mode().is_enabled() {
+                    let mirror_task = MirrorTask::new(
+                        session_id,
+                        current_query_id,
+                        route_key(
+                            &route_database,
+                            &route_user,
+                            route_application_name.as_deref(),
+                            client_addr,
+                        ),
+                        mirror_route_target,
+                        mirror_sql_command_for_frames(&prepared, &frames),
+                        startup_packet.clone().freeze(),
+                        replay.clone().unwrap_or_default(),
+                        frames.clone(),
+                        session.pin_reason(),
+                    );
+                    let _ = mirror_dispatcher.dispatch(mirror_task);
                 }
 
                 let mut progress = QueryProgress::default();
@@ -1696,6 +1743,10 @@ fn routing_sql_for_frames<'a>(
     }
 
     Cow::Borrowed("")
+}
+
+fn mirror_sql_command_for_frames(prepared: &PreparedCatalog, frames: &[FrontendFrame]) -> SqlCommand {
+    classify(routing_sql_for_frames(prepared, frames).as_ref())
 }
 
 fn route_checkout_freshness_outcome(

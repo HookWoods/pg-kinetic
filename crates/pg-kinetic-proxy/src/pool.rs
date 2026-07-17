@@ -188,6 +188,16 @@ impl BackendPoolRef {
         self.inner.pool.reset_query()
     }
 
+    #[must_use]
+    pub fn backend_addr(&self) -> SocketAddr {
+        self.inner.pool.backend_addr
+    }
+
+    #[must_use]
+    pub fn backend_connection_settings(&self) -> (TlsConfig, SocketConfig) {
+        (self.inner.pool.tls.clone(), self.inner.pool.socket.clone())
+    }
+
     fn new(id: u64, role: BackendRole, weight: usize, pool: Arc<BackendPool>) -> Self {
         Self {
             inner: Arc::new(BackendPoolRefInner {
