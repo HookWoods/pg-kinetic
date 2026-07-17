@@ -3,6 +3,7 @@ use pg_kinetic::core::performance::{
     ProcessMetricValue,
 };
 use pg_kinetic_proxy::benchmark::collect_process_metrics;
+use serde_json::Value;
 
 #[test]
 fn collection_exposes_process_metrics_and_timestamp() {
@@ -14,6 +15,14 @@ fn collection_exposes_process_metrics_and_timestamp() {
         ProcessMetricKind::ResidentMemory,
         ProcessMetricKind::OpenFileDescriptors,
     ] {
+        assert!(
+            collection
+                .sample()
+                .metrics()
+                .iter()
+                .any(|(candidate, _)| *candidate == kind),
+            "required process metric key {kind} is missing"
+        );
         assert!(
             collection.sample().metric(kind).is_unknown()
                 || collection.sample().metric(kind).as_f64().is_some()
@@ -84,8 +93,10 @@ fn process_samples_render_redacted_json() {
         )],
     );
     let json = sample.to_json();
-    assert!(json.contains("sampled_at_ms"));
-    assert!(json.contains("resident_memory"));
-    assert!(json.contains("\"process_id\":null"));
-    assert!(json.contains("\"command_line\":null"));
+    let parsed: Value =
+        serde_json::from_str(&json).expect("serialized sample should be valid JSON");
+    assert_eq!(parsed["sampled_at_ms"], 42);
+    assert_eq!(parsed["metrics"]["resident_memory"], 12);
+    assert!(parsed["process_id"].is_null());
+    assert!(parsed["command_line"].is_null());
 }

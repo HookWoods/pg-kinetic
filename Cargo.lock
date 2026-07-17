@@ -940,6 +940,7 @@ dependencies = [
  "pg-kinetic-wire",
  "pretty_assertions",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tokio",
