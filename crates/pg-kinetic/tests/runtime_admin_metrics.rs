@@ -153,12 +153,18 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
         "postgres://benchmark_user:secret-password@127.0.0.1:5432/pgkinetic",
     )
     .expect("benchmark target");
+    let direct_benchmark_target = BenchmarkTarget::new(
+        "direct",
+        BenchmarkComparison::DirectPostgreSQL,
+        "postgres://benchmark_user:secret-password@127.0.0.1:5432/postgres",
+    )
+    .expect("direct benchmark target");
     let benchmark_scenario = BenchmarkScenario::new(
         "nightly_latency",
         BenchmarkDriver::PgBench,
         12_000,
         1_000,
-        vec![benchmark_target.clone()],
+        vec![direct_benchmark_target, benchmark_target.clone()],
     )
     .expect("benchmark scenario");
     let benchmark_result = BenchmarkResult::new(
@@ -405,12 +411,18 @@ async fn metric_labels_stay_low_cardinality() {
         "postgres://benchmark_user:secret-password@127.0.0.1:5432/pgkinetic",
     )
     .expect("benchmark target");
+    let direct_benchmark_target = BenchmarkTarget::new(
+        "direct",
+        BenchmarkComparison::DirectPostgreSQL,
+        "postgres://benchmark_user:secret-password@127.0.0.1:5432/postgres",
+    )
+    .expect("direct benchmark target");
     let benchmark_scenario = BenchmarkScenario::new(
         "nightly_latency",
         BenchmarkDriver::PgBench,
         12_000,
         1_000,
-        vec![benchmark_target.clone()],
+        vec![direct_benchmark_target, benchmark_target.clone()],
     )
     .expect("benchmark scenario");
     let benchmark_result = BenchmarkResult::new(
