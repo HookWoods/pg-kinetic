@@ -3,11 +3,18 @@ use std::{fs, path::PathBuf, process, sync::Arc};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
+use pg_kinetic::core::benchmark::{
+    BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkScenario,
+    BenchmarkTarget, BenchmarkValidationError,
+};
 use pg_kinetic::core::{
     lsn::FreshnessStatus, policy::PolicyAction, routing::QueryClass as RoutingQueryClass,
     session::TransactionAccessMode,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
+use pg_kinetic_proxy::benchmark::{
+    prepare_benchmark_results, validate_benchmark_scenario,
+};
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
@@ -27,6 +34,7 @@ struct Cli {
 enum Command {
     RoutePreview(RoutePreviewArgs),
     PolicyPreview(PolicyPreviewArgs),
+    Benchmark(BenchmarkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -74,6 +82,33 @@ struct PolicyPreviewArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug, Args)]
+struct BenchmarkArgs {
+    #[command(subcommand)]
+    command: BenchmarkCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchmarkCommand {
+    Validate(BenchmarkValidateArgs),
+    Run(BenchmarkRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct BenchmarkValidateArgs {
+    #[arg(long)]
+    scenario: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct BenchmarkRunArgs {
+    #[arg(long)]
+    scenario: PathBuf,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -101,6 +136,7 @@ fn main() -> anyhow::Result<()> {
     match command {
         Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
         Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
+        Some(Command::Benchmark(args)) => return run_benchmark(config, args),
         None => {}
     }
 
@@ -203,6 +239,50 @@ fn run_route_preview(_config: Config, args: RoutePreviewArgs) -> anyhow::Result<
             process::exit(1);
         }
     }
+}
+
+fn run_benchmark(_config: Config, args: BenchmarkArgs) -> anyhow::Result<()> {
+    match args.command {
+        BenchmarkCommand::Validate(args) => run_benchmark_validate(args),
+        BenchmarkCommand::Run(args) => run_benchmark_run(args),
+    }
+}
+
+fn run_benchmark_validate(args: BenchmarkValidateArgs) -> anyhow::Result<()> {
+    let BenchmarkValidateArgs { scenario } = args;
+
+    match validate_benchmark_scenario(&scenario) {
+        Ok(scenario) => {
+            println!("{}", render_benchmark_validation_success(&scenario));
+            Ok(())
+        }
+        Err(error) => {
+            println!("{}", render_benchmark_error(&scenario, &error));
+            process::exit(1);
+        }
+    }
+}
+
+fn run_benchmark_run(args: BenchmarkRunArgs) -> anyhow::Result<()> {
+    let BenchmarkRunArgs { scenario, format } = args;
+
+    let scenario = match validate_benchmark_scenario(&scenario) {
+        Ok(scenario) => scenario,
+        Err(error) => {
+            println!("{}", render_benchmark_error(&scenario, &error));
+            process::exit(1);
+        }
+    };
+
+    let results = prepare_benchmark_results(&scenario);
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", render_benchmark_run_success(&scenario, &results));
+        }
+    }
+
+    Ok(())
 }
 
 fn build_policy_preview_input(
@@ -362,6 +442,89 @@ fn render_preview_error(route: &str, error: &RoutePreviewError) -> String {
         json_string(&error.code),
         json_string(&error.code),
         json_string(&error.message)
+    )
+}
+
+fn render_benchmark_validation_success(scenario: &BenchmarkScenario) -> String {
+    format!(
+        "{{\"ok\":true,\"scenario\":{},\"targets\":{}}}",
+        render_benchmark_scenario(scenario),
+        render_benchmark_targets(scenario.targets())
+    )
+}
+
+fn render_benchmark_run_success(scenario: &BenchmarkScenario, results: &[BenchmarkResult]) -> String {
+    let rendered_results = results
+        .iter()
+        .map(render_benchmark_result)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"ok\":true,\"scenario\":{},\"results\":[{}]}}",
+        render_benchmark_scenario(scenario),
+        rendered_results
+    )
+}
+
+fn render_benchmark_error(path: &PathBuf, error: &BenchmarkValidationError) -> String {
+    format!(
+        "{{\"ok\":false,\"scenario\":{},\"error\":{{\"code\":\"benchmark_validation_failed\",\"message\":{}}}}}",
+        json_string(path.to_str().unwrap_or("<invalid-path>")),
+        json_string(&error.to_string())
+    )
+}
+
+fn render_benchmark_scenario(scenario: &BenchmarkScenario) -> String {
+    format!(
+        "{{\"name\":{},\"driver\":{},\"duration_ms\":{},\"warmup_ms\":{}}}",
+        json_string(scenario.name()),
+        json_string(scenario.driver().as_str()),
+        scenario.duration_ms(),
+        scenario.warmup_ms()
+    )
+}
+
+fn render_benchmark_targets(targets: &[BenchmarkTarget]) -> String {
+    let rendered_targets = targets
+        .iter()
+        .map(render_benchmark_target)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{}]", rendered_targets)
+}
+
+fn render_benchmark_target(target: &BenchmarkTarget) -> String {
+    format!(
+        "{{\"label\":{},\"comparison\":{},\"dsn\":{}}}",
+        json_string(target.label()),
+        json_string(target.comparison().as_str()),
+        json_string(&target.redacted_dsn())
+    )
+}
+
+fn render_benchmark_result(result: &BenchmarkResult) -> String {
+    format!(
+        "{{\"scenario\":{},\"target\":{},\"driver\":{},\"duration_ms\":{},\"metrics\":{}}}",
+        json_string(result.scenario()),
+        render_benchmark_target(result.target()),
+        json_string(result.driver().as_str()),
+        result.duration_ms(),
+        render_benchmark_metric(result.metrics())
+    )
+}
+
+fn render_benchmark_metric(metric: &BenchmarkMetric) -> String {
+    format!(
+        "{{\"p50_ms\":{},\"p95_ms\":{},\"p99_ms\":{},\"throughput_qps\":{},\"cpu_label\":{},\"memory_label\":{},\"error_rate\":{}}}",
+        metric.p50_ms(),
+        metric.p95_ms(),
+        metric.p99_ms(),
+        metric.throughput_qps(),
+        json_string(metric.cpu_label()),
+        json_string(metric.memory_label()),
+        metric.error_rate()
     )
 }
 

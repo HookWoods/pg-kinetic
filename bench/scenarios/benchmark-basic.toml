@@ -1,0 +1,24 @@
+name = "benchmark-basic"
+driver = "pgbench"
+duration_ms = 60000
+warmup_ms = 5000
+
+[[targets]]
+label = "direct-postgresql"
+comparison = "direct_postgresql"
+dsn = "postgres://bench:bench-secret@127.0.0.1:5432/bench"
+
+[[targets]]
+label = "pgbouncer"
+comparison = "pgbouncer"
+dsn = "postgres://bench:bench-secret@127.0.0.1:6432/bench"
+
+[[targets]]
+label = "pgdog"
+comparison = "pgdog"
+dsn = "postgres://bench:bench-secret@127.0.0.1:7432/bench"
+
+[[targets]]
+label = "pg-kinetic"
+comparison = "pg_kinetic"
+dsn = "postgres://bench:bench-secret@127.0.0.1:8432/bench"

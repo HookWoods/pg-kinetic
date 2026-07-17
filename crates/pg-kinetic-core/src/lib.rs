@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod adaptive;
 pub mod backpressure;
+pub mod benchmark;
 pub mod cleanup;
 pub mod control;
 pub mod constants;

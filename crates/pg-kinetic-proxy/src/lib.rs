@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod benchmark;
 pub mod auth;
 pub mod adaptive;
 pub mod backend;
