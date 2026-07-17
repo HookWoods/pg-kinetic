@@ -90,7 +90,54 @@ impl FromStr for BenchmarkDriver {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum BenchmarkWorkloadKind {
+    #[default]
+    SimpleQuery,
+    ExtendedQuery,
+    PreparedStatementReuse,
+    TransactionPool,
+    IdleClients,
+    RoutingShardingPolicy,
+}
+
+impl BenchmarkWorkloadKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SimpleQuery => "simple_query",
+            Self::ExtendedQuery => "extended_query",
+            Self::PreparedStatementReuse => "prepared_statement_reuse",
+            Self::TransactionPool => "transaction_pool",
+            Self::IdleClients => "idle_clients",
+            Self::RoutingShardingPolicy => "routing_sharding_policy",
+        }
+    }
+}
+
+impl fmt::Display for BenchmarkWorkloadKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BenchmarkWorkloadKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "simple_query" => Ok(Self::SimpleQuery),
+            "extended_query" => Ok(Self::ExtendedQuery),
+            "prepared_statement_reuse" => Ok(Self::PreparedStatementReuse),
+            "transaction_pool" => Ok(Self::TransactionPool),
+            "idle_clients" => Ok(Self::IdleClients),
+            "routing_sharding_policy" => Ok(Self::RoutingShardingPolicy),
+            other => Err(format!("unknown benchmark workload '{other}'")),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct BenchmarkTarget {
     label: Arc<str>,
     comparison: BenchmarkComparison,
@@ -151,13 +198,231 @@ impl BenchmarkTarget {
     }
 }
 
+impl fmt::Debug for BenchmarkTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BenchmarkTarget")
+            .field("label", &self.label)
+            .field("comparison", &self.comparison)
+            .field("dsn", &self.redacted_dsn())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BenchmarkScenarioMatrix {
+    targets: Vec<BenchmarkTarget>,
+}
+
+impl BenchmarkScenarioMatrix {
+    pub fn new(targets: Vec<BenchmarkTarget>) -> Result<Self, BenchmarkValidationError> {
+        let matrix = Self { targets };
+        matrix.validate()?;
+        Ok(matrix)
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[BenchmarkTarget] {
+        &self.targets
+    }
+
+    fn validate(&self) -> Result<(), BenchmarkValidationError> {
+        if self.targets.is_empty() {
+            return Err(BenchmarkValidationError::EmptyTargets);
+        }
+
+        let mut labels = HashSet::new();
+        for target in &self.targets {
+            target.validate()?;
+            if !labels.insert(target.label()) {
+                return Err(BenchmarkValidationError::DuplicateTargetLabel {
+                    label: Arc::from(target.label()),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkWarmupConfig {
+    duration_ms: u64,
+}
+
+impl BenchmarkWarmupConfig {
+    pub fn new(duration_ms: u64) -> Result<Self, BenchmarkValidationError> {
+        Ok(Self { duration_ms })
+    }
+
+    #[must_use]
+    pub const fn duration_ms(self) -> u64 {
+        self.duration_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkConnectionProfile {
+    concurrency: u32,
+    connection_count: u32,
+}
+
+impl BenchmarkConnectionProfile {
+    pub fn new(concurrency: u32, connection_count: u32) -> Result<Self, BenchmarkValidationError> {
+        if concurrency == 0 {
+            return Err(BenchmarkValidationError::InvalidConnectionProfile {
+                field: "concurrency",
+            });
+        }
+        if connection_count == 0 {
+            return Err(BenchmarkValidationError::InvalidConnectionProfile {
+                field: "connection_count",
+            });
+        }
+
+        Ok(Self {
+            concurrency,
+            connection_count,
+        })
+    }
+
+    #[must_use]
+    pub const fn concurrency(self) -> u32 {
+        self.concurrency
+    }
+
+    #[must_use]
+    pub const fn connection_count(self) -> u32 {
+        self.connection_count
+    }
+}
+
+impl Default for BenchmarkConnectionProfile {
+    fn default() -> Self {
+        Self {
+            concurrency: 16,
+            connection_count: 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BenchmarkFeatureToggleSet {
+    read_routing: bool,
+    sharding: bool,
+    policy_overhead: bool,
+}
+
+impl BenchmarkFeatureToggleSet {
+    #[must_use]
+    pub const fn new(read_routing: bool, sharding: bool, policy_overhead: bool) -> Self {
+        Self {
+            read_routing,
+            sharding,
+            policy_overhead,
+        }
+    }
+
+    #[must_use]
+    pub const fn read_routing(self) -> bool {
+        self.read_routing
+    }
+
+    #[must_use]
+    pub const fn sharding(self) -> bool {
+        self.sharding
+    }
+
+    #[must_use]
+    pub const fn policy_overhead(self) -> bool {
+        self.policy_overhead
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkExpectedMetricSet {
+    latency: bool,
+    throughput: bool,
+    cpu: bool,
+    memory: bool,
+    error_rate: bool,
+}
+
+impl BenchmarkExpectedMetricSet {
+    pub fn new(
+        latency: bool,
+        throughput: bool,
+        cpu: bool,
+        memory: bool,
+        error_rate: bool,
+    ) -> Result<Self, BenchmarkValidationError> {
+        let metrics = Self {
+            latency,
+            throughput,
+            cpu,
+            memory,
+            error_rate,
+        };
+        if !metrics.any_enabled() {
+            return Err(BenchmarkValidationError::EmptyExpectedMetrics);
+        }
+        Ok(metrics)
+    }
+
+    #[must_use]
+    pub const fn latency(self) -> bool {
+        self.latency
+    }
+
+    #[must_use]
+    pub const fn throughput(self) -> bool {
+        self.throughput
+    }
+
+    #[must_use]
+    pub const fn cpu(self) -> bool {
+        self.cpu
+    }
+
+    #[must_use]
+    pub const fn memory(self) -> bool {
+        self.memory
+    }
+
+    #[must_use]
+    pub const fn error_rate(self) -> bool {
+        self.error_rate
+    }
+
+    #[must_use]
+    pub const fn any_enabled(self) -> bool {
+        self.latency || self.throughput || self.cpu || self.memory || self.error_rate
+    }
+}
+
+impl Default for BenchmarkExpectedMetricSet {
+    fn default() -> Self {
+        Self {
+            latency: true,
+            throughput: true,
+            cpu: true,
+            memory: true,
+            error_rate: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BenchmarkScenario {
     name: Arc<str>,
     driver: BenchmarkDriver,
+    workload: BenchmarkWorkloadKind,
     duration_ms: u64,
-    warmup_ms: u64,
-    targets: Vec<BenchmarkTarget>,
+    warmup: BenchmarkWarmupConfig,
+    matrix: BenchmarkScenarioMatrix,
+    connections: BenchmarkConnectionProfile,
+    features: BenchmarkFeatureToggleSet,
+    expected_metrics: BenchmarkExpectedMetricSet,
 }
 
 impl BenchmarkScenario {
@@ -168,6 +433,31 @@ impl BenchmarkScenario {
         warmup_ms: u64,
         targets: Vec<BenchmarkTarget>,
     ) -> Result<Self, BenchmarkValidationError> {
+        Self::new_with_configuration(
+            name,
+            driver,
+            BenchmarkWorkloadKind::default(),
+            duration_ms,
+            BenchmarkWarmupConfig::new(warmup_ms)?,
+            BenchmarkScenarioMatrix::new(targets)?,
+            BenchmarkConnectionProfile::default(),
+            BenchmarkFeatureToggleSet::default(),
+            BenchmarkExpectedMetricSet::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_configuration(
+        name: impl Into<Arc<str>>,
+        driver: BenchmarkDriver,
+        workload: BenchmarkWorkloadKind,
+        duration_ms: u64,
+        warmup: BenchmarkWarmupConfig,
+        matrix: BenchmarkScenarioMatrix,
+        connections: BenchmarkConnectionProfile,
+        features: BenchmarkFeatureToggleSet,
+        expected_metrics: BenchmarkExpectedMetricSet,
+    ) -> Result<Self, BenchmarkValidationError> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(BenchmarkValidationError::EmptyScenarioName);
@@ -177,30 +467,19 @@ impl BenchmarkScenario {
                 field: "duration_ms",
             });
         }
-        if warmup_ms > duration_ms {
-            return Err(BenchmarkValidationError::WarmupExceedsDuration);
-        }
-        if targets.is_empty() {
-            return Err(BenchmarkValidationError::EmptyTargets);
-        }
-
-        let mut labels = HashSet::new();
-        for target in &targets {
-            target.validate()?;
-            if !labels.insert(target.label()) {
-                return Err(BenchmarkValidationError::DuplicateTargetLabel {
-                    label: Arc::from(target.label()),
-                });
-            }
-        }
-
-        Ok(Self {
+        let scenario = Self {
             name,
             driver,
+            workload,
             duration_ms,
-            warmup_ms,
-            targets,
-        })
+            warmup,
+            matrix,
+            connections,
+            features,
+            expected_metrics,
+        };
+        scenario.validate()?;
+        Ok(scenario)
     }
 
     #[must_use]
@@ -214,18 +493,48 @@ impl BenchmarkScenario {
     }
 
     #[must_use]
+    pub const fn workload(&self) -> BenchmarkWorkloadKind {
+        self.workload
+    }
+
+    #[must_use]
     pub const fn duration_ms(&self) -> u64 {
         self.duration_ms
     }
 
     #[must_use]
     pub const fn warmup_ms(&self) -> u64 {
-        self.warmup_ms
+        self.warmup.duration_ms()
+    }
+
+    #[must_use]
+    pub const fn warmup(&self) -> BenchmarkWarmupConfig {
+        self.warmup
+    }
+
+    #[must_use]
+    pub const fn matrix(&self) -> &BenchmarkScenarioMatrix {
+        &self.matrix
+    }
+
+    #[must_use]
+    pub const fn connections(&self) -> BenchmarkConnectionProfile {
+        self.connections
+    }
+
+    #[must_use]
+    pub const fn features(&self) -> BenchmarkFeatureToggleSet {
+        self.features
+    }
+
+    #[must_use]
+    pub const fn expected_metrics(&self) -> BenchmarkExpectedMetricSet {
+        self.expected_metrics
     }
 
     #[must_use]
     pub fn targets(&self) -> &[BenchmarkTarget] {
-        &self.targets
+        self.matrix.targets()
     }
 
     pub fn validate(&self) -> Result<(), BenchmarkValidationError> {
@@ -237,21 +546,12 @@ impl BenchmarkScenario {
                 field: "duration_ms",
             });
         }
-        if self.warmup_ms > self.duration_ms {
+        if self.warmup.duration_ms() > self.duration_ms {
             return Err(BenchmarkValidationError::WarmupExceedsDuration);
         }
-        if self.targets.is_empty() {
-            return Err(BenchmarkValidationError::EmptyTargets);
-        }
-
-        let mut labels = HashSet::new();
-        for target in &self.targets {
-            target.validate()?;
-            if !labels.insert(target.label()) {
-                return Err(BenchmarkValidationError::DuplicateTargetLabel {
-                    label: Arc::from(target.label()),
-                });
-            }
+        self.matrix.validate()?;
+        if !self.expected_metrics.any_enabled() {
+            return Err(BenchmarkValidationError::EmptyExpectedMetrics);
         }
 
         Ok(())
@@ -430,6 +730,10 @@ pub enum BenchmarkValidationError {
     EmptyTargetDsn,
     #[error("benchmark scenario must define at least one target")]
     EmptyTargets,
+    #[error("benchmark connection profile field '{field}' must be greater than zero")]
+    InvalidConnectionProfile { field: &'static str },
+    #[error("benchmark scenario must declare at least one expected metric")]
+    EmptyExpectedMetrics,
     #[error("benchmark target label '{label}' is duplicated")]
     DuplicateTargetLabel { label: Arc<str> },
     #[error("benchmark {field} must be greater than zero")]
@@ -446,6 +750,8 @@ pub enum BenchmarkValidationError {
     UnsupportedComparisonLabel { label: Arc<str> },
     #[error("benchmark driver label '{label}' is unsupported")]
     UnsupportedDriverLabel { label: Arc<str> },
+    #[error("benchmark workload label '{label}' is unsupported")]
+    UnsupportedWorkloadLabel { label: Arc<str> },
 }
 
 fn validate_metric_value(field: &'static str, value: f64) -> Result<(), BenchmarkValidationError> {

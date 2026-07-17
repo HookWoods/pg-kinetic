@@ -1,0 +1,44 @@
+name = "benchmark-idle-clients"
+driver = "pgbench"
+workload = "idle_clients"
+duration_ms = 30000
+
+[warmup]
+duration_ms = 5000
+
+[connections]
+concurrency = 8
+connection_count = 128
+
+[features]
+read_routing = false
+sharding = false
+policy_overhead = false
+
+[expected_metrics]
+latency = true
+throughput = true
+cpu = true
+memory = true
+error_rate = true
+
+[target_matrix]
+[[target_matrix.targets]]
+label = "direct-postgresql"
+comparison = "direct_postgresql"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:5432/bench"
+
+[[target_matrix.targets]]
+label = "pgbouncer"
+comparison = "pgbouncer"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:6432/bench"
+
+[[target_matrix.targets]]
+label = "pgdog"
+comparison = "pgdog"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:7432/bench"
+
+[[target_matrix.targets]]
+label = "pg-kinetic"
+comparison = "pg_kinetic"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:8432/bench"

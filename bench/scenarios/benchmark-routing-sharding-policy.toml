@@ -1,0 +1,34 @@
+name = "benchmark-routing-sharding-policy"
+driver = "tokio_postgres"
+workload = "routing_sharding_policy"
+duration_ms = 30000
+
+[warmup]
+duration_ms = 5000
+
+[connections]
+concurrency = 16
+connection_count = 16
+
+[features]
+read_routing = true
+sharding = true
+policy_overhead = true
+
+[expected_metrics]
+latency = true
+throughput = true
+cpu = true
+memory = true
+error_rate = true
+
+[target_matrix]
+[[target_matrix.targets]]
+label = "pgdog"
+comparison = "pgdog"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:7432/bench"
+
+[[target_matrix.targets]]
+label = "pg-kinetic"
+comparison = "pg_kinetic"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:8432/bench"
