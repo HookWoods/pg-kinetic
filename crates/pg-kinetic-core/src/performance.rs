@@ -193,12 +193,12 @@ impl PerformanceBudget {
                 let failure_delta = self.failure_threshold.allowed_delta(baseline)?;
                 let regression_delta = self.metric.regression_delta(observed_value, baseline);
 
-                Some(if regression_delta <= warning_delta {
-                    PerformanceBudgetOutcome::Passed
-                } else if regression_delta <= failure_delta {
+                Some(if regression_delta > failure_delta {
+                    PerformanceBudgetOutcome::Failed
+                } else if regression_delta > warning_delta {
                     PerformanceBudgetOutcome::Warning
                 } else {
-                    PerformanceBudgetOutcome::Failed
+                    PerformanceBudgetOutcome::Passed
                 })
             })
             .unwrap_or(PerformanceBudgetOutcome::Warning);

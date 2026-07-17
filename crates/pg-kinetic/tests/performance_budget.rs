@@ -64,6 +64,22 @@ fn budget_comparison_classifies_pass_warning_and_failure() {
 }
 
 #[test]
+fn failure_threshold_takes_precedence_when_thresholds_are_unordered() {
+    let budget = PerformanceBudget::new(
+        PerformanceMetric::LatencyP99,
+        PerformanceRegressionThreshold::Percentage(20.0),
+        PerformanceRegressionThreshold::Percentage(10.0),
+    );
+
+    assert_eq!(
+        budget
+            .evaluate("read-heavy", BenchmarkTarget::PgKinetic, 115.0, Some(100.0))
+            .outcome(),
+        PerformanceBudgetOutcome::Failed
+    );
+}
+
+#[test]
 fn regression_thresholds_support_percentage_and_absolute_deltas() {
     let percentage = PerformanceRegressionThreshold::Percentage(12.5);
     let absolute = PerformanceRegressionThreshold::Absolute(3.5);
