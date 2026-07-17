@@ -4,7 +4,11 @@ use pg_kinetic_core::benchmark::{
     BenchmarkComparison, BenchmarkDriver, BenchmarkScenario, BenchmarkTarget,
     BenchmarkValidationError, BenchmarkWorkloadKind,
 };
-use pg_kinetic_proxy::benchmark::validate_benchmark_scenario;
+use pg_kinetic_proxy::benchmark::{
+    benchmark_target_is_required, benchmark_target_label, validate_benchmark_scenario,
+    validate_benchmark_targets_with, BenchmarkTargetAvailability, BenchmarkTargetOutcome,
+    BenchmarkTargetReportOutcome,
+};
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_pg-kinetic")
@@ -44,6 +48,148 @@ label = "pg-kinetic"
 comparison = "pg_kinetic"
 dsn = "postgres://bench:benchmark-secret@127.0.0.1:8432/bench"
 "#
+}
+
+fn benchmark_target(label: &str, comparison: BenchmarkComparison, port: u16) -> BenchmarkTarget {
+    BenchmarkTarget::new(
+        label,
+        comparison,
+        format!("postgres://bench:target-secret@127.0.0.1:{port}/bench"),
+    )
+    .expect("target is valid")
+}
+
+fn orchestration_scenario(targets: Vec<BenchmarkTarget>) -> BenchmarkScenario {
+    BenchmarkScenario::new(
+        "target-orchestration",
+        BenchmarkDriver::PgBench,
+        1_000,
+        100,
+        targets,
+    )
+    .expect("scenario is valid")
+}
+
+#[test]
+fn target_orchestration_requires_direct_postgresql_and_pg_kinetic() {
+    for comparison in [
+        BenchmarkComparison::DirectPostgreSQL,
+        BenchmarkComparison::PgKinetic,
+    ] {
+        let scenario = orchestration_scenario(vec![benchmark_target(
+            "configured-label",
+            comparison,
+            54_321,
+        )]);
+        let report = validate_benchmark_targets_with(&scenario, |_| false);
+        let target = &report.targets()[0];
+
+        assert!(benchmark_target_is_required(comparison));
+        assert_eq!(
+            report.outcome(),
+            BenchmarkTargetReportOutcome::FailedRequired
+        );
+        assert!(!report.can_run());
+        assert_eq!(
+            target.availability(),
+            BenchmarkTargetAvailability::Unavailable
+        );
+        assert_eq!(target.outcome(), BenchmarkTargetOutcome::FailedRequired);
+    }
+}
+
+#[test]
+fn target_orchestration_supports_optional_competitors() {
+    let scenario = orchestration_scenario(vec![
+        benchmark_target(
+            "configured-pgbouncer",
+            BenchmarkComparison::PgBouncer,
+            64_320,
+        ),
+        benchmark_target("configured-pgdog", BenchmarkComparison::PgDog, 64_319),
+    ]);
+    let report = validate_benchmark_targets_with(&scenario, |_| true);
+
+    assert_eq!(report.outcome(), BenchmarkTargetReportOutcome::Ready);
+    assert!(report.can_run());
+    assert!(!benchmark_target_is_required(
+        BenchmarkComparison::PgBouncer
+    ));
+    assert!(!benchmark_target_is_required(BenchmarkComparison::PgDog));
+    assert!(report.targets().iter().all(|target| {
+        target.availability() == BenchmarkTargetAvailability::Ready
+            && target.outcome() == BenchmarkTargetOutcome::Ready
+    }));
+}
+
+#[test]
+fn unavailable_optional_target_is_partial_and_skipped() {
+    let scenario = orchestration_scenario(vec![
+        benchmark_target(
+            "configured-direct",
+            BenchmarkComparison::DirectPostgreSQL,
+            54_321,
+        ),
+        benchmark_target(
+            "configured-pgbouncer",
+            BenchmarkComparison::PgBouncer,
+            64_320,
+        ),
+        benchmark_target("configured-kinetic", BenchmarkComparison::PgKinetic, 64_318),
+    ]);
+    let report = validate_benchmark_targets_with(&scenario, |target| {
+        target.comparison() != BenchmarkComparison::PgBouncer
+    });
+    let optional = report
+        .targets()
+        .iter()
+        .find(|target| target.comparison() == BenchmarkComparison::PgBouncer)
+        .expect("PgBouncer target report");
+
+    assert_eq!(report.outcome(), BenchmarkTargetReportOutcome::Partial);
+    assert!(report.can_run());
+    assert_eq!(
+        optional.availability(),
+        BenchmarkTargetAvailability::Unavailable
+    );
+    assert_eq!(optional.outcome(), BenchmarkTargetOutcome::SkippedOptional);
+}
+
+#[test]
+fn target_reports_use_stable_labels_and_redacted_connection_strings() {
+    let scenario = orchestration_scenario(vec![
+        benchmark_target(
+            "direct-custom",
+            BenchmarkComparison::DirectPostgreSQL,
+            54_321,
+        ),
+        benchmark_target("bouncer-custom", BenchmarkComparison::PgBouncer, 64_320),
+        benchmark_target("dog-custom", BenchmarkComparison::PgDog, 64_319),
+        benchmark_target("kinetic-custom", BenchmarkComparison::PgKinetic, 64_318),
+    ]);
+    let report = validate_benchmark_targets_with(&scenario, |_| true);
+    let labels = report
+        .targets()
+        .iter()
+        .map(|target| target.label())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        labels,
+        vec!["direct-postgresql", "pgbouncer", "pgdog", "pg-kinetic"]
+    );
+    assert_eq!(
+        benchmark_target_label(BenchmarkComparison::DirectPostgreSQL),
+        "direct-postgresql"
+    );
+    assert!(report
+        .targets()
+        .iter()
+        .all(|target| !target.dsn().contains("target-secret")));
+    assert!(report
+        .targets()
+        .iter()
+        .all(|target| target.dsn().contains("<redacted>@")));
 }
 
 #[test]
