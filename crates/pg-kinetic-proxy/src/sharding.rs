@@ -707,24 +707,27 @@ pub fn plan_sharded_route(
 
     let explicit_hint = parsed_shard_hint(context.sql);
     let route_maps = planner.route_map_store.route_maps();
-    let route_map = match route_maps.iter().find(|route_map| {
-        route_map_matches_context(route_map, &context)
-            && route_map_matches_explicit_hint(route_map, &explicit_hint)
-    }) {
+    let mut fallback_route_map = None;
+    let mut explicit_route_map = None;
+    for route_map in route_maps
+        .iter()
+        .filter(|route_map| route_map_matches_context(route_map, &context))
+    {
+        fallback_route_map.get_or_insert(route_map);
+        if route_map_matches_explicit_hint(route_map, &explicit_hint) {
+            explicit_route_map = Some(route_map);
+            break;
+        }
+    }
+    let route_map = match explicit_route_map.or(fallback_route_map) {
         Some(route_map) => route_map,
-        None => match route_maps
-            .iter()
-            .find(|route_map| route_map_matches_context(route_map, &context))
-        {
-            Some(route_map) => route_map,
-            None => {
-                return ShardRouteDecision::new(
-                    None,
-                    ShardRouteReason::NoMatch,
-                    MultiShardPolicy::Reject,
-                );
-            }
-        },
+        None => {
+            return ShardRouteDecision::new(
+                None,
+                ShardRouteReason::NoMatch,
+                MultiShardPolicy::Reject,
+            );
+        }
     };
 
     if matches!(explicit_hint, ShardHint::Unknown) && context.sql.contains("pg-kinetic:") {

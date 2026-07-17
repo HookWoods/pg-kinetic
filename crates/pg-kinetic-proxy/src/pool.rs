@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
     },
     time::{Duration, Instant},
 };
@@ -32,7 +32,7 @@ pub struct BackendPool {
     socket: SocketConfig,
     reset_query: Arc<str>,
     gate: BackpressureGate,
-    route_gates: StdMutex<HashMap<RouteKey, BackpressureGate>>,
+    route_gates: StdRwLock<HashMap<RouteKey, BackpressureGate>>,
     idle: Mutex<VecDeque<Backend>>,
     backend_available: Notify,
     snapshot_store: StdMutex<Option<SnapshotStore>>,
@@ -105,7 +105,7 @@ pub struct RoutePools {
 
 #[derive(Debug, Default)]
 pub struct RoutePoolRegistry {
-    routes: StdMutex<HashMap<RouteKey, RoutePools>>,
+    routes: StdRwLock<HashMap<RouteKey, RoutePools>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -116,8 +116,7 @@ pub struct ShardPoolKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardPoolCheckoutTarget {
-    route: RouteKey,
-    shard_id: ShardId,
+    key: ShardPoolKey,
     target_role: BackendRole,
     fallback_reason: Option<RoutingReason>,
 }
@@ -130,7 +129,7 @@ pub struct ShardPools {
 
 #[derive(Debug, Default)]
 pub struct ShardedPoolRegistry {
-    routes: StdMutex<HashMap<ShardPoolKey, ShardPools>>,
+    routes: StdRwLock<HashMap<ShardPoolKey, ShardPools>>,
 }
 
 impl BackendPoolRef {
@@ -394,13 +393,13 @@ impl RoutePoolRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            routes: StdMutex::new(HashMap::new()),
+            routes: StdRwLock::new(HashMap::new()),
         }
     }
 
     pub fn insert(&self, route: RouteKey, pools: RoutePools) {
         self.routes
-            .lock()
+            .write()
             .expect("route registry poisoned")
             .insert(route, pools);
     }
@@ -408,7 +407,7 @@ impl RoutePoolRegistry {
     #[must_use]
     pub fn route_pools(&self, route: &RouteKey) -> Option<RoutePools> {
         self.routes
-            .lock()
+            .read()
             .expect("route registry poisoned")
             .get(route)
             .cloned()
@@ -504,9 +503,9 @@ impl ShardPoolCheckoutTarget {
         target_role: BackendRole,
         fallback_reason: Option<RoutingReason>,
     ) -> Self {
+        let key = ShardPoolKey::new(route, shard_id);
         Self {
-            route,
-            shard_id,
+            key,
             target_role,
             fallback_reason,
         }
@@ -514,12 +513,12 @@ impl ShardPoolCheckoutTarget {
 
     #[must_use]
     pub fn route_key(&self) -> &RouteKey {
-        &self.route
+        self.key.route()
     }
 
     #[must_use]
     pub fn shard_id(&self) -> &ShardId {
-        &self.shard_id
+        self.key.shard_id()
     }
 
     #[must_use]
@@ -533,8 +532,8 @@ impl ShardPoolCheckoutTarget {
     }
 
     #[must_use]
-    pub fn key(&self) -> ShardPoolKey {
-        ShardPoolKey::new(self.route.clone(), self.shard_id.clone())
+    pub fn key(&self) -> &ShardPoolKey {
+        &self.key
     }
 }
 
@@ -633,14 +632,14 @@ impl ShardedPoolRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            routes: StdMutex::new(HashMap::new()),
+            routes: StdRwLock::new(HashMap::new()),
         }
     }
 
     pub fn insert(&self, key: ShardPoolKey, pools: ShardPools) {
         assert_eq!(key.shard_id(), pools.shard_id());
         self.routes
-            .lock()
+            .write()
             .expect("sharded route registry poisoned")
             .insert(key, pools);
     }
@@ -648,7 +647,7 @@ impl ShardedPoolRegistry {
     #[must_use]
     pub fn shard_pools(&self, key: &ShardPoolKey) -> Option<ShardPools> {
         self.routes
-            .lock()
+            .read()
             .expect("sharded route registry poisoned")
             .get(key)
             .cloned()
@@ -660,7 +659,7 @@ impl ShardedPoolRegistry {
         mode: CheckoutMode,
     ) -> Result<PooledBackend, PoolError> {
         let pools = self
-            .shard_pools(&target.key())
+            .shard_pools(target.key())
             .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
         pools.checkout_target(target, mode).await
     }
@@ -737,7 +736,7 @@ impl BackendPool {
             socket,
             reset_query: reset_query.into(),
             gate: BackpressureGate::new(max_backends, max_waiters),
-            route_gates: StdMutex::new(HashMap::new()),
+            route_gates: StdRwLock::new(HashMap::new()),
             idle: Mutex::new(VecDeque::new()),
             backend_available: Notify::new(),
             snapshot_store: StdMutex::new(None),
@@ -917,7 +916,17 @@ impl BackendPool {
     }
 
     fn route_gate(&self, route: &RouteKey) -> BackpressureGate {
-        let mut route_gates = self.route_gates.lock().expect("route gates poisoned");
+        if let Some(route_gate) = self
+            .route_gates
+            .read()
+            .expect("route gates poisoned")
+            .get(route)
+            .cloned()
+        {
+            return route_gate;
+        }
+
+        let mut route_gates = self.route_gates.write().expect("route gates poisoned");
         route_gates
             .entry(route.clone())
             .or_insert_with(|| {

@@ -480,7 +480,7 @@ fn select_safe_replica(
     max_replica_lag_ms: u64,
     freshness_policy: FreshnessPolicy,
 ) -> Option<ReplicaCandidate> {
-    let mut candidates: Vec<&ReplicaCandidate> = health
+    health
         .replicas
         .iter()
         .filter(|candidate| candidate.healthy && !candidate.split_brain)
@@ -492,12 +492,8 @@ fn select_safe_replica(
                 max_replica_lag_ms,
             )
         })
-        .collect();
-
-    candidates
-        .sort_by_key(|candidate| (candidate.lag_ms.unwrap_or(u64::MAX), candidate.replica_id));
-
-    candidates.into_iter().next().cloned()
+        .min_by_key(|candidate| (candidate.lag_ms.unwrap_or(u64::MAX), candidate.replica_id))
+        .cloned()
 }
 
 fn replica_satisfies_freshness(
