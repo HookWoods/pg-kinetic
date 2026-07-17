@@ -23,6 +23,7 @@ use crate::routing::{
     RoutingContext, RoutingReason, RoutingTarget,
 };
 use crate::{
+    adaptive::AdaptiveController,
     admin, auth,
     config::{Config, RouteConfig},
     drain::DrainController,
@@ -231,11 +232,12 @@ impl Proxy {
             .into_iter()
             .next()
             .context("missing effective route config")?;
+        let mirror_outcome_recorder = MirrorOutcomeRecorder::default();
         let mirror_dispatcher = Arc::new(MirrorDispatcher::disabled(
             route_config.primary.address,
             effective_config.tls.clone(),
             effective_config.socket.clone(),
-            MirrorOutcomeRecorder::default(),
+            mirror_outcome_recorder.clone(),
         ));
         let route_pools = Arc::new(build_route_pools(
             &effective_config,
@@ -294,6 +296,17 @@ impl Proxy {
             let active_config = Arc::clone(&active_config);
             tokio::spawn(async move {
                 reload::spawn_reload_loop(base_config, reload_config, active_config).await;
+            });
+        }
+
+        if effective_config.runtime.production.adaptive_enabled {
+            let controller = AdaptiveController::new(
+                self.snapshot_store.clone(),
+                mirror_outcome_recorder.clone(),
+                Arc::clone(&active_config),
+            );
+            tokio::spawn(async move {
+                controller.run().await;
             });
         }
 

@@ -25,9 +25,15 @@ use crate::metrics;
 use crate::policy::{PolicyReloadErrorCode, PolicyReloadResult};
 use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
+use pg_kinetic_core::adaptive::{
+    AdaptiveAction, AdaptiveOutcome, AdaptiveRecommendation, AdaptiveSignal, TuningBound,
+    TunableKnob,
+};
 
 const POLICY_AUDIT_RING_CAPACITY: usize = 128;
 const POLICY_DECISION_RING_CAPACITY: usize = 128;
+const ADAPTIVE_RECOMMENDATION_RING_CAPACITY: usize = 64;
+const ADAPTIVE_OUTCOME_RING_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientSnapshot {
@@ -229,6 +235,75 @@ impl BackpressureSnapshot {
             rejected: 0,
             timed_out: 0,
             canceled: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdaptiveRecommendationSnapshot {
+    pub signal: AdaptiveSignal,
+    pub action: AdaptiveAction,
+    pub knob: TunableKnob,
+    pub confidence: f64,
+    pub reason: String,
+    pub window: Duration,
+    pub safety_bound: TuningBound,
+}
+
+impl AdaptiveRecommendationSnapshot {
+    #[must_use]
+    pub fn from_recommendation(recommendation: &AdaptiveRecommendation) -> Self {
+        Self {
+            signal: recommendation.signal(),
+            action: recommendation.action(),
+            knob: recommendation.knob(),
+            confidence: recommendation.confidence(),
+            reason: recommendation.reason().to_string(),
+            window: Duration::from_millis(recommendation.window_ms()),
+            safety_bound: recommendation.safety_bound(),
+        }
+    }
+}
+
+impl From<&AdaptiveRecommendation> for AdaptiveRecommendationSnapshot {
+    fn from(recommendation: &AdaptiveRecommendation) -> Self {
+        Self::from_recommendation(recommendation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdaptiveOutcomeSnapshot {
+    pub signal: AdaptiveSignal,
+    pub knob: TunableKnob,
+    pub outcome: AdaptiveOutcome,
+    pub reason: String,
+    pub before_value: Option<f64>,
+    pub after_value: Option<f64>,
+    pub change_percent: Option<u8>,
+    pub disabled_by_reload: bool,
+}
+
+impl AdaptiveOutcomeSnapshot {
+    #[must_use]
+    pub fn new(
+        signal: AdaptiveSignal,
+        knob: TunableKnob,
+        outcome: AdaptiveOutcome,
+        reason: impl Into<String>,
+        before_value: Option<f64>,
+        after_value: Option<f64>,
+        change_percent: Option<u8>,
+        disabled_by_reload: bool,
+    ) -> Self {
+        Self {
+            signal,
+            knob,
+            outcome,
+            reason: reason.into(),
+            before_value,
+            after_value,
+            change_percent,
+            disabled_by_reload,
         }
     }
 }
@@ -568,6 +643,8 @@ struct SnapshotStoreInner {
     policy_status: Option<PolicyStatusSnapshot>,
     policy_decisions: VecDeque<PolicyAuditEvent>,
     policy_audit_events: VecDeque<PolicyAuditEvent>,
+    adaptive_recommendations: VecDeque<AdaptiveRecommendationSnapshot>,
+    adaptive_outcomes: VecDeque<AdaptiveOutcomeSnapshot>,
     sharding: ShardingConfig,
     shard_lifecycles: HashMap<ShardId, ShardLifecycleSnapshot>,
     shard_migration_safety: Vec<ShardMigrationSafetySnapshot>,
@@ -617,6 +694,44 @@ impl SnapshotStore {
     #[must_use]
     pub fn policy_audit_handle(&self) -> PolicyAuditSnapshotHandle {
         PolicyAuditSnapshotHandle::new(Arc::clone(&self.inner))
+    }
+
+    pub fn record_adaptive_recommendation(&self, snapshot: AdaptiveRecommendationSnapshot) {
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if inner.adaptive_recommendations.len() == ADAPTIVE_RECOMMENDATION_RING_CAPACITY {
+            inner.adaptive_recommendations.pop_front();
+        }
+        inner.adaptive_recommendations.push_back(snapshot);
+    }
+
+    #[must_use]
+    pub fn adaptive_recommendation_snapshots(&self) -> Vec<AdaptiveRecommendationSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .adaptive_recommendations
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_adaptive_outcome(&self, snapshot: AdaptiveOutcomeSnapshot) {
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        if inner.adaptive_outcomes.len() == ADAPTIVE_OUTCOME_RING_CAPACITY {
+            inner.adaptive_outcomes.pop_front();
+        }
+        inner.adaptive_outcomes.push_back(snapshot);
+    }
+
+    #[must_use]
+    pub fn adaptive_outcome_snapshots(&self) -> Vec<AdaptiveOutcomeSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .adaptive_outcomes
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn register_client(&self, snapshot: ClientSnapshot) {

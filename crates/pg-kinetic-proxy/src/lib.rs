@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod adaptive;
 pub mod backend;
 pub mod config;
 pub mod control;
