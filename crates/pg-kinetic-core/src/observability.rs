@@ -745,7 +745,11 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         MetricKind::Counter,
         "1",
         "Benchmark runs by engine, target, and outcome",
-        &[MetricLabel::Engine, MetricLabel::Target, MetricLabel::Outcome],
+        &[
+            MetricLabel::Engine,
+            MetricLabel::Target,
+            MetricLabel::Outcome,
+        ],
         "Engine, target, and outcome stay bounded to benchmark runs.",
     ),
     MetricDescriptor::new(

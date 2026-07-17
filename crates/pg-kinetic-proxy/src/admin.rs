@@ -24,9 +24,9 @@ use crate::{
         BenchmarkRunSnapshot, ClientSnapshot, LimitsSnapshot, MirrorSummarySnapshot,
         NodeSummaryRole, NodeSummarySnapshot, PinningSnapshot, PolicyReloadSnapshot,
         PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot, RecoverySnapshot,
-        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
-        RoutePolicySnapshot, RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot,
-        ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RoutePolicySnapshot,
+        RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot, ShardLifecycleSnapshot,
+        ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -38,8 +38,8 @@ use pg_kinetic_core::{
     lsn::PgLsn,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
-    session::PinReason,
     runtime::{ReadinessState, RuntimeLifecycleState},
+    session::PinReason,
     sharding::ShardLifecycleState,
 };
 use pg_kinetic_wire::{
@@ -396,20 +396,22 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.server_snapshots(),
             &state.snapshot_store.replica_health_snapshots(),
         ),
-        AdminView::Runtime => runtime_table(
-            state.snapshot_store.runtime_snapshot(),
-            &state.config,
-        ),
+        AdminView::Runtime => runtime_table(state.snapshot_store.runtime_snapshot(), &state.config),
         AdminView::Nodes => nodes_table(
             state.snapshot_store.node_snapshots(),
             state.snapshot_store.runtime_snapshot(),
         ),
-        AdminView::Mirroring => mirroring_table(
-            state.snapshot_store.mirror_snapshot(),
-            &state.config,
-        ),
+        AdminView::Mirroring => {
+            mirroring_table(state.snapshot_store.mirror_snapshot(), &state.config)
+        }
         AdminView::Adaptive => adaptive_table(
-            state.config.runtime.production.adaptive.adaptive_mode.as_str(),
+            state
+                .config
+                .runtime
+                .production
+                .adaptive
+                .adaptive_mode
+                .as_str(),
             &state.config.runtime.production.adaptive.apply,
             &state.config.runtime.production.adaptive.guardrail,
             &state.snapshot_store.adaptive_recommendation_snapshots(),
@@ -658,7 +660,9 @@ fn nodes_table(nodes: Vec<NodeSummarySnapshot>, runtime: Option<RuntimeSnapshot>
 }
 
 fn mirroring_table(snapshot: Option<MirrorSummarySnapshot>, _config: &Config) -> AdminTable {
-    let snapshot = snapshot.unwrap_or_else(|| MirrorSummarySnapshot::new(pg_kinetic_core::mirror::MirrorMode::Off, 0.0));
+    let snapshot = snapshot.unwrap_or_else(|| {
+        MirrorSummarySnapshot::new(pg_kinetic_core::mirror::MirrorMode::Off, 0.0)
+    });
     admin_table(
         AdminView::Mirroring,
         &[
@@ -1534,8 +1538,7 @@ fn adaptive_guardrails_label(
 
     format!(
         "mode={mode};apply={};allowlist={allowlist};max_change={}%",
-        apply.adaptive_apply_enabled,
-        guardrail.adaptive_max_change_percent
+        apply.adaptive_apply_enabled, guardrail.adaptive_max_change_percent
     )
 }
 

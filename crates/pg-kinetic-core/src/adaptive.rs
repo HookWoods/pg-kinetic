@@ -259,7 +259,6 @@ pub struct AdaptiveRecommendation {
 }
 
 impl AdaptiveRecommendation {
-    #[must_use]
     pub fn new(
         signal: AdaptiveSignal,
         action: AdaptiveAction,

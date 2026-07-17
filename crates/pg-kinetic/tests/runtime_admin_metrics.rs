@@ -18,10 +18,12 @@ use pg_kinetic::{
     },
     core::{
         adaptive::{
-            AdaptiveAction, AdaptiveMode, AdaptiveOutcome, AdaptiveSignal, TunableKnob,
-            TuningBound,
+            AdaptiveAction, AdaptiveMode, AdaptiveOutcome, AdaptiveSignal, TunableKnob, TuningBound,
         },
-        benchmark::{BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkScenario, BenchmarkTarget},
+        benchmark::{
+            BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult,
+            BenchmarkScenario, BenchmarkTarget,
+        },
         control::PeerHealth,
         mirror::MirrorMode,
         runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
@@ -47,11 +49,11 @@ use tokio::{
 };
 
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
-static METRICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ASYNC_METRICS_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[tokio::test(flavor = "current_thread")]
 async fn show_runtime_views_cover_telemetry_and_redaction() {
-    let _guard = metrics_lock().lock().expect("metrics lock");
+    let _guard = async_metrics_lock().lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
 
@@ -60,10 +62,24 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
     let admin_addr = free_port().await;
     let mut config = test_config(Some(admin_addr), Some("admin"), backend_addr);
     config.runtime.production.adaptive.adaptive_mode = AdaptiveMode::Apply;
-    config.runtime.production.adaptive.apply.adaptive_apply_enabled = true;
-    config.runtime.production.adaptive.apply.adaptive_apply_allowlist =
-        vec![TunableKnob::MirrorSampling];
-    config.runtime.production.adaptive.guardrail.adaptive_max_change_percent = 20;
+    config
+        .runtime
+        .production
+        .adaptive
+        .apply
+        .adaptive_apply_enabled = true;
+    config
+        .runtime
+        .production
+        .adaptive
+        .apply
+        .adaptive_apply_allowlist = vec![TunableKnob::MirrorSampling];
+    config
+        .runtime
+        .production
+        .adaptive
+        .guardrail
+        .adaptive_max_change_percent = 20;
     let (run_handle, _, snapshot_store) = spawn_proxy(config).await;
 
     let node_id = NodeId::new("node-a").expect("node id");
@@ -78,28 +94,28 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
     runtime_snapshot.shutdown_reason = Some(ShutdownReason::AdminRequest);
     snapshot_store.set_runtime_snapshot(runtime_snapshot.clone());
 
-    snapshot_store.set_node_snapshot(NodeSummarySnapshot::new(
-        NodeSummaryRole::Local,
-        node_id.clone(),
-        RuntimeLifecycleState::Ready,
-        ReadinessState::Ready,
-        PeerHealth::Healthy,
-        41,
-        7,
-        Duration::from_millis(250),
-        false,
-    ));
-    snapshot_store.set_node_snapshot(NodeSummarySnapshot::new(
-        NodeSummaryRole::Peer,
-        NodeId::new("node-b").expect("peer node id"),
-        RuntimeLifecycleState::Draining,
-        ReadinessState::Draining,
-        PeerHealth::Overloaded,
-        42,
-        8,
-        Duration::from_secs(3),
-        true,
-    ));
+    snapshot_store.set_node_snapshot(NodeSummarySnapshot {
+        role: NodeSummaryRole::Local,
+        node_id: node_id.clone(),
+        lifecycle_state: RuntimeLifecycleState::Ready,
+        readiness_state: ReadinessState::Ready,
+        health: PeerHealth::Healthy,
+        route_map_generation: 41,
+        policy_generation: 7,
+        heartbeat_age: Duration::from_millis(250),
+        overloaded: false,
+    });
+    snapshot_store.set_node_snapshot(NodeSummarySnapshot {
+        role: NodeSummaryRole::Peer,
+        node_id: NodeId::new("node-b").expect("peer node id"),
+        lifecycle_state: RuntimeLifecycleState::Draining,
+        readiness_state: ReadinessState::Draining,
+        health: PeerHealth::Overloaded,
+        route_map_generation: 42,
+        policy_generation: 8,
+        heartbeat_age: Duration::from_secs(3),
+        overloaded: true,
+    });
 
     let mut mirror_snapshot = MirrorSummarySnapshot::new(MirrorMode::ReadOnly, 0.125);
     mirror_snapshot.in_flight = 6;
@@ -120,16 +136,16 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
         window: Duration::from_secs(30),
         safety_bound: TuningBound::percent(20),
     });
-    snapshot_store.record_adaptive_outcome(AdaptiveOutcomeSnapshot::new(
-        AdaptiveSignal::MirrorSamplingPressure,
-        TunableKnob::MirrorSampling,
-        AdaptiveOutcome::Applied,
-        "applied after analysis",
-        Some(10.0),
-        Some(12.5),
-        Some(20),
-        false,
-    ));
+    snapshot_store.record_adaptive_outcome(AdaptiveOutcomeSnapshot {
+        signal: AdaptiveSignal::MirrorSamplingPressure,
+        knob: TunableKnob::MirrorSampling,
+        outcome: AdaptiveOutcome::Applied,
+        reason: String::from("applied after analysis"),
+        before_value: Some(10.0),
+        after_value: Some(12.5),
+        change_percent: Some(20),
+        disabled_by_reload: false,
+    });
 
     let benchmark_target = BenchmarkTarget::new(
         "primary",
@@ -169,7 +185,13 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             "runtime_engine",
             "uptime_ms",
         ],
-        &[vec!["node-a", "ready", "ready", "tokio_current_thread", "73000"]],
+        &[vec![
+            "node-a",
+            "ready",
+            "ready",
+            "tokio_current_thread",
+            "73000",
+        ]],
     );
 
     let nodes_frames = admin_query(admin_addr, "SHOW NODES").await;
@@ -188,15 +210,7 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
         ],
         &[
             vec![
-                "local",
-                "node-a",
-                "ready",
-                "ready",
-                "healthy",
-                "41",
-                "7",
-                "250",
-                "false",
+                "local", "node-a", "ready", "ready", "healthy", "41", "7", "250", "false",
             ],
             vec![
                 "peer",
@@ -242,7 +256,12 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
     let adaptive_frames = admin_query(admin_addr, "SHOW ADAPTIVE").await;
     assert_admin_table_response(
         &adaptive_frames,
-        &["mode", "latest_recommendation", "apply_status", "guardrails"],
+        &[
+            "mode",
+            "latest_recommendation",
+            "apply_status",
+            "guardrails",
+        ],
         &[vec![
             "apply",
             "mirror_sampling_pressure:mirror_sampling:0.875",
@@ -284,7 +303,11 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
         ]],
     );
 
-    let redaction_text = format!("{}{}", table_text(&adaptive_frames), table_text(&benchmark_frames));
+    let redaction_text = format!(
+        "{}{}",
+        table_text(&adaptive_frames),
+        table_text(&benchmark_frames)
+    );
     for forbidden in [
         "SELECT * FROM sensitive_table",
         "secret-password",
@@ -303,9 +326,9 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
     let _ = run_handle.await;
 }
 
-#[test]
-fn metric_labels_stay_low_cardinality() {
-    let _guard = metrics_lock().lock().expect("metrics lock");
+#[tokio::test(flavor = "current_thread")]
+async fn metric_labels_stay_low_cardinality() {
+    let _guard = async_metrics_lock().lock().await;
     let recorder = install_metrics_recorder();
     recorder.clear();
 
@@ -323,28 +346,28 @@ fn metric_labels_stay_low_cardinality() {
     runtime_snapshot.shutdown_reason = Some(ShutdownReason::AdminRequest);
     store.set_runtime_snapshot(runtime_snapshot);
 
-    store.set_node_snapshot(NodeSummarySnapshot::new(
-        NodeSummaryRole::Local,
-        runtime_node,
-        RuntimeLifecycleState::Ready,
-        ReadinessState::Ready,
-        PeerHealth::Healthy,
-        10,
-        11,
-        Duration::from_secs(2),
-        false,
-    ));
-    store.set_node_snapshot(NodeSummarySnapshot::new(
-        NodeSummaryRole::Peer,
-        peer_node,
-        RuntimeLifecycleState::Draining,
-        ReadinessState::Draining,
-        PeerHealth::Overloaded,
-        12,
-        13,
-        Duration::from_secs(4),
-        true,
-    ));
+    store.set_node_snapshot(NodeSummarySnapshot {
+        role: NodeSummaryRole::Local,
+        node_id: runtime_node,
+        lifecycle_state: RuntimeLifecycleState::Ready,
+        readiness_state: ReadinessState::Ready,
+        health: PeerHealth::Healthy,
+        route_map_generation: 10,
+        policy_generation: 11,
+        heartbeat_age: Duration::from_secs(2),
+        overloaded: false,
+    });
+    store.set_node_snapshot(NodeSummarySnapshot {
+        role: NodeSummaryRole::Peer,
+        node_id: peer_node,
+        lifecycle_state: RuntimeLifecycleState::Draining,
+        readiness_state: ReadinessState::Draining,
+        health: PeerHealth::Overloaded,
+        route_map_generation: 12,
+        policy_generation: 13,
+        heartbeat_age: Duration::from_secs(4),
+        overloaded: true,
+    });
 
     let mut mirror_snapshot = MirrorSummarySnapshot::new(MirrorMode::ReadOnly, 0.5);
     mirror_snapshot.in_flight = 3;
@@ -365,16 +388,16 @@ fn metric_labels_stay_low_cardinality() {
         window: Duration::from_secs(15),
         safety_bound: TuningBound::percent(10),
     });
-    store.record_adaptive_outcome(AdaptiveOutcomeSnapshot::new(
-        AdaptiveSignal::BackpressureThresholdPressure,
-        TunableKnob::BackpressureThresholds,
-        AdaptiveOutcome::Applied,
-        "applied",
-        Some(10.0),
-        Some(11.0),
-        Some(10),
-        false,
-    ));
+    store.record_adaptive_outcome(AdaptiveOutcomeSnapshot {
+        signal: AdaptiveSignal::BackpressureThresholdPressure,
+        knob: TunableKnob::BackpressureThresholds,
+        outcome: AdaptiveOutcome::Applied,
+        reason: String::from("applied"),
+        before_value: Some(10.0),
+        after_value: Some(11.0),
+        change_percent: Some(10),
+        disabled_by_reload: false,
+    });
 
     let benchmark_target = BenchmarkTarget::new(
         "primary",
@@ -407,26 +430,14 @@ fn metric_labels_stay_low_cardinality() {
     proxy_metrics::record_preflight_finding("tls_files", "warning");
     proxy_metrics::record_preflight_finding("lifecycle_guardrails", "error");
 
-    assert!(recorder.has_metric(
-        "pg_kinetic_runtime_lifecycle_state",
-        &[("state", "ready")],
-    ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_runtime_readiness_state",
-        &[("state", "ready")],
-    ));
+    assert!(recorder.has_metric("pg_kinetic_runtime_lifecycle_state", &[("state", "ready")],));
+    assert!(recorder.has_metric("pg_kinetic_runtime_readiness_state", &[("state", "ready")],));
     assert!(recorder.has_metric(
         "pg_kinetic_runtime_shutdown_total",
         &[("reason", "admin_request")],
     ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_node_heartbeat_age_ms",
-        &[("node", "node-a")],
-    ));
-    assert!(recorder.has_metric(
-        "pg_kinetic_node_heartbeat_age_ms",
-        &[("node", "node-b")],
-    ));
+    assert!(recorder.has_metric("pg_kinetic_node_heartbeat_age_ms", &[("node", "node-a")],));
+    assert!(recorder.has_metric("pg_kinetic_node_heartbeat_age_ms", &[("node", "node-b")],));
     assert!(recorder.has_metric(
         "pg_kinetic_mirror_in_flight",
         &[("mode", "read_only"), ("target", "mirror")],
@@ -437,11 +448,19 @@ fn metric_labels_stay_low_cardinality() {
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_mirror_decisions_total",
-        &[("mode", "read_only"), ("target", "mirror"), ("outcome", "mirrored")],
+        &[
+            ("mode", "read_only"),
+            ("target", "mirror"),
+            ("outcome", "mirrored")
+        ],
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_mirror_duration_ms",
-        &[("mode", "read_only"), ("target", "mirror"), ("outcome", "mirrored")],
+        &[
+            ("mode", "read_only"),
+            ("target", "mirror"),
+            ("outcome", "mirrored")
+        ],
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_adaptive_recommendations_total",
@@ -461,7 +480,11 @@ fn metric_labels_stay_low_cardinality() {
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_benchmark_runs_total",
-        &[("engine", "pgbench"), ("target", "pg_kinetic"), ("outcome", "ok")],
+        &[
+            ("engine", "pgbench"),
+            ("target", "pg_kinetic"),
+            ("outcome", "ok")
+        ],
     ));
     assert!(recorder.has_metric(
         "pg_kinetic_preflight_findings_total",
@@ -471,8 +494,8 @@ fn metric_labels_stay_low_cardinality() {
     assert_no_sensitive_metric_labels(&recorder);
 }
 
-fn metrics_lock() -> &'static Mutex<()> {
-    METRICS_LOCK.get_or_init(|| Mutex::new(()))
+fn async_metrics_lock() -> &'static tokio::sync::Mutex<()> {
+    ASYNC_METRICS_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn install_metrics_recorder() -> Arc<TestRecorder> {

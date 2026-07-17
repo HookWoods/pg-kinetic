@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -70,7 +73,10 @@ impl LocalControlEventSink {
     }
 
     pub fn publish(&self, event: ControlEvent) {
-        self.events.lock().expect("control event sink lock").push_back(event);
+        self.events
+            .lock()
+            .expect("control event sink lock")
+            .push_back(event);
     }
 
     #[must_use]
@@ -106,14 +112,9 @@ impl HeartbeatPublisher {
     }
 
     #[must_use]
-    pub fn publish(
-        &self,
-        lifecycle: NodeLifecycleSummary,
-        health: PeerHealth,
-    ) -> NodeHeartbeat {
-        let generation = ClusterViewGeneration::new(
-            self.generation.fetch_add(1, Ordering::AcqRel) + 1,
-        );
+    pub fn publish(&self, lifecycle: NodeLifecycleSummary, health: PeerHealth) -> NodeHeartbeat {
+        let generation =
+            ClusterViewGeneration::new(self.generation.fetch_add(1, Ordering::AcqRel) + 1);
         let heartbeat = NodeHeartbeat::new(
             NodeStatus::redacted(self.registry.node_identity(), lifecycle, health),
             generation,
@@ -161,7 +162,11 @@ impl ClusterViewStore {
 
     #[must_use]
     pub fn snapshot(&self) -> ClusterView {
-        self.inner.lock().expect("cluster view store lock").view.clone()
+        self.inner
+            .lock()
+            .expect("cluster view store lock")
+            .view
+            .clone()
     }
 
     pub fn set_local(&self, local: NodeStatus) {
@@ -253,10 +258,12 @@ impl HeartbeatObserver {
     }
 
     #[must_use]
-    pub fn mark_stale(&self, node_id: &NodeId, heartbeat_generation: ClusterViewGeneration) -> bool {
-        let marked = self
-            .store
-            .mark_peer_unknown(node_id, heartbeat_generation);
+    pub fn mark_stale(
+        &self,
+        node_id: &NodeId,
+        heartbeat_generation: ClusterViewGeneration,
+    ) -> bool {
+        let marked = self.store.mark_peer_unknown(node_id, heartbeat_generation);
         if marked {
             self.sink.publish(ControlEvent::new(
                 node_id.clone(),

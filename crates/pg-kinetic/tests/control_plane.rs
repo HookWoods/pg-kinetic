@@ -31,7 +31,12 @@ fn summary(
 }
 
 fn status(node_id: &str, summary: NodeLifecycleSummary, health: PeerHealth) -> NodeStatus {
-    NodeStatus::new(NodeId::new(node_id).expect("node id"), summary, health, node_id)
+    NodeStatus::new(
+        NodeId::new(node_id).expect("node id"),
+        summary,
+        health,
+        node_id,
+    )
 }
 
 #[test]
@@ -125,7 +130,7 @@ fn cluster_view_is_local_and_non_authoritative() {
 
     assert!(view.is_local());
     assert!(!view.is_authoritative());
-    assert!(view.requires_consensus() == false);
+    assert!(!view.requires_consensus());
 }
 
 #[test]
@@ -179,7 +184,9 @@ fn peer_metadata_is_redacted() {
 
 #[test]
 fn heartbeat_publisher_and_observer_use_local_control_events() {
-    let registry = Arc::new(NodeRegistry::new(NodeId::new("node-local").expect("node id")));
+    let registry = Arc::new(NodeRegistry::new(
+        NodeId::new("node-local").expect("node id"),
+    ));
     let sink = LocalControlEventSink::new();
     let publisher = HeartbeatPublisher::new(Arc::clone(&registry), sink.clone());
     let store = ClusterViewStore::new(status(

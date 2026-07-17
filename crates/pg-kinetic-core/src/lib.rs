@@ -1,10 +1,10 @@
-pub mod admin;
 pub mod adaptive;
+pub mod admin;
 pub mod backpressure;
 pub mod benchmark;
 pub mod cleanup;
-pub mod control;
 pub mod constants;
+pub mod control;
 pub mod ha;
 pub mod lsn;
 pub mod mirror;

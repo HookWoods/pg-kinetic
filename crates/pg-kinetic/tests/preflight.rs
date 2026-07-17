@@ -337,10 +337,13 @@ target.isolated = false
 
     assert!(!report.warnings().is_empty());
     assert!(!report.errors().is_empty());
-    assert!(report
-        .warnings()
-        .iter()
-        .all(|finding| finding.severity == pg_kinetic_proxy::preflight::PreflightSeverity::Warning));
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .all(|finding| finding.severity
+                == pg_kinetic_proxy::preflight::PreflightSeverity::Warning)
+    );
     assert!(report
         .errors()
         .iter()

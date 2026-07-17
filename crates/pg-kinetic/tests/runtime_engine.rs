@@ -103,8 +103,8 @@ fn experimental_runtime_engine_cannot_be_enabled_without_feature_or_config_gate(
     assert!(!ungated_selector.selection_snapshot().available);
 
     let gated = RuntimeEngineExperiment::new(true);
-    let gated_selector = RuntimeEngineSelector::new(RuntimeEngine::ExperimentalThreadPerCore)
-        .with_experiment(gated);
+    let gated_selector =
+        RuntimeEngineSelector::new(RuntimeEngine::ExperimentalThreadPerCore).with_experiment(gated);
 
     if gated.feature_enabled() {
         assert!(gated.feature_enabled());
@@ -132,6 +132,12 @@ fn runtime_engine_benchmark_label_is_stable() {
 
     assert_eq!(selector.benchmark_label(), "tokio_default");
     assert_eq!(capabilities.benchmark_label(), "tokio_default");
-    assert_eq!(selector.selection_snapshot().benchmark_label, "tokio_default");
-    assert_eq!(selector.selection_metrics().benchmark_label, "tokio_default");
+    assert_eq!(
+        selector.selection_snapshot().benchmark_label,
+        "tokio_default"
+    );
+    assert_eq!(
+        selector.selection_metrics().benchmark_label,
+        "tokio_default"
+    );
 }

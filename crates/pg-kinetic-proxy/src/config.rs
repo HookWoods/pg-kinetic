@@ -264,7 +264,10 @@ impl MirrorConfig {
             return Err(String::from("mirror target must be explicitly configured"));
         }
 
-        self.target.validate_against(production_target, self.safety.mirror_require_isolated_target)
+        self.target.validate_against(
+            production_target,
+            self.safety.mirror_require_isolated_target,
+        )
     }
 }
 
@@ -282,10 +285,13 @@ impl Default for MirrorConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct MirrorTargetConfig {
-    #[arg(long = "mirror-target-address", env = "PG_KINETIC_MIRROR_TARGET_ADDRESS")]
+    #[arg(
+        long = "mirror-target-address",
+        env = "PG_KINETIC_MIRROR_TARGET_ADDRESS"
+    )]
     pub address: Option<SocketAddr>,
 
     #[arg(
@@ -316,15 +322,6 @@ impl MirrorTargetConfig {
                 ))
             }
             _ => Ok(()),
-        }
-    }
-}
-
-impl Default for MirrorTargetConfig {
-    fn default() -> Self {
-        Self {
-            address: None,
-            isolated: false,
         }
     }
 }
@@ -677,9 +674,7 @@ impl AdaptiveConfig {
         }
 
         if self.adaptive_window_ms == 0 {
-            return Err(String::from(
-                "adaptive_window_ms must be greater than zero",
-            ));
+            return Err(String::from("adaptive_window_ms must be greater than zero"));
         }
 
         self.guardrail.validate()?;
@@ -710,8 +705,10 @@ impl AdaptiveConfig {
     pub fn evaluate(
         &self,
         recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
-    ) -> Result<pg_kinetic_core::adaptive::AdaptiveOutcome, pg_kinetic_core::adaptive::AdaptiveApplyError>
-    {
+    ) -> Result<
+        pg_kinetic_core::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::adaptive::AdaptiveApplyError,
+    > {
         if recommendation.confidence() < self.adaptive_min_confidence {
             return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
                 pg_kinetic_core::adaptive::AdaptiveGuardrail::ConfidenceFloor,
@@ -797,8 +794,10 @@ impl AdaptiveApplyConfig {
         &self,
         recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
         guardrail: &AdaptiveGuardrailConfig,
-    ) -> Result<pg_kinetic_core::adaptive::AdaptiveOutcome, pg_kinetic_core::adaptive::AdaptiveApplyError>
-    {
+    ) -> Result<
+        pg_kinetic_core::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::adaptive::AdaptiveApplyError,
+    > {
         if !self.adaptive_apply_enabled {
             return Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Skipped);
         }
@@ -814,12 +813,12 @@ impl AdaptiveApplyConfig {
         }
 
         match recommendation.safety_bound() {
-            pg_kinetic_core::adaptive::TuningBound::Unbounded => Err(
-                pg_kinetic_core::adaptive::AdaptiveApplyError::new(
+            pg_kinetic_core::adaptive::TuningBound::Unbounded => {
+                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
                     pg_kinetic_core::adaptive::AdaptiveGuardrail::UnboundedChange,
                     "adaptive apply rejected an unbounded change",
-                ),
-            ),
+                ))
+            }
             pg_kinetic_core::adaptive::TuningBound::Percent(change_percent)
                 if change_percent > guardrail.adaptive_max_change_percent =>
             {
@@ -2474,10 +2473,7 @@ where
         .collect()
 }
 
-fn serialize_tunable_knob_list<S>(
-    knobs: &[TunableKnob],
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_tunable_knob_list<S>(knobs: &[TunableKnob], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

@@ -30,7 +30,7 @@ use pg_kinetic_core::{
     virtual_session::PinReason,
 };
 use pg_kinetic_wire::{
-    backend::{BackendFrame},
+    backend::BackendFrame,
     frame::FrontendFrame,
     protocol::{BackendTag, FrontendTag},
     rewrite::encode_frontend_frame,
@@ -177,6 +177,15 @@ impl MirrorOutcomeRecorder {
             .lock()
             .expect("mirror observation lock")
             .len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .observations
+            .lock()
+            .expect("mirror observation lock")
+            .is_empty()
     }
 
     pub async fn wait_for_count(&self, expected: usize) {
@@ -338,7 +347,8 @@ impl MirrorSampler {
 
     #[must_use]
     pub fn should_mirror(self, session_id: u64, query_id: u64) -> bool {
-        self.sample.should_sample(self.sample_value(session_id, query_id))
+        self.sample
+            .should_sample(self.sample_value(session_id, query_id))
     }
 }
 
@@ -379,7 +389,11 @@ impl MirrorSafetyClassifier {
     #[must_use]
     pub fn classify(&self, task: &MirrorTask) -> MirrorDecision {
         if !self.mode.is_enabled() {
-            return MirrorDecision::skipped(self.mode, MirrorSafetyGate::Disabled, MirrorReason::Disabled);
+            return MirrorDecision::skipped(
+                self.mode,
+                MirrorSafetyGate::Disabled,
+                MirrorReason::Disabled,
+            );
         }
 
         let Some(target) = self.target.as_ref() else {
@@ -498,19 +512,22 @@ impl MirrorSafetyClassifier {
 
         if let Some(reason) = task.session_pin_reason() {
             let (gate, mirror_reason) = match reason {
-                PinReason::OpenTransaction | PinReason::FailedTransaction => {
-                    (MirrorSafetyGate::Transactions, MirrorReason::TransactionsDisabled)
-                }
+                PinReason::OpenTransaction | PinReason::FailedTransaction => (
+                    MirrorSafetyGate::Transactions,
+                    MirrorReason::TransactionsDisabled,
+                ),
                 PinReason::Copy => (MirrorSafetyGate::Copy, MirrorReason::CopyDisabled),
-                PinReason::ListenNotify => {
-                    (MirrorSafetyGate::ListenNotify, MirrorReason::ListenNotifyDisabled)
-                }
+                PinReason::ListenNotify => (
+                    MirrorSafetyGate::ListenNotify,
+                    MirrorReason::ListenNotifyDisabled,
+                ),
                 PinReason::TempTable => {
                     (MirrorSafetyGate::TempTable, MirrorReason::TempTableDisabled)
                 }
-                PinReason::SessionState | PinReason::AdvisoryLock => {
-                    (MirrorSafetyGate::SessionMutation, MirrorReason::SessionMutationDisabled)
-                }
+                PinReason::SessionState | PinReason::AdvisoryLock => (
+                    MirrorSafetyGate::SessionMutation,
+                    MirrorReason::SessionMutationDisabled,
+                ),
                 PinReason::UnknownProtocolState => {
                     (MirrorSafetyGate::Disabled, MirrorReason::UnsupportedMode)
                 }
@@ -701,7 +718,10 @@ impl MirrorDispatcher {
             return decision;
         }
 
-        if !self.sampler.should_mirror(task.session_id(), task.query_id()) {
+        if !self
+            .sampler
+            .should_mirror(task.session_id(), task.query_id())
+        {
             let dropped_decision = MirrorDecision::skipped(
                 self.classifier.mode(),
                 MirrorSafetyGate::Sampling,
@@ -740,7 +760,12 @@ impl MirrorDispatcher {
         let config = self.config.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            let status = match timeout(config.timeout, run_mirror_task(&runner, config.clone(), task)).await {
+            let status = match timeout(
+                config.timeout,
+                run_mirror_task(&runner, config.clone(), task),
+            )
+            .await
+            {
                 Ok(Ok(())) => MirrorTaskStatus::Completed,
                 Ok(Err(error)) => {
                     tracing::debug!(error = %error, "mirror task failed");

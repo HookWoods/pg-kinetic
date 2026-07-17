@@ -98,7 +98,6 @@ pub struct BenchmarkTarget {
 }
 
 impl BenchmarkTarget {
-    #[must_use]
     pub fn new(
         label: impl Into<Arc<str>>,
         comparison: BenchmarkComparison,
@@ -162,7 +161,6 @@ pub struct BenchmarkScenario {
 }
 
 impl BenchmarkScenario {
-    #[must_use]
     pub fn new(
         name: impl Into<Arc<str>>,
         driver: BenchmarkDriver,
@@ -272,7 +270,6 @@ pub struct BenchmarkMetric {
 }
 
 impl BenchmarkMetric {
-    #[must_use]
     pub fn new(
         p50_ms: f64,
         p95_ms: f64,
@@ -367,7 +364,6 @@ pub struct BenchmarkResult {
 }
 
 impl BenchmarkResult {
-    #[must_use]
     pub fn new(
         scenario: impl Into<Arc<str>>,
         target: BenchmarkTarget,

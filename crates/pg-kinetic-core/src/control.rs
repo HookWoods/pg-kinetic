@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::runtime::{NodeId, ReadinessState, RuntimeLifecycleState};
 
@@ -154,11 +150,7 @@ impl NodeStatus {
     }
 
     #[must_use]
-    pub fn redacted(
-        node_id: NodeId,
-        lifecycle: NodeLifecycleSummary,
-        health: PeerHealth,
-    ) -> Self {
+    pub fn redacted(node_id: NodeId, lifecycle: NodeLifecycleSummary, health: PeerHealth) -> Self {
         Self {
             node_id,
             lifecycle,
@@ -415,10 +407,7 @@ impl ClusterView {
     }
 
     #[must_use]
-    pub fn with_peers(
-        local: NodeStatus,
-        peers: impl IntoIterator<Item = PeerState>,
-    ) -> Self {
+    pub fn with_peers(local: NodeStatus, peers: impl IntoIterator<Item = PeerState>) -> Self {
         let peers = peers
             .into_iter()
             .map(|peer| (peer.status().node_id().clone(), peer))

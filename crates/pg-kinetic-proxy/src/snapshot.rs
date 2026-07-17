@@ -6,17 +6,17 @@ use std::{
 };
 
 use pg_kinetic_core::{
+    benchmark::{BenchmarkResult, BenchmarkScenario},
     ha::{HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome},
     lsn::{FreshnessStatus, PgLsn},
-    benchmark::{BenchmarkResult, BenchmarkScenario},
     mirror::MirrorMode,
-    runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
     observability::MetricOutcome,
     policy::{PolicyAuditEvent, PolicyMode},
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
     session::PinReason,
     sharding::{ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan},
 };
@@ -29,8 +29,8 @@ use crate::policy::{PolicyReloadErrorCode, PolicyReloadResult};
 use crate::routing::RoutingTarget;
 use crate::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
 use pg_kinetic_core::adaptive::{
-    AdaptiveAction, AdaptiveOutcome, AdaptiveRecommendation, AdaptiveSignal, TuningBound,
-    TunableKnob,
+    AdaptiveAction, AdaptiveOutcome, AdaptiveRecommendation, AdaptiveSignal, TunableKnob,
+    TuningBound,
 };
 
 const POLICY_AUDIT_RING_CAPACITY: usize = 128;
@@ -302,33 +302,6 @@ pub struct NodeSummarySnapshot {
     pub overloaded: bool,
 }
 
-impl NodeSummarySnapshot {
-    #[must_use]
-    pub fn new(
-        role: NodeSummaryRole,
-        node_id: NodeId,
-        lifecycle_state: RuntimeLifecycleState,
-        readiness_state: ReadinessState,
-        health: pg_kinetic_core::control::PeerHealth,
-        route_map_generation: u64,
-        policy_generation: u64,
-        heartbeat_age: Duration,
-        overloaded: bool,
-    ) -> Self {
-        Self {
-            role,
-            node_id,
-            lifecycle_state,
-            readiness_state,
-            health,
-            route_map_generation,
-            policy_generation,
-            heartbeat_age,
-            overloaded,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MirrorSummarySnapshot {
     pub mode: MirrorMode,
@@ -414,31 +387,6 @@ pub struct AdaptiveOutcomeSnapshot {
     pub after_value: Option<f64>,
     pub change_percent: Option<u8>,
     pub disabled_by_reload: bool,
-}
-
-impl AdaptiveOutcomeSnapshot {
-    #[must_use]
-    pub fn new(
-        signal: AdaptiveSignal,
-        knob: TunableKnob,
-        outcome: AdaptiveOutcome,
-        reason: impl Into<String>,
-        before_value: Option<f64>,
-        after_value: Option<f64>,
-        change_percent: Option<u8>,
-        disabled_by_reload: bool,
-    ) -> Self {
-        Self {
-            signal,
-            knob,
-            outcome,
-            reason: reason.into(),
-            before_value,
-            after_value,
-            change_percent,
-            disabled_by_reload,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

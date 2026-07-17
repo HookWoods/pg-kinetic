@@ -4,10 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
-use tokio::{
-    sync::RwLock,
-    time::sleep,
-};
+use tokio::{sync::RwLock, time::sleep};
 
 use crate::{
     config::{AdaptiveConfig, Config},
@@ -18,8 +15,8 @@ use crate::{
     },
 };
 use pg_kinetic_core::adaptive::{
-    AdaptiveAction, AdaptiveOutcome, AdaptiveRecommendation, AdaptiveSignal,
-    TuningBound, TunableKnob,
+    AdaptiveAction, AdaptiveOutcome, AdaptiveRecommendation, AdaptiveSignal, TunableKnob,
+    TuningBound,
 };
 
 const DEFAULT_HISTORY_CAPACITY: usize = 64;
@@ -154,21 +151,45 @@ impl AdaptiveSignalCollector {
         let backpressure_snapshots = self.snapshot_store.backpressure_snapshots();
         let mirror_observations = self.mirror_outcomes.snapshot();
 
-        let (mirror_completed, mirror_timed_out, mirror_dropped, mirror_skipped, mirror_rejected, mirror_errors) =
-            mirror_observations.iter().fold(
-                (0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
-                |(completed, timed_out, dropped, skipped, rejected, errors), observation| match &observation.status {
-                    MirrorTaskStatus::Completed => (completed + 1, timed_out, dropped, skipped, rejected, errors),
-                    MirrorTaskStatus::TimedOut => (completed, timed_out + 1, dropped, skipped, rejected, errors),
-                    MirrorTaskStatus::Dropped { .. } => (completed, timed_out, dropped + 1, skipped, rejected, errors),
-                    MirrorTaskStatus::Skipped { .. } => (completed, timed_out, dropped, skipped + 1, rejected, errors),
-                    MirrorTaskStatus::Rejected { .. } => (completed, timed_out, dropped, skipped, rejected + 1, errors),
-                    MirrorTaskStatus::Error => (completed, timed_out, dropped, skipped, rejected, errors + 1),
-                },
-            );
+        let (
+            mirror_completed,
+            mirror_timed_out,
+            mirror_dropped,
+            mirror_skipped,
+            mirror_rejected,
+            mirror_errors,
+        ) = mirror_observations.iter().fold(
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
+            |(completed, timed_out, dropped, skipped, rejected, errors), observation| {
+                match &observation.status {
+                    MirrorTaskStatus::Completed => {
+                        (completed + 1, timed_out, dropped, skipped, rejected, errors)
+                    }
+                    MirrorTaskStatus::TimedOut => {
+                        (completed, timed_out + 1, dropped, skipped, rejected, errors)
+                    }
+                    MirrorTaskStatus::Dropped { .. } => {
+                        (completed, timed_out, dropped + 1, skipped, rejected, errors)
+                    }
+                    MirrorTaskStatus::Skipped { .. } => {
+                        (completed, timed_out, dropped, skipped + 1, rejected, errors)
+                    }
+                    MirrorTaskStatus::Rejected { .. } => {
+                        (completed, timed_out, dropped, skipped, rejected + 1, errors)
+                    }
+                    MirrorTaskStatus::Error => {
+                        (completed, timed_out, dropped, skipped, rejected, errors + 1)
+                    }
+                }
+            },
+        );
 
-        let (backpressure_waiting, backpressure_rejected, backpressure_timed_out, backpressure_canceled) =
-            aggregate_backpressure(&backpressure_snapshots);
+        let (
+            backpressure_waiting,
+            backpressure_rejected,
+            backpressure_timed_out,
+            backpressure_canceled,
+        ) = aggregate_backpressure(&backpressure_snapshots);
 
         AdaptiveSignalSnapshot {
             pool_waiting_clients: pool.waiting_clients,
@@ -280,64 +301,65 @@ impl AdaptiveApplyEngine {
         tuning: &AdaptiveTuningSnapshot,
     ) -> AdaptiveOutcomeSnapshot {
         let adaptive = &config.runtime.production.adaptive;
-        let disabled_by_reload = !adaptive.adaptive_mode.is_apply() || !adaptive.apply.adaptive_apply_enabled;
+        let disabled_by_reload =
+            !adaptive.adaptive_mode.is_apply() || !adaptive.apply.adaptive_apply_enabled;
         match adaptive.evaluate(recommendation) {
-            Ok(AdaptiveOutcome::Recommended) => AdaptiveOutcomeSnapshot::new(
-                recommendation.signal(),
-                recommendation.knob(),
-                AdaptiveOutcome::Recommended,
-                recommendation.reason().to_string(),
-                None,
-                None,
-                recommendation.safety_bound().max_change_percent(),
+            Ok(AdaptiveOutcome::Recommended) => AdaptiveOutcomeSnapshot {
+                signal: recommendation.signal(),
+                knob: recommendation.knob(),
+                outcome: AdaptiveOutcome::Recommended,
+                reason: recommendation.reason().to_string(),
+                before_value: None,
+                after_value: None,
+                change_percent: recommendation.safety_bound().max_change_percent(),
                 disabled_by_reload,
-            ),
+            },
             Ok(AdaptiveOutcome::Applied) => {
                 let change_percent = recommendation.safety_bound().max_change_percent();
                 let (before_value, after_value) = self
-                .apply_adjustment(config, recommendation, tuning, change_percent)
+                    .apply_adjustment(config, recommendation, tuning, change_percent)
                     .unwrap_or((None, None));
-                AdaptiveOutcomeSnapshot::new(
-                    recommendation.signal(),
-                    recommendation.knob(),
-                    AdaptiveOutcome::Applied,
-                    recommendation.reason().to_string(),
+                AdaptiveOutcomeSnapshot {
+                    signal: recommendation.signal(),
+                    knob: recommendation.knob(),
+                    outcome: AdaptiveOutcome::Applied,
+                    reason: recommendation.reason().to_string(),
                     before_value,
                     after_value,
                     change_percent,
-                    false,
-                )
+                    disabled_by_reload: false,
+                }
             }
-            Ok(AdaptiveOutcome::Skipped) => AdaptiveOutcomeSnapshot::new(
-                recommendation.signal(),
-                recommendation.knob(),
-                AdaptiveOutcome::Skipped,
-                recommendation.reason().to_string(),
-                None,
-                None,
-                recommendation.safety_bound().max_change_percent(),
+            Ok(AdaptiveOutcome::Skipped) => AdaptiveOutcomeSnapshot {
+                signal: recommendation.signal(),
+                knob: recommendation.knob(),
+                outcome: AdaptiveOutcome::Skipped,
+                reason: recommendation.reason().to_string(),
+                before_value: None,
+                after_value: None,
+                change_percent: recommendation.safety_bound().max_change_percent(),
                 disabled_by_reload,
-            ),
-            Ok(AdaptiveOutcome::Rejected) => AdaptiveOutcomeSnapshot::new(
-                recommendation.signal(),
-                recommendation.knob(),
-                AdaptiveOutcome::Rejected,
-                recommendation.reason().to_string(),
-                None,
-                None,
-                recommendation.safety_bound().max_change_percent(),
-                false,
-            ),
-            Err(error) => AdaptiveOutcomeSnapshot::new(
-                recommendation.signal(),
-                recommendation.knob(),
-                AdaptiveOutcome::Rejected,
-                error.to_string(),
-                None,
-                None,
-                recommendation.safety_bound().max_change_percent(),
-                false,
-            ),
+            },
+            Ok(AdaptiveOutcome::Rejected) => AdaptiveOutcomeSnapshot {
+                signal: recommendation.signal(),
+                knob: recommendation.knob(),
+                outcome: AdaptiveOutcome::Rejected,
+                reason: recommendation.reason().to_string(),
+                before_value: None,
+                after_value: None,
+                change_percent: recommendation.safety_bound().max_change_percent(),
+                disabled_by_reload: false,
+            },
+            Err(error) => AdaptiveOutcomeSnapshot {
+                signal: recommendation.signal(),
+                knob: recommendation.knob(),
+                outcome: AdaptiveOutcome::Rejected,
+                reason: error.to_string(),
+                before_value: None,
+                after_value: None,
+                change_percent: recommendation.safety_bound().max_change_percent(),
+                disabled_by_reload: false,
+            },
         }
     }
 
@@ -348,7 +370,14 @@ impl AdaptiveApplyEngine {
         tuning: &AdaptiveTuningSnapshot,
         change_percent: Option<u8>,
     ) -> anyhow::Result<(Option<f64>, Option<f64>)> {
-        let change_percent = change_percent.unwrap_or(config.runtime.production.adaptive.guardrail.adaptive_max_change_percent);
+        let change_percent = change_percent.unwrap_or(
+            config
+                .runtime
+                .production
+                .adaptive
+                .guardrail
+                .adaptive_max_change_percent,
+        );
         let before_value = current_value(recommendation.knob(), tuning);
         let after_value = adjusted_value(before_value, recommendation.knob(), change_percent);
         Ok((Some(before_value), Some(after_value)))
@@ -384,7 +413,10 @@ impl AdaptiveController {
 
     #[must_use]
     pub fn history(&self) -> AdaptiveHistory {
-        self.history.read().expect("adaptive history poisoned").clone()
+        self.history
+            .read()
+            .expect("adaptive history poisoned")
+            .clone()
     }
 
     pub async fn tick(&self) -> anyhow::Result<Vec<AdaptiveRecommendation>> {
@@ -401,7 +433,8 @@ impl AdaptiveController {
             .context("build adaptive recommendations")?;
 
         for recommendation in &recommendations {
-            let recommendation_snapshot = AdaptiveRecommendationSnapshot::from_recommendation(recommendation);
+            let recommendation_snapshot =
+                AdaptiveRecommendationSnapshot::from_recommendation(recommendation);
             self.snapshot_store
                 .record_adaptive_recommendation(recommendation_snapshot.clone());
             self.history
@@ -460,7 +493,9 @@ fn recommendation_confidence(min_confidence: f64) -> f64 {
     (min_confidence + 0.05).min(0.99).max(min_confidence)
 }
 
-fn aggregate_backpressure(backpressure_snapshots: &[BackpressureSnapshot]) -> (usize, u64, u64, u64) {
+fn aggregate_backpressure(
+    backpressure_snapshots: &[BackpressureSnapshot],
+) -> (usize, u64, u64, u64) {
     backpressure_snapshots.iter().fold(
         (0usize, 0u64, 0u64, 0u64),
         |(waiting, rejected, timed_out, canceled), snapshot| {
@@ -487,9 +522,9 @@ fn adjusted_value(before_value: f64, knob: TunableKnob, change_percent: u8) -> f
     let change = change_percent as f64 / 100.0;
     let adjusted = match knob {
         TunableKnob::PoolSize => (before_value * (1.0 + change)).ceil(),
-        TunableKnob::BackpressureThresholds | TunableKnob::Timeout | TunableKnob::MirrorSampling => {
-            (before_value * (1.0 - change)).floor()
-        }
+        TunableKnob::BackpressureThresholds
+        | TunableKnob::Timeout
+        | TunableKnob::MirrorSampling => (before_value * (1.0 - change)).floor(),
     };
 
     match knob {

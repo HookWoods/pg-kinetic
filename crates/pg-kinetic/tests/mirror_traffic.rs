@@ -100,10 +100,15 @@ fn writes_and_session_mutation_traffic_are_not_mirrored_by_default() {
 
 #[test]
 fn mirror_config_rejects_using_the_same_production_target_without_isolation() {
-    let mut config = MirrorConfig::default();
-    config.mirroring_enabled = true;
-    config.mirror_mode = MirrorMode::ReadOnly;
-    config.target.address = Some("127.0.0.1:5432".parse().expect("mirror target"));
+    let mut config = MirrorConfig {
+        mirroring_enabled: true,
+        mirror_mode: MirrorMode::ReadOnly,
+        target: MirrorTargetConfig {
+            address: Some("127.0.0.1:5432".parse().expect("mirror target")),
+            ..MirrorTargetConfig::default()
+        },
+        ..MirrorConfig::default()
+    };
 
     let error = config
         .validate("127.0.0.1:5432".parse().expect("production target"))

@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf, process, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,11 +16,9 @@ use pg_kinetic::core::{
     session::TransactionAccessMode,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
-use pg_kinetic_proxy::benchmark::{
-    prepare_benchmark_results, validate_benchmark_scenario,
-};
-use pg_kinetic_proxy::preflight::PreflightRunner;
+use pg_kinetic_proxy::benchmark::{prepare_benchmark_results, validate_benchmark_scenario};
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
+use pg_kinetic_proxy::preflight::PreflightRunner;
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -481,7 +484,10 @@ fn render_benchmark_validation_success(scenario: &BenchmarkScenario) -> String {
     )
 }
 
-fn render_benchmark_run_success(scenario: &BenchmarkScenario, results: &[BenchmarkResult]) -> String {
+fn render_benchmark_run_success(
+    scenario: &BenchmarkScenario,
+    results: &[BenchmarkResult],
+) -> String {
     let rendered_results = results
         .iter()
         .map(render_benchmark_result)
@@ -495,7 +501,7 @@ fn render_benchmark_run_success(scenario: &BenchmarkScenario, results: &[Benchma
     )
 }
 
-fn render_benchmark_error(path: &PathBuf, error: &BenchmarkValidationError) -> String {
+fn render_benchmark_error(path: &Path, error: &BenchmarkValidationError) -> String {
     format!(
         "{{\"ok\":false,\"scenario\":{},\"error\":{{\"code\":\"benchmark_validation_failed\",\"message\":{}}}}}",
         json_string(path.to_str().unwrap_or("<invalid-path>")),

@@ -10,15 +10,12 @@ use pg_kinetic::proxy_runtime::{
         AdaptiveSignalCollector, AdaptiveSignalSnapshot, AdaptiveTuningSnapshot,
     },
     mirror::{MirrorObservation, MirrorOutcomeRecorder, MirrorTaskStatus, MirrorTelemetry},
-    snapshot::{
-        AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BackpressureSnapshot,
-        LimitsSnapshot, PoolSnapshot, SnapshotStore,
-    },
+    snapshot::{BackpressureSnapshot, LimitsSnapshot, PoolSnapshot, SnapshotStore},
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
 use pg_kinetic_core::adaptive::{
     AdaptiveAction, AdaptiveGuardrail, AdaptiveMode, AdaptiveOutcome, AdaptiveRecommendation,
-    AdaptiveSignal, TuningBound, TunableKnob,
+    AdaptiveSignal, TunableKnob, TuningBound,
 };
 use tokio::sync::RwLock;
 
@@ -66,16 +63,12 @@ fn mirror_observation(route_key: &RouteKey, status: MirrorTaskStatus) -> MirrorO
             MirrorSafetyGate::TargetConfigured,
             MirrorReason::Disabled,
         ),
-        MirrorTaskStatus::Dropped { reason } => MirrorDecision::skipped(
-            MirrorMode::ReadOnly,
-            MirrorSafetyGate::Sampling,
-            *reason,
-        ),
-        MirrorTaskStatus::Skipped { reason } => MirrorDecision::skipped(
-            MirrorMode::ReadOnly,
-            MirrorSafetyGate::Sampling,
-            *reason,
-        ),
+        MirrorTaskStatus::Dropped { reason } => {
+            MirrorDecision::skipped(MirrorMode::ReadOnly, MirrorSafetyGate::Sampling, *reason)
+        }
+        MirrorTaskStatus::Skipped { reason } => {
+            MirrorDecision::skipped(MirrorMode::ReadOnly, MirrorSafetyGate::Sampling, *reason)
+        }
         MirrorTaskStatus::Rejected { reason } => MirrorDecision::rejected(
             MirrorMode::ReadOnly,
             MirrorSafetyGate::TargetConfigured,
@@ -101,26 +94,39 @@ fn mirror_observation(route_key: &RouteKey, status: MirrorTaskStatus) -> MirrorO
 
 fn configured_store() -> SnapshotStore {
     let store = SnapshotStore::new();
-    let mut limits = LimitsSnapshot::default();
-    limits.max_backends = 16;
-    limits.max_checkout_waiters = 24;
-    limits.max_route_waiters = 32;
-    limits.checkout_timeout = Duration::from_millis(1_000);
+    let limits = LimitsSnapshot {
+        max_backends: 16,
+        max_checkout_waiters: 24,
+        max_route_waiters: 32,
+        checkout_timeout: Duration::from_millis(1_000),
+        ..LimitsSnapshot::default()
+    };
     store.set_limits_snapshot(limits);
     store
 }
 
-fn tuned_config(
-    mode: AdaptiveMode,
-    apply_enabled: bool,
-    allowlist: Vec<TunableKnob>,
-) -> Config {
+fn tuned_config(mode: AdaptiveMode, apply_enabled: bool, allowlist: Vec<TunableKnob>) -> Config {
     let mut config = Config::default();
     config.runtime.production.adaptive_enabled = true;
     config.runtime.production.adaptive.adaptive_mode = mode;
-    config.runtime.production.adaptive.apply.adaptive_apply_enabled = apply_enabled;
-    config.runtime.production.adaptive.apply.adaptive_apply_allowlist = allowlist;
-    config.runtime.production.adaptive.guardrail.adaptive_max_change_percent = 10;
+    config
+        .runtime
+        .production
+        .adaptive
+        .apply
+        .adaptive_apply_enabled = apply_enabled;
+    config
+        .runtime
+        .production
+        .adaptive
+        .apply
+        .adaptive_apply_allowlist = allowlist;
+    config
+        .runtime
+        .production
+        .adaptive
+        .guardrail
+        .adaptive_max_change_percent = 10;
     config.capacity.max_backends = 16;
     config.qos.max_route_waiters = 32;
     config.performance.checkout_timeout_ms = 1_000;
@@ -148,10 +154,7 @@ fn adaptive_ops_are_disabled_by_default() {
     assert!(!adaptive.apply.adaptive_apply_enabled);
     assert!(adaptive.apply.adaptive_apply_allowlist.is_empty());
     assert_eq!(adaptive.guardrail.adaptive_max_change_percent, 10);
-    assert_eq!(
-        adaptive.guardrail.safety_bound(),
-        TuningBound::percent(10)
-    );
+    assert_eq!(adaptive.guardrail.safety_bound(), TuningBound::percent(10));
 }
 
 #[test]
@@ -176,7 +179,9 @@ fn recommendation_mode_can_run_without_applying_changes() {
     );
 
     assert_eq!(
-        adaptive.evaluate(&recommendation).expect("recommendation outcome"),
+        adaptive
+            .evaluate(&recommendation)
+            .expect("recommendation outcome"),
         AdaptiveOutcome::Recommended
     );
 }
@@ -191,7 +196,9 @@ fn apply_mode_requires_explicit_allowlist_of_tunable_knobs() {
     )
     .expect("apply mode parses");
 
-    let error = adaptive.validate().expect_err("missing allowlist is rejected");
+    let error = adaptive
+        .validate()
+        .expect_err("missing allowlist is rejected");
     assert!(
         error.to_lowercase().contains("allow"),
         "validation error: {error}"
@@ -206,7 +213,9 @@ fn apply_mode_requires_explicit_allowlist_of_tunable_knobs() {
     )
     .expect("allowlisted apply mode parses");
 
-    allowlisted.validate().expect("allowlisted apply mode is valid");
+    allowlisted
+        .validate()
+        .expect("allowlisted apply mode is valid");
     assert!(allowlisted.apply.allows(TunableKnob::PoolSize));
     assert!(allowlisted.apply.allows(TunableKnob::Timeout));
 }
@@ -467,7 +476,9 @@ fn mirror_drops_recommend_lower_mirror_sample_rate() {
         .expect("mirror recommendation present");
 
     assert_eq!(recommendation.knob(), TunableKnob::MirrorSampling);
-    assert!(recommendation.reason().contains("lower the mirror sample rate"));
+    assert!(recommendation
+        .reason()
+        .contains("lower the mirror sample rate"));
 }
 
 #[test]
@@ -509,7 +520,9 @@ fn apply_mode_only_changes_allowlisted_knobs() {
     let applied = engine.apply(&config, &allowlisted, &tuning);
     assert_eq!(applied.outcome, AdaptiveOutcome::Applied);
     assert_eq!(applied.change_percent, Some(8));
-    assert!(applied.before_value.expect("before value") > applied.after_value.expect("after value"));
+    assert!(
+        applied.before_value.expect("before value") > applied.after_value.expect("after value")
+    );
 
     let rejected = recommendation(
         AdaptiveSignal::TimeoutPressure,
@@ -550,13 +563,21 @@ async fn apply_mode_records_before_after_values_and_can_be_disabled_by_reload() 
     assert_eq!(recommendation_snapshots.len(), 1);
     assert_eq!(outcome_snapshots.len(), 1);
     assert_eq!(outcome_snapshots[0].outcome, AdaptiveOutcome::Applied);
-    assert!(outcome_snapshots[0].before_value.expect("before value") > outcome_snapshots[0].after_value.expect("after value"));
+    assert!(
+        outcome_snapshots[0].before_value.expect("before value")
+            > outcome_snapshots[0].after_value.expect("after value")
+    );
     assert!(!outcome_snapshots[0].disabled_by_reload);
 
     {
         let mut config = active_config.write().await;
         config.runtime.production.adaptive.adaptive_mode = AdaptiveMode::Recommend;
-        config.runtime.production.adaptive.apply.adaptive_apply_enabled = false;
+        config
+            .runtime
+            .production
+            .adaptive
+            .apply
+            .adaptive_apply_enabled = false;
     }
 
     controller.tick().await.expect("second adaptive tick");

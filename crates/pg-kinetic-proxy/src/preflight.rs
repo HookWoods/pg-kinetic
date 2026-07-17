@@ -94,7 +94,9 @@ impl PreflightRunner {
             }
         }
 
-        if client_tls_files_configured || tls_config.client_tls_mode != crate::config::ClientTlsMode::Disable {
+        if client_tls_files_configured
+            || tls_config.client_tls_mode != crate::config::ClientTlsMode::Disable
+        {
             if let Err(error) = tls::load_server_config(tls_config) {
                 report.add_error(PreflightCheck::TlsFiles, error.to_string());
             }
@@ -124,27 +126,18 @@ impl PreflightRunner {
         }
 
         if tls_config.client_tls_mode == crate::config::ClientTlsMode::Disable {
-            report.add_warning(
-                PreflightCheck::TlsFiles,
-                "client TLS is disabled",
-            );
+            report.add_warning(PreflightCheck::TlsFiles, "client TLS is disabled");
         }
 
         if tls_config.backend_tls_mode == crate::config::BackendTlsMode::Disable {
-            report.add_warning(
-                PreflightCheck::TlsFiles,
-                "backend TLS is disabled",
-            );
+            report.add_warning(PreflightCheck::TlsFiles, "backend TLS is disabled");
         }
     }
 
     fn validate_auth(&self, config: &Config, report: &mut PreflightReport) {
         if let Some(path) = config.auth.auth_users_file.as_deref() {
             if let Err(error) = auth::load_user_store(Some(path)) {
-                report.add_error(
-                    PreflightCheck::AuthUsers,
-                    error.to_string(),
-                );
+                report.add_error(PreflightCheck::AuthUsers, error.to_string());
             }
         }
 
@@ -212,10 +205,8 @@ impl PreflightRunner {
                     }
 
                     if !mirror.is_enabled() {
-                        report.add_warning(
-                            PreflightCheck::MirrorIsolation,
-                            "mirroring is disabled",
-                        );
+                        report
+                            .add_warning(PreflightCheck::MirrorIsolation, "mirroring is disabled");
                     }
                 }
             }
@@ -229,7 +220,9 @@ impl PreflightRunner {
         let lifecycle = &config.runtime.lifecycle;
         let startup_grace = lifecycle.startup_grace_ms;
         let shutdown_grace = lifecycle.shutdown_grace_ms;
-        let termination_grace_ms = lifecycle.termination_grace_period_seconds.saturating_mul(1_000);
+        let termination_grace_ms = lifecycle
+            .termination_grace_period_seconds
+            .saturating_mul(1_000);
 
         if startup_grace == 0 {
             report.add_error(

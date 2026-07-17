@@ -118,10 +118,7 @@ impl RuntimeEngineCapabilities {
 
     #[must_use]
     pub const fn platform_supported(self) -> bool {
-        match self.engine {
-            RuntimeEngine::ExperimentalIoUring => cfg!(target_os = "linux"),
-            _ => true,
-        }
+        !matches!(self.engine, RuntimeEngine::ExperimentalIoUring) || cfg!(target_os = "linux")
     }
 
     #[must_use]

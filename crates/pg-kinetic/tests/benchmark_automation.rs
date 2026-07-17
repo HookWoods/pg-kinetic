@@ -1,12 +1,7 @@
-use std::{
-    fs,
-    path::PathBuf,
-    process::Command,
-};
+use std::{fs, path::PathBuf, process::Command};
 
 use pg_kinetic_core::benchmark::{
-    BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkScenario,
-    BenchmarkTarget,
+    BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkTarget,
 };
 use pg_kinetic_proxy::benchmark::validate_benchmark_scenario;
 
@@ -24,7 +19,10 @@ fn repo_root() -> PathBuf {
 }
 
 fn scenario_path() -> PathBuf {
-    repo_root().join("bench").join("scenarios").join("benchmark-basic.toml")
+    repo_root()
+        .join("bench")
+        .join("scenarios")
+        .join("benchmark-basic.toml")
 }
 
 fn run_benchmark(args: &[&str]) -> std::process::Output {
@@ -47,9 +45,7 @@ fn benchmark_scenario_schema_parses() {
         scenario.targets()[0].comparison(),
         BenchmarkComparison::DirectPostgreSQL
     );
-    assert!(scenario.targets()[0]
-        .redacted_dsn()
-        .contains("<redacted>"));
+    assert!(scenario.targets()[0].redacted_dsn().contains("<redacted>"));
 }
 
 #[test]
@@ -103,7 +99,12 @@ fn benchmark_comparison_labels_are_supported() {
 
     for (comparison, expected) in labels {
         assert_eq!(comparison.as_str(), expected);
-        assert_eq!(expected.parse::<BenchmarkComparison>().expect("label parses"), comparison);
+        assert_eq!(
+            expected
+                .parse::<BenchmarkComparison>()
+                .expect("label parses"),
+            comparison
+        );
     }
 }
 

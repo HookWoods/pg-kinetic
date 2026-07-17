@@ -809,12 +809,12 @@ async fn handle_client(
                     }
                 };
 
-                let replay = if should_replay_session(&session, &pinned_backend, backend.backend_id())
-                {
-                    Some(replay_frames(&session))
-                } else {
-                    None
-                };
+                let replay =
+                    if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
+                        Some(replay_frames(&session))
+                    } else {
+                        None
+                    };
 
                 if let Some(replay_frames) = replay.as_ref() {
                     let status = execute_backend_batch(
@@ -1758,7 +1758,10 @@ fn routing_sql_for_frames<'a>(
     Cow::Borrowed("")
 }
 
-fn mirror_sql_command_for_frames(prepared: &PreparedCatalog, frames: &[FrontendFrame]) -> SqlCommand {
+fn mirror_sql_command_for_frames(
+    prepared: &PreparedCatalog,
+    frames: &[FrontendFrame],
+) -> SqlCommand {
     classify(routing_sql_for_frames(prepared, frames).as_ref())
 }
 
