@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod control;
 pub mod drain;
 pub mod health;
 pub mod lifecycle;
