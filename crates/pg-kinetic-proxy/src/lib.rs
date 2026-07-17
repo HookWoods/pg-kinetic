@@ -15,6 +15,7 @@ pub mod policy;
 pub mod policy_wasm;
 pub mod pool;
 pub mod preflight;
+pub mod profile;
 pub mod proxy;
 pub mod reload;
 pub mod routing;

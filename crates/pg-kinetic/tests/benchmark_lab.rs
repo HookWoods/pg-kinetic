@@ -9,6 +9,7 @@ use pg_kinetic_proxy::benchmark::{
     validate_benchmark_targets_with, BenchmarkTargetAvailability, BenchmarkTargetOutcome,
     BenchmarkTargetReportOutcome,
 };
+use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunOutcome, ProfileRunner, ProfileTool};
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_pg-kinetic")
@@ -534,4 +535,44 @@ fn benchmark_scenario_constructor_remains_compatible_with_existing_callers() {
 
     assert_eq!(scenario.workload(), BenchmarkWorkloadKind::SimpleQuery);
     assert_eq!(scenario.connections().concurrency(), 16);
+}
+
+#[test]
+fn profile_validate_command_reports_optional_tool_availability_without_profiling() {
+    let output = Command::new(binary_path())
+        .args(["profile", "validate"])
+        .output()
+        .expect("run profile validation");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 profile validation output");
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"flamegraph\""));
+    assert!(stdout.contains("\"perf\""));
+}
+
+#[test]
+fn profile_result_records_redacted_metadata_and_skips_missing_tools() {
+    let runner = ProfileRunner::with_tool_lookup(|_| false);
+    let config = ProfileRunConfig::new(
+        ProfileTool::Flamegraph,
+        std::env::temp_dir().join("profile-lab-scenario.toml"),
+        "pg-kinetic",
+        30_000,
+        std::env::temp_dir().join("profile-lab-output.svg"),
+    );
+
+    let result = runner.run(&config).expect("optional tool should skip");
+    let metadata = result.render_json().expect("serialize profile metadata");
+
+    assert_eq!(result.outcome, ProfileRunOutcome::Skipped);
+    assert!(metadata.contains("\"profile_kind\":\"flamegraph\""));
+    assert!(metadata.contains("\"duration_ms\":30000"));
+    assert!(metadata.contains("<absolute>/profile-lab-scenario.toml"));
+    assert!(metadata.contains("<absolute>/profile-lab-output.svg"));
+    assert!(!metadata.contains(std::env::temp_dir().to_string_lossy().as_ref()));
 }

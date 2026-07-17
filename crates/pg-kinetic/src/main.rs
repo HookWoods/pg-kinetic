@@ -20,6 +20,7 @@ use pg_kinetic_proxy::benchmark::{
 };
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::preflight::PreflightRunner;
+use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -39,6 +40,7 @@ enum Command {
     RoutePreview(RoutePreviewArgs),
     PolicyPreview(PolicyPreviewArgs),
     Benchmark(BenchmarkArgs),
+    Profile(ProfileArgs),
     Preflight(PreflightArgs),
 }
 
@@ -94,6 +96,12 @@ struct BenchmarkArgs {
 }
 
 #[derive(Debug, Args)]
+struct ProfileArgs {
+    #[command(subcommand)]
+    command: ProfileCommand,
+}
+
+#[derive(Debug, Args)]
 struct PreflightArgs {
     #[arg(long)]
     config: PathBuf,
@@ -107,6 +115,27 @@ enum BenchmarkCommand {
     Validate(BenchmarkValidateArgs),
     Run(BenchmarkRunArgs),
     Compare(BenchmarkCompareArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    Validate,
+    Run(ProfileRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProfileRunArgs {
+    #[arg(long)]
+    scenario: PathBuf,
+
+    #[arg(long, value_parser = parse_profile_tool)]
+    kind: ProfileTool,
+
+    #[arg(long, default_value = "pg-kinetic")]
+    target: String,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -167,6 +196,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
         Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
         Some(Command::Benchmark(args)) => return run_benchmark(config, args),
+        Some(Command::Profile(args)) => return run_profile(config, args),
         Some(Command::Preflight(args)) => return run_preflight(config, args),
         None => {}
     }
@@ -278,6 +308,63 @@ fn run_benchmark(_config: Config, args: BenchmarkArgs) -> anyhow::Result<()> {
         BenchmarkCommand::Run(args) => run_benchmark_run(args),
         BenchmarkCommand::Compare(args) => run_benchmark_compare(args),
     }
+}
+
+fn run_profile(_config: Config, args: ProfileArgs) -> anyhow::Result<()> {
+    let runner = ProfileRunner::new();
+    match args.command {
+        ProfileCommand::Validate => {
+            let statuses = ProfileTool::ALL
+                .into_iter()
+                .map(|tool| (tool.as_str(), runner.validate(tool)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({ "ok": true, "tools": statuses }))
+                    .context("serialize profile validation")?
+            );
+            Ok(())
+        }
+        ProfileCommand::Run(args) => run_profile_run(&runner, args),
+    }
+}
+
+fn run_profile_run(runner: &ProfileRunner, args: ProfileRunArgs) -> anyhow::Result<()> {
+    let ProfileRunArgs {
+        scenario,
+        kind,
+        target,
+        output,
+    } = args;
+    let scenario_config = validate_benchmark_scenario(&scenario)
+        .map_err(|error| anyhow::anyhow!("profile scenario validation failed: {error}"))?;
+    let output = output.unwrap_or_else(|| default_profile_output(&scenario, kind));
+    let config = ProfileRunConfig::new(
+        kind,
+        scenario,
+        target,
+        scenario_config.duration_ms(),
+        output,
+    );
+    let result = runner.run(&config)?;
+    println!("{}", result.render_json()?);
+    Ok(())
+}
+
+fn default_profile_output(scenario: &Path, kind: ProfileTool) -> PathBuf {
+    let scenario_name = scenario
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile");
+    let extension = match kind {
+        ProfileTool::Flamegraph => "svg",
+        ProfileTool::Perf => "data",
+    };
+    PathBuf::from("bench").join("profiles").join(format!(
+        "{scenario_name}-{}.{}",
+        kind.as_str(),
+        extension
+    ))
 }
 
 fn run_preflight(_config: Config, args: PreflightArgs) -> anyhow::Result<()> {
@@ -630,6 +717,16 @@ fn parse_routing_query_class(value: &str) -> Result<RoutingQueryClass, String> {
         "unknown" => Ok(RoutingQueryClass::Unknown),
         _ => Err(format!(
             "invalid query class '{value}', expected one of: write, read_only, read_candidate, transaction_control, session_mutation, copy, unknown"
+        )),
+    }
+}
+
+fn parse_profile_tool(value: &str) -> Result<ProfileTool, String> {
+    match value {
+        "flamegraph" => Ok(ProfileTool::Flamegraph),
+        "perf" => Ok(ProfileTool::Perf),
+        _ => Err(format!(
+            "invalid profile kind '{value}', expected one of: flamegraph, perf"
         )),
     }
 }
