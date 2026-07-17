@@ -14,6 +14,106 @@ use pg_kinetic_core::benchmark::{
     BenchmarkScenarioMatrix, BenchmarkTarget, BenchmarkValidationError, BenchmarkWarmupConfig,
     BenchmarkWorkloadKind,
 };
+use pg_kinetic_core::performance::{
+    ProcessMetricCollectionStatus, ProcessMetricKind, ProcessMetricSample, ProcessMetricValue,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessMetricCollection {
+    status: ProcessMetricCollectionStatus,
+    sample: ProcessMetricSample,
+}
+
+impl ProcessMetricCollection {
+    #[must_use]
+    pub const fn status(&self) -> ProcessMetricCollectionStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn sample(&self) -> &ProcessMetricSample {
+        &self.sample
+    }
+}
+
+#[must_use]
+pub fn collect_process_metrics() -> ProcessMetricCollection {
+    let metrics = [
+        (ProcessMetricKind::CpuTime, collect_cpu_time()),
+        (ProcessMetricKind::ResidentMemory, collect_resident_memory()),
+        (
+            ProcessMetricKind::OpenFileDescriptors,
+            collect_open_file_descriptors(),
+        ),
+    ];
+    let unknown = metrics
+        .iter()
+        .filter(|(_, value)| value.is_unknown())
+        .count();
+    let status = if unknown == 0 {
+        ProcessMetricCollectionStatus::Complete
+    } else if unknown == metrics.len() {
+        ProcessMetricCollectionStatus::Unavailable
+    } else {
+        ProcessMetricCollectionStatus::Partial
+    };
+    ProcessMetricCollection {
+        status,
+        sample: ProcessMetricSample::now(metrics).redacted(),
+    }
+}
+
+#[cfg(unix)]
+fn collect_cpu_time() -> ProcessMetricValue {
+    fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|contents| {
+            contents.rsplit_once(") ").map(|(_, rest)| {
+                rest.split_whitespace()
+                    .nth(11)
+                    .and_then(|value| value.parse().ok())
+            })
+        })
+        .flatten()
+        .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
+}
+
+#[cfg(not(unix))]
+fn collect_cpu_time() -> ProcessMetricValue {
+    ProcessMetricValue::Unknown
+}
+
+#[cfg(unix)]
+fn collect_resident_memory() -> ProcessMetricValue {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        })
+        .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
+}
+
+#[cfg(not(unix))]
+fn collect_resident_memory() -> ProcessMetricValue {
+    ProcessMetricValue::Unknown
+}
+
+#[cfg(unix)]
+fn collect_open_file_descriptors() -> ProcessMetricValue {
+    fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| entries.count().try_into().ok())
+        .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
+}
+
+#[cfg(not(unix))]
+fn collect_open_file_descriptors() -> ProcessMetricValue {
+    ProcessMetricValue::Unknown
+}
 
 #[derive(Debug, Deserialize)]
 struct BenchmarkScenarioDocument {
