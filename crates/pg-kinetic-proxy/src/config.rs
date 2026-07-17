@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
+    mirror::MirrorMode,
     policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
     recovery::RecoveryMode,
     routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
@@ -202,6 +203,222 @@ pub struct RuntimeConfig {
 
     #[command(flatten)]
     pub production: ProductionConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct MirrorConfig {
+    #[arg(
+        long = "mirror-enabled",
+        env = "PG_KINETIC_MIRROR_ENABLED",
+        default_value_t = false
+    )]
+    pub mirroring_enabled: bool,
+
+    #[arg(
+        long = "mirror-mode",
+        env = "PG_KINETIC_MIRROR_MODE",
+        value_parser = parse_mirror_mode,
+        default_value = "off"
+    )]
+    #[serde(
+        default = "default_mirror_mode",
+        deserialize_with = "deserialize_mirror_mode",
+        serialize_with = "serialize_mirror_mode"
+    )]
+    pub mirror_mode: MirrorMode,
+
+    #[arg(
+        long = "mirror-timeout-ms",
+        env = "PG_KINETIC_MIRROR_TIMEOUT_MS",
+        default_value_t = 100
+    )]
+    pub mirror_timeout_ms: u64,
+
+    #[arg(
+        long = "mirror-max-in-flight",
+        env = "PG_KINETIC_MIRROR_MAX_IN_FLIGHT",
+        default_value_t = 128
+    )]
+    pub mirror_max_in_flight: usize,
+
+    #[command(flatten)]
+    pub target: MirrorTargetConfig,
+
+    #[command(flatten)]
+    pub sampling: MirrorSamplingConfig,
+
+    #[command(flatten)]
+    pub safety: MirrorSafetyConfig,
+}
+
+impl MirrorConfig {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.mirroring_enabled && self.mirror_mode.is_enabled()
+    }
+
+    pub fn validate(&self, production_target: SocketAddr) -> Result<(), String> {
+        if self.is_enabled() && !self.target.is_configured() {
+            return Err(String::from("mirror target must be explicitly configured"));
+        }
+
+        self.target.validate_against(production_target, self.safety.mirror_require_isolated_target)
+    }
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        Self {
+            mirroring_enabled: false,
+            mirror_mode: MirrorMode::Off,
+            mirror_timeout_ms: 100,
+            mirror_max_in_flight: 128,
+            target: MirrorTargetConfig::default(),
+            sampling: MirrorSamplingConfig::default(),
+            safety: MirrorSafetyConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct MirrorTargetConfig {
+    #[arg(long = "mirror-target-address", env = "PG_KINETIC_MIRROR_TARGET_ADDRESS")]
+    pub address: Option<SocketAddr>,
+
+    #[arg(
+        long = "mirror-target-isolated",
+        env = "PG_KINETIC_MIRROR_TARGET_ISOLATED",
+        default_value_t = false
+    )]
+    pub isolated: bool,
+}
+
+impl MirrorTargetConfig {
+    #[must_use]
+    pub const fn is_configured(&self) -> bool {
+        self.address.is_some()
+    }
+
+    pub fn validate_against(
+        &self,
+        production_target: SocketAddr,
+        require_isolated_target: bool,
+    ) -> Result<(), String> {
+        match self.address {
+            Some(address)
+                if require_isolated_target && !self.isolated && address == production_target =>
+            {
+                Err(String::from(
+                    "mirror target must be marked isolated when it matches the production target",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Default for MirrorTargetConfig {
+    fn default() -> Self {
+        Self {
+            address: None,
+            isolated: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct MirrorSamplingConfig {
+    #[arg(
+        long = "mirror-sample-rate",
+        env = "PG_KINETIC_MIRROR_SAMPLE_RATE",
+        default_value_t = 0.0
+    )]
+    pub mirror_sample_rate: f64,
+}
+
+impl MirrorSamplingConfig {
+    #[must_use]
+    pub fn sample_rate(&self) -> f64 {
+        pg_kinetic_core::mirror::MirrorSample::new(self.mirror_sample_rate).rate()
+    }
+}
+
+impl Default for MirrorSamplingConfig {
+    fn default() -> Self {
+        Self {
+            mirror_sample_rate: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct MirrorSafetyConfig {
+    #[arg(
+        long = "mirror-writes-enabled",
+        env = "PG_KINETIC_MIRROR_WRITES_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_writes_enabled: bool,
+
+    #[arg(
+        long = "mirror-transactions-enabled",
+        env = "PG_KINETIC_MIRROR_TRANSACTIONS_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_transactions_enabled: bool,
+
+    #[arg(
+        long = "mirror-copy-enabled",
+        env = "PG_KINETIC_MIRROR_COPY_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_copy_enabled: bool,
+
+    #[arg(
+        long = "mirror-listen-notify-enabled",
+        env = "PG_KINETIC_MIRROR_LISTEN_NOTIFY_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_listen_notify_enabled: bool,
+
+    #[arg(
+        long = "mirror-temp-table-enabled",
+        env = "PG_KINETIC_MIRROR_TEMP_TABLE_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_temp_table_enabled: bool,
+
+    #[arg(
+        long = "mirror-session-mutation-enabled",
+        env = "PG_KINETIC_MIRROR_SESSION_MUTATION_ENABLED",
+        default_value_t = false
+    )]
+    pub mirror_session_mutation_enabled: bool,
+
+    #[arg(
+        long = "mirror-require-isolated-target",
+        env = "PG_KINETIC_MIRROR_REQUIRE_ISOLATED_TARGET",
+        default_value_t = true
+    )]
+    pub mirror_require_isolated_target: bool,
+}
+
+impl Default for MirrorSafetyConfig {
+    fn default() -> Self {
+        Self {
+            mirror_writes_enabled: false,
+            mirror_transactions_enabled: false,
+            mirror_copy_enabled: false,
+            mirror_listen_notify_enabled: false,
+            mirror_temp_table_enabled: false,
+            mirror_session_mutation_enabled: false,
+            mirror_require_isolated_target: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -1965,6 +2182,34 @@ where
     S: Serializer,
 {
     serializer.serialize_str(engine.as_str())
+}
+
+fn default_mirror_mode() -> MirrorMode {
+    MirrorMode::Off
+}
+
+fn parse_mirror_mode(value: &str) -> Result<MirrorMode, String> {
+    match value {
+        "off" => Ok(MirrorMode::Off),
+        "read_only" => Ok(MirrorMode::ReadOnly),
+        "explicit" => Ok(MirrorMode::Explicit),
+        _ => Err(format!("invalid mirror mode '{value}'")),
+    }
+}
+
+fn deserialize_mirror_mode<'de, D>(deserializer: D) -> Result<MirrorMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_mirror_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_mirror_mode<S>(mode: &MirrorMode, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
 }
 
 #[cfg(test)]

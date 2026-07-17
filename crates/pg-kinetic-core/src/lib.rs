@@ -4,6 +4,7 @@ pub mod cleanup;
 pub mod constants;
 pub mod ha;
 pub mod lsn;
+pub mod mirror;
 pub mod observability;
 pub mod pin;
 pub mod policy;
