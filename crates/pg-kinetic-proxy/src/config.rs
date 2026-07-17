@@ -6,6 +6,7 @@ use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
+    adaptive::{AdaptiveMode, TunableKnob},
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
     mirror::MirrorMode,
     policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
@@ -189,7 +190,7 @@ pub struct Config {
     pub socket: SocketConfig,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
     #[command(flatten)]
@@ -354,7 +355,7 @@ impl Default for MirrorSamplingConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct MirrorSafetyConfig {
     #[arg(
@@ -421,7 +422,7 @@ impl Default for MirrorSafetyConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct LifecycleConfig {
     #[arg(long, env = "PG_KINETIC_STARTUP_GRACE_MS", default_value_t = 30_000)]
@@ -605,7 +606,7 @@ impl<'de> Deserialize<'de> for RuntimeEngineConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ProductionConfig {
     #[arg(
@@ -620,6 +621,257 @@ pub struct ProductionConfig {
 
     #[arg(long, env = "PG_KINETIC_ADAPTIVE_ENABLED", default_value_t = false)]
     pub adaptive_enabled: bool,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub adaptive: AdaptiveConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct AdaptiveConfig {
+    #[arg(
+        long = "adaptive-mode",
+        env = "PG_KINETIC_ADAPTIVE_MODE",
+        value_parser = parse_adaptive_mode,
+        default_value = "recommend"
+    )]
+    #[serde(
+        default = "default_adaptive_mode",
+        deserialize_with = "deserialize_adaptive_mode",
+        serialize_with = "serialize_adaptive_mode"
+    )]
+    pub adaptive_mode: AdaptiveMode,
+
+    #[arg(
+        long = "adaptive-window-ms",
+        env = "PG_KINETIC_ADAPTIVE_WINDOW_MS",
+        default_value_t = 60_000
+    )]
+    pub adaptive_window_ms: u64,
+
+    #[arg(
+        long = "adaptive-min-confidence",
+        env = "PG_KINETIC_ADAPTIVE_MIN_CONFIDENCE",
+        default_value_t = 0.8
+    )]
+    pub adaptive_min_confidence: f64,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub apply: AdaptiveApplyConfig,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub guardrail: AdaptiveGuardrailConfig,
+}
+
+impl AdaptiveConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.adaptive_min_confidence.is_finite()
+            || !(0.0..=1.0).contains(&self.adaptive_min_confidence)
+        {
+            return Err(String::from(
+                "adaptive_min_confidence must be between 0.0 and 1.0",
+            ));
+        }
+
+        if self.adaptive_window_ms == 0 {
+            return Err(String::from(
+                "adaptive_window_ms must be greater than zero",
+            ));
+        }
+
+        self.guardrail.validate()?;
+        self.apply.validate()?;
+
+        if self.adaptive_mode.is_apply() {
+            if !self.apply.adaptive_apply_enabled {
+                return Err(String::from(
+                    "adaptive mode 'apply' requires adaptive_apply_enabled = true",
+                ));
+            }
+
+            if self.apply.adaptive_apply_allowlist.is_empty() {
+                return Err(String::from(
+                    "adaptive mode 'apply' requires an explicit allowlist of tunable knobs",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn recommendation_window(&self) -> Duration {
+        Duration::from_millis(self.adaptive_window_ms)
+    }
+
+    pub fn evaluate(
+        &self,
+        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+    ) -> Result<pg_kinetic_core::adaptive::AdaptiveOutcome, pg_kinetic_core::adaptive::AdaptiveApplyError>
+    {
+        if recommendation.confidence() < self.adaptive_min_confidence {
+            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::adaptive::AdaptiveGuardrail::ConfidenceFloor,
+                format!(
+                    "adaptive recommendation confidence {:.3} is below the minimum {:.3}",
+                    recommendation.confidence(),
+                    self.adaptive_min_confidence
+                ),
+            ));
+        }
+
+        if self.adaptive_mode.is_apply() {
+            self.apply.evaluate(recommendation, &self.guardrail)
+        } else {
+            Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Recommended)
+        }
+    }
+}
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_mode: AdaptiveMode::Recommend,
+            adaptive_window_ms: 60_000,
+            adaptive_min_confidence: 0.8,
+            apply: AdaptiveApplyConfig::default(),
+            guardrail: AdaptiveGuardrailConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct AdaptiveApplyConfig {
+    #[arg(
+        long = "adaptive-apply-enabled",
+        env = "PG_KINETIC_ADAPTIVE_APPLY_ENABLED",
+        default_value_t = false
+    )]
+    pub adaptive_apply_enabled: bool,
+
+    #[arg(
+        long = "adaptive-apply-allowlist",
+        env = "PG_KINETIC_ADAPTIVE_APPLY_ALLOWLIST",
+        value_parser = parse_tunable_knob,
+        value_delimiter = ','
+    )]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_tunable_knob_list",
+        serialize_with = "serialize_tunable_knob_list"
+    )]
+    pub adaptive_apply_allowlist: Vec<TunableKnob>,
+}
+
+impl AdaptiveApplyConfig {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.adaptive_apply_enabled
+    }
+
+    #[must_use]
+    pub fn allows(&self, knob: TunableKnob) -> bool {
+        self.adaptive_apply_allowlist.contains(&knob)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let mut unique_knobs = HashSet::new();
+        if self
+            .adaptive_apply_allowlist
+            .iter()
+            .any(|knob| !unique_knobs.insert(*knob))
+        {
+            return Err(String::from(
+                "adaptive_apply_allowlist cannot contain duplicate knobs",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+        guardrail: &AdaptiveGuardrailConfig,
+    ) -> Result<pg_kinetic_core::adaptive::AdaptiveOutcome, pg_kinetic_core::adaptive::AdaptiveApplyError>
+    {
+        if !self.adaptive_apply_enabled {
+            return Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Skipped);
+        }
+
+        if !self.allows(recommendation.knob()) {
+            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::adaptive::AdaptiveGuardrail::Allowlist,
+                format!(
+                    "adaptive knob '{}' is not on the apply allowlist",
+                    recommendation.knob()
+                ),
+            ));
+        }
+
+        match recommendation.safety_bound() {
+            pg_kinetic_core::adaptive::TuningBound::Unbounded => Err(
+                pg_kinetic_core::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::adaptive::AdaptiveGuardrail::UnboundedChange,
+                    "adaptive apply rejected an unbounded change",
+                ),
+            ),
+            pg_kinetic_core::adaptive::TuningBound::Percent(change_percent)
+                if change_percent > guardrail.adaptive_max_change_percent =>
+            {
+                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::adaptive::AdaptiveGuardrail::MaxChangePercent,
+                    format!(
+                        "adaptive change percent {change_percent} exceeds the configured limit {}",
+                        guardrail.adaptive_max_change_percent
+                    ),
+                ))
+            }
+            pg_kinetic_core::adaptive::TuningBound::Percent(_) => {
+                Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Applied)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct AdaptiveGuardrailConfig {
+    #[arg(
+        long = "adaptive-max-change-percent",
+        env = "PG_KINETIC_ADAPTIVE_MAX_CHANGE_PERCENT",
+        default_value_t = 10
+    )]
+    pub adaptive_max_change_percent: u8,
+}
+
+impl AdaptiveGuardrailConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.adaptive_max_change_percent == 0 || self.adaptive_max_change_percent > 100 {
+            return Err(String::from(
+                "adaptive_max_change_percent must be between 1 and 100",
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn safety_bound(&self) -> pg_kinetic_core::adaptive::TuningBound {
+        pg_kinetic_core::adaptive::TuningBound::percent(self.adaptive_max_change_percent)
+    }
+}
+
+impl Default for AdaptiveGuardrailConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_max_change_percent: 10,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -2182,6 +2434,54 @@ where
     S: Serializer,
 {
     serializer.serialize_str(engine.as_str())
+}
+
+fn default_adaptive_mode() -> AdaptiveMode {
+    AdaptiveMode::Recommend
+}
+
+fn parse_adaptive_mode(value: &str) -> Result<AdaptiveMode, String> {
+    value.parse()
+}
+
+fn deserialize_adaptive_mode<'de, D>(deserializer: D) -> Result<AdaptiveMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_adaptive_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_adaptive_mode<S>(mode: &AdaptiveMode, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(mode.as_str())
+}
+
+fn parse_tunable_knob(value: &str) -> Result<TunableKnob, String> {
+    value.parse()
+}
+
+fn deserialize_tunable_knob_list<'de, D>(deserializer: D) -> Result<Vec<TunableKnob>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| parse_tunable_knob(&value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn serialize_tunable_knob_list<S>(
+    knobs: &[TunableKnob],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_seq(knobs.iter().map(|knob| knob.as_str()))
 }
 
 fn default_mirror_mode() -> MirrorMode {

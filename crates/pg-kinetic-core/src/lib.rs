@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod adaptive;
 pub mod backpressure;
 pub mod cleanup;
 pub mod control;
