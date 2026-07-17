@@ -4,8 +4,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
 use pg_kinetic::core::benchmark::{
-    BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkScenario,
-    BenchmarkTarget, BenchmarkValidationError,
+    BenchmarkMetric, BenchmarkResult, BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError,
 };
 use pg_kinetic::core::{
     lsn::FreshnessStatus, policy::PolicyAction, routing::QueryClass as RoutingQueryClass,
@@ -15,6 +14,7 @@ use pg_kinetic::route::{QueryClass, RouteKey};
 use pg_kinetic_proxy::benchmark::{
     prepare_benchmark_results, validate_benchmark_scenario,
 };
+use pg_kinetic_proxy::preflight::PreflightRunner;
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
@@ -35,6 +35,7 @@ enum Command {
     RoutePreview(RoutePreviewArgs),
     PolicyPreview(PolicyPreviewArgs),
     Benchmark(BenchmarkArgs),
+    Preflight(PreflightArgs),
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +89,15 @@ struct BenchmarkArgs {
     command: BenchmarkCommand,
 }
 
+#[derive(Debug, Args)]
+struct PreflightArgs {
+    #[arg(long)]
+    config: PathBuf,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
 #[derive(Debug, Subcommand)]
 enum BenchmarkCommand {
     Validate(BenchmarkValidateArgs),
@@ -137,6 +147,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
         Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
         Some(Command::Benchmark(args)) => return run_benchmark(config, args),
+        Some(Command::Preflight(args)) => return run_preflight(config, args),
         None => {}
     }
 
@@ -246,6 +257,23 @@ fn run_benchmark(_config: Config, args: BenchmarkArgs) -> anyhow::Result<()> {
         BenchmarkCommand::Validate(args) => run_benchmark_validate(args),
         BenchmarkCommand::Run(args) => run_benchmark_run(args),
     }
+}
+
+fn run_preflight(_config: Config, args: PreflightArgs) -> anyhow::Result<()> {
+    let PreflightArgs { config, format } = args;
+    let report = PreflightRunner::new(config).run();
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", report.render_json());
+        }
+    }
+
+    if report.has_errors() {
+        process::exit(1);
+    }
+
+    Ok(())
 }
 
 fn run_benchmark_validate(args: BenchmarkValidateArgs) -> anyhow::Result<()> {

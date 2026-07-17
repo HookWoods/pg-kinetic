@@ -10,6 +10,7 @@ pub mod health;
 pub mod lifecycle;
 pub mod metrics;
 pub mod mirror;
+pub mod preflight;
 pub mod policy;
 #[cfg(feature = "policy-wasm")]
 pub mod policy_wasm;
