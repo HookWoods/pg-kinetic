@@ -12,6 +12,10 @@ The first milestone focuses on:
 ## Public Docs
 
 - [Admin reference](docs/admin.md)
+- [Production runtime guide](docs/production-runtime.md)
+- [Mirroring guide](docs/mirroring.md)
+- [Adaptive operations guide](docs/adaptive-ops.md)
+- [Benchmarking guide](docs/benchmarking.md)
 - [Metrics catalog](docs/metrics.md)
 - [Policy guide](docs/policy.md)
 - [Read routing guide](docs/read-routing.md)
@@ -60,6 +64,8 @@ Windows:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\compat.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\runtime.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\mirroring.ps1
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\read-routing.ps1
 powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\sharding.ps1
 ```
@@ -271,6 +277,13 @@ cargo test -p pg-kinetic --test reload_config
 cargo test -p pg-kinetic --test graceful_drain
 cargo test -p pg-kinetic --test health_endpoints
 cargo test -p pg-kinetic --test socket_options
+```
+
+Runtime and mirroring smoke checks:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\runtime.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\mirroring.ps1
 ```
 
 For a local stack:

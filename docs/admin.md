@@ -3,7 +3,7 @@
 pg-kinetic exposes a separate PostgreSQL-compatible admin listener for operational reads.
 Enable it by setting `admin_addr`. When that address is unset, the admin plane stays off.
 
-For routing and policy guidance, see [docs/policy.md](policy.md).
+For routing and policy guidance, see [docs/policy.md](policy.md). For runtime, mirroring, adaptive control, and benchmark operations, see [docs/production-runtime.md](production-runtime.md), [docs/mirroring.md](mirroring.md), [docs/adaptive-ops.md](adaptive-ops.md), and [docs/benchmarking.md](benchmarking.md).
 
 ## Connection Behavior
 
@@ -41,6 +41,10 @@ Unset optional fields render as `<none>`.
 | `SHOW ROUTE MAPS` | Sharding scopes, strategies, priorities, and the active multi-shard policy. |
 | `SHOW SHARDS` | Shard lifecycle state, route scope, primary and replica target counts, and a health summary. |
 | `SHOW MIGRATIONS` | Migration state, override status, source and target shard ids, and the current safety report. |
+| `SHOW RUNTIME` | Runtime lifecycle state, readiness state, selected runtime engine, and process uptime. |
+| `SHOW MIRRORING` | Mirror mode, sample rate, in-flight work, dropped work, and mirrored/skipped/rejected totals. |
+| `SHOW ADAPTIVE` | Adaptive mode, latest recommendation, apply status, and guardrails. |
+| `SHOW BENCHMARKS` | Scenario name, target, comparison, driver, duration, latency percentiles, throughput, error rate, CPU label, and memory label. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
 
@@ -58,4 +62,5 @@ Unset optional fields render as `<none>`.
 - Use `SHOW ROUTE MAPS`, `SHOW SHARDS`, and `SHOW MIGRATIONS` together to see how shard scopes, lifecycle state, and migration safety line up.
 - Use `SHOW ROUTE MAPS` and `SHOW MIGRATIONS` with the policy guide to confirm that any route or shard override is still within the intended safety envelope.
 - Use `SHOW PINNING` and `SHOW RECOVERY` together to distinguish long-lived state from recovery churn.
+- Use `SHOW RUNTIME`, `SHOW MIRRORING`, `SHOW ADAPTIVE`, and `SHOW BENCHMARKS` with the runtime, mirroring, adaptive, and benchmarking guides to track rollout health.
 - Use `SHOW SETTINGS` and `SHOW LIMITS` to verify the live configuration after a reload or before a support investigation.
