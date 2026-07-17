@@ -9,6 +9,7 @@ pub mod ha;
 pub mod lsn;
 pub mod mirror;
 pub mod observability;
+pub mod performance;
 pub mod pin;
 pub mod policy;
 pub mod policy_rule;
