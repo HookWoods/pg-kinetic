@@ -261,9 +261,10 @@ pub fn record_route_checkout_snapshot(snapshot: &RouteCheckoutSnapshot) {
     let decision = snapshot.decision.clone();
     let target_role = decision.clone().target_role();
     let reason = decision.clone().reason();
+    let route_label = snapshot.route_key.metric_label();
     metrics_crate::counter!(
         ObservabilityMetricName::RouteDecisionsTotal.as_str(),
-        "route" => snapshot.route_key.metric_label(),
+        "route" => route_label.clone(),
         "target_role" => target_role_label(target_role),
         "query_class" => route_query_class_label(snapshot.route_key.query_class())
     )
@@ -272,7 +273,7 @@ pub fn record_route_checkout_snapshot(snapshot: &RouteCheckoutSnapshot) {
     if let Some(fallback_policy) = fallback_policy_from_reason(reason) {
         metrics_crate::counter!(
             ObservabilityMetricName::RouteFallbacksTotal.as_str(),
-            "route" => snapshot.route_key.metric_label(),
+            "route" => route_label,
             "reason" => reason.as_str(),
             "fallback_policy" => fallback_policy.as_str()
         )

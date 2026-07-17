@@ -144,6 +144,7 @@ pub fn close_span() -> tracing::Span {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DebugSampler {
     sampling_ratio: f64,
+    sampling_threshold: u64,
 }
 
 impl DebugSampler {
@@ -155,7 +156,12 @@ impl DebugSampler {
             0.0
         };
 
-        Self { sampling_ratio }
+        let sampling_threshold = (sampling_ratio * (u64::MAX as f64)) as u64;
+
+        Self {
+            sampling_ratio,
+            sampling_threshold,
+        }
     }
 
     #[must_use]
@@ -172,14 +178,21 @@ impl DebugSampler {
             return true;
         }
 
-        let sample = splitmix64(session_id);
-        let normalized = (sample as f64) / (u64::MAX as f64);
-        normalized < self.sampling_ratio
+        splitmix64(session_id) < self.sampling_threshold
     }
 
     #[must_use]
     pub fn sample(self, session_id: u64, sample: DebugSample) -> Option<DebugSample> {
         self.should_sample(session_id).then_some(sample)
+    }
+
+    #[must_use]
+    pub fn sample_with(
+        self,
+        session_id: u64,
+        build_sample: impl FnOnce() -> DebugSample,
+    ) -> Option<DebugSample> {
+        self.should_sample(session_id).then(build_sample)
     }
 }
 

@@ -950,6 +950,7 @@ pub const fn metric_catalog() -> &'static [MetricDescriptor] {
 pub struct LabelPolicy;
 
 impl LabelPolicy {
+    pub const ACTION: &'static str = "action";
     pub const PHASE: &'static str = "phase";
     pub const OUTCOME: &'static str = "outcome";
     pub const ENDPOINT: &'static str = "endpoint";
@@ -964,49 +965,63 @@ impl LabelPolicy {
     pub const CHECK: &'static str = "check";
     pub const SEVERITY: &'static str = "severity";
     pub const HOOK: &'static str = "hook";
+    pub const KIND: &'static str = "kind";
+    pub const OPTION: &'static str = "option";
     pub const SOURCE: &'static str = "source";
     pub const TARGET_ROLE: &'static str = "target_role";
     pub const QUERY_CLASS: &'static str = "query_class";
     pub const REASON: &'static str = "reason";
     pub const FALLBACK_POLICY: &'static str = "fallback_policy";
     pub const SHARD: &'static str = "shard";
+    pub const SCOPE: &'static str = "scope";
+    pub const SOCKET: &'static str = "socket";
+    pub const SQLSTATE: &'static str = "sqlstate";
+    pub const STATUS: &'static str = "status";
     pub const STRATEGY: &'static str = "strategy";
     pub const POLICY: &'static str = "policy";
     pub const LIFECYCLE_STATE: &'static str = "lifecycle_state";
     pub const ERROR_CODE: &'static str = "error_code";
     pub const HEALTH: &'static str = "health";
     pub const LAG_STATE: &'static str = "lag_state";
-    pub const ALLOWED_LABELS: [&'static str; 26] = [
-        Self::PHASE,
-        Self::OUTCOME,
-        Self::ENDPOINT,
-        Self::ROUTE,
-        Self::SHARD,
-        Self::STRATEGY,
-        Self::POLICY,
-        Self::HOOK,
-        Self::SOURCE,
-        Self::MODE,
-        Self::TARGET,
-        Self::ENGINE,
-        Self::NODE,
-        Self::CHECK,
-        Self::SEVERITY,
-        Self::TARGET_ROLE,
-        Self::QUERY_CLASS,
-        Self::REASON,
-        Self::FALLBACK_POLICY,
-        Self::LIFECYCLE_STATE,
-        Self::ERROR_CODE,
-        Self::HEALTH,
-        Self::LAG_STATE,
-        Self::VIEW,
-        Self::STATE,
-        Self::EVENT,
-    ];
-
+    pub const TRIGGER: &'static str = "trigger";
     #[must_use]
     pub fn allows(label: &str) -> bool {
-        Self::ALLOWED_LABELS.contains(&label)
+        matches!(
+            label,
+            Self::ACTION
+                | Self::PHASE
+                | Self::OUTCOME
+                | Self::ENDPOINT
+                | Self::ROUTE
+                | Self::SHARD
+                | Self::SCOPE
+                | Self::SOCKET
+                | Self::SQLSTATE
+                | Self::STATUS
+                | Self::STRATEGY
+                | Self::POLICY
+                | Self::HOOK
+                | Self::KIND
+                | Self::OPTION
+                | Self::SOURCE
+                | Self::MODE
+                | Self::TARGET
+                | Self::ENGINE
+                | Self::NODE
+                | Self::CHECK
+                | Self::SEVERITY
+                | Self::TARGET_ROLE
+                | Self::QUERY_CLASS
+                | Self::REASON
+                | Self::FALLBACK_POLICY
+                | Self::LIFECYCLE_STATE
+                | Self::ERROR_CODE
+                | Self::HEALTH
+                | Self::LAG_STATE
+                | Self::TRIGGER
+                | Self::VIEW
+                | Self::STATE
+                | Self::EVENT
+        )
     }
 }
