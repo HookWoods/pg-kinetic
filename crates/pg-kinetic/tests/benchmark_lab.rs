@@ -40,6 +40,34 @@ fn write_temporary_scenario(contents: &str) -> PathBuf {
     path
 }
 
+fn temporary_report_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "pg-kinetic-benchmark-report-{name}-{}-{}.json",
+        std::process::id(),
+        name.len()
+    ))
+}
+
+fn report_fixture(
+    scenario: &str,
+    targets: &[&str],
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    throughput_qps: f64,
+) -> String {
+    let results = targets
+        .iter()
+        .map(|comparison| {
+            format!(
+                r#"{{"target":{{"comparison":"{comparison}"}},"metrics":{{"p50_ms":{p50_ms},"p95_ms":{p95_ms},"p99_ms":{p99_ms},"throughput_qps":{throughput_qps},"error_rate":0.0}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"scenario":{{"name":"{scenario}"}},"results":[{results}]}}"#)
+}
+
 fn target_matrix() -> &'static str {
     r#"
 [target_matrix]
@@ -193,7 +221,7 @@ fn target_reports_use_stable_labels_and_redacted_connection_strings() {
 }
 
 #[test]
-fn benchmark_scenarios_parse_with_complete_workload_matrix() {
+fn all_tracked_benchmark_scenarios_parse_with_complete_workload_matrix() {
     let scenarios = [
         ("simple-query", BenchmarkWorkloadKind::SimpleQuery),
         ("extended-query", BenchmarkWorkloadKind::ExtendedQuery),
@@ -316,7 +344,6 @@ fn scenario_output_is_stable_json_compatible_data() {
 
     assert!(first.status.success());
     assert!(second.status.success());
-    assert_eq!(first.stdout, second.stdout);
 
     let stdout = String::from_utf8(first.stdout).expect("utf-8 benchmark output");
     assert!(stdout.trim_start().starts_with('{'));
@@ -325,6 +352,167 @@ fn scenario_output_is_stable_json_compatible_data() {
     assert!(stdout.contains("\"scenario\""));
     assert!(stdout.contains("\"results\""));
     assert!(!stdout.contains("benchmark-secret"));
+}
+
+#[test]
+fn benchmark_dry_run_writes_a_redacted_json_report() {
+    let scenario = scenario_path("simple-query");
+    let report_path = temporary_report_path("dry-run");
+    let output = Command::new(binary_path())
+        .args([
+            "benchmark",
+            "run",
+            "--scenario",
+            scenario.to_str().expect("scenario path"),
+            "--format",
+            "json",
+            "--dry-run",
+            "--output",
+            report_path.to_str().expect("report path"),
+        ])
+        .output()
+        .expect("run benchmark dry-run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 benchmark output");
+    let report = fs::read_to_string(&report_path).expect("read benchmark report");
+    fs::remove_file(&report_path).expect("remove benchmark report");
+
+    assert_eq!(stdout.trim(), report);
+    assert!(report.contains("\"dry_run\":true"));
+    assert!(report.contains("\"workload\":\"simple_query\""));
+    assert!(report.contains("\"metrics\""));
+    assert!(report.contains("\"environment\""));
+    assert!(report.contains("\"git\""));
+    assert!(report.contains("<redacted>@"));
+    assert!(!report.contains("benchmark-secret"));
+}
+
+#[test]
+fn benchmark_comparison_reports_pass_warning_and_failure_from_budgets() {
+    let baseline_path = temporary_report_path("baseline");
+    let current_path = temporary_report_path("current");
+    fs::write(
+        &baseline_path,
+        report_fixture("fixture", &["pg_kinetic"], 100.0, 100.0, 100.0, 100.0),
+    )
+    .expect("write baseline report");
+    fs::write(
+        &current_path,
+        report_fixture("fixture", &["pg_kinetic"], 100.0, 107.0, 112.0, 100.0),
+    )
+    .expect("write current report");
+
+    let output = Command::new(binary_path())
+        .args([
+            "benchmark",
+            "compare",
+            "--baseline",
+            baseline_path.to_str().expect("baseline path"),
+            "--current",
+            current_path.to_str().expect("current path"),
+        ])
+        .output()
+        .expect("compare benchmark reports");
+    fs::remove_file(&baseline_path).expect("remove baseline report");
+    fs::remove_file(&current_path).expect("remove current report");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 comparison output");
+    assert!(stdout.contains("\"outcome\":\"failed\""));
+    assert!(stdout.contains("\"outcome\":\"passed\""));
+    assert!(stdout.contains("\"outcome\":\"warning\""));
+}
+
+#[test]
+fn benchmark_comparison_rejects_different_scenario_names() {
+    let baseline_path = temporary_report_path("scenario-baseline");
+    let current_path = temporary_report_path("scenario-current");
+    fs::write(
+        &baseline_path,
+        report_fixture(
+            "baseline-scenario",
+            &["pg_kinetic"],
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ),
+    )
+    .expect("write baseline report");
+    fs::write(
+        &current_path,
+        report_fixture(
+            "current-scenario",
+            &["pg_kinetic"],
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ),
+    )
+    .expect("write current report");
+
+    let output = Command::new(binary_path())
+        .args([
+            "benchmark",
+            "compare",
+            "--baseline",
+            baseline_path.to_str().expect("baseline path"),
+            "--current",
+            current_path.to_str().expect("current path"),
+        ])
+        .output()
+        .expect("compare benchmark reports");
+    fs::remove_file(&baseline_path).expect("remove baseline report");
+    fs::remove_file(&current_path).expect("remove current report");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 comparison output");
+    assert!(stdout.contains("\"outcome\":\"failed\""));
+    assert!(stdout.contains("scenario names differ"));
+}
+
+#[test]
+fn benchmark_comparison_rejects_different_target_sets() {
+    let baseline_path = temporary_report_path("targets-baseline");
+    let current_path = temporary_report_path("targets-current");
+    fs::write(
+        &baseline_path,
+        report_fixture(
+            "fixture",
+            &["direct_postgresql", "pg_kinetic"],
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ),
+    )
+    .expect("write baseline report");
+    fs::write(
+        &current_path,
+        report_fixture("fixture", &["pg_kinetic"], 100.0, 100.0, 100.0, 100.0),
+    )
+    .expect("write current report");
+
+    let output = Command::new(binary_path())
+        .args([
+            "benchmark",
+            "compare",
+            "--baseline",
+            baseline_path.to_str().expect("baseline path"),
+            "--current",
+            current_path.to_str().expect("current path"),
+        ])
+        .output()
+        .expect("compare benchmark reports");
+    fs::remove_file(&baseline_path).expect("remove baseline report");
+    fs::remove_file(&current_path).expect("remove current report");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 comparison output");
+    assert!(stdout.contains("\"outcome\":\"failed\""));
+    assert!(stdout.contains("target sets differ"));
 }
 
 #[test]

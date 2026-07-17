@@ -13,6 +13,7 @@ policy-wasm = ["pg-kinetic-proxy/policy-wasm"]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 pg-kinetic-core = { path = "../pg-kinetic-core" }
 pg-kinetic-proxy = { path = "../pg-kinetic-proxy" }
 pg-kinetic-wire = { path = "../pg-kinetic-wire" }

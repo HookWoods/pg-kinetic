@@ -2,11 +2,13 @@ use std::{
     fs,
     net::{TcpStream, ToSocketAddrs},
     path::Path,
+    process::Command,
     sync::Arc,
     time::Duration,
 };
 
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use pg_kinetic_core::benchmark::{
     BenchmarkComparison, BenchmarkConnectionProfile, BenchmarkDriver, BenchmarkExpectedMetricSet,
@@ -15,8 +17,11 @@ use pg_kinetic_core::benchmark::{
     BenchmarkWorkloadKind,
 };
 use pg_kinetic_core::performance::{
+    BenchmarkTarget as PerformanceBenchmarkTarget, PerformanceBudget, PerformanceBudgetOutcome,
+    PerformanceBudgetSet, PerformanceMetric, PerformanceRegressionThreshold,
     ProcessMetricCollectionStatus, ProcessMetricKind, ProcessMetricSample, ProcessMetricValue,
 };
+use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessMetricCollection {
@@ -520,6 +525,372 @@ pub fn prepare_benchmark_results(scenario: &BenchmarkScenario) -> Vec<BenchmarkR
             .expect("prepared benchmark result is valid")
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkRunReport {
+    scenario: BenchmarkScenario,
+    results: Vec<BenchmarkResult>,
+    process_metrics: ProcessMetricCollection,
+    dry_run: bool,
+    git_commit: Option<String>,
+}
+
+impl BenchmarkRunReport {
+    #[must_use]
+    pub fn new(scenario: BenchmarkScenario, results: Vec<BenchmarkResult>, dry_run: bool) -> Self {
+        Self {
+            scenario,
+            results,
+            process_metrics: collect_process_metrics(),
+            dry_run,
+            git_commit: current_git_commit(),
+        }
+    }
+
+    #[must_use]
+    pub fn render_json(&self) -> String {
+        let sample = serde_json::from_str::<Value>(&self.process_metrics.sample().to_json())
+            .unwrap_or(Value::Null);
+        json!({
+            "ok": true,
+            "dry_run": self.dry_run,
+            "scenario": {
+                "name": self.scenario.name(),
+                "driver": self.scenario.driver().as_str(),
+                "workload": self.scenario.workload().as_str(),
+                "duration_ms": self.scenario.duration_ms(),
+                "warmup_ms": self.scenario.warmup_ms(),
+                "connections": {
+                    "concurrency": self.scenario.connections().concurrency(),
+                    "connection_count": self.scenario.connections().connection_count(),
+                },
+            },
+            "results": self.results.iter().map(|result| json!({
+                "scenario": result.scenario(),
+                "target": {
+                    "label": result.target().label(),
+                    "comparison": result.target().comparison().as_str(),
+                    "dsn": result.target().redacted_dsn(),
+                },
+                "driver": result.driver().as_str(),
+                "duration_ms": result.duration_ms(),
+                "metrics": {
+                    "p50_ms": result.metrics().p50_ms(),
+                    "p95_ms": result.metrics().p95_ms(),
+                    "p99_ms": result.metrics().p99_ms(),
+                    "throughput_qps": result.metrics().throughput_qps(),
+                    "cpu_label": result.metrics().cpu_label(),
+                    "memory_label": result.metrics().memory_label(),
+                    "error_rate": result.metrics().error_rate(),
+                },
+            })).collect::<Vec<_>>(),
+            "process_metrics": {
+                "status": self.process_metrics.status().as_str(),
+                "sample": sample,
+            },
+            "environment": {
+                "operating_system": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "git": { "commit": self.git_commit },
+            },
+        })
+        .to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BenchmarkReportOutcome {
+    Passed,
+    Warning,
+    Failed,
+}
+
+impl BenchmarkReportOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Warning => "warning",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkReportComparison {
+    baseline: String,
+    current: String,
+    outcome: BenchmarkReportOutcome,
+    error: Option<String>,
+    entries: Vec<BenchmarkReportComparisonEntry>,
+}
+
+impl BenchmarkReportComparison {
+    #[must_use]
+    pub const fn outcome(&self) -> BenchmarkReportOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn render_json(&self) -> String {
+        json!({
+            "ok": !matches!(self.outcome, BenchmarkReportOutcome::Failed),
+            "outcome": self.outcome.as_str(),
+            "baseline": self.baseline,
+            "current": self.current,
+            "error": self.error,
+            "results": self.entries.iter().map(|entry| json!({
+                "scenario": entry.scenario,
+                "target": entry.target,
+                "metric": entry.metric.as_str(),
+                "baseline_value": entry.baseline_value,
+                "current_value": entry.current_value,
+                "outcome": entry.outcome.as_str(),
+            })).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkReportComparisonEntry {
+    scenario: String,
+    target: String,
+    metric: PerformanceMetric,
+    baseline_value: Option<f64>,
+    current_value: f64,
+    outcome: PerformanceBudgetOutcome,
+}
+
+#[derive(Debug, Error)]
+#[error("benchmark report error: {message}")]
+pub struct BenchmarkReportError {
+    message: String,
+}
+
+impl BenchmarkReportError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredBenchmarkReport {
+    scenario: StoredBenchmarkScenario,
+    results: Vec<StoredBenchmarkResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredBenchmarkScenario {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredBenchmarkResult {
+    target: StoredBenchmarkTarget,
+    metrics: StoredBenchmarkMetrics,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredBenchmarkTarget {
+    comparison: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredBenchmarkMetrics {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    throughput_qps: f64,
+    error_rate: f64,
+}
+
+pub fn compare_benchmark_reports(
+    baseline_path: &Path,
+    current_path: &Path,
+) -> Result<BenchmarkReportComparison, BenchmarkReportError> {
+    let baseline = load_benchmark_report(baseline_path)?;
+    let current = load_benchmark_report(current_path)?;
+
+    if baseline.scenario.name != current.scenario.name {
+        return Ok(BenchmarkReportComparison {
+            baseline: baseline_path.display().to_string(),
+            current: current_path.display().to_string(),
+            outcome: BenchmarkReportOutcome::Failed,
+            error: Some(format!(
+                "incompatible benchmark reports: scenario names differ (baseline '{}', current '{}')",
+                baseline.scenario.name, current.scenario.name
+            )),
+            entries: Vec::new(),
+        });
+    }
+
+    let baseline_targets = report_target_set(&baseline);
+    let current_targets = report_target_set(&current);
+    if baseline_targets != current_targets {
+        return Ok(BenchmarkReportComparison {
+            baseline: baseline_path.display().to_string(),
+            current: current_path.display().to_string(),
+            outcome: BenchmarkReportOutcome::Failed,
+            error: Some(format!(
+                "incompatible benchmark reports: target sets differ (baseline {:?}, current {:?})",
+                baseline_targets, current_targets
+            )),
+            entries: Vec::new(),
+        });
+    }
+
+    let budgets = benchmark_report_budgets();
+    let mut entries = Vec::new();
+
+    for current_result in &current.results {
+        let comparison = current_result
+            .target
+            .comparison
+            .parse::<BenchmarkComparison>()
+            .map_err(|_| {
+                BenchmarkReportError::new(format!(
+                    "current report contains unsupported target comparison '{}'",
+                    current_result.target.comparison
+                ))
+            })?;
+        let target = performance_target(comparison);
+        let baseline_result = baseline.results.iter().find(|baseline_result| {
+            baseline_result.target.comparison == current_result.target.comparison
+        });
+
+        for metric in [
+            PerformanceMetric::LatencyP50,
+            PerformanceMetric::LatencyP95,
+            PerformanceMetric::LatencyP99,
+            PerformanceMetric::Throughput,
+            PerformanceMetric::ErrorRate,
+        ] {
+            let current_value = stored_metric_value(&current_result.metrics, metric);
+            let baseline_value =
+                baseline_result.map(|result| stored_metric_value(&result.metrics, metric));
+            let result = budgets.evaluate(
+                current.scenario.name.clone(),
+                target,
+                metric,
+                current_value,
+                baseline_value,
+            );
+            entries.push(BenchmarkReportComparisonEntry {
+                scenario: result.scenario().to_owned(),
+                target: result.target().as_str().to_owned(),
+                metric,
+                baseline_value: result.baseline_value(),
+                current_value: result.observed_value(),
+                outcome: result.outcome(),
+            });
+        }
+    }
+
+    let outcome = if entries
+        .iter()
+        .any(|entry| entry.outcome == PerformanceBudgetOutcome::Failed)
+    {
+        BenchmarkReportOutcome::Failed
+    } else if entries
+        .iter()
+        .any(|entry| entry.outcome == PerformanceBudgetOutcome::Warning)
+    {
+        BenchmarkReportOutcome::Warning
+    } else {
+        BenchmarkReportOutcome::Passed
+    };
+
+    Ok(BenchmarkReportComparison {
+        baseline: baseline_path.display().to_string(),
+        current: current_path.display().to_string(),
+        outcome,
+        error: None,
+        entries,
+    })
+}
+
+fn report_target_set(report: &StoredBenchmarkReport) -> Vec<String> {
+    let mut targets = report
+        .results
+        .iter()
+        .map(|result| result.target.comparison.clone())
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets
+}
+
+fn current_git_commit() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| commit.trim().to_owned())
+        .filter(|commit| !commit.is_empty())
+}
+
+fn load_benchmark_report(path: &Path) -> Result<StoredBenchmarkReport, BenchmarkReportError> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| BenchmarkReportError::new(format!("read {}: {error}", path.display())))?;
+    let report = serde_json::from_str::<StoredBenchmarkReport>(&contents)
+        .map_err(|error| BenchmarkReportError::new(format!("parse {}: {error}", path.display())))?;
+
+    if report.scenario.name.trim().is_empty() || report.results.is_empty() {
+        return Err(BenchmarkReportError::new(format!(
+            "{} does not contain a scenario and at least one result",
+            path.display()
+        )));
+    }
+
+    Ok(report)
+}
+
+fn benchmark_report_budgets() -> PerformanceBudgetSet {
+    let percentage = |metric| {
+        PerformanceBudget::new(
+            metric,
+            PerformanceRegressionThreshold::Percentage(5.0),
+            PerformanceRegressionThreshold::Percentage(10.0),
+        )
+    };
+    PerformanceBudgetSet::new([
+        percentage(PerformanceMetric::LatencyP50),
+        percentage(PerformanceMetric::LatencyP95),
+        percentage(PerformanceMetric::LatencyP99),
+        percentage(PerformanceMetric::Throughput),
+        PerformanceBudget::new(
+            PerformanceMetric::ErrorRate,
+            PerformanceRegressionThreshold::Absolute(0.001),
+            PerformanceRegressionThreshold::Absolute(0.01),
+        ),
+    ])
+}
+
+fn performance_target(comparison: BenchmarkComparison) -> PerformanceBenchmarkTarget {
+    match comparison {
+        BenchmarkComparison::DirectPostgreSQL => PerformanceBenchmarkTarget::DirectPostgres,
+        BenchmarkComparison::PgBouncer => PerformanceBenchmarkTarget::PgBouncer,
+        BenchmarkComparison::PgDog => PerformanceBenchmarkTarget::PgDog,
+        BenchmarkComparison::PgKinetic => PerformanceBenchmarkTarget::PgKinetic,
+    }
+}
+
+fn stored_metric_value(metrics: &StoredBenchmarkMetrics, metric: PerformanceMetric) -> f64 {
+    match metric {
+        PerformanceMetric::LatencyP50 => metrics.p50_ms,
+        PerformanceMetric::LatencyP95 => metrics.p95_ms,
+        PerformanceMetric::LatencyP99 => metrics.p99_ms,
+        PerformanceMetric::Throughput => metrics.throughput_qps,
+        PerformanceMetric::ErrorRate => metrics.error_rate,
+        PerformanceMetric::LatencyP999
+        | PerformanceMetric::CpuPerQuery
+        | PerformanceMetric::MemoryPerClient => 0.0,
+    }
 }
 
 fn parse_comparison(value: &str) -> Result<BenchmarkComparison, BenchmarkValidationError> {
