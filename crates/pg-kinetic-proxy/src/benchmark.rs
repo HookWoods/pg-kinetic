@@ -70,17 +70,17 @@ pub fn collect_process_metrics() -> ProcessMetricCollection {
 
 #[cfg(unix)]
 fn collect_cpu_time() -> ProcessMetricValue {
+    let clock_ticks_per_second = rustix::param::clock_ticks_per_second();
     fs::read_to_string("/proc/self/stat")
         .ok()
         .and_then(|contents| {
-            contents.rsplit_once(") ").map(|(_, rest)| {
-                rest.split_whitespace()
-                    .nth(11)
-                    .and_then(|value| value.parse().ok())
-            })
+            contents
+                .rsplit_once(") ")
+                .and_then(|(_, rest)| rest.split_whitespace().nth(11))
+                .and_then(|value| value.parse().ok())
         })
-        .flatten()
-        .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
+        .and_then(|clock_ticks| cpu_time_seconds(clock_ticks, clock_ticks_per_second))
+        .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Float)
 }
 
 #[cfg(not(unix))]
@@ -99,6 +99,7 @@ fn collect_resident_memory() -> ProcessMetricValue {
                     .and_then(|value| value.parse::<u64>().ok())
             })
         })
+        .and_then(resident_memory_bytes)
         .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
 }
 
@@ -113,6 +114,16 @@ fn collect_open_file_descriptors() -> ProcessMetricValue {
         .ok()
         .and_then(|entries| entries.count().try_into().ok())
         .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
+}
+
+#[cfg(unix)]
+fn cpu_time_seconds(clock_ticks: u64, clock_ticks_per_second: u64) -> Option<f64> {
+    (clock_ticks_per_second > 0).then(|| clock_ticks as f64 / clock_ticks_per_second as f64)
+}
+
+#[cfg(unix)]
+fn resident_memory_bytes(kibibytes: u64) -> Option<u64> {
+    kibibytes.checked_mul(1024)
 }
 
 #[cfg(not(unix))]
@@ -927,4 +938,21 @@ fn default_duration_ms() -> u64 {
 
 fn default_warmup_ms() -> u64 {
     5_000
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{cpu_time_seconds, resident_memory_bytes};
+
+    #[test]
+    fn cpu_clock_ticks_convert_to_seconds() {
+        assert_eq!(cpu_time_seconds(250, 100), Some(2.5));
+        assert_eq!(cpu_time_seconds(1, 0), None);
+    }
+
+    #[test]
+    fn resident_memory_kibibytes_convert_to_bytes() {
+        assert_eq!(resident_memory_bytes(4_096), Some(4_194_304));
+        assert_eq!(resident_memory_bytes(u64::MAX), None);
+    }
 }

@@ -30,6 +30,23 @@ fn collection_exposes_process_metrics_and_timestamp() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_collection_uses_metric_exposure_units() {
+    let collection = collect_process_metrics();
+    let sample = collection.sample();
+
+    let cpu_time = sample.metric(ProcessMetricKind::CpuTime);
+    if !cpu_time.is_unknown() {
+        assert!(matches!(cpu_time, ProcessMetricValue::Float(_)));
+    }
+
+    let resident_memory = sample.metric(ProcessMetricKind::ResidentMemory);
+    if let ProcessMetricValue::Integer(bytes) = resident_memory {
+        assert_eq!(bytes % 1024, 0);
+    }
+}
+
 #[test]
 fn derived_metrics_use_process_deltas() {
     let before = ProcessMetricSample::new(
