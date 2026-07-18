@@ -73,12 +73,7 @@ fn collect_cpu_time() -> ProcessMetricValue {
     let clock_ticks_per_second = rustix::param::clock_ticks_per_second();
     fs::read_to_string("/proc/self/stat")
         .ok()
-        .and_then(|contents| {
-            contents
-                .rsplit_once(") ")
-                .and_then(|(_, rest)| rest.split_whitespace().nth(11))
-                .and_then(|value| value.parse().ok())
-        })
+        .and_then(|contents| proc_stat_cpu_ticks(&contents))
         .and_then(|clock_ticks| cpu_time_seconds(clock_ticks, clock_ticks_per_second))
         .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Float)
 }
@@ -116,14 +111,20 @@ fn collect_open_file_descriptors() -> ProcessMetricValue {
         .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
 }
 
-#[cfg(unix)]
 fn cpu_time_seconds(clock_ticks: u64, clock_ticks_per_second: u64) -> Option<f64> {
     (clock_ticks_per_second > 0).then(|| clock_ticks as f64 / clock_ticks_per_second as f64)
 }
 
-#[cfg(unix)]
 fn resident_memory_bytes(kibibytes: u64) -> Option<u64> {
     kibibytes.checked_mul(1024)
+}
+
+fn proc_stat_cpu_ticks(contents: &str) -> Option<u64> {
+    let (_, fields) = contents.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let utime = fields.nth(11)?.parse::<u64>().ok()?;
+    let stime = fields.next()?.parse::<u64>().ok()?;
+    utime.checked_add(stime)
 }
 
 #[cfg(not(unix))]
@@ -940,9 +941,16 @@ fn default_warmup_ms() -> u64 {
     5_000
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::{cpu_time_seconds, resident_memory_bytes};
+    use super::{cpu_time_seconds, proc_stat_cpu_ticks, resident_memory_bytes};
+
+    #[test]
+    fn proc_stat_cpu_ticks_include_user_and_system_time() {
+        let stat = "123 (pg kinetic) S 1 2 3 4 5 6 7 8 9 10 200 50 0 0";
+
+        assert_eq!(proc_stat_cpu_ticks(stat), Some(250));
+    }
 
     #[test]
     fn cpu_clock_ticks_convert_to_seconds() {
