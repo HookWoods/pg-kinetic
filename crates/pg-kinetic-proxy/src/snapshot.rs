@@ -11,6 +11,10 @@ use pg_kinetic_core::{
     lsn::{FreshnessStatus, PgLsn},
     mirror::MirrorMode,
     observability::MetricOutcome,
+    performance::{
+        PerformanceBudget, PerformanceBudgetOutcome, PerformanceRegressionResult,
+        ProcessMetricCollectionStatus, ProcessMetricSample, ProfileCaptureStatus,
+    },
     policy::{PolicyAuditEvent, PolicyMode},
     prepare::PreparedStatementSnapshot,
     recovery::{RecoveryAction, RecoveryTrigger},
@@ -342,6 +346,75 @@ impl BenchmarkRunSnapshot {
     #[must_use]
     pub fn new(scenario: BenchmarkScenario, results: Vec<BenchmarkResult>) -> Self {
         Self { scenario, results }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PerformanceSnapshot {
+    pub budgets: Vec<PerformanceBudget>,
+    pub regressions: Vec<PerformanceRegressionResult>,
+    pub profile_status: ProfileCaptureStatus,
+    pub process_status: ProcessMetricCollectionStatus,
+    pub process_sample: Option<ProcessMetricSample>,
+    pub cpu_per_query: Option<f64>,
+    pub memory_per_client_bytes: Option<f64>,
+    pub protocol_buffer_copies: u64,
+    pub pool_checkout_lock_wait_ms: Option<f64>,
+    pub prepared_cache_hits: u64,
+    pub prepared_cache_misses: u64,
+    pub observability_hot_path_allocations: u64,
+    pub idle_clients: usize,
+}
+
+impl Default for PerformanceSnapshot {
+    fn default() -> Self {
+        Self {
+            budgets: Vec::new(),
+            regressions: Vec::new(),
+            profile_status: ProfileCaptureStatus::NotRequested,
+            process_status: ProcessMetricCollectionStatus::Unavailable,
+            process_sample: None,
+            cpu_per_query: None,
+            memory_per_client_bytes: None,
+            protocol_buffer_copies: 0,
+            pool_checkout_lock_wait_ms: None,
+            prepared_cache_hits: 0,
+            prepared_cache_misses: 0,
+            observability_hot_path_allocations: 0,
+            idle_clients: 0,
+        }
+    }
+}
+
+impl PerformanceSnapshot {
+    #[must_use]
+    pub fn latest_regression_for(
+        &self,
+        metric: pg_kinetic_core::performance::PerformanceMetric,
+    ) -> Option<&PerformanceRegressionResult> {
+        self.regressions
+            .iter()
+            .rev()
+            .find(|regression| regression.metric() == metric)
+    }
+
+    #[must_use]
+    pub fn comparison_outcome(
+        &self,
+        scenario: &str,
+        target: pg_kinetic_core::benchmark::BenchmarkComparison,
+    ) -> Option<PerformanceBudgetOutcome> {
+        self.regressions
+            .iter()
+            .filter(|regression| {
+                regression.scenario() == scenario && regression.target().as_str() == target.as_str()
+            })
+            .map(PerformanceRegressionResult::outcome)
+            .max_by_key(|outcome| match outcome {
+                PerformanceBudgetOutcome::Passed => 0,
+                PerformanceBudgetOutcome::Warning => 1,
+                PerformanceBudgetOutcome::Failed => 2,
+            })
     }
 }
 
@@ -720,6 +793,7 @@ struct SnapshotStoreInner {
     nodes: Vec<NodeSummarySnapshot>,
     mirror: Option<MirrorSummarySnapshot>,
     benchmark_runs: VecDeque<BenchmarkRunSnapshot>,
+    performance: PerformanceSnapshot,
     routes: HashMap<RouteKey, RouteSnapshot>,
     route_policies: HashMap<RouteKey, RoutePolicySnapshot>,
     route_checkouts: HashMap<RouteKey, RouteCheckoutSnapshot>,
@@ -857,6 +931,23 @@ impl SnapshotStore {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub fn set_performance_snapshot(&self, snapshot: PerformanceSnapshot) {
+        metrics::record_performance_snapshot(&snapshot);
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .performance = snapshot;
+    }
+
+    #[must_use]
+    pub fn performance_snapshot(&self) -> PerformanceSnapshot {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .performance
+            .clone()
     }
 
     pub fn record_adaptive_recommendation(&self, snapshot: AdaptiveRecommendationSnapshot) {

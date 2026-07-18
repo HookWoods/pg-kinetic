@@ -5,9 +5,9 @@ use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
 use crate::sharding::RouteMapReloadErrorCode;
 use crate::snapshot::{
     AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BenchmarkRunSnapshot,
-    MirrorSummarySnapshot, PoolSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
-    RouteMapReloadSnapshot, RuntimeSnapshot, ServerSnapshot, ShardLifecycleSnapshot,
-    ShardMigrationSafetySnapshot, SnapshotStore,
+    MirrorSummarySnapshot, PerformanceSnapshot, PoolSnapshot, ReplicaHealthSnapshot,
+    RouteCheckoutSnapshot, RouteMapReloadSnapshot, RuntimeSnapshot, ServerSnapshot,
+    ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
 };
 use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -20,6 +20,7 @@ use pg_kinetic_core::{
         metric_catalog, MetricDescriptor, MetricKind, MetricName as ObservabilityMetricName,
         MetricOutcome, ProtocolPhase,
     },
+    performance::{PerformanceBudgetOutcome, ProcessMetricKind},
     policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecisionReason, PolicyHookPoint,
         PolicyMode, PolicyOutcome,
@@ -61,6 +62,14 @@ pub fn record_pool_checkout(wait_ms: f64, stage: &'static str, outcome: &'static
         "outcome" => outcome
     )
     .record(wait_ms);
+
+    if stage == "route_gate_registry" {
+        metrics_crate::histogram!(
+            ObservabilityMetricName::PoolCheckoutLockWaitMs.as_str(),
+            "outcome" => outcome,
+        )
+        .record(wait_ms);
+    }
 }
 
 pub fn record_runtime_lifecycle_state(state: RuntimeLifecycleState) {
@@ -217,14 +226,117 @@ pub fn record_adaptive_outcome(snapshot: &AdaptiveOutcomeSnapshot) {
 
 pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {
     for result in &snapshot.results {
+        let scenario = snapshot.scenario.name().to_string();
+        let target = result.target().comparison().as_str();
+        let workload = snapshot.scenario.workload().as_str();
+        let driver = result.driver().as_str();
         metrics_crate::counter!(
             ObservabilityMetricName::BenchmarkRunsTotal.as_str(),
-            "engine" => result.driver().as_str(),
-            "target" => result.target().comparison().as_str(),
+            "engine" => driver,
+            "target" => target,
             "outcome" => "ok"
         )
         .increment(1);
+
+        for (metric, value) in [
+            ("p50", result.metrics().p50_ms()),
+            ("p95", result.metrics().p95_ms()),
+            ("p99", result.metrics().p99_ms()),
+        ] {
+            metrics_crate::histogram!(
+                ObservabilityMetricName::BenchmarkLatencyMs.as_str(),
+                "scenario" => scenario.clone(),
+                "target" => target,
+                "workload" => workload,
+                "driver" => driver,
+                "metric" => metric,
+            )
+            .record(value);
+        }
+
+        metrics_crate::histogram!(
+            ObservabilityMetricName::BenchmarkThroughputQps.as_str(),
+            "scenario" => scenario.clone(),
+            "target" => target,
+            "workload" => workload,
+            "driver" => driver,
+        )
+        .record(result.metrics().throughput_qps());
+
+        if result.metrics().error_rate() > 0.0 {
+            metrics_crate::counter!(
+                ObservabilityMetricName::BenchmarkErrorsTotal.as_str(),
+                "scenario" => scenario,
+                "target" => target,
+                "workload" => workload,
+                "driver" => driver,
+                "outcome" => "nonzero_error_rate",
+            )
+            .increment(1);
+        }
     }
+}
+
+pub fn record_performance_snapshot(snapshot: &PerformanceSnapshot) {
+    for regression in &snapshot.regressions {
+        for outcome in [
+            PerformanceBudgetOutcome::Passed,
+            PerformanceBudgetOutcome::Warning,
+            PerformanceBudgetOutcome::Failed,
+        ] {
+            metrics_crate::gauge!(
+                ObservabilityMetricName::PerformanceBudgetStatus.as_str(),
+                "metric" => regression.metric().as_str(),
+                "outcome" => outcome.as_str(),
+            )
+            .set(if outcome == regression.outcome() {
+                1.0
+            } else {
+                0.0
+            });
+        }
+    }
+
+    if let Some(sample) = &snapshot.process_sample {
+        if let Some(value) = sample.metric(ProcessMetricKind::CpuTime).as_f64() {
+            metrics_crate::gauge!(ObservabilityMetricName::ProcessCpuSeconds.as_str()).set(value);
+        }
+        if let Some(value) = sample.metric(ProcessMetricKind::ResidentMemory).as_f64() {
+            metrics_crate::gauge!(ObservabilityMetricName::ProcessResidentMemoryBytes.as_str())
+                .set(value);
+        }
+    }
+
+    if let Some(value) = snapshot.cpu_per_query {
+        metrics_crate::gauge!(ObservabilityMetricName::CpuPerQuery.as_str()).set(value);
+    }
+    if let Some(value) = snapshot.memory_per_client_bytes {
+        metrics_crate::gauge!(ObservabilityMetricName::MemoryPerClientBytes.as_str()).set(value);
+    }
+    if let Some(value) = snapshot.pool_checkout_lock_wait_ms {
+        metrics_crate::histogram!(
+            ObservabilityMetricName::PoolCheckoutLockWaitMs.as_str(),
+            "outcome" => "ok",
+        )
+        .record(value);
+    }
+
+    metrics_crate::counter!(
+        ObservabilityMetricName::ProtocolBufferCopiesTotal.as_str(),
+        "feature" => "protocol",
+    )
+    .increment(snapshot.protocol_buffer_copies);
+    metrics_crate::counter!(ObservabilityMetricName::PreparedCacheHitsTotal.as_str())
+        .increment(snapshot.prepared_cache_hits);
+    metrics_crate::counter!(ObservabilityMetricName::PreparedCacheMissesTotal.as_str())
+        .increment(snapshot.prepared_cache_misses);
+    metrics_crate::counter!(
+        ObservabilityMetricName::ObservabilityHotPathAllocationsTotal.as_str(),
+        "feature" => "metrics",
+    )
+    .increment(snapshot.observability_hot_path_allocations);
+    metrics_crate::gauge!(ObservabilityMetricName::IdleClients.as_str())
+        .set(snapshot.idle_clients as f64);
 }
 
 pub fn record_preflight_finding(check: &str, severity: &str) {

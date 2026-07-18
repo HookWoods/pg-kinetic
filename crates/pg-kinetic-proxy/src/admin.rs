@@ -22,11 +22,11 @@ use crate::{
     snapshot::{
         AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BackpressureSnapshot,
         BenchmarkRunSnapshot, ClientSnapshot, LimitsSnapshot, MirrorSummarySnapshot,
-        NodeSummaryRole, NodeSummarySnapshot, PinningSnapshot, PolicyReloadSnapshot,
-        PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot, RecoverySnapshot,
-        ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RoutePolicySnapshot,
-        RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot, ShardLifecycleSnapshot,
-        ShardMigrationSafetySnapshot, SnapshotStore,
+        NodeSummaryRole, NodeSummarySnapshot, PerformanceSnapshot, PinningSnapshot,
+        PolicyReloadSnapshot, PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot,
+        RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
+        RoutePolicySnapshot, RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot,
+        ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -36,6 +36,7 @@ use pg_kinetic_core::{
         AdminView,
     },
     lsn::PgLsn,
+    performance::{PerformanceBudget, PerformanceRegressionThreshold, ProcessMetricKind},
     recovery::{RecoveryAction, RecoveryTrigger},
     route::RouteKey,
     runtime::{ReadinessState, RuntimeLifecycleState},
@@ -417,7 +418,11 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.adaptive_recommendation_snapshots(),
             &state.snapshot_store.adaptive_outcome_snapshots(),
         ),
-        AdminView::Benchmarks => benchmarks_table(&state.snapshot_store.benchmark_run_snapshots()),
+        AdminView::Benchmarks => benchmarks_table(
+            &state.snapshot_store.benchmark_run_snapshots(),
+            &state.snapshot_store.performance_snapshot(),
+        ),
+        AdminView::Performance => performance_table(&state.snapshot_store.performance_snapshot()),
         AdminView::Prepared => prepared_table(&state.snapshot_store.prepared_snapshot()),
         AdminView::Pinning => pinning_table(&state.snapshot_store.pinning_snapshots()),
         AdminView::Recovery => recovery_table(&state.snapshot_store.recovery_snapshots()),
@@ -732,7 +737,10 @@ fn adaptive_table(
     )
 }
 
-fn benchmarks_table(runs: &[BenchmarkRunSnapshot]) -> AdminTable {
+fn benchmarks_table(
+    runs: &[BenchmarkRunSnapshot],
+    performance: &PerformanceSnapshot,
+) -> AdminTable {
     let rows = runs
         .iter()
         .rev()
@@ -752,6 +760,11 @@ fn benchmarks_table(runs: &[BenchmarkRunSnapshot]) -> AdminTable {
                     benchmark_metric_value(result.metrics().error_rate()),
                     result.metrics().cpu_label().to_string(),
                     result.metrics().memory_label().to_string(),
+                    run.scenario.workload().as_str().to_string(),
+                    benchmark_matrix_targets(&run.scenario),
+                    performance
+                        .comparison_outcome(run.scenario.name(), result.target().comparison())
+                        .map_or_else(|| String::from("unknown"), |outcome| outcome.to_string()),
                 ])
             })
         })
@@ -772,9 +785,125 @@ fn benchmarks_table(runs: &[BenchmarkRunSnapshot]) -> AdminTable {
             ("error_rate", AdminColumnType::Float8),
             ("cpu_label", AdminColumnType::Text),
             ("memory_label", AdminColumnType::Text),
+            ("workload", AdminColumnType::Text),
+            ("matrix_targets", AdminColumnType::Text),
+            ("comparison_outcome", AdminColumnType::Text),
         ],
         rows,
     )
+}
+
+fn performance_table(performance: &PerformanceSnapshot) -> AdminTable {
+    let rows = if performance.budgets.is_empty() {
+        vec![performance_row(None, performance)]
+    } else {
+        performance
+            .budgets
+            .iter()
+            .map(|budget| performance_row(Some(budget), performance))
+            .collect()
+    };
+
+    admin_table(
+        AdminView::Performance,
+        &[
+            ("metric", AdminColumnType::Text),
+            ("warning_threshold", AdminColumnType::Text),
+            ("failure_threshold", AdminColumnType::Text),
+            ("observed_value", AdminColumnType::Float8),
+            ("baseline_value", AdminColumnType::Float8),
+            ("regression_outcome", AdminColumnType::Text),
+            ("profile_status", AdminColumnType::Text),
+            ("process_status", AdminColumnType::Text),
+            ("process_cpu_seconds", AdminColumnType::Float8),
+            ("process_resident_memory_bytes", AdminColumnType::Float8),
+            ("cpu_per_query", AdminColumnType::Float8),
+            ("memory_per_client_bytes", AdminColumnType::Float8),
+            ("protocol_buffer_copies", AdminColumnType::Int8),
+            ("pool_checkout_lock_wait_ms", AdminColumnType::Float8),
+            ("prepared_cache_hits", AdminColumnType::Int8),
+            ("prepared_cache_misses", AdminColumnType::Int8),
+            ("observability_hot_path_allocations", AdminColumnType::Int8),
+            ("idle_clients", AdminColumnType::Int8),
+        ],
+        rows,
+    )
+}
+
+fn performance_row(
+    budget: Option<&PerformanceBudget>,
+    performance: &PerformanceSnapshot,
+) -> AdminRow {
+    let regression = budget.and_then(|budget| performance.latest_regression_for(budget.metric()));
+    let process_sample = performance.process_sample.as_ref();
+    AdminRow::new(vec![
+        budget.map_or_else(
+            || String::from("none"),
+            |budget| budget.metric().to_string(),
+        ),
+        budget.map_or_else(
+            || String::from("none"),
+            |budget| performance_threshold_label(budget.warning_threshold()),
+        ),
+        budget.map_or_else(
+            || String::from("none"),
+            |budget| performance_threshold_label(budget.failure_threshold()),
+        ),
+        regression.map_or_else(
+            || String::from("unknown"),
+            |result| benchmark_metric_value(result.observed_value()),
+        ),
+        regression.map_or_else(
+            || String::from("unknown"),
+            |result| {
+                result
+                    .baseline_value()
+                    .map_or_else(|| String::from("unknown"), benchmark_metric_value)
+            },
+        ),
+        regression.map_or_else(
+            || String::from("unknown"),
+            |result| result.outcome().to_string(),
+        ),
+        performance.profile_status.to_string(),
+        performance.process_status.to_string(),
+        process_metric_value(process_sample, ProcessMetricKind::CpuTime),
+        process_metric_value(process_sample, ProcessMetricKind::ResidentMemory),
+        optional_metric_value(performance.cpu_per_query),
+        optional_metric_value(performance.memory_per_client_bytes),
+        performance.protocol_buffer_copies.to_string(),
+        optional_metric_value(performance.pool_checkout_lock_wait_ms),
+        performance.prepared_cache_hits.to_string(),
+        performance.prepared_cache_misses.to_string(),
+        performance.observability_hot_path_allocations.to_string(),
+        performance.idle_clients.to_string(),
+    ])
+}
+
+fn benchmark_matrix_targets(scenario: &pg_kinetic_core::benchmark::BenchmarkScenario) -> String {
+    scenario
+        .targets()
+        .iter()
+        .map(|target| target.comparison().as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn performance_threshold_label(threshold: PerformanceRegressionThreshold) -> String {
+    format!("{}:{:.3}", threshold.as_str(), threshold.value())
+}
+
+fn process_metric_value(
+    sample: Option<&pg_kinetic_core::performance::ProcessMetricSample>,
+    metric: ProcessMetricKind,
+) -> String {
+    sample
+        .and_then(|sample| sample.metric(metric).as_f64())
+        .map_or_else(|| String::from("unknown"), benchmark_metric_value)
+}
+
+fn optional_metric_value(value: Option<f64>) -> String {
+    value.map_or_else(|| String::from("unknown"), benchmark_metric_value)
 }
 
 fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {

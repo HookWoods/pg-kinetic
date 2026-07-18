@@ -26,6 +26,12 @@ use pg_kinetic::{
         },
         control::PeerHealth,
         mirror::MirrorMode,
+        performance::{
+            BenchmarkTarget as PerformanceBenchmarkTarget, PerformanceBudget,
+            PerformanceBudgetOutcome, PerformanceMetric, PerformanceRegressionResult,
+            PerformanceRegressionThreshold, ProcessMetricCollectionStatus, ProcessMetricKind,
+            ProcessMetricSample, ProcessMetricValue, ProfileCaptureStatus,
+        },
         runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
     },
     proxy::Proxy,
@@ -33,8 +39,8 @@ use pg_kinetic::{
         metrics as proxy_metrics,
         snapshot::{
             AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BenchmarkRunSnapshot,
-            MirrorSummarySnapshot, NodeSummaryRole, NodeSummarySnapshot, RuntimeSnapshot,
-            SnapshotStore,
+            MirrorSummarySnapshot, NodeSummaryRole, NodeSummarySnapshot, PerformanceSnapshot,
+            RuntimeSnapshot, SnapshotStore,
         },
     },
     wire::{
@@ -180,6 +186,41 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
         benchmark_scenario,
         vec![benchmark_result],
     ));
+    snapshot_store.set_performance_snapshot(PerformanceSnapshot {
+        budgets: vec![PerformanceBudget::new(
+            PerformanceMetric::LatencyP95,
+            PerformanceRegressionThreshold::Percentage(5.0),
+            PerformanceRegressionThreshold::Percentage(10.0),
+        )],
+        regressions: vec![PerformanceRegressionResult::new(
+            "nightly_latency",
+            PerformanceBenchmarkTarget::PgKinetic,
+            PerformanceMetric::LatencyP95,
+            2.5,
+            Some(2.0),
+            PerformanceBudgetOutcome::Failed,
+        )],
+        profile_status: ProfileCaptureStatus::Captured,
+        process_status: ProcessMetricCollectionStatus::Complete,
+        process_sample: Some(ProcessMetricSample::new(
+            1,
+            [
+                (ProcessMetricKind::CpuTime, ProcessMetricValue::Float(12.0)),
+                (
+                    ProcessMetricKind::ResidentMemory,
+                    ProcessMetricValue::Integer(4_096),
+                ),
+            ],
+        )),
+        cpu_per_query: Some(0.012),
+        memory_per_client_bytes: Some(512.0),
+        protocol_buffer_copies: 7,
+        pool_checkout_lock_wait_ms: Some(3.5),
+        prepared_cache_hits: 9,
+        prepared_cache_misses: 2,
+        observability_hot_path_allocations: 1,
+        idle_clients: 2,
+    });
 
     let runtime_frames = admin_query(admin_addr, "SHOW RUNTIME").await;
     assert_admin_table_response(
@@ -292,6 +333,9 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             "error_rate",
             "cpu_label",
             "memory_label",
+            "workload",
+            "matrix_targets",
+            "comparison_outcome",
         ],
         &[vec![
             "nightly_latency",
@@ -306,13 +350,62 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             "0.005",
             "c7g.large",
             "4GiB",
+            "simple_query",
+            "direct_postgresql,pg_kinetic",
+            "failed",
+        ]],
+    );
+
+    let performance_frames = admin_query(admin_addr, "SHOW PERFORMANCE").await;
+    assert_admin_table_response(
+        &performance_frames,
+        &[
+            "metric",
+            "warning_threshold",
+            "failure_threshold",
+            "observed_value",
+            "baseline_value",
+            "regression_outcome",
+            "profile_status",
+            "process_status",
+            "process_cpu_seconds",
+            "process_resident_memory_bytes",
+            "cpu_per_query",
+            "memory_per_client_bytes",
+            "protocol_buffer_copies",
+            "pool_checkout_lock_wait_ms",
+            "prepared_cache_hits",
+            "prepared_cache_misses",
+            "observability_hot_path_allocations",
+            "idle_clients",
+        ],
+        &[vec![
+            "latency_p95",
+            "percentage:5.000",
+            "percentage:10.000",
+            "2.500",
+            "2.000",
+            "failed",
+            "captured",
+            "complete",
+            "12.000",
+            "4096.000",
+            "0.012",
+            "512.000",
+            "7",
+            "3.500",
+            "9",
+            "2",
+            "1",
+            "2",
         ]],
     );
 
     let redaction_text = format!(
-        "{}{}",
+        "{}{}{}",
         table_text(&adaptive_frames),
-        table_text(&benchmark_frames)
+        table_text(&benchmark_frames),
+        table_text(&performance_frames)
     );
     for forbidden in [
         "SELECT * FROM sensitive_table",
@@ -438,6 +531,37 @@ async fn metric_labels_stay_low_cardinality() {
         benchmark_scenario,
         vec![benchmark_result],
     ));
+    store.set_performance_snapshot(PerformanceSnapshot {
+        regressions: vec![PerformanceRegressionResult::new(
+            "nightly_latency",
+            PerformanceBenchmarkTarget::PgKinetic,
+            PerformanceMetric::LatencyP95,
+            2.5,
+            Some(2.0),
+            PerformanceBudgetOutcome::Failed,
+        )],
+        profile_status: ProfileCaptureStatus::Captured,
+        process_status: ProcessMetricCollectionStatus::Complete,
+        process_sample: Some(ProcessMetricSample::new(
+            1,
+            [
+                (ProcessMetricKind::CpuTime, ProcessMetricValue::Float(12.0)),
+                (
+                    ProcessMetricKind::ResidentMemory,
+                    ProcessMetricValue::Integer(4_096),
+                ),
+            ],
+        )),
+        cpu_per_query: Some(0.012),
+        memory_per_client_bytes: Some(512.0),
+        protocol_buffer_copies: 7,
+        pool_checkout_lock_wait_ms: Some(3.5),
+        prepared_cache_hits: 9,
+        prepared_cache_misses: 2,
+        observability_hot_path_allocations: 1,
+        idle_clients: 2,
+        ..Default::default()
+    });
 
     proxy_metrics::record_preflight_finding("tls_files", "warning");
     proxy_metrics::record_preflight_finding("lifecycle_guardrails", "error");
@@ -498,6 +622,58 @@ async fn metric_labels_stay_low_cardinality() {
             ("outcome", "ok")
         ],
     ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_benchmark_latency_ms",
+        &[
+            ("scenario", "nightly_latency"),
+            ("target", "pg_kinetic"),
+            ("workload", "simple_query"),
+            ("driver", "pgbench"),
+            ("metric", "p95"),
+        ],
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_benchmark_throughput_qps",
+        &[
+            ("scenario", "nightly_latency"),
+            ("target", "pg_kinetic"),
+            ("workload", "simple_query"),
+            ("driver", "pgbench"),
+        ],
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_benchmark_errors_total",
+        &[
+            ("scenario", "nightly_latency"),
+            ("target", "pg_kinetic"),
+            ("workload", "simple_query"),
+            ("driver", "pgbench"),
+            ("outcome", "nonzero_error_rate"),
+        ],
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_performance_budget_status",
+        &[("metric", "latency_p95"), ("outcome", "failed")],
+    ));
+    assert!(recorder.has_metric("pg_kinetic_process_cpu_seconds", &[]));
+    assert!(recorder.has_metric("pg_kinetic_process_resident_memory_bytes", &[],));
+    assert!(recorder.has_metric("pg_kinetic_cpu_per_query", &[]));
+    assert!(recorder.has_metric("pg_kinetic_memory_per_client_bytes", &[]));
+    assert!(recorder.has_metric(
+        "pg_kinetic_protocol_buffer_copies_total",
+        &[("feature", "protocol")],
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_pool_checkout_lock_wait_ms",
+        &[("outcome", "ok")],
+    ));
+    assert!(recorder.has_metric("pg_kinetic_prepared_cache_hits_total", &[]));
+    assert!(recorder.has_metric("pg_kinetic_prepared_cache_misses_total", &[]));
+    assert!(recorder.has_metric(
+        "pg_kinetic_observability_hot_path_allocations_total",
+        &[("feature", "metrics")],
+    ));
+    assert!(recorder.has_metric("pg_kinetic_idle_clients", &[]));
     assert!(recorder.has_metric(
         "pg_kinetic_preflight_findings_total",
         &[("check", "tls_files"), ("severity", "warning")],

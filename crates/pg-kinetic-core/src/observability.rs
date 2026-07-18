@@ -120,6 +120,20 @@ pub enum MetricName {
     TimeoutTotal,
     BufferLimitTotal,
     ProtocolPhaseDuration,
+    BenchmarkLatencyMs,
+    BenchmarkThroughputQps,
+    BenchmarkErrorsTotal,
+    PerformanceBudgetStatus,
+    ProcessCpuSeconds,
+    ProcessResidentMemoryBytes,
+    CpuPerQuery,
+    MemoryPerClientBytes,
+    ProtocolBufferCopiesTotal,
+    PoolCheckoutLockWaitMs,
+    PreparedCacheHitsTotal,
+    PreparedCacheMissesTotal,
+    ObservabilityHotPathAllocationsTotal,
+    IdleClients,
 }
 
 impl MetricName {
@@ -178,6 +192,22 @@ impl MetricName {
             Self::TimeoutTotal => "pg_kinetic_timeout_total",
             Self::BufferLimitTotal => "pg_kinetic_buffer_limit_total",
             Self::ProtocolPhaseDuration => "pg_kinetic_protocol_phase_duration_ms",
+            Self::BenchmarkLatencyMs => "pg_kinetic_benchmark_latency_ms",
+            Self::BenchmarkThroughputQps => "pg_kinetic_benchmark_throughput_qps",
+            Self::BenchmarkErrorsTotal => "pg_kinetic_benchmark_errors_total",
+            Self::PerformanceBudgetStatus => "pg_kinetic_performance_budget_status",
+            Self::ProcessCpuSeconds => "pg_kinetic_process_cpu_seconds",
+            Self::ProcessResidentMemoryBytes => "pg_kinetic_process_resident_memory_bytes",
+            Self::CpuPerQuery => "pg_kinetic_cpu_per_query",
+            Self::MemoryPerClientBytes => "pg_kinetic_memory_per_client_bytes",
+            Self::ProtocolBufferCopiesTotal => "pg_kinetic_protocol_buffer_copies_total",
+            Self::PoolCheckoutLockWaitMs => "pg_kinetic_pool_checkout_lock_wait_ms",
+            Self::PreparedCacheHitsTotal => "pg_kinetic_prepared_cache_hits_total",
+            Self::PreparedCacheMissesTotal => "pg_kinetic_prepared_cache_misses_total",
+            Self::ObservabilityHotPathAllocationsTotal => {
+                "pg_kinetic_observability_hot_path_allocations_total"
+            }
+            Self::IdleClients => "pg_kinetic_idle_clients",
         }
     }
 }
@@ -260,6 +290,11 @@ pub enum MetricLabel {
     TargetRole,
     Trigger,
     Target,
+    Scenario,
+    Workload,
+    Driver,
+    Metric,
+    Feature,
 }
 
 impl MetricLabel {
@@ -300,6 +335,11 @@ impl MetricLabel {
             Self::TargetRole => "target_role",
             Self::Trigger => "trigger",
             Self::Target => "target",
+            Self::Scenario => "scenario",
+            Self::Workload => "workload",
+            Self::Driver => "driver",
+            Self::Metric => "metric",
+            Self::Feature => "feature",
         }
     }
 }
@@ -434,7 +474,6 @@ const SCOPE_MODE_REASON_LABELS: &[MetricLabel] =
     &[MetricLabel::Scope, MetricLabel::Mode, MetricLabel::Reason];
 const MODE_LABELS: &[MetricLabel] = &[MetricLabel::Mode];
 const MODE_REASON_LABELS: &[MetricLabel] = &[MetricLabel::Mode, MetricLabel::Reason];
-const OUTCOME_ONLY_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];
 const STAGE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Stage, MetricLabel::Outcome];
 const ENDPOINT_HEALTH_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::Health];
 const ENDPOINT_LAG_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::LagState];
@@ -453,6 +492,28 @@ const SOCKET_OPTION_OUTCOME_LABELS: &[MetricLabel] = &[
     MetricLabel::Outcome,
 ];
 const SQLSTATE_LABELS: &[MetricLabel] = &[MetricLabel::Sqlstate];
+const BENCHMARK_LATENCY_LABELS: &[MetricLabel] = &[
+    MetricLabel::Scenario,
+    MetricLabel::Target,
+    MetricLabel::Workload,
+    MetricLabel::Driver,
+    MetricLabel::Metric,
+];
+const BENCHMARK_WORKLOAD_LABELS: &[MetricLabel] = &[
+    MetricLabel::Scenario,
+    MetricLabel::Target,
+    MetricLabel::Workload,
+    MetricLabel::Driver,
+];
+const BENCHMARK_ERROR_LABELS: &[MetricLabel] = &[
+    MetricLabel::Scenario,
+    MetricLabel::Target,
+    MetricLabel::Workload,
+    MetricLabel::Driver,
+    MetricLabel::Outcome,
+];
+const METRIC_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Metric, MetricLabel::Outcome];
+const FEATURE_LABELS: &[MetricLabel] = &[MetricLabel::Feature];
 
 static METRIC_CATALOG: &[MetricDescriptor] = &[
     MetricDescriptor::new(
@@ -938,6 +999,118 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Protocol phase duration in milliseconds",
         PHASE_OUTCOME_LABELS,
         "Phase and outcome are both bounded by protocol enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_benchmark_latency_ms",
+        MetricKind::Histogram,
+        "ms",
+        "Benchmark latency samples by bounded scenario matrix dimensions and percentile.",
+        BENCHMARK_LATENCY_LABELS,
+        "Scenario, target, workload, driver, and metric values come from validated benchmark configuration enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_benchmark_throughput_qps",
+        MetricKind::Histogram,
+        "qps",
+        "Benchmark throughput samples by bounded scenario matrix dimensions.",
+        BENCHMARK_WORKLOAD_LABELS,
+        "Scenario, target, workload, and driver values come from validated benchmark configuration enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_benchmark_errors_total",
+        MetricKind::Counter,
+        "1",
+        "Benchmark runs reporting a nonzero error rate.",
+        BENCHMARK_ERROR_LABELS,
+        "Scenario, target, workload, driver, and outcome values come from validated benchmark configuration enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_performance_budget_status",
+        MetricKind::Gauge,
+        "1",
+        "Performance budget status series (1.0 for the latest outcome).",
+        METRIC_OUTCOME_LABELS,
+        "Metric and outcome values come from bounded performance enums.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_process_cpu_seconds",
+        MetricKind::Gauge,
+        "s",
+        "Latest redacted process CPU time sample.",
+        NO_LABELS,
+        "Single gauge without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_process_resident_memory_bytes",
+        MetricKind::Gauge,
+        "By",
+        "Latest redacted process resident memory sample.",
+        NO_LABELS,
+        "Single gauge without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_cpu_per_query",
+        MetricKind::Gauge,
+        "s",
+        "Latest derived CPU time per completed query.",
+        NO_LABELS,
+        "Single gauge without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_memory_per_client_bytes",
+        MetricKind::Gauge,
+        "By",
+        "Latest derived resident memory per client.",
+        NO_LABELS,
+        "Single gauge without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_protocol_buffer_copies_total",
+        MetricKind::Counter,
+        "1",
+        "Protocol buffer copies by fixed feature path.",
+        FEATURE_LABELS,
+        "Feature values are fixed implementation paths, never request content.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_pool_checkout_lock_wait_ms",
+        MetricKind::Histogram,
+        "ms",
+        "Pool checkout registry lock wait time.",
+        OUTCOME_LABELS,
+        "Outcome is bounded to checkout completion states.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_prepared_cache_hits_total",
+        MetricKind::Counter,
+        "1",
+        "Prepared statement cache hits.",
+        NO_LABELS,
+        "Single counter without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_prepared_cache_misses_total",
+        MetricKind::Counter,
+        "1",
+        "Prepared statement cache misses.",
+        NO_LABELS,
+        "Single counter without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_observability_hot_path_allocations_total",
+        MetricKind::Counter,
+        "1",
+        "Observability hot-path allocations by fixed feature path.",
+        FEATURE_LABELS,
+        "Feature values are fixed implementation paths, never request content.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_idle_clients",
+        MetricKind::Gauge,
+        "1",
+        "Current idle client count.",
+        NO_LABELS,
+        "Single gauge without labels.",
     ),
 ];
 
