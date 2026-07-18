@@ -196,6 +196,7 @@ impl ProfileRunner {
                     "run",
                     "--scenario",
                     path_arg(&config.scenario),
+                    "--dry-run",
                 ])
                 .status()
                 .context("run cargo flamegraph")?,
@@ -213,6 +214,7 @@ impl ProfileRunner {
                     "run",
                     "--scenario",
                     path_arg(&config.scenario),
+                    "--dry-run",
                 ])
                 .status()
                 .context("run perf record")?,

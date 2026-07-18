@@ -415,6 +415,12 @@ fn run_benchmark_run(args: BenchmarkRunArgs) -> anyhow::Result<()> {
         }
     };
 
+    if !dry_run {
+        anyhow::bail!(
+            "live benchmark execution is not implemented yet; rerun with --dry-run to produce a structural report"
+        );
+    }
+
     let results = prepare_benchmark_results(&scenario);
     let report = BenchmarkRunReport::new(scenario, results, dry_run);
 

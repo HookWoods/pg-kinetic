@@ -34,7 +34,7 @@ cargo run -p pg-kinetic -- benchmark validate --scenario bench/scenarios/benchma
 
 ## Reports And Budgets
 
-Create a JSON report with the product runner:
+Create a structural dry-run JSON report with the product runner:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts/bench/run-performance.ps1 `
@@ -42,7 +42,7 @@ powershell.exe -ExecutionPolicy Bypass -File scripts/bench/run-performance.ps1 `
   -Output bench/results/simple-query.json
 ```
 
-Store reviewed baselines under `bench/baselines/` and keep candidate reports under the ignored `bench/results/` directory. A report records scenario metadata, target comparison labels, latency percentiles, throughput, error rate, process-metric collection status, environment data, and the current Git commit when available.
+Store reviewed live-measurement baselines under `bench/baselines/` and keep candidate reports under the ignored `bench/results/` directory. A report records scenario metadata, target comparison labels, latency percentiles, throughput, error rate, CPU/query, memory/client, process-metric collection status, environment data, and the current Git commit when available.
 
 Compare reports only when they use the same scenario and target set:
 
@@ -52,7 +52,7 @@ powershell.exe -ExecutionPolicy Bypass -File scripts/bench/compare-performance.p
   -Current bench/results/simple-query.json
 ```
 
-The comparison returns a warning for more than 5% latency or throughput regression and fails above 10%. Error rate warns above `0.001` and fails above `0.01`. A warning leaves the command successful for review; a failed budget returns a nonzero exit code. Missing or unknown baseline values remain warnings rather than passes.
+The comparison returns a warning for more than 5% latency, throughput, CPU/query, or memory/client regression and fails above 10%. Error rate warns above `0.001` and fails above `0.01`. A warning leaves the command successful for review; a failed budget returns a nonzero exit code. Missing or unknown baseline values remain warnings rather than passes, while missing current values fail the gate.
 
 `benchmark run` currently validates the scenario and emits a structured report; it does not itself drive traffic against the target DSNs. Use the local stack and workload driver to collect measurements, and do not treat a dry-run report as performance evidence.
 
@@ -64,7 +64,7 @@ Check whether optional profile tools are available:
 powershell.exe -ExecutionPolicy Bypass -File scripts/bench/profile-performance.ps1 -Validate
 ```
 
-Capture a pg-kinetic profile after the scenario and target are fixed:
+Validate profile capture plumbing after the scenario and target are fixed:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts/bench/profile-performance.ps1 `

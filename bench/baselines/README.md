@@ -1,12 +1,14 @@
 # Performance Baselines
 
-Store reviewed JSON reports from `pg-kinetic benchmark run` in this directory.
+Store reviewed JSON reports from real workload measurements in this directory.
 
-Create a report with:
+Validate the report schema with:
 
 ```powershell
 scripts/bench/run-performance.ps1 -Scenario bench/scenarios/benchmark-simple-query.toml -Output bench/baselines/simple-query.json
 ```
+
+The helper emits a dry-run structural report only. Do not commit or bless dry-run output as a performance baseline.
 
 Compare a current report against a baseline with:
 

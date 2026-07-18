@@ -12,9 +12,7 @@ $arguments = @(
     "--output", $Output
 )
 
-if ($DryRun) {
-    $arguments += "--dry-run"
-}
+$arguments += "--dry-run"
 
 & cargo @arguments
 exit $LASTEXITCODE

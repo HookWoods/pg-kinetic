@@ -418,7 +418,28 @@ pub fn validate_benchmark_scenario(
 ) -> Result<BenchmarkScenario, BenchmarkValidationError> {
     let scenario = load_benchmark_scenario(path)?;
     scenario.validate()?;
+    validate_required_benchmark_targets(&scenario)?;
     Ok(scenario)
+}
+
+fn validate_required_benchmark_targets(
+    scenario: &BenchmarkScenario,
+) -> Result<(), BenchmarkValidationError> {
+    for required in [
+        BenchmarkComparison::DirectPostgreSQL,
+        BenchmarkComparison::PgKinetic,
+    ] {
+        if !scenario
+            .targets()
+            .iter()
+            .any(|target| target.comparison() == required)
+        {
+            return Err(BenchmarkValidationError::MissingRequiredTarget {
+                comparison: Arc::from(required.as_str()),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -529,6 +550,13 @@ pub fn prepare_benchmark_results(scenario: &BenchmarkScenario) -> Vec<BenchmarkR
                 "resident_set_bytes",
                 0.0,
             )
+            .and_then(|metric| {
+                metric.with_extended_metrics(
+                    16.0 + index as f64,
+                    0.001 + (index as f64 * 0.0001),
+                    1024.0 + (index as f64 * 128.0),
+                )
+            })
             .expect("prepared benchmark metrics are valid");
             BenchmarkResult::new(
                 scenario.name(),
@@ -594,8 +622,11 @@ impl BenchmarkRunReport {
                     "p50_ms": result.metrics().p50_ms(),
                     "p95_ms": result.metrics().p95_ms(),
                     "p99_ms": result.metrics().p99_ms(),
+                    "p999_ms": result.metrics().p999_ms(),
                     "throughput_qps": result.metrics().throughput_qps(),
+                    "cpu_per_query": result.metrics().cpu_per_query(),
                     "cpu_label": result.metrics().cpu_label(),
+                    "memory_per_client_bytes": result.metrics().memory_per_client_bytes(),
                     "memory_label": result.metrics().memory_label(),
                     "error_rate": result.metrics().error_rate(),
                 },
@@ -674,7 +705,7 @@ struct BenchmarkReportComparisonEntry {
     target: String,
     metric: PerformanceMetric,
     baseline_value: Option<f64>,
-    current_value: f64,
+    current_value: Option<f64>,
     outcome: PerformanceBudgetOutcome,
 }
 
@@ -716,11 +747,14 @@ struct StoredBenchmarkTarget {
 
 #[derive(Debug, Deserialize)]
 struct StoredBenchmarkMetrics {
-    p50_ms: f64,
-    p95_ms: f64,
-    p99_ms: f64,
-    throughput_qps: f64,
-    error_rate: f64,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    p999_ms: Option<f64>,
+    throughput_qps: Option<f64>,
+    cpu_per_query: Option<f64>,
+    memory_per_client_bytes: Option<f64>,
+    error_rate: Option<f64>,
 }
 
 pub fn compare_benchmark_reports(
@@ -781,26 +815,36 @@ pub fn compare_benchmark_reports(
             PerformanceMetric::LatencyP50,
             PerformanceMetric::LatencyP95,
             PerformanceMetric::LatencyP99,
+            PerformanceMetric::LatencyP999,
             PerformanceMetric::Throughput,
+            PerformanceMetric::CpuPerQuery,
+            PerformanceMetric::MemoryPerClient,
             PerformanceMetric::ErrorRate,
         ] {
             let current_value = stored_metric_value(&current_result.metrics, metric);
             let baseline_value =
-                baseline_result.map(|result| stored_metric_value(&result.metrics, metric));
-            let result = budgets.evaluate(
-                current.scenario.name.clone(),
-                target,
-                metric,
-                current_value,
-                baseline_value,
+                baseline_result.and_then(|result| stored_metric_value(&result.metrics, metric));
+            let result = current_value.map_or_else(
+                || PerformanceBudgetOutcome::Failed,
+                |value| {
+                    budgets
+                        .evaluate(
+                            current.scenario.name.clone(),
+                            target,
+                            metric,
+                            value,
+                            baseline_value,
+                        )
+                        .outcome()
+                },
             );
             entries.push(BenchmarkReportComparisonEntry {
-                scenario: result.scenario().to_owned(),
-                target: result.target().as_str().to_owned(),
+                scenario: current.scenario.name.clone(),
+                target: target.as_str().to_owned(),
                 metric,
-                baseline_value: result.baseline_value(),
-                current_value: result.observed_value(),
-                outcome: result.outcome(),
+                baseline_value,
+                current_value,
+                outcome: result,
             });
         }
     }
@@ -877,7 +921,10 @@ fn benchmark_report_budgets() -> PerformanceBudgetSet {
         percentage(PerformanceMetric::LatencyP50),
         percentage(PerformanceMetric::LatencyP95),
         percentage(PerformanceMetric::LatencyP99),
+        percentage(PerformanceMetric::LatencyP999),
         percentage(PerformanceMetric::Throughput),
+        percentage(PerformanceMetric::CpuPerQuery),
+        percentage(PerformanceMetric::MemoryPerClient),
         PerformanceBudget::new(
             PerformanceMetric::ErrorRate,
             PerformanceRegressionThreshold::Absolute(0.001),
@@ -895,16 +942,16 @@ fn performance_target(comparison: BenchmarkComparison) -> PerformanceBenchmarkTa
     }
 }
 
-fn stored_metric_value(metrics: &StoredBenchmarkMetrics, metric: PerformanceMetric) -> f64 {
+fn stored_metric_value(metrics: &StoredBenchmarkMetrics, metric: PerformanceMetric) -> Option<f64> {
     match metric {
         PerformanceMetric::LatencyP50 => metrics.p50_ms,
         PerformanceMetric::LatencyP95 => metrics.p95_ms,
         PerformanceMetric::LatencyP99 => metrics.p99_ms,
+        PerformanceMetric::LatencyP999 => metrics.p999_ms,
         PerformanceMetric::Throughput => metrics.throughput_qps,
+        PerformanceMetric::CpuPerQuery => metrics.cpu_per_query,
+        PerformanceMetric::MemoryPerClient => metrics.memory_per_client_bytes,
         PerformanceMetric::ErrorRate => metrics.error_rate,
-        PerformanceMetric::LatencyP999
-        | PerformanceMetric::CpuPerQuery
-        | PerformanceMetric::MemoryPerClient => 0.0,
     }
 }
 

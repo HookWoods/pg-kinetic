@@ -962,7 +962,6 @@ impl SnapshotStore {
             .expect("snapshot store poisoned")
             .performance
             .pool_checkout_lock_wait_ms = Some(wait_ms);
-        metrics::record_pool_checkout_lock_wait(wait_ms);
     }
 
     #[must_use]

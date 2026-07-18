@@ -82,8 +82,11 @@ fn benchmark_result_schema_records_target_scenario_driver_and_metrics() {
     assert_eq!(result.metrics().p50_ms(), 4.5);
     assert_eq!(result.metrics().p95_ms(), 9.0);
     assert_eq!(result.metrics().p99_ms(), 12.5);
+    assert_eq!(result.metrics().p999_ms(), 12.5);
     assert_eq!(result.metrics().throughput_qps(), 1_234.5);
+    assert_eq!(result.metrics().cpu_per_query(), 0.0);
     assert_eq!(result.metrics().cpu_label(), "x86_64");
+    assert_eq!(result.metrics().memory_per_client_bytes(), 0.0);
     assert_eq!(result.metrics().memory_label(), "resident_set_bytes");
     assert_eq!(result.metrics().error_rate(), 0.01);
 }
@@ -137,6 +140,7 @@ fn benchmark_run_command_supports_json_output() {
         scenario_path().to_str().expect("scenario path"),
         "--format",
         "json",
+        "--dry-run",
     ]);
 
     assert!(
@@ -149,6 +153,9 @@ fn benchmark_run_command_supports_json_output() {
     assert!(stdout.contains("\"results\""));
     assert!(stdout.contains("\"metrics\""));
     assert!(stdout.contains("\"p50_ms\""));
+    assert!(stdout.contains("\"p999_ms\""));
+    assert!(stdout.contains("\"cpu_per_query\""));
+    assert!(stdout.contains("\"memory_per_client_bytes\""));
     assert!(!stdout.contains("bench-secret"));
 }
 

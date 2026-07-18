@@ -61,7 +61,7 @@ fn report_fixture(
         .iter()
         .map(|comparison| {
             format!(
-                r#"{{"target":{{"comparison":"{comparison}"}},"metrics":{{"p50_ms":{p50_ms},"p95_ms":{p95_ms},"p99_ms":{p99_ms},"throughput_qps":{throughput_qps},"error_rate":0.0}}}}"#
+                r#"{{"target":{{"comparison":"{comparison}"}},"metrics":{{"p50_ms":{p50_ms},"p95_ms":{p95_ms},"p99_ms":{p99_ms},"p999_ms":{p99_ms},"throughput_qps":{throughput_qps},"cpu_per_query":0.01,"memory_per_client_bytes":1024.0,"error_rate":0.0}}}}"#
             )
         })
         .collect::<Vec<_>>()
@@ -72,6 +72,11 @@ fn report_fixture(
 fn target_matrix() -> &'static str {
     r#"
 [target_matrix]
+[[target_matrix.targets]]
+label = "direct-postgresql"
+comparison = "direct_postgresql"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:5432/bench"
+
 [[target_matrix.targets]]
 label = "pg-kinetic"
 comparison = "pg_kinetic"
@@ -245,6 +250,14 @@ fn all_tracked_benchmark_scenarios_parse_with_complete_workload_matrix() {
         assert!(scenario.connections().connection_count() > 0);
         assert!(!scenario.matrix().targets().is_empty());
         assert!(scenario.expected_metrics().any_enabled());
+        assert!(scenario
+            .targets()
+            .iter()
+            .any(|target| target.comparison() == BenchmarkComparison::DirectPostgreSQL));
+        assert!(scenario
+            .targets()
+            .iter()
+            .any(|target| target.comparison() == BenchmarkComparison::PgKinetic));
     }
 }
 
@@ -273,6 +286,15 @@ fn scenario_validation_rejects_zero_duration_concurrency_and_target_matrix() {
         BenchmarkValidationError::MissingTargetMatrix
     );
     fs::remove_file(missing_matrix).expect("remove missing matrix scenario");
+
+    let missing_direct = write_temporary_scenario(
+        "name = \"missing-direct\"\n[target_matrix]\n[[target_matrix.targets]]\nlabel = \"pg-kinetic\"\ncomparison = \"pg_kinetic\"\ndsn = \"postgres://bench:benchmark-secret@127.0.0.1:8432/bench\"\n",
+    );
+    assert!(matches!(
+        validate_benchmark_scenario(&missing_direct),
+        Err(BenchmarkValidationError::MissingRequiredTarget { .. })
+    ));
+    fs::remove_file(missing_direct).expect("remove missing direct scenario");
 }
 
 #[test]
@@ -332,6 +354,7 @@ fn scenario_output_is_stable_json_compatible_data() {
         path.to_str().expect("scenario path"),
         "--format",
         "json",
+        "--dry-run",
     ];
 
     let first = Command::new(binary_path())
@@ -353,6 +376,26 @@ fn scenario_output_is_stable_json_compatible_data() {
     assert!(stdout.contains("\"scenario\""));
     assert!(stdout.contains("\"results\""));
     assert!(!stdout.contains("benchmark-secret"));
+}
+
+#[test]
+fn benchmark_run_rejects_non_dry_synthetic_reports() {
+    let path = scenario_path("prepared");
+    let output = Command::new(binary_path())
+        .args([
+            "benchmark",
+            "run",
+            "--scenario",
+            path.to_str().expect("scenario path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run non-dry benchmark report");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 benchmark error");
+    assert!(stderr.contains("live benchmark execution is not implemented yet"));
 }
 
 #[test]
@@ -383,6 +426,9 @@ fn benchmark_dry_run_writes_a_redacted_json_report() {
     assert!(report.contains("\"dry_run\":true"));
     assert!(report.contains("\"workload\":\"simple_query\""));
     assert!(report.contains("\"metrics\""));
+    assert!(report.contains("\"p999_ms\""));
+    assert!(report.contains("\"cpu_per_query\""));
+    assert!(report.contains("\"memory_per_client_bytes\""));
     assert!(report.contains("\"environment\""));
     assert!(report.contains("\"git\""));
     assert!(report.contains("<redacted>@"));

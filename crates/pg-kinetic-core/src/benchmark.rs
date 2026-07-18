@@ -580,8 +580,11 @@ pub struct BenchmarkMetric {
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
+    p999_ms: f64,
     throughput_qps: f64,
+    cpu_per_query: f64,
     cpu_label: Arc<str>,
+    memory_per_client_bytes: f64,
     memory_label: Arc<str>,
     error_rate: f64,
 }
@@ -602,13 +605,29 @@ impl BenchmarkMetric {
             p50_ms,
             p95_ms,
             p99_ms,
+            p999_ms: p99_ms,
             throughput_qps,
+            cpu_per_query: 0.0,
             cpu_label,
+            memory_per_client_bytes: 0.0,
             memory_label,
             error_rate,
         };
         metric.validate()?;
         Ok(metric)
+    }
+
+    pub fn with_extended_metrics(
+        mut self,
+        p999_ms: f64,
+        cpu_per_query: f64,
+        memory_per_client_bytes: f64,
+    ) -> Result<Self, BenchmarkValidationError> {
+        self.p999_ms = p999_ms;
+        self.cpu_per_query = cpu_per_query;
+        self.memory_per_client_bytes = memory_per_client_bytes;
+        self.validate()?;
+        Ok(self)
     }
 
     #[must_use]
@@ -627,13 +646,28 @@ impl BenchmarkMetric {
     }
 
     #[must_use]
+    pub const fn p999_ms(&self) -> f64 {
+        self.p999_ms
+    }
+
+    #[must_use]
     pub const fn throughput_qps(&self) -> f64 {
         self.throughput_qps
     }
 
     #[must_use]
+    pub const fn cpu_per_query(&self) -> f64 {
+        self.cpu_per_query
+    }
+
+    #[must_use]
     pub fn cpu_label(&self) -> &str {
         &self.cpu_label
+    }
+
+    #[must_use]
+    pub const fn memory_per_client_bytes(&self) -> f64 {
+        self.memory_per_client_bytes
     }
 
     #[must_use]
@@ -650,8 +684,11 @@ impl BenchmarkMetric {
         validate_metric_value("p50_ms", self.p50_ms)?;
         validate_metric_value("p95_ms", self.p95_ms)?;
         validate_metric_value("p99_ms", self.p99_ms)?;
+        validate_metric_value("p999_ms", self.p999_ms)?;
         validate_metric_value("throughput_qps", self.throughput_qps)?;
-        if self.p95_ms < self.p50_ms || self.p99_ms < self.p95_ms {
+        validate_metric_value("cpu_per_query", self.cpu_per_query)?;
+        validate_metric_value("memory_per_client_bytes", self.memory_per_client_bytes)?;
+        if self.p95_ms < self.p50_ms || self.p99_ms < self.p95_ms || self.p999_ms < self.p99_ms {
             return Err(BenchmarkValidationError::InvalidMetric {
                 field: "latency_order",
             });
@@ -749,6 +786,8 @@ pub enum BenchmarkValidationError {
     EmptyTargets,
     #[error("benchmark scenario must define a target matrix")]
     MissingTargetMatrix,
+    #[error("benchmark scenario must define required target '{comparison}'")]
+    MissingRequiredTarget { comparison: Arc<str> },
     #[error("benchmark connection profile field '{field}' must be greater than zero")]
     InvalidConnectionProfile { field: &'static str },
     #[error("benchmark scenario must declare at least one expected metric")]

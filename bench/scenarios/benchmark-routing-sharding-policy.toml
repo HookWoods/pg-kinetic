@@ -24,6 +24,11 @@ error_rate = true
 
 [target_matrix]
 [[target_matrix.targets]]
+label = "direct-postgresql"
+comparison = "direct_postgresql"
+dsn = "postgres://bench:benchmark-secret@127.0.0.1:5432/bench"
+
+[[target_matrix.targets]]
 label = "pgdog"
 comparison = "pgdog"
 dsn = "postgres://bench:benchmark-secret@127.0.0.1:7432/bench"
