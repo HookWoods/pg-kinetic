@@ -15,22 +15,56 @@ $env:PGSSLMODE = $SslMode
 $env:PGGSSENCMODE = $GssEncMode
 $env:PGCONNECT_TIMEOUT = $ConnectTimeoutSeconds
 
-if (-not (Get-Command psql -ErrorAction SilentlyContinue)) {
-    throw "psql is required on PATH for read routing smoke"
+function Test-DockerAvailable {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $stdout = Join-Path ([System.IO.Path]::GetTempPath()) ("pg-kinetic-docker-version-" + [guid]::NewGuid().ToString("n") + ".out")
+    $stderr = Join-Path ([System.IO.Path]::GetTempPath()) ("pg-kinetic-docker-version-" + [guid]::NewGuid().ToString("n") + ".err")
+    try {
+        $process = Start-Process -FilePath "docker" -ArgumentList @("version", "--format", "{{.Server.Version}}") -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if (-not $process.WaitForExit(5000)) {
+            Stop-Process -Id $process.Id -Force
+            return $false
+        }
+
+        return $process.ExitCode -eq 0
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $stdout, $stderr
+    }
 }
 
 function Invoke-PgScalar {
     param([string]$Sql)
 
-    $output = (& psql `
-        -X `
-        -v ON_ERROR_STOP=1 `
-        -h $HostName `
-        -p $Port `
-        -U $User `
-        -d $Database `
-        -Atq `
-        -c $Sql) -join "`n"
+    if (Get-Command psql -ErrorAction SilentlyContinue) {
+        $output = (& psql `
+            -X `
+            -v ON_ERROR_STOP=1 `
+            -h $HostName `
+            -p $Port `
+            -U $User `
+            -d $Database `
+            -Atq `
+            -c $Sql) -join "`n"
+    } elseif (Test-DockerAvailable) {
+        $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        Push-Location $repoRoot
+        try {
+            $output = (& docker compose -f bench/compose.yml exec -T postgres env `
+                "PGPASSWORD=$Password" `
+                "PGSSLMODE=$SslMode" `
+                "PGGSSENCMODE=$GssEncMode" `
+                "PGCONNECT_TIMEOUT=$ConnectTimeoutSeconds" `
+                psql -X -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U $User -d $Database -Atq -c $Sql) -join "`n"
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Write-Host "SKIP: psql is not available and Docker fallback is unavailable"
+        exit 0
+    }
 
     if ($LASTEXITCODE -ne 0) {
         throw "psql failed with exit code $LASTEXITCODE for SQL: $Sql"

@@ -4,6 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+foreach ($dependency in "cargo", "go", "npm", "python") {
+    if (-not (Get-Command $dependency -ErrorAction SilentlyContinue)) {
+        Write-Host "SKIP: $dependency is not available"
+        exit 0
+    }
+}
+
 function Assert-LastCommand {
     param([string]$Name)
 
