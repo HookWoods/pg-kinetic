@@ -2,7 +2,8 @@
 
 Regression cases live in `regression/manifest.toml`. The checked-in schema at
 `regression/manifest.schema.json` defines the supported category, platform,
-timeout, service, success-marker, and artifact-policy fields.
+timeout, service, success-marker, artifact-policy, and compatibility metadata
+fields.
 
 List matching cases without running them:
 
@@ -26,6 +27,32 @@ by Git; manifest artifact paths must be relative paths under `target/`.
 Use `scripts/regression/run.sh` or `scripts/regression/run.ps1` for the same
 command on Unix-like shells or PowerShell.
 
+## Compatibility reports
+
+Compatibility cases use the same regression manifest with an additional
+`case.compatibility` table. The table records suite id, language, library,
+library version, target, command, required services, artifact policy, smoke,
+category, and required-suite metadata. Optional suites include a stable skip
+reason.
+
+List compatibility regression cases:
+
+```sh
+cargo run -p xtask -- regression --category compatibility --list
+cargo run -p xtask -- compat --list
+```
+
+Run smoke reports for both comparison targets:
+
+```sh
+cargo run -p xtask -- compat --target direct-postgres --smoke
+cargo run -p xtask -- compat --target pg-kinetic --smoke
+```
+
+Normalized reports include direct PostgreSQL and pg-kinetic target labels,
+library versions, stable skip reasons, durations, and redacted error summaries.
+Large artifacts must stay under `target/compat/`.
+
 ## Performance score
 
 `benchmark score` compares benchmark report JSON. It evaluates p50, p95, p99,
@@ -45,6 +72,5 @@ Use `--release` to return a nonzero exit code for `fail` or `missing-baseline`.
 Score JSON does not include target DSNs and redacts credential-shaped paths or
 error text before rendering.
 
-The compatibility matrix is the next step. It should add production-relevant
-client libraries on top of this runner instead of changing the shared manifest
-and score contracts.
+Compatibility cases share the manifest and report contracts with smoke,
+protocol, docs, and benchmark regressions.

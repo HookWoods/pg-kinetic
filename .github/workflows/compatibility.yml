@@ -1,0 +1,132 @@
+name: Compatibility
+
+on:
+  pull_request:
+    paths:
+      - "compat/**"
+      - "crates/**"
+      - "regression/**"
+      - "scripts/compat/**"
+      - "docs/**"
+      - "docs-site/**"
+      - "README.md"
+      - ".github/workflows/compatibility.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * *"
+
+jobs:
+  smoke:
+    name: compat-${{ matrix.language }}
+    runs-on: ubuntu-latest
+    env:
+      PG_KINETIC_COMPAT_LIVE: "1"
+      PG_KINETIC_COMPAT_SERVICES: direct-postgres,pg-kinetic
+      DATABASE_URL_DIRECT: postgres://postgres:postgres@127.0.0.1:55432/pgkinetic
+      DATABASE_URL_PROXY: postgres://postgres:postgres@127.0.0.1:58432/pgkinetic
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, go, java, javascript, python, dotnet, c, cpp]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native client dependencies
+        if: matrix.language == 'c' || matrix.language == 'cpp'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake libpq-dev libpqxx-dev
+      - uses: actions/setup-go@v5
+        if: matrix.language == 'go'
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: compat/go/go.sum
+      - uses: actions/setup-java@v4
+        if: matrix.language == 'java'
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        if: matrix.language == 'java'
+        with:
+          gradle-version: current
+      - uses: actions/setup-node@v4
+        if: matrix.language == 'javascript'
+        with:
+          node-version: 22
+      - name: Install JavaScript compatibility dependencies
+        if: matrix.language == 'javascript'
+        run: npm --prefix compat/javascript install
+      - uses: actions/setup-python@v5
+        if: matrix.language == 'python'
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: compat/python/requirements.txt
+      - name: Install Python compatibility dependencies
+        if: matrix.language == 'python'
+        run: python -m pip install -r compat/python/requirements.txt
+      - uses: actions/setup-dotnet@v4
+        if: matrix.language == 'dotnet'
+        with:
+          dotnet-version: "8.0.x"
+      - name: Restore .NET compatibility dependencies
+        if: matrix.language == 'dotnet'
+        run: dotnet restore compat/dotnet/PgKinetic.Compatibility.csproj --nologo
+      - name: List suites
+        run: cargo run -p xtask -- compat --list
+      - name: Start compatibility stack
+        run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+      - name: Load compatibility fixtures
+        run: cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+      - name: Run direct smoke
+        run: cargo run -p xtask -- compat --language ${{ matrix.language }} --target direct-postgres --smoke
+      - name: Run proxy smoke
+        run: cargo run -p xtask -- compat --language ${{ matrix.language }} --target pg-kinetic --smoke
+      - name: Run paired smoke comparison
+        run: cargo run -p xtask -- compat --language ${{ matrix.language }} --smoke
+      - name: Stop compatibility stack
+        if: always()
+        run: docker compose -f bench/compose.yml down --volumes
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: Install documentation dependencies
+        run: npm --prefix docs-site ci
+      - name: Build documentation site
+        run: npm --prefix docs-site run build
+
+  frameworks:
+    name: compat-frameworks
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      PG_KINETIC_COMPAT_LIVE: "1"
+      PG_KINETIC_COMPAT_SERVICES: direct-postgres,pg-kinetic
+      DATABASE_URL_DIRECT: postgres://postgres:postgres@127.0.0.1:55432/pgkinetic
+      DATABASE_URL_PROXY: postgres://postgres:postgres@127.0.0.1:58432/pgkinetic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+      - name: Start compatibility stack
+        run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+      - name: Load compatibility fixtures
+        run: cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+      - name: Run framework compatibility path
+        run: cargo run -p xtask -- compat --category framework
+      - name: Stop compatibility stack
+        if: always()
+        run: docker compose -f bench/compose.yml down --volumes

@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
 use pg_kinetic::core::benchmark::{BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError};
 use pg_kinetic::core::{
+    compatibility::{CompatibilityLanguage, CompatibilityTarget},
     lsn::FreshnessStatus,
     policy::PolicyAction,
     regression::{RegressionCategory, RegressionPlatform},
@@ -20,6 +21,9 @@ use pg_kinetic::route::{QueryClass, RouteKey};
 use pg_kinetic_proxy::benchmark::{
     compare_benchmark_reports, prepare_benchmark_results, validate_benchmark_scenario,
     BenchmarkReportOutcome, BenchmarkRunReport,
+};
+use pg_kinetic_proxy::compatibility::{
+    CompatibilityRunConfig, CompatibilityRunner, CompatibilitySuiteSelector,
 };
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::preflight::PreflightRunner;
@@ -47,6 +51,7 @@ enum Command {
     RoutePreview(RoutePreviewArgs),
     PolicyPreview(PolicyPreviewArgs),
     Benchmark(BenchmarkArgs),
+    Compat(CompatArgs),
     Regression(RegressionArgs),
     Profile(ProfileArgs),
     Preflight(PreflightArgs),
@@ -110,6 +115,12 @@ struct RegressionArgs {
 }
 
 #[derive(Debug, Args)]
+struct CompatArgs {
+    #[command(subcommand)]
+    command: CompatCommand,
+}
+
+#[derive(Debug, Args)]
 struct ProfileArgs {
     #[command(subcommand)]
     command: ProfileCommand,
@@ -136,6 +147,12 @@ enum BenchmarkCommand {
 enum RegressionCommand {
     List(RegressionListArgs),
     Run(RegressionRunArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum CompatCommand {
+    List(CompatListArgs),
+    Run(CompatRunArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -237,6 +254,57 @@ struct RegressionRunArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug, Args)]
+struct CompatListArgs {
+    #[arg(long, default_value = "regression/manifest.toml")]
+    manifest: PathBuf,
+
+    #[arg(long, value_parser = parse_compatibility_language)]
+    language: Option<CompatibilityLanguage>,
+
+    #[arg(long)]
+    library: Option<String>,
+
+    #[arg(long, value_parser = parse_compatibility_target)]
+    target: Option<CompatibilityTarget>,
+
+    #[arg(long)]
+    category: Option<String>,
+
+    #[arg(long)]
+    smoke: bool,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct CompatRunArgs {
+    #[arg(long, default_value = "regression/manifest.toml")]
+    manifest: PathBuf,
+
+    #[arg(long, value_parser = parse_compatibility_language)]
+    language: Option<CompatibilityLanguage>,
+
+    #[arg(long)]
+    library: Option<String>,
+
+    #[arg(long, value_parser = parse_compatibility_target)]
+    target: Option<CompatibilityTarget>,
+
+    #[arg(long)]
+    category: Option<String>,
+
+    #[arg(long)]
+    smoke: bool,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -265,6 +333,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
         Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
         Some(Command::Benchmark(args)) => return run_benchmark(config, args),
+        Some(Command::Compat(args)) => return run_compat(args),
         Some(Command::Regression(args)) => return run_regression(args),
         Some(Command::Profile(args)) => return run_profile(config, args),
         Some(Command::Preflight(args)) => return run_preflight(config, args),
@@ -386,6 +455,96 @@ fn run_regression(args: RegressionArgs) -> anyhow::Result<()> {
         RegressionCommand::List(args) => run_regression_list(args),
         RegressionCommand::Run(args) => run_regression_run(args),
     }
+}
+
+fn run_compat(args: CompatArgs) -> anyhow::Result<()> {
+    match args.command {
+        CompatCommand::List(args) => run_compat_list(args),
+        CompatCommand::Run(args) => run_compat_run(args),
+    }
+}
+
+fn run_compat_list(args: CompatListArgs) -> anyhow::Result<()> {
+    let CompatListArgs {
+        manifest,
+        language,
+        library,
+        target,
+        category,
+        smoke,
+        format,
+    } = args;
+    let selector = CompatibilitySuiteSelector {
+        language,
+        target,
+        smoke,
+    };
+    let suites = CompatibilityRunner
+        .list(&manifest, selector, library.as_deref(), category.as_deref())
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "suites": suites.iter().map(|suite| serde_json::json!({
+                    "id": suite.id(),
+                    "language": suite.language().as_str(),
+                    "library": suite.library().name(),
+                    "version": suite.library().version(),
+                    "target": suite.target().as_str(),
+                    "timeout_seconds": suite.timeout().as_secs(),
+                    "required_services": suite
+                        .required_services()
+                        .iter()
+                        .map(|service| service.as_ref())
+                        .collect::<Vec<_>>(),
+                    "artifact_policy": suite.artifact_policy().as_str(),
+                    "artifact_path": suite.artifact_path(),
+                    "smoke": suite.smoke(),
+                })).collect::<Vec<_>>(),
+            }))
+            .context("serialize compatibility suite list")?
+        ),
+    }
+    Ok(())
+}
+
+fn run_compat_run(args: CompatRunArgs) -> anyhow::Result<()> {
+    let CompatRunArgs {
+        manifest,
+        language,
+        library,
+        target,
+        category,
+        smoke,
+        format,
+        output,
+    } = args;
+    let report = CompatibilityRunner
+        .run(&CompatibilityRunConfig {
+            manifest_path: manifest,
+            selector: CompatibilitySuiteSelector {
+                language,
+                target,
+                smoke,
+            },
+            library,
+            category,
+        })
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    let rendered = report.render_json();
+    if let Some(output) = output {
+        write_ignored_output(&output, &rendered)
+            .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    }
+    match format {
+        OutputFormat::Json => println!("{rendered}"),
+    }
+    if report.has_failures() {
+        process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_regression_list(args: RegressionListArgs) -> anyhow::Result<()> {
@@ -899,4 +1058,12 @@ fn parse_profile_tool(value: &str) -> Result<ProfileTool, String> {
             "invalid profile kind '{value}', expected one of: flamegraph, perf"
         )),
     }
+}
+
+fn parse_compatibility_language(value: &str) -> Result<CompatibilityLanguage, String> {
+    value.parse()
+}
+
+fn parse_compatibility_target(value: &str) -> Result<CompatibilityTarget, String> {
+    value.parse()
 }

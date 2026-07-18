@@ -50,3 +50,972 @@ services = []
 command = "cargo test -p pg-kinetic --test regression_manifest"
 success_marker = "test result: ok"
 artifact_policy = "summary"
+
+[[case]]
+id = "compat-rust-tokio-postgres-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/rust/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/rust-tokio-postgres-direct.json"
+
+[case.compatibility]
+suite_id = "rust-tokio-postgres-direct"
+language = "rust"
+library = "tokio-postgres"
+library_version = "0.7"
+target = "direct-postgres"
+command = "bash compat/rust/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/rust-tokio-postgres-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-rust-tokio-postgres-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/rust/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/rust-tokio-postgres-proxy.json"
+
+[case.compatibility]
+suite_id = "rust-tokio-postgres-proxy"
+language = "rust"
+library = "tokio-postgres"
+library_version = "0.7"
+target = "pg-kinetic"
+command = "bash compat/rust/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/rust-tokio-postgres-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-rust-sqlx-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/rust/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/rust-sqlx-direct.json"
+
+[case.compatibility]
+suite_id = "rust-sqlx-direct"
+language = "rust"
+library = "sqlx"
+library_version = "0.8"
+target = "direct-postgres"
+command = "bash compat/rust/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/rust-sqlx-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-rust-sqlx-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/rust/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/rust-sqlx-proxy.json"
+
+[case.compatibility]
+suite_id = "rust-sqlx-proxy"
+language = "rust"
+library = "sqlx"
+library_version = "0.8"
+target = "pg-kinetic"
+command = "bash compat/rust/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/rust-sqlx-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-rust-diesel-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/rust/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/rust-diesel-direct.json"
+
+[case.compatibility]
+suite_id = "rust-diesel-direct"
+language = "rust"
+library = "diesel"
+library_version = "2"
+target = "direct-postgres"
+command = "bash compat/rust/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/rust-diesel-direct.json"
+smoke = false
+category = "orm"
+required = false
+skip_reason = "optional diesel runtime coverage"
+
+[[case]]
+id = "compat-go-pgx-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/go/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/go-pgx-direct.json"
+
+[case.compatibility]
+suite_id = "go-pgx-direct"
+language = "go"
+library = "pgx"
+library_version = "5.9"
+target = "direct-postgres"
+command = "bash compat/go/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/go-pgx-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-go-pgx-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/go/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/go-pgx-proxy.json"
+
+[case.compatibility]
+suite_id = "go-pgx-proxy"
+language = "go"
+library = "pgx"
+library_version = "5.9"
+target = "pg-kinetic"
+command = "bash compat/go/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/go-pgx-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-go-database-sql-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/go/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/go-database-sql-direct.json"
+
+[case.compatibility]
+suite_id = "go-database-sql-direct"
+language = "go"
+library = "database-sql"
+library_version = "stdlib"
+target = "direct-postgres"
+command = "bash compat/go/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/go-database-sql-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-go-database-sql-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/go/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/go-database-sql-proxy.json"
+
+[case.compatibility]
+suite_id = "go-database-sql-proxy"
+language = "go"
+library = "database-sql"
+library_version = "stdlib"
+target = "pg-kinetic"
+command = "bash compat/go/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/go-database-sql-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-java-jdbc-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["direct-postgres"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-jdbc-direct.json"
+
+[case.compatibility]
+suite_id = "java-jdbc-direct"
+language = "java"
+library = "jdbc"
+library_version = "42.7"
+target = "direct-postgres"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-jdbc-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-java-jdbc-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-jdbc-proxy.json"
+
+[case.compatibility]
+suite_id = "java-jdbc-proxy"
+language = "java"
+library = "jdbc"
+library_version = "42.7"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-jdbc-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-java-hikari-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["direct-postgres"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-hikari-direct.json"
+
+[case.compatibility]
+suite_id = "java-hikari-direct"
+language = "java"
+library = "hikari"
+library_version = "6.3"
+target = "direct-postgres"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-hikari-direct.json"
+smoke = true
+category = "pool"
+required = true
+
+[[case]]
+id = "compat-java-hikari-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-hikari-proxy.json"
+
+[case.compatibility]
+suite_id = "java-hikari-proxy"
+language = "java"
+library = "hikari"
+library_version = "6.3"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-hikari-proxy.json"
+smoke = true
+category = "pool"
+required = true
+
+[[case]]
+id = "compat-java-datasource-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["direct-postgres"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-datasource-direct.json"
+
+[case.compatibility]
+suite_id = "java-datasource-direct"
+language = "java"
+library = "datasource"
+library_version = "42.7"
+target = "direct-postgres"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-datasource-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-java-datasource-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-datasource-proxy.json"
+
+[case.compatibility]
+suite_id = "java-datasource-proxy"
+language = "java"
+library = "datasource"
+library_version = "42.7"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-datasource-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-java-spring-jdbc-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["direct-postgres"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-jdbc-direct.json"
+
+[case.compatibility]
+suite_id = "java-spring-jdbc-direct"
+language = "java"
+library = "spring-jdbc"
+library_version = "6.2"
+target = "direct-postgres"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-jdbc-direct.json"
+smoke = false
+category = "framework"
+required = true
+
+[[case]]
+id = "compat-java-spring-jdbc-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-jdbc-proxy.json"
+
+[case.compatibility]
+suite_id = "java-spring-jdbc-proxy"
+language = "java"
+library = "spring-jdbc"
+library_version = "6.2"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-jdbc-proxy.json"
+smoke = false
+category = "framework"
+required = true
+
+[[case]]
+id = "compat-java-spring-boot-datasource-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-boot-datasource-proxy.json"
+
+[case.compatibility]
+suite_id = "java-spring-boot-datasource-proxy"
+language = "java"
+library = "spring-boot-datasource"
+library_version = "3.5"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-spring-boot-datasource-proxy.json"
+smoke = false
+category = "framework"
+required = false
+skip_reason = "optional Spring Boot DataSource mapping"
+
+[[case]]
+id = "compat-java-jooq-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 180
+services = ["pg-kinetic"]
+command = "bash compat/java/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/java-jooq-proxy.json"
+
+[case.compatibility]
+suite_id = "java-jooq-proxy"
+language = "java"
+library = "jooq"
+library_version = "3.20"
+target = "pg-kinetic"
+command = "bash compat/java/run.sh"
+timeout_seconds = 180
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/java-jooq-proxy.json"
+smoke = false
+category = "orm"
+required = false
+skip_reason = "optional jooq runtime coverage"
+
+[[case]]
+id = "compat-javascript-pg-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/javascript/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-pg-direct.json"
+
+[case.compatibility]
+suite_id = "javascript-pg-direct"
+language = "javascript"
+library = "pg"
+library_version = "8.16"
+target = "direct-postgres"
+command = "bash compat/javascript/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-pg-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-javascript-pg-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/javascript/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-pg-proxy.json"
+
+[case.compatibility]
+suite_id = "javascript-pg-proxy"
+language = "javascript"
+library = "pg"
+library_version = "8.16"
+target = "pg-kinetic"
+command = "bash compat/javascript/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-pg-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-javascript-kysely-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/javascript/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-kysely-direct.json"
+
+[case.compatibility]
+suite_id = "javascript-kysely-direct"
+language = "javascript"
+library = "kysely"
+library_version = "0.28"
+target = "direct-postgres"
+command = "bash compat/javascript/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-kysely-direct.json"
+smoke = true
+category = "query-builder"
+required = true
+
+[[case]]
+id = "compat-javascript-kysely-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/javascript/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-kysely-proxy.json"
+
+[case.compatibility]
+suite_id = "javascript-kysely-proxy"
+language = "javascript"
+library = "kysely"
+library_version = "0.28"
+target = "pg-kinetic"
+command = "bash compat/javascript/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-kysely-proxy.json"
+smoke = true
+category = "query-builder"
+required = true
+
+[[case]]
+id = "compat-javascript-prisma-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/javascript/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-prisma-proxy.json"
+
+[case.compatibility]
+suite_id = "javascript-prisma-proxy"
+language = "javascript"
+library = "prisma"
+library_version = "6.12"
+target = "pg-kinetic"
+command = "bash compat/javascript/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/javascript-prisma-proxy.json"
+smoke = false
+category = "orm"
+required = false
+skip_reason = "optional prisma runtime coverage"
+
+[[case]]
+id = "compat-python-psycopg-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-psycopg-direct.json"
+
+[case.compatibility]
+suite_id = "python-psycopg-direct"
+language = "python"
+library = "psycopg"
+library_version = "3"
+target = "direct-postgres"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-psycopg-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-python-psycopg-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-psycopg-proxy.json"
+
+[case.compatibility]
+suite_id = "python-psycopg-proxy"
+language = "python"
+library = "psycopg"
+library_version = "3"
+target = "pg-kinetic"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-psycopg-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-python-asyncpg-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-asyncpg-direct.json"
+
+[case.compatibility]
+suite_id = "python-asyncpg-direct"
+language = "python"
+library = "asyncpg"
+library_version = "0.30"
+target = "direct-postgres"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-asyncpg-direct.json"
+smoke = true
+category = "async"
+required = true
+
+[[case]]
+id = "compat-python-asyncpg-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-asyncpg-proxy.json"
+
+[case.compatibility]
+suite_id = "python-asyncpg-proxy"
+language = "python"
+library = "asyncpg"
+library_version = "0.30"
+target = "pg-kinetic"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-asyncpg-proxy.json"
+smoke = true
+category = "async"
+required = true
+
+[[case]]
+id = "compat-python-sqlalchemy-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-sqlalchemy-direct.json"
+
+[case.compatibility]
+suite_id = "python-sqlalchemy-direct"
+language = "python"
+library = "sqlalchemy"
+library_version = "2"
+target = "direct-postgres"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-sqlalchemy-direct.json"
+smoke = true
+category = "orm"
+required = true
+
+[[case]]
+id = "compat-python-sqlalchemy-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/python/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/python-sqlalchemy-proxy.json"
+
+[case.compatibility]
+suite_id = "python-sqlalchemy-proxy"
+language = "python"
+library = "sqlalchemy"
+library_version = "2"
+target = "pg-kinetic"
+command = "bash compat/python/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/python-sqlalchemy-proxy.json"
+smoke = true
+category = "orm"
+required = true
+
+[[case]]
+id = "compat-dotnet-npgsql-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/dotnet/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-npgsql-direct.json"
+
+[case.compatibility]
+suite_id = "dotnet-npgsql-direct"
+language = "dotnet"
+library = "npgsql"
+library_version = "9"
+target = "direct-postgres"
+command = "bash compat/dotnet/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-npgsql-direct.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-dotnet-npgsql-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/dotnet/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-npgsql-proxy.json"
+
+[case.compatibility]
+suite_id = "dotnet-npgsql-proxy"
+language = "dotnet"
+library = "npgsql"
+library_version = "9"
+target = "pg-kinetic"
+command = "bash compat/dotnet/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-npgsql-proxy.json"
+smoke = true
+category = "core"
+required = true
+
+[[case]]
+id = "compat-dotnet-ef-core-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/dotnet/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-ef-core-proxy.json"
+
+[case.compatibility]
+suite_id = "dotnet-ef-core-proxy"
+language = "dotnet"
+library = "ef-core"
+library_version = "9"
+target = "pg-kinetic"
+command = "bash compat/dotnet/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/dotnet-ef-core-proxy.json"
+smoke = false
+category = "orm"
+required = false
+skip_reason = "optional ef core runtime coverage"
+
+[[case]]
+id = "compat-c-libpq-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/c/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/c-libpq-direct.json"
+
+[case.compatibility]
+suite_id = "c-libpq-direct"
+language = "c"
+library = "libpq"
+library_version = "system"
+target = "direct-postgres"
+command = "bash compat/c/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/c-libpq-direct.json"
+smoke = true
+category = "native"
+required = true
+
+[[case]]
+id = "compat-c-libpq-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/c/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/c-libpq-proxy.json"
+
+[case.compatibility]
+suite_id = "c-libpq-proxy"
+language = "c"
+library = "libpq"
+library_version = "system"
+target = "pg-kinetic"
+command = "bash compat/c/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/c-libpq-proxy.json"
+smoke = true
+category = "native"
+required = true
+
+[[case]]
+id = "compat-cpp-libpqxx-direct"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["direct-postgres"]
+command = "bash compat/cpp/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/cpp-libpqxx-direct.json"
+
+[case.compatibility]
+suite_id = "cpp-libpqxx-direct"
+language = "cpp"
+library = "libpqxx"
+library_version = "system"
+target = "direct-postgres"
+command = "bash compat/cpp/run.sh"
+timeout_seconds = 120
+required_services = ["direct-postgres"]
+artifact_policy = "large"
+artifact_path = "target/compat/cpp-libpqxx-direct.json"
+smoke = true
+category = "native"
+required = false
+skip_reason = "optional libpqxx system dependency"
+
+[[case]]
+id = "compat-cpp-libpqxx-proxy"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 120
+services = ["pg-kinetic"]
+command = "bash compat/cpp/run.sh"
+success_marker = "compatibility report complete"
+artifact_policy = "large"
+artifact_path = "target/compat/cpp-libpqxx-proxy.json"
+
+[case.compatibility]
+suite_id = "cpp-libpqxx-proxy"
+language = "cpp"
+library = "libpqxx"
+library_version = "system"
+target = "pg-kinetic"
+command = "bash compat/cpp/run.sh"
+timeout_seconds = 120
+required_services = ["pg-kinetic"]
+artifact_policy = "large"
+artifact_path = "target/compat/cpp-libpqxx-proxy.json"
+smoke = true
+category = "native"
+required = false
+skip_reason = "optional libpqxx system dependency"

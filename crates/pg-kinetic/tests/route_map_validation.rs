@@ -216,7 +216,7 @@ shard_id = "tenant-l"
 }
 
 #[test]
-fn route_map_can_target_primary_and_replicas_from_phase_7_route_config() {
+fn route_map_can_target_primary_and_replicas_from_route_config() {
     let sharding = parse_sharding_config(
         r#"
 [sharding]

@@ -13,6 +13,7 @@ const sidebars = {
         'mirroring',
         'adaptive-ops',
         'benchmarking',
+        'compatibility',
         'metrics',
         'kubernetes',
       ],

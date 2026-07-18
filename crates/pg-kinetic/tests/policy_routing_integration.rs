@@ -165,7 +165,7 @@ fn after_routing_require_replica_respects_freshness_and_health() {
 }
 
 #[test]
-fn route_override_and_shard_override_validate_against_phase_8_context() {
+fn route_override_and_shard_override_validate_against_sharded_context() {
     let route_policy = toml::from_str::<PolicyDocument>(
         r#"
         [policy]

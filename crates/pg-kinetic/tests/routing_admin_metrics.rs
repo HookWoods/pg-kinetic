@@ -146,7 +146,7 @@ fn replica_health_lag_and_split_brain_metrics_use_stable_labels() {
 }
 
 #[tokio::test]
-async fn show_routes_servers_clients_and_backpressure_include_phase_7_columns() {
+async fn show_routes_servers_clients_and_backpressure_include_route_columns() {
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
     let admin_addr = free_port().await;

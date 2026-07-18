@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "result_key": "cases",
+  "cases": {
+    "startup-connect": { "outcome": "connected" },
+    "simple-query": { "rows": [{ "id": 1, "name": "alpha" }] },
+    "parameterized-query": { "rows": [{ "id": 2, "name": "beta" }] },
+    "prepared-statement": { "rows": [{ "id": 1, "name": "alpha" }] },
+    "transaction-commit": { "outcome": "committed" },
+    "transaction-rollback": {
+      "outcome": "rolled-back",
+      "verification": { "rows": [] }
+    },
+    "pool-reuse": { "outcome": "reused" },
+    "error-propagation": { "sqlstate": "42P01" },
+    "read-routing-safe-read": { "outcome": "read-ok" },
+    "primary-write-route": { "outcome": "write-ok" },
+    "shard-key-lookup": { "rows": [{ "id": 1, "shard_key": 101 }] },
+    "policy-deny": {
+      "outcome": "denied",
+      "policy": {
+        "rule_name": "deny_sensitive_read",
+        "action": "deny"
+      }
+    },
+    "tls-connect": { "outcome": "connected" },
+    "auth-failure": { "outcome": "auth-error" },
+    "prepared-invalidation": { "outcome": "reprepared" }
+  }
+}

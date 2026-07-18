@@ -38,6 +38,62 @@
           "artifact_path": {
             "type": "string",
             "pattern": "^target/(?!private(?:/|$))(?!drafts?(?:/|$))(?!planning(?:/|$))(?!generated-output(?:/|$))(?!.*(?:/(?:private|drafts?|planning|generated-output)(?:/|$))).+"
+          },
+          "compatibility": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "suite_id",
+              "language",
+              "library",
+              "library_version",
+              "target",
+              "command",
+              "timeout_seconds",
+              "required_services",
+              "artifact_policy",
+              "artifact_path",
+              "smoke",
+              "category",
+              "required"
+            ],
+            "properties": {
+              "suite_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9-]{1,96}$"
+              },
+              "language": {
+                "enum": [
+                  "rust",
+                  "go",
+                  "java",
+                  "javascript",
+                  "python",
+                  "dotnet",
+                  "c",
+                  "cpp"
+                ]
+              },
+              "library": { "type": "string", "minLength": 1 },
+              "library_version": { "type": "string", "minLength": 1 },
+              "target": { "enum": ["direct-postgres", "pg-kinetic"] },
+              "command": { "type": "string", "minLength": 1 },
+              "timeout_seconds": { "type": "integer", "minimum": 1 },
+              "required_services": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+              },
+              "artifact_policy": { "enum": ["none", "summary", "large"] },
+              "artifact_path": {
+                "type": "string",
+                "pattern": "^target/compat/.+"
+              },
+              "smoke": { "type": "boolean" },
+              "category": { "type": "string", "minLength": 1 },
+              "required": { "type": "boolean" },
+              "skip_reason": { "type": "string", "minLength": 1 }
+            }
           }
         }
       }

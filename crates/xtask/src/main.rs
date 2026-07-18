@@ -8,6 +8,8 @@ const COMMANDS: &[&str] = &[
     "check",
     "smoke",
     "smoke-linux",
+    "compat",
+    "compat-ci",
     "regression",
     "bench-validate",
     "bench-score",
@@ -51,6 +53,8 @@ fn run() -> Result<(), String> {
         "check" => run_standard_command(&root, "check", &options),
         "smoke" => run_standard_command(&root, "smoke", &options),
         "smoke-linux" => run_standard_command(&root, "smoke-linux", &options),
+        "compat" => run_compat(&root, &options),
+        "compat-ci" => run_compat_ci(&root, &options),
         "regression" => run_delegate(
             &root,
             "scripts/regression/run.sh",
@@ -266,6 +270,57 @@ fn run_bench_score(root: &Path, options: &Options) -> Result<(), String> {
     run_command(root, "cargo", arguments, options.dry_run)
 }
 
+fn run_compat(root: &Path, options: &Options) -> Result<(), String> {
+    let mut arguments = vec![
+        "run".to_owned(),
+        "-p".to_owned(),
+        "pg-kinetic".to_owned(),
+        "--".to_owned(),
+        "compat".to_owned(),
+    ];
+    if options.list {
+        arguments.push("list".to_owned());
+    } else {
+        arguments.push("run".to_owned());
+    }
+    arguments.push("--manifest".to_owned());
+    arguments.push("regression/manifest.toml".to_owned());
+    arguments.extend(options.passthrough.iter().cloned());
+
+    run_command(root, "cargo", arguments, options.dry_run)
+}
+
+fn run_compat_ci(root: &Path, options: &Options) -> Result<(), String> {
+    if options.list {
+        return Err("compat-ci does not support --list".to_owned());
+    }
+    let matrix = [
+        "rust",
+        "go",
+        "java",
+        "javascript",
+        "python",
+        "dotnet",
+        "c",
+        "cpp",
+    ];
+    for language in matrix {
+        run_compat(
+            root,
+            &Options {
+                dry_run: options.dry_run,
+                list: false,
+                passthrough: vec![
+                    "--language".to_owned(),
+                    language.to_owned(),
+                    "--smoke".to_owned(),
+                ],
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn run_command<I, S>(root: &Path, program: &str, arguments: I, dry_run: bool) -> Result<(), String>
 where
     I: IntoIterator<Item = S>,
@@ -331,5 +386,6 @@ fn print_usage() {
     println!("commands:");
     print_commands();
     println!("regression passes --list to its Bash runner");
+    println!("compat passes filters to the compatibility runner");
     println!("bench-score defaults to the deterministic sample comparison");
 }

@@ -19,6 +19,7 @@ The first milestone focuses on:
 - [Mirroring guide](docs/mirroring.md)
 - [Adaptive operations guide](docs/adaptive-ops.md)
 - [Benchmarking guide](docs/benchmarking.md)
+- [Compatibility matrix](docs/compatibility.md)
 - [Metrics catalog](docs/metrics.md)
 - [Policy guide](docs/policy.md)
 - [Read routing guide](docs/read-routing.md)
@@ -94,6 +95,18 @@ The smoke clients exercise prepared queries through:
 - Go `pgx`
 - Node.js `pg`
 - Python `psycopg`
+
+For the full cross-language matrix covering Rust, Go, Java, JavaScript and
+TypeScript, Python, .NET, C, and C++, use:
+
+```bash
+cargo run -p xtask -- compat --list
+cargo run -p xtask -- compat --target direct-postgres --smoke
+cargo run -p xtask -- compat --target pg-kinetic --smoke
+```
+
+See [docs/compatibility.md](docs/compatibility.md) for the library matrix,
+report shape, skip policy, and local setup.
 
 ## Virtual Sessions
 

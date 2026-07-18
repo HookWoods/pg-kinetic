@@ -56,6 +56,8 @@ struct RegressionCaseDocument {
     #[serde(default = "default_artifact_policy")]
     artifact_policy: String,
     artifact_path: Option<String>,
+    #[allow(dead_code)]
+    compatibility: Option<toml::Value>,
 }
 
 fn default_artifact_policy() -> String {

@@ -3,6 +3,7 @@ pub mod admin;
 pub mod backpressure;
 pub mod benchmark;
 pub mod cleanup;
+pub mod compatibility;
 pub mod constants;
 pub mod control;
 pub mod ha;

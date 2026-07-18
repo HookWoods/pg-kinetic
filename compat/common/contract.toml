@@ -1,0 +1,282 @@
+version = 1
+
+[contract]
+name = "postgres-client-behavior"
+case_id_pattern = "^[a-z0-9-]+$"
+targets = ["direct-postgres", "pg-kinetic"]
+outcomes = ["pass", "fail", "skip", "blocked"]
+skip_reasons = ["toolchain-unavailable", "library-unavailable", "feature-unsupported", "live-stack-unavailable", "live-disabled", "database-url-unavailable", "optional-case"]
+
+[fixtures]
+schema = "compat/common/schema.sql"
+seed = "compat/common/seed.sql"
+expected_results = "compat/common/expected-results.json"
+reset = "truncate-and-reseed"
+
+[connection]
+target_env = "PG_KINETIC_COMPAT_TARGET"
+direct_url_env = "DATABASE_URL_DIRECT"
+proxy_url_env = "DATABASE_URL_PROXY"
+tls_mode_env = "PG_KINETIC_COMPAT_TLS_MODE"
+auth_failure_url_env = "DATABASE_URL_AUTH_FAILURE"
+
+[connection.tls]
+case = "tls-connect"
+required_environment = ["PG_KINETIC_COMPAT_TLS_MODE"]
+skip_reason = "feature-unsupported"
+
+[connection.auth]
+case = "auth-failure"
+required_environment = ["DATABASE_URL_AUTH_FAILURE"]
+skip_reason = "feature-unsupported"
+
+[policy]
+fixture_table = "compat_policy_rules"
+deny_rule = "deny_sensitive_read"
+skip_reason = "optional-case"
+
+[report]
+result_key = "cases"
+case_id_field = "case_id"
+outcome_field = "outcome"
+skip_reason_field = "skip_reason"
+
+[[skip]]
+id = "tls-without-profile"
+scope = "case"
+case = "tls-connect"
+reason = "feature-unsupported"
+when = "PG_KINETIC_COMPAT_TLS_MODE is unset"
+description = "TLS behavior requires an explicitly configured TLS profile."
+
+[[skip]]
+id = "auth-without-failure-profile"
+scope = "case"
+case = "auth-failure"
+reason = "feature-unsupported"
+when = "DATABASE_URL_AUTH_FAILURE is unset"
+description = "Authentication failure behavior requires a dedicated invalid-credential URL."
+
+[[skip]]
+id = "advanced-capability-not-configured"
+scope = "case"
+case = "read-routing-safe-read"
+reason = "optional-case"
+when = "read routing is not configured for the target"
+description = "Routing cases are opt-in and must not become synthetic passes."
+
+[[skip]]
+id = "primary-routing-not-configured"
+scope = "case"
+case = "primary-write-route"
+reason = "optional-case"
+when = "primary routing is not configured for the target"
+description = "Write routing is opt-in and must remain on the primary path."
+
+[[skip]]
+id = "sharding-not-configured"
+scope = "case"
+case = "shard-key-lookup"
+reason = "optional-case"
+when = "sharding is not configured for the target"
+description = "Shard-key routing requires an explicitly configured shard map."
+
+[[skip]]
+id = "policy-not-configured"
+scope = "case"
+case = "policy-deny"
+reason = "optional-case"
+when = "the deny_sensitive_read policy is not configured"
+description = "Policy denial is only evaluated when the shared deny rule is active."
+
+[result]
+key_field = "id"
+file_field = "cases"
+
+[[case]]
+id = "startup-connect"
+description = "open a new PostgreSQL client connection"
+category = "connection"
+operation = "connect"
+sql_mode = "startup"
+expected_result = "startup-connect"
+assertion = "outcome"
+expected_outcome = "connected"
+required_capability = "connect"
+
+[[case]]
+id = "simple-query"
+description = "execute a simple query"
+category = "query"
+operation = "select"
+sql_mode = "simple"
+statement = "SELECT id, name FROM compat_items WHERE id = 1"
+expected_result = "simple-query"
+assertion = "rows-exact"
+expected_outcome = "one-row"
+required_capability = "query"
+
+[[case]]
+id = "parameterized-query"
+description = "execute a query with one bind parameter"
+category = "parameterized"
+operation = "select"
+sql_mode = "extended"
+statement = "SELECT id, name FROM compat_items WHERE id = $1"
+parameters = [2]
+expected_result = "parameterized-query"
+assertion = "rows-exact"
+expected_outcome = "one-row"
+required_capability = "parameters"
+
+[[case]]
+id = "prepared-statement"
+description = "prepare and execute a reusable statement"
+category = "prepared"
+operation = "prepare-execute"
+sql_mode = "extended"
+statement = "SELECT id, name FROM compat_items WHERE id = $1"
+parameters = [1]
+expected_result = "prepared-statement"
+assertion = "rows-exact"
+expected_outcome = "one-row"
+required_capability = "prepared-statements"
+
+[[case]]
+id = "transaction-commit"
+description = "commit a transaction"
+category = "transaction"
+operation = "begin-commit"
+sql_mode = "extended"
+statement = "INSERT INTO compat_audit (id, item_id, note) VALUES (10, 1, 'committed')"
+expected_result = "transaction-commit"
+assertion = "outcome"
+expected_outcome = "committed"
+required_capability = "transactions"
+
+[[case]]
+id = "transaction-rollback"
+description = "roll back a transaction"
+category = "transaction"
+operation = "begin-rollback"
+sql_mode = "extended"
+statement = "INSERT INTO compat_audit (id, item_id, note) VALUES (11, 1, 'rolled-back')"
+expected_result = "transaction-rollback"
+assertion = "outcome"
+expected_outcome = "rolled-back"
+required_capability = "transactions"
+
+[[case]]
+id = "pool-reuse"
+description = "reuse an idle pooled connection"
+category = "pool"
+operation = "acquire-release-acquire"
+sql_mode = "extended"
+expected_result = "pool-reuse"
+assertion = "outcome"
+expected_outcome = "reused"
+required_capability = "pooling"
+
+[[case]]
+id = "error-propagation"
+description = "return a PostgreSQL server error"
+category = "error"
+operation = "select-missing-relation"
+sql_mode = "simple"
+statement = "SELECT * FROM compat_missing_relation"
+expected_result = "error-propagation"
+assertion = "sqlstate"
+expected_outcome = "sqlstate"
+required_capability = "error-handling"
+
+[[case]]
+id = "read-routing-safe-read"
+description = "route a safe read through the configured read path"
+category = "routing"
+operation = "safe-read"
+sql_mode = "simple"
+statement = "SELECT id, name FROM compat_items WHERE active = true ORDER BY id LIMIT 1"
+expected_result = "read-routing-safe-read"
+assertion = "outcome"
+expected_outcome = "read-ok"
+required_capability = "read-routing"
+advanced = true
+
+[[case]]
+id = "primary-write-route"
+description = "keep writes on the primary path"
+category = "routing"
+operation = "write-primary"
+sql_mode = "extended"
+statement = "UPDATE compat_items SET name = name WHERE id = 1"
+expected_result = "primary-write-route"
+assertion = "outcome"
+expected_outcome = "write-ok"
+required_capability = "primary-routing"
+advanced = true
+
+[[case]]
+id = "shard-key-lookup"
+description = "route a simple key lookup to one shard"
+category = "sharding"
+operation = "select-by-shard-key"
+sql_mode = "extended"
+statement = "SELECT id, shard_key FROM compat_items WHERE shard_key = $1"
+parameters = [101]
+expected_result = "shard-key-lookup"
+assertion = "rows-exact"
+expected_outcome = "shard-ok"
+required_capability = "sharding"
+advanced = true
+
+[[case]]
+id = "policy-deny"
+description = "return a documented policy denial"
+category = "policy"
+operation = "policy-check"
+sql_mode = "simple"
+statement = "SELECT rule_name, action FROM compat_policy_rules WHERE rule_name = 'deny_sensitive_read' AND enabled = true"
+fixture = "deny_sensitive_read"
+expected_result = "policy-deny"
+assertion = "outcome"
+expected_outcome = "denied"
+required_capability = "policy"
+advanced = true
+
+[[case]]
+id = "tls-connect"
+description = "connect with TLS when configured"
+category = "tls"
+operation = "connect"
+sql_mode = "startup"
+expected_result = "tls-connect"
+assertion = "outcome"
+expected_outcome = "connected"
+required_capability = "tls"
+advanced = true
+
+[[case]]
+id = "auth-failure"
+description = "surface authentication failure"
+category = "auth"
+operation = "authenticate"
+sql_mode = "startup"
+expected_result = "auth-failure"
+assertion = "outcome"
+expected_outcome = "auth-error"
+required_capability = "auth"
+advanced = true
+
+[[case]]
+id = "prepared-invalidation"
+description = "recover from prepared statement invalidation"
+category = "prepared"
+operation = "invalidate-reprepare-execute"
+sql_mode = "extended"
+statement = "SELECT id, name FROM compat_items WHERE id = $1"
+parameters = [1]
+expected_result = "prepared-invalidation"
+assertion = "outcome"
+expected_outcome = "reprepared"
+required_capability = "prepared-invalidation"
+advanced = true
