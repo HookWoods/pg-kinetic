@@ -3,6 +3,7 @@ pub mod admin;
 pub mod auth;
 pub mod backend;
 pub mod benchmark;
+pub mod buffers;
 pub mod config;
 pub mod control;
 pub mod drain;

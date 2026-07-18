@@ -6,6 +6,7 @@ use pg_kinetic::wire::{
     message::parse_simple_query,
     rewrite::encode_frontend_frame,
 };
+use pg_kinetic_proxy::buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool};
 use pretty_assertions::assert_eq;
 
 const FRAME_HEADER_LEN: usize = 5;
@@ -111,4 +112,96 @@ fn malformed_frames_return_safe_protocol_errors() {
     };
     let error = parse_simple_query(&malformed_query).expect_err("unterminated query is rejected");
     assert!(matches!(error, WireError::IncompleteFrame));
+}
+
+#[test]
+fn common_forwarding_reuses_session_write_buffers() {
+    let pool = ProxyBufferPool::default();
+    let initial = pool.stats();
+    let mut lease = pool.acquire();
+    let buffers = lease.buffers_mut();
+
+    buffers.append_frontend_frame(b'Q', b"select 1\0");
+    assert_eq!(
+        buffers.backend_write(),
+        wire_frame(b'Q', b"select 1\0").as_ref()
+    );
+    buffers.clear_backend_write();
+    buffers.append_frontend_frame(b'Q', b"select 2\0");
+
+    let current = pool.stats();
+    assert_eq!(current.allocations, initial.allocations + 4);
+    assert_eq!(current.copies, initial.copies + 2);
+    assert_eq!(current.copied_bytes, initial.copied_bytes + 18);
+}
+
+#[test]
+fn oversized_session_buffers_are_trimmed_before_reuse() {
+    let pool = ProxyBufferPool::new(
+        BufferReusePolicy {
+            initial_capacity: 64,
+            max_cached_sessions: 1,
+        },
+        OversizedBufferPolicy {
+            max_retained_capacity: 128,
+        },
+    );
+    {
+        let mut lease = pool.acquire();
+        let buffers = lease.buffers_mut();
+        buffers.append_backend_frame(b'D', &[0; 1024]);
+        buffers.clear_client_write();
+    }
+
+    let mut lease = pool.acquire();
+    assert!(lease
+        .buffers_mut()
+        .capacities()
+        .into_iter()
+        .all(|capacity| capacity <= 128));
+    assert_eq!(pool.stats().oversized_buffers_released, 1);
+}
+
+#[test]
+fn buffer_stats_track_copies_and_growth() {
+    let pool = ProxyBufferPool::new(
+        BufferReusePolicy {
+            initial_capacity: 8,
+            max_cached_sessions: 1,
+        },
+        OversizedBufferPolicy::default(),
+    );
+    let mut lease = pool.acquire();
+    let buffers = lease.buffers_mut();
+    buffers.append_backend_frame(b'D', &[0; 64]);
+
+    let stats = pool.stats();
+    assert_eq!(stats.copies, 1);
+    assert_eq!(stats.copied_bytes, 64);
+    assert!(stats.allocations > 4);
+    assert!(stats.allocation_bytes >= 32);
+}
+
+#[test]
+fn active_session_buffers_are_isolated() {
+    let pool = ProxyBufferPool::default();
+    let mut first = pool.acquire();
+    first
+        .buffers_mut()
+        .append_frontend_frame(b'Q', b"select first\0");
+
+    let mut second = pool.acquire();
+    second
+        .buffers_mut()
+        .append_frontend_frame(b'Q', b"select second\0");
+
+    assert_eq!(
+        first.buffers_mut().backend_write(),
+        wire_frame(b'Q', b"select first\0").as_ref()
+    );
+    assert_eq!(
+        second.buffers_mut().backend_write(),
+        wire_frame(b'Q', b"select second\0").as_ref()
+    );
+    assert_eq!(pool.stats().sessions_created, 2);
 }

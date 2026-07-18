@@ -25,6 +25,7 @@ use crate::routing::{
 use crate::{
     adaptive::AdaptiveController,
     admin, auth,
+    buffers::{ProxyBufferPool, SessionBufferSet},
     config::{Config, RouteConfig},
     drain::DrainController,
     health,
@@ -167,6 +168,7 @@ impl ClientConnection {
 #[derive(Debug)]
 pub struct Proxy {
     config: Config,
+    buffer_pool: ProxyBufferPool,
     client_slots: Arc<Semaphore>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
@@ -187,6 +189,7 @@ impl Proxy {
 
         Self {
             config,
+            buffer_pool: ProxyBufferPool::default(),
             client_slots,
             lifecycle,
             snapshot_store,
@@ -419,6 +422,7 @@ impl Proxy {
                     let phase_recorder = Arc::clone(&phase_recorder);
 
                     let mirror_dispatcher = Arc::clone(&mirror_dispatcher);
+                    let buffer_pool = self.buffer_pool.clone();
 
                     client_tasks.spawn(async move {
                         let _client_guard = client_guard;
@@ -434,6 +438,7 @@ impl Proxy {
                             phase_recorder,
                             debug_sampler,
                             mirror_dispatcher,
+                            buffer_pool,
                         )
                         .await;
                         drop(permit);
@@ -462,7 +467,10 @@ async fn handle_client(
     phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     debug_sampler: DebugSampler,
     mirror_dispatcher: Arc<MirrorDispatcher>,
+    buffer_pool: ProxyBufferPool,
 ) -> anyhow::Result<()> {
+    let mut session_buffer_lease = buffer_pool.acquire();
+    let session_buffers = session_buffer_lease.buffers_mut();
     let session_started = Instant::now();
     let _client_snapshot_guard = ClientSnapshotGuard::new(
         client_snapshot_handle.clone(),
@@ -501,12 +509,13 @@ async fn handle_client(
     let mut wait_for_client_activity_after_timeout = false;
     let mut mirror_query_id = 0_u64;
 
-    let startup_packet = match read_startup_packet(
+    let startup_packet = match read_startup_packet_with_buffer(
         &mut client,
         client_tls_mode,
         client_tls_server_config.as_ref(),
         qos.idle_client_timeout(),
         qos.max_client_buffer_bytes,
+        session_buffers.client_read_mut(),
         phase_recorder.as_ref(),
     )
     .await
@@ -538,6 +547,7 @@ async fn handle_client(
             return Err(error);
         }
     };
+    session_buffers.observe_client_read();
 
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
@@ -646,6 +656,7 @@ async fn handle_client(
         qos.max_backend_buffer_bytes,
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
+        session_buffers,
         phase_recorder.as_ref(),
     )
     .await
@@ -695,8 +706,6 @@ async fn handle_client(
         session_started.elapsed(),
     );
 
-    let mut client_buffer = BytesMut::with_capacity(16 * 1024);
-
     loop {
         let idle_timeout_kind = if matches!(
             session.pin_reason(),
@@ -719,7 +728,7 @@ async fn handle_client(
 
         let Some(cycle) = next_client_cycle(
             &mut client,
-            &mut client_buffer,
+            session_buffers.client_read_mut(),
             cycle_timeout,
             idle_timeout_kind,
             qos.max_client_buffer_bytes,
@@ -728,6 +737,8 @@ async fn handle_client(
         else {
             continue;
         };
+        session_buffers.observe_client_read();
+        session_buffers.trim_empty_buffers();
 
         wait_for_client_activity_after_timeout = false;
         match cycle {
@@ -866,6 +877,7 @@ async fn handle_client(
                         &mut state,
                         frames,
                         qos.max_backend_buffer_bytes,
+                        session_buffers,
                         phase_recorder.as_ref(),
                     ),
                 )
@@ -1141,7 +1153,7 @@ async fn handle_client(
                     .await?;
                 }
 
-                client_buffer.clear();
+                session_buffers.client_read_mut().clear();
                 handle_idle_timeout(&mut client, kind).await?;
                 if kind == IdleTimeoutKind::Transaction {
                     return Ok(());
@@ -2135,12 +2147,33 @@ pub(crate) async fn read_startup_packet(
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<StartupRead> {
     let mut buffer = BytesMut::with_capacity(8192);
+    read_startup_packet_with_buffer(
+        client,
+        client_tls_mode,
+        client_tls_server_config,
+        idle_timeout,
+        max_client_buffer_bytes,
+        &mut buffer,
+        phase_recorder,
+    )
+    .await
+}
+
+async fn read_startup_packet_with_buffer(
+    client: &mut ClientConnection,
+    client_tls_mode: crate::config::ClientTlsMode,
+    client_tls_server_config: Option<&Arc<ServerConfig>>,
+    idle_timeout: Duration,
+    max_client_buffer_bytes: usize,
+    buffer: &mut BytesMut,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+) -> anyhow::Result<StartupRead> {
     let client_tls_required = matches!(
         client_tls_mode,
         crate::config::ClientTlsMode::Require | crate::config::ClientTlsMode::VerifyClient
     );
     loop {
-        while let Some(packet) = next_startup_packet(&mut buffer)? {
+        while let Some(packet) = next_startup_packet(buffer)? {
             match parse_startup_packet(&packet) {
                 Ok(StartupPacket::SslRequest) => {
                     match client_tls_mode {
@@ -2202,7 +2235,7 @@ pub(crate) async fn read_startup_packet(
             return Ok(StartupRead::BufferLimitExceeded);
         }
 
-        match timeout(idle_timeout, client.read_buf(&mut buffer)).await {
+        match timeout(idle_timeout, client.read_buf(buffer)).await {
             Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
             Ok(Ok(_)) => {
                 if buffer.len() > max_client_buffer_bytes {
@@ -2262,6 +2295,7 @@ async fn proxy_startup(
     max_backend_buffer_bytes: usize,
     forward_backend_auth_requests_to_client: bool,
     emit_auth_ok_when_backend_requires_no_startup: bool,
+    buffers: &mut SessionBufferSet,
     _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
@@ -2284,24 +2318,25 @@ async fn proxy_startup(
         .await
         .context("forward startup")?;
 
-    let mut client_buffer = BytesMut::with_capacity(8192);
-    let mut backend_buffer = BytesMut::with_capacity(8192);
+    buffers.client_read_mut().clear();
+    buffers.backend_read_mut().clear();
     loop {
-        if backend_buffer.len() >= max_backend_buffer_bytes {
+        if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
         backend
             .backend_mut()
             .stream_mut()
-            .read_buf(&mut backend_buffer)
+            .read_buf(buffers.backend_read_mut())
             .await
             .context("read startup response")?;
-        if backend_buffer.len() > max_backend_buffer_bytes {
+        buffers.observe_backend_read();
+        if buffers.backend_read_mut().len() > max_backend_buffer_bytes {
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
-        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+        while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
             if frame.tag == u8::from(BackendTag::Authentication) {
                 let code = auth_request_code(&frame.payload)?;
                 if code == 0 {
@@ -2321,23 +2356,24 @@ async fn proxy_startup(
                         .context("forward startup response")?;
 
                     if auth_request_expects_client_response(&frame.payload)? {
-                        if client_buffer.len() >= max_client_buffer_bytes {
+                        if buffers.client_read_mut().len() >= max_client_buffer_bytes {
                             return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
                         }
 
-                        client_buffer.clear();
+                        buffers.client_read_mut().clear();
                         let read = client
-                            .read_buf(&mut client_buffer)
+                            .read_buf(buffers.client_read_mut())
                             .await
                             .context("read startup auth response")?;
                         anyhow::ensure!(read > 0, "client disconnected during startup auth");
-                        if client_buffer.len() > max_client_buffer_bytes {
+                        buffers.observe_client_read();
+                        if buffers.client_read_mut().len() > max_client_buffer_bytes {
                             return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
                         }
                         backend
                             .backend_mut()
                             .stream_mut()
-                            .write_all(&client_buffer)
+                            .write_all(buffers.client_read_mut())
                             .await
                             .context("forward startup auth response")?;
                     }
@@ -2459,11 +2495,12 @@ async fn forward_message_cycle(
     state: &mut ForwardCycleState<'_>,
     frames: Vec<FrontendFrame>,
     max_backend_buffer_bytes: usize,
+    buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
-    let mut outbound = BytesMut::new();
+    buffers.clear_backend_write();
     for frame in frames {
         let plan = prepare_frame_for_backend(
             backend.backend_id(),
@@ -2479,23 +2516,24 @@ async fn forward_message_cycle(
         )?;
 
         for prelude in &plan.prelude {
-            outbound.extend_from_slice(&encode_frontend_frame(prelude));
+            buffers.append_frontend_frame(prelude.tag, &prelude.payload);
         }
-        outbound.extend_from_slice(&encode_frontend_frame(&plan.frame));
+        buffers.append_frontend_frame(plan.frame.tag, &plan.frame.payload);
     }
 
     backend
         .backend_mut()
         .stream_mut()
-        .write_all(&outbound)
+        .write_all(buffers.backend_write())
         .await
         .context("write frontend cycle to backend")?;
     execute_timer.finish(MetricOutcome::Ok);
+    buffers.clear_backend_write();
 
     let rows_timer = PhaseTimer::start(ProtocolPhase::Rows, phase_recorder);
-    let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+    buffers.backend_read_mut().clear();
     loop {
-        if backend_buffer.len() >= max_backend_buffer_bytes {
+        if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             record_buffer_limit(BufferBudgetKind::Backend);
             rows_timer.finish(MetricOutcome::Discarded);
             return Ok(ForwardOutcome::BufferLimitExceeded);
@@ -2504,21 +2542,22 @@ async fn forward_message_cycle(
         let read = backend
             .backend_mut()
             .stream_mut()
-            .read_buf(&mut backend_buffer)
+            .read_buf(buffers.backend_read_mut())
             .await
             .context("read backend frame")?;
         if read == 0 {
             anyhow::bail!("backend disconnected during response cycle");
         }
 
-        if backend_buffer.len() > max_backend_buffer_bytes {
+        buffers.observe_backend_read();
+        if buffers.backend_read_mut().len() > max_backend_buffer_bytes {
             record_buffer_limit(BufferBudgetKind::Backend);
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
-        let mut forward = BytesMut::new();
+        buffers.clear_client_write();
         let mut ready = None;
-        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+        while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
             state.progress.response_started = true;
             if let Some(sqlstate) = frame.sqlstate() {
                 metrics::increment_sqlstate(sqlstate);
@@ -2537,13 +2576,17 @@ async fn forward_message_cycle(
                 state.session.mark_failed_transaction();
             }
 
-            forward.extend_from_slice(&encode_backend_frame(&frame));
+            buffers.append_backend_frame(frame.tag, &frame.payload);
             if let Some(status) = frame.ready_status() {
                 ready = Some(status);
             }
         }
 
-        if !forward.is_empty() && client.write_all(&forward).await.is_err() {
+        if !buffers.client_write().is_empty()
+            && client.write_all(buffers.client_write()).await.is_err()
+        {
+            buffers.clear_client_write();
+            buffers.trim_empty_buffers();
             if let Some(status) = ready {
                 rows_timer.finish(MetricOutcome::Canceled);
                 return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
@@ -2554,6 +2597,8 @@ async fn forward_message_cycle(
         }
 
         if let Some(status) = ready {
+            buffers.clear_client_write();
+            buffers.trim_empty_buffers();
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));
         }
