@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a focused improvement to pg-kinetic.
+title: "feature: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the operational problem first. Proposals are easier to review
+        when they include behavior, compatibility, and observability impacts.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Who is affected, and what cannot be done safely or efficiently today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the expected interface, behavior, and failure modes.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe existing pg-kinetic configuration, PostgreSQL, or external tooling you considered.
+  - type: textarea
+    id: operations
+    attributes:
+      label: Compatibility and operations
+      description: Note expected effects on protocol compatibility, pooling, routing, metrics, health, deployment, or upgrades.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to help implement or test this proposal.
+          required: false

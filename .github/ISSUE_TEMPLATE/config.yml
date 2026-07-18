@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://docs.pgkinetic.dev
+    about: Read installation, configuration, operations, and troubleshooting guidance.
+  - name: Security vulnerability reporting
+    url: https://github.com/HookWoods/pg-kinetic/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

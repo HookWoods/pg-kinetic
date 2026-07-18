@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible problem in pg-kinetic.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Do not include credentials, private keys,
+        connection strings with passwords, or customer data. Report security
+        vulnerabilities privately as described in SECURITY.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its impact.
+      placeholder: Connections remain queued after a backend becomes healthy.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the smallest safe steps, configuration, and commands needed to reproduce the problem.
+      placeholder: |
+        1. Start PostgreSQL 16 and pg-kinetic with this sanitized configuration.
+        2. Run this client command.
+        3. Observe this result.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Explain what you expected to happen instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: pg-kinetic version
+      description: Provide a release tag, container tag, chart version, or commit SHA.
+      placeholder: v0.1.0 or ghcr.io/hookwoods/pg-kinetic:0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include PostgreSQL version, client driver, deployment method, and operating system or Kubernetes version.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Safe diagnostics
+      description: Add sanitized logs, metrics, admin output, or a minimal trace if available.
+      render: text
