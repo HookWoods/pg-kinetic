@@ -5,6 +5,7 @@ members = [
     "crates/pg-kinetic-wire",
     "crates/pg-kinetic-core",
     "crates/pg-kinetic-proxy",
+    "crates/xtask",
 ]
 
 [workspace.package]
