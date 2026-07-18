@@ -33,6 +33,19 @@ powershell.exe -ExecutionPolicy Bypass -File scripts/docs/check-config-coverage.
 
 The implicit Docusaurus `current` version tracks the `main` branch. Released versions are cut manually only when a release is published. Do not create placeholder or synthetic versioned documentation.
 
+## Cloudflare Pages
+
+Production documentation is deployed by Cloudflare Pages, not GitHub Pages. Keep the project settings aligned with:
+
+- production branch: `main`
+- build command: `npm --prefix docs-site ci && npm --prefix docs-site run build`
+- build output directory: `docs-site/build`
+- root directory: repository root
+- environment variable: `NODE_VERSION=22`
+- custom domain: `docs.pgkinetic.dev`
+
+The GitHub `Documentation` workflow only validates the documentation build and link/config checks. GitHub Pages is reserved for the Helm chart repository on `helm.pgkinetic.dev`.
+
 ## Publication gate
 
 Do not treat the site as a final operator reference until:

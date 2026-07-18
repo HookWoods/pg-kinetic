@@ -7,8 +7,11 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/workspace/target \
+ARG TARGETPLATFORM
+
+RUN --mount=type=cache,id=pg-kinetic-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=pg-kinetic-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=pg-kinetic-target-${TARGETPLATFORM},target=/workspace/target,sharing=locked \
     cargo build --locked --release -p pg-kinetic && \
     cp /workspace/target/release/pg-kinetic /usr/local/bin/pg-kinetic
 

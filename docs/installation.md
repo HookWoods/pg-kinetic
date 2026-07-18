@@ -1,6 +1,6 @@
 ---
 title: "Installation"
-description: "Install pg-kinetic from local Docker assets today and prepare for future Docker Hub, GHCR, and Helm chart release workflows."
+description: "Install pg-kinetic from local Docker assets today and prepare for future GHCR and Helm chart release workflows."
 keywords:
   - install pg-kinetic
   - Docker PostgreSQL proxy
@@ -10,7 +10,7 @@ keywords:
 
 # Installation
 
-This repository contains local deployment assets for Docker, Docker Compose, and Kubernetes. Public Docker Hub, GHCR, and Helm chart releases are created only after a version tag is pushed.
+This repository contains local deployment assets for Docker, Docker Compose, and Kubernetes. Public GHCR and Helm chart releases are created when a GitHub Release with a `vMAJOR.MINOR.PATCH` tag is published.
 
 ## Current Installation Source
 
@@ -75,22 +75,21 @@ The chart does not configure a pre-stop drain hook because the HTTP health serve
 
 ## Future Release Images
 
-After a version tag matching `v*.*.*` is pushed, the container workflow publishes multi-platform images:
+After a GitHub Release with a tag matching `v*.*.*` is published, the container workflow publishes multi-platform images:
 
 | Registry | Image |
 | --- | --- |
-| Docker Hub | `hookwoods/pg-kinetic:<version>` |
 | GitHub Container Registry | `ghcr.io/hookwoods/pg-kinetic:<version>` |
 
 Use immutable version tags in production once they exist:
 
 ```bash
-docker pull hookwoods/pg-kinetic:0.1.0
+docker pull ghcr.io/hookwoods/pg-kinetic:0.1.0
 ```
 
 ## Future Helm Repository
 
-The Helm workflow publishes a chart repository for `https://helm.pgkinetic.dev` after a version tag creates the first chart release and chart index.
+The Helm workflow publishes a chart repository for `https://helm.pgkinetic.dev` after a GitHub Release creates the first chart archive and chart index.
 
 After that release exists:
 
@@ -105,6 +104,6 @@ Until `https://helm.pgkinetic.dev/index.yaml` exists, use the local chart path.
 
 ## Release Publishing
 
-The container workflow runs on tags matching `v*.*.*`. It builds the Dockerfile and publishes `hookwoods/pg-kinetic` and `ghcr.io/hookwoods/pg-kinetic`.
+The container workflow runs when a GitHub Release is published. It builds the Dockerfile and publishes `ghcr.io/hookwoods/pg-kinetic`.
 
-The Helm workflow runs on the same version tags. It packages chart versions, uploads chart archives to GitHub Releases, and updates the chart repository index.
+The Helm workflow runs on the same GitHub Release event. It derives the chart version from the release tag, uploads the chart archive to that release, and updates the chart repository index.

@@ -12,7 +12,7 @@ keywords:
 
 pg-kinetic currently ships Kubernetes manifests as a local Helm chart in `charts/pg-kinetic`.
 
-The chart repository workflow is present, but `https://helm.pgkinetic.dev` is usable only after a version tag publishes the first chart index. Until that release exists, install from the local chart path.
+The chart repository workflow is present, but `https://helm.pgkinetic.dev` is usable only after a GitHub Release publishes the first chart index. Until that release exists, install from the local chart path.
 
 ## Install From The Local Chart
 
@@ -63,7 +63,7 @@ Important values:
 
 | Value | Default | Purpose |
 | --- | --- | --- |
-| `image.repository` | `hookwoods/pg-kinetic` | Container image repository. Override until the first public image exists. |
+| `image.repository` | `ghcr.io/hookwoods/pg-kinetic` | Container image repository. Override until the first public image exists. |
 | `image.tag` | `0.1.0` | Image tag to deploy. Use only a tag that already exists. |
 | `replicaCount` | `2` | Number of proxy pods. |
 | `service.proxyPort` | `6432` | PostgreSQL client-facing service port. |

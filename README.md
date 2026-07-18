@@ -69,7 +69,7 @@ docker compose -f deploy/docker-compose.yml down
 | Kubernetes | Rendering and validating the local Helm chart | [Kubernetes deployment](docs/kubernetes.md) |
 | Production rollout | Readiness, drain, migration, and rollback planning | [Production runtime](docs/production-runtime.md) and [Migration](docs/migration.md) |
 
-Public Docker Hub, GHCR, and Helm repository artifacts are published after the first version tag. Until then, build from this repository or use the local chart as described in the installation guide.
+Public GHCR and Helm repository artifacts are published after the first GitHub Release with a `vMAJOR.MINOR.PATCH` tag. Until then, build from this repository or use the local chart as described in the installation guide.
 
 ## Operator Workflow
 

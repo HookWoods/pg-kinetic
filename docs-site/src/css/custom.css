@@ -392,6 +392,19 @@ body {
   text-underline-offset: 0.16rem;
 }
 
+.theme-doc-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.theme-doc-markdown th,
+.theme-doc-markdown td {
+  min-width: 9.5rem;
+  vertical-align: top;
+}
+
 .table-of-contents {
   border-radius: 8px;
   padding: 0.85rem;
@@ -431,7 +444,7 @@ pre,
 
 @media (max-width: 996px) {
   .navbar {
-    z-index: 200;
+    z-index: 900;
   }
 
   .navbar__toggle {
@@ -452,10 +465,19 @@ pre,
   }
 
   .navbar-sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 1001;
     width: min(88vw, 23rem);
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow-y: auto;
     border-right: 1px solid var(--pg-border);
     background: #05070c;
     box-shadow: 28px 0 70px -38px rgba(0, 0, 0, 0.95);
+    -webkit-overflow-scrolling: touch;
   }
 
   .navbar-sidebar__brand {
@@ -475,7 +497,20 @@ pre,
   }
 
   .navbar-sidebar__backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
     background: rgba(0, 0, 0, 0.7);
+  }
+
+  .theme-doc-markdown {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .theme-doc-markdown h1 {
+    font-size: clamp(2.4rem, 12vw, 3.35rem);
+    line-height: 1.05;
   }
 
   .docs-home {

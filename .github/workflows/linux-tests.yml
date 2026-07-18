@@ -2,37 +2,49 @@ name: Linux tests
 
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "docs-site/**"
+      - "charts/**"
+      - ".github/workflows/docs.yml"
+      - ".github/workflows/container.yml"
+      - ".github/workflows/helm.yml"
+      - "README.md"
   push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "docs-site/**"
+      - "charts/**"
+      - ".github/workflows/docs.yml"
+      - ".github/workflows/container.yml"
+      - ".github/workflows/helm.yml"
+      - "README.md"
 
 permissions:
   contents: read
 
+concurrency:
+  group: linux-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable]
-        go: [stable]
-        node: [22]
-        python: ["3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
-      - uses: actions/setup-go@v5
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          go-version: ${{ matrix.go }}
+          cache-on-failure: true
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 22
           cache: npm
           cache-dependency-path: docs-site/package-lock.json
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
       - name: Install docs dependencies
         working-directory: docs-site
         run: npm ci
