@@ -5,8 +5,6 @@ use std::sync::{
 
 use bytes::{BufMut, BytesMut};
 
-const BUFFER_COUNT_PER_SESSION: u64 = 4;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferReusePolicy {
     pub initial_capacity: usize,
@@ -190,23 +188,16 @@ impl SessionBufferSet {
         counters: Arc<BufferCounters>,
     ) -> Self {
         let initial_capacity = policy.initial_capacity;
-        counters
-            .allocations
-            .fetch_add(BUFFER_COUNT_PER_SESSION, Ordering::Relaxed);
-        counters.allocation_bytes.fetch_add(
-            (initial_capacity * BUFFER_COUNT_PER_SESSION as usize) as u64,
-            Ordering::Relaxed,
-        );
 
         Self {
-            client_read: BytesMut::with_capacity(initial_capacity),
-            backend_read: BytesMut::with_capacity(initial_capacity),
-            backend_write: BytesMut::with_capacity(initial_capacity),
-            client_write: BytesMut::with_capacity(initial_capacity),
-            client_read_capacity: initial_capacity,
-            backend_read_capacity: initial_capacity,
-            backend_write_capacity: initial_capacity,
-            client_write_capacity: initial_capacity,
+            client_read: BytesMut::new(),
+            backend_read: BytesMut::new(),
+            backend_write: BytesMut::new(),
+            client_write: BytesMut::new(),
+            client_read_capacity: 0,
+            backend_read_capacity: 0,
+            backend_write_capacity: 0,
+            client_write_capacity: 0,
             initial_capacity,
             oversized_policy,
             counters,
