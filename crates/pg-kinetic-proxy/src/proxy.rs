@@ -1329,7 +1329,7 @@ async fn checkout_backend(
             .await
             .map_err(CheckoutFailure::Fatal)?;
     }
-    metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "ok");
+    metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "request", "ok");
     telemetry::emit_debug_sample(
         &request.debug_sampler,
         DebugSample::backend_checkout(

@@ -795,7 +795,13 @@ impl BackendPool {
         route: RouteKey,
         mode: CheckoutMode,
     ) -> Result<PooledBackend, PoolError> {
+        let route_gate_lookup_started = Instant::now();
         let route_gate = self.route_gate(&route);
+        metrics::record_pool_checkout(
+            route_gate_lookup_started.elapsed().as_secs_f64() * 1_000.0,
+            "route_gate_registry",
+            "ok",
+        );
         let started = Instant::now();
         let checkout = async {
             let route_permit = match route_gate.checkout(self.checkout_timeout).await {
@@ -861,7 +867,7 @@ impl BackendPool {
             })
         };
 
-        match timeout(self.checkout_timeout, checkout).await {
+        let result = match timeout(self.checkout_timeout, checkout).await {
             Ok(result) => result,
             Err(_) => {
                 metrics::increment_backpressure_event(&route, "timeout");
@@ -873,7 +879,13 @@ impl BackendPool {
                 self.record_backpressure_counts(&route);
                 Err(PoolError::Backpressure(BackpressureError::Timeout))
             }
-        }
+        };
+        metrics::record_pool_checkout(
+            started.elapsed().as_secs_f64() * 1_000.0,
+            "checkout",
+            pool_checkout_outcome(&result),
+        );
+        result
     }
 
     async fn checkout_idle_backend(&self, mode: CheckoutMode) -> Option<Backend> {
@@ -992,6 +1004,14 @@ fn backpressure_outcome(error: BackpressureError) -> &'static str {
         BackpressureError::QueueFull => "queue_full",
         BackpressureError::Timeout => "timeout",
         BackpressureError::Closed => "closed",
+    }
+}
+
+fn pool_checkout_outcome(result: &Result<PooledBackend, PoolError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(PoolError::Backpressure(error)) => backpressure_outcome(*error),
+        Err(PoolError::Connect(_)) => "error",
     }
 }
 

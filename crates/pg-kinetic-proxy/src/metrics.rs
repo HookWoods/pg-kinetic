@@ -54,9 +54,10 @@ pub fn install(config: MetricsConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn record_pool_checkout(wait_ms: f64, outcome: &'static str) {
+pub fn record_pool_checkout(wait_ms: f64, stage: &'static str, outcome: &'static str) {
     metrics_crate::histogram!(
         MetricName::PoolCheckoutWaitMs.as_str(),
+        "stage" => stage,
         "outcome" => outcome
     )
     .record(wait_ms);
