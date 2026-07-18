@@ -39,6 +39,14 @@ require_command() {
   return 1
 }
 
+temporary_output_path() {
+  local prefix="${1:-pg-kinetic}"
+  local suffix="${2:-tmp}"
+  local temp_root="${TMPDIR:-/tmp}"
+
+  printf '%s/%s-%s.%s\n' "$temp_root" "$prefix" "$$" "$suffix"
+}
+
 run_from_repo_root() {
   local executable
   executable="$(resolve_command "$1")" || {

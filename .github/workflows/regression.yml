@@ -1,0 +1,23 @@
+name: Regression
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: List regression manifest
+        run: cargo run -p xtask -- regression --list
+      - name: Validate benchmark scenario
+        run: cargo run -p xtask -- bench-validate
+      - name: Compare sample performance score
+        run: cargo run -p xtask -- bench-score --baseline regression/baselines/performance-score.sample.json --current regression/baselines/performance-score.sample.json
+      - name: Dry-run Linux smokes
+        run: cargo run -p xtask -- smoke-linux --dry-run

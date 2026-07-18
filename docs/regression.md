@@ -44,3 +44,5 @@ cargo run -p pg-kinetic -- benchmark score \
 Use `--release` to return a nonzero exit code for `fail` or `missing-baseline`.
 Score JSON does not include target DSNs and redacts credential-shaped paths or
 error text before rendering.
+
+The compatibility matrix is the next step. It should add production-relevant client libraries on top of this runner instead of changing the shared manifest and score contracts.

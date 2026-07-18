@@ -1,0 +1,32 @@
+name: Documentation
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: Install docs dependencies
+        working-directory: docs-site
+        run: npm ci
+      - name: Check Markdown links
+        run: bash scripts/docs/check-links.sh
+      - name: Build docs site
+        working-directory: docs-site
+        run: npm run check
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-kinetic-docs
+          path: docs-site/build

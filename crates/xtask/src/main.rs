@@ -58,12 +58,7 @@ fn run() -> Result<(), String> {
             &options,
         ),
         "bench-validate" => run_standard_command(&root, "bench-validate", &options),
-        "bench-score" => run_delegate(
-            &root,
-            "scripts/bench/score-performance.sh",
-            "benchmark score runner",
-            &options,
-        ),
+        "bench-score" => run_bench_score(&root, &options),
         "docs-check" => run_standard_command(&root, "docs-check", &options),
         "ci-linux" => run_standard_command(&root, "ci-linux", &options),
         "--help" | "-h" | "help" => {
@@ -121,6 +116,12 @@ fn run_standard_command(root: &Path, command: &str, options: &Options) -> Result
                 "bash",
                 vec!["scripts/smoke/compat.sh"],
                 options.dry_run,
+            )?;
+            run_command(
+                root,
+                "bash",
+                vec!["scripts/smoke/performance.sh"],
+                options.dry_run,
             )
         }
         "bench-validate" => run_command(
@@ -148,8 +149,14 @@ fn run_standard_command(root: &Path, command: &str, options: &Options) -> Result
             println!("PASS: testing workflow documentation present");
             run_command(
                 root,
-                "cargo",
-                vec!["fmt", "--all", "--", "--check"],
+                "bash",
+                vec!["scripts/docs/check-links.sh"],
+                options.dry_run,
+            )?;
+            run_command(
+                root,
+                npm_command(),
+                vec!["--prefix", "docs-site", "run", "check"],
                 options.dry_run,
             )
         }
@@ -190,6 +197,51 @@ fn run_delegate(
     run_command(root, "bash", arguments, false)
 }
 
+fn run_bench_score(root: &Path, options: &Options) -> Result<(), String> {
+    if options.list {
+        return Err("bench-score does not support --list".to_owned());
+    }
+
+    let mut arguments = vec![
+        "run".to_owned(),
+        "-p".to_owned(),
+        "pg-kinetic".to_owned(),
+        "--".to_owned(),
+        "benchmark".to_owned(),
+        "score".to_owned(),
+    ];
+    let has_baseline = options
+        .passthrough
+        .iter()
+        .any(|argument| argument == "--baseline");
+    let has_current = options
+        .passthrough
+        .iter()
+        .any(|argument| argument == "--current");
+    let has_format = options
+        .passthrough
+        .iter()
+        .any(|argument| argument == "--format");
+
+    if !has_baseline {
+        arguments.push("--baseline".to_owned());
+        arguments.push("regression/baselines/performance-score.sample.json".to_owned());
+    }
+    if !has_current {
+        arguments.push("--current".to_owned());
+        arguments.push("regression/baselines/performance-score.sample.json".to_owned());
+    }
+
+    arguments.extend(options.passthrough.iter().cloned());
+
+    if !has_format {
+        arguments.push("--format".to_owned());
+        arguments.push("json".to_owned());
+    }
+
+    run_command(root, "cargo", arguments, options.dry_run)
+}
+
 fn run_command<I, S>(root: &Path, program: &str, arguments: I, dry_run: bool) -> Result<(), String>
 where
     I: IntoIterator<Item = S>,
@@ -222,6 +274,14 @@ where
     }
 }
 
+fn npm_command() -> &'static str {
+    if cfg!(windows) {
+        "npm.cmd"
+    } else {
+        "npm"
+    }
+}
+
 fn workspace_root() -> Result<PathBuf, String> {
     let current_dir =
         env::current_dir().map_err(|error| format!("read current directory: {error}"))?;
@@ -246,5 +306,6 @@ fn print_usage() {
     println!("usage: cargo run -p xtask -- <command> [--dry-run]");
     println!("commands:");
     print_commands();
-    println!("regression and bench-score also pass --list to their optional Bash runners");
+    println!("regression passes --list to its Bash runner");
+    println!("bench-score defaults to the deterministic sample comparison");
 }

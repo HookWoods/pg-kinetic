@@ -12,6 +12,8 @@ The first milestone focuses on:
 ## Public Docs
 
 - [Documentation site](docs-site/README.md)
+- [Testing guide](docs/testing.md)
+- [Regression workflow](docs/regression.md)
 - [Admin reference](docs/admin.md)
 - [Production runtime guide](docs/production-runtime.md)
 - [Mirroring guide](docs/mirroring.md)

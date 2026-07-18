@@ -20,7 +20,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Contributing',
-      items: ['docs-site'],
+      items: ['testing', 'regression', 'docs-site'],
     },
   ],
 };

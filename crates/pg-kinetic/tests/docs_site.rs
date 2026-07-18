@@ -10,18 +10,19 @@ fn repo_root() -> PathBuf {
 }
 
 fn read_repo_file(path: &str) -> String {
-    fs::read_to_string(repo_root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"))
+    fs::read_to_string(repo_root().join(path))
+        .unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
 #[test]
 fn docusaurus_uses_canonical_docs_and_current_version_policy() {
     let config = read_repo_file("docs-site/docusaurus.config.js");
-    let package: serde_json::Value = serde_json::from_str(&read_repo_file("docs-site/package.json"))
-        .expect("parse docs-site package manifest");
+    let package: serde_json::Value =
+        serde_json::from_str(&read_repo_file("docs-site/package.json"))
+            .expect("parse docs-site package manifest");
 
     assert_eq!(
-        package["dependencies"]["@docusaurus/core"],
-        "3.10.2",
+        package["dependencies"]["@docusaurus/core"], "3.10.2",
         "keep the site on the reviewed Docusaurus release"
     );
     assert!(config.contains("path: '../docs'"));
@@ -53,21 +54,22 @@ fn sidebar_only_lists_checked_in_public_guides() {
     ];
 
     for document in docs {
-        assert!(repo_root().join("docs").join(format!("{document}.md")).is_file());
+        assert!(repo_root()
+            .join("docs")
+            .join(format!("{document}.md"))
+            .is_file());
         assert!(sidebar.contains(&format!("'{document}'")));
     }
 
-    for optional_document in ["testing", "regression"] {
-        if !repo_root()
+    for document in ["testing", "regression"] {
+        assert!(repo_root()
             .join("docs")
-            .join(format!("{optional_document}.md"))
-            .is_file()
-        {
-            assert!(
-                !sidebar.contains(optional_document),
-                "sidebar references missing {optional_document} documentation"
-            );
-        }
+            .join(format!("{document}.md"))
+            .is_file());
+        assert!(
+            sidebar.contains(&format!("'{document}'")),
+            "sidebar must publish {document} documentation"
+        );
     }
 }
 
@@ -79,6 +81,9 @@ fn docs_link_checkers_are_checked_in() {
     ] {
         let contents = read_repo_file(script);
         assert!(!contents.is_empty(), "{script} must not be empty");
-        assert!(contents.contains("docs"), "{script} must check canonical docs");
+        assert!(
+            contents.contains("docs"),
+            "{script} must check canonical docs"
+        );
     }
 }

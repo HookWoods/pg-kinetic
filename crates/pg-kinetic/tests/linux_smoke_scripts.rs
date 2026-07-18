@@ -29,6 +29,11 @@ fn bash_scripts_use_the_shared_contract() {
     for path in [
         "scripts/smoke/psql.sh",
         "scripts/smoke/compat.sh",
+        "scripts/smoke/read-routing.sh",
+        "scripts/smoke/sharding.sh",
+        "scripts/smoke/runtime.sh",
+        "scripts/smoke/mirroring.sh",
+        "scripts/smoke/performance.sh",
         "scripts/bench/run-performance.sh",
         "scripts/bench/compare-performance.sh",
         "scripts/bench/profile-performance.sh",
@@ -41,6 +46,25 @@ fn bash_scripts_use_the_shared_contract() {
         assert!(
             script.contains("source \"$SCRIPT_DIR/../lib/common.sh\""),
             "{path} must use the shared Bash helpers"
+        );
+    }
+}
+
+#[test]
+fn every_powershell_smoke_has_a_bash_entrypoint() {
+    for script in fs::read_dir(repository_root().join("scripts/smoke"))
+        .expect("read smoke scripts")
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".ps1"))
+    {
+        let bash_script = script.trim_end_matches(".ps1").to_owned() + ".sh";
+        assert!(
+            repository_root()
+                .join("scripts/smoke")
+                .join(&bash_script)
+                .is_file(),
+            "{script} must have Bash parity at {bash_script}"
         );
     }
 }
@@ -96,4 +120,5 @@ fn testing_guide_documents_linux_and_windows_workflows() {
     assert!(guide.contains("## Linux"));
     assert!(guide.contains("## Windows"));
     assert!(guide.contains("cargo run -p xtask -- ci-linux"));
+    assert!(guide.contains("scripts/smoke/performance.sh"));
 }
