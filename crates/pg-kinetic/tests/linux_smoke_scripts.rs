@@ -85,9 +85,13 @@ fn linux_smoke_scripts_cover_the_powershell_smoke_contract() {
         "PGSSLMODE",
         "PGGSSENCMODE",
         "PGCONNECT_TIMEOUT",
+        "READY_TIMEOUT_SECONDS",
+        "READY_RETRY_SECONDS",
     ] {
         assert!(psql.contains(setting), "psql smoke is missing {setting}");
     }
+    assert!(psql.contains("is_transient_psql_error"));
+    assert!(psql.contains("run_psql_count"));
     assert!(!psql.contains("powershell.exe"));
 
     let compatibility = read_repository_file("scripts/smoke/compat.sh");
