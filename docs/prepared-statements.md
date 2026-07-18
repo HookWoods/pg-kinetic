@@ -65,5 +65,4 @@ Most PostgreSQL drivers use prepared statements differently:
 - some expose explicit prepare APIs
 - some wrap prepared statements in transactions
 
-The compatibility matrix exists to keep those differences visible across Rust, Go, Java, JavaScript and TypeScript, Python, .NET, C, and C++ clients.
-
+The compatibility matrix exists to keep those differences visible across Rust, Go, Java, JavaScript and TypeScript, Python, PHP, .NET, C, and C++ clients.

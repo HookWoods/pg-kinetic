@@ -159,12 +159,16 @@ const config = {
       ],
       navbar: {
         title: 'pg-kinetic',
+        logo: {
+          alt: 'pg-kinetic',
+          src: 'img/favicon.svg',
+        },
         items: [
           {
             type: 'docSidebar',
             sidebarId: 'docsSidebar',
             position: 'left',
-            label: 'Documentation',
+            label: 'Guides',
           },
           {
             type: 'docsVersionDropdown',

@@ -6,6 +6,7 @@ keywords:
   - pg-kinetic compatibility
   - PostgreSQL wire compatibility
   - driver testing
+  - PHP PostgreSQL driver
 ---
 
 # Compatibility Matrix
@@ -31,6 +32,7 @@ pg-kinetic keeps a cross-language compatibility matrix for PostgreSQL clients. T
 | Java | JDBC `DriverManager`, PostgreSQL `DataSource`, HikariCP, Spring JDBC, optional Spring Boot DataSource, optional jOOQ |
 | JavaScript and TypeScript | `pg`, Prisma where available, Kysely |
 | Python | `psycopg` 3, `asyncpg`, SQLAlchemy |
+| PHP | PDO PostgreSQL, `pgsql`, framework database layers that use the PostgreSQL protocol |
 | .NET | Npgsql, optional EF Core provider |
 | C | `libpq` |
 | C++ | optional `libpqxx` |

@@ -17,8 +17,8 @@ repository root.
 ## Linux
 
 Install Rust, Bash, Docker Compose, PostgreSQL client tools, Go, Node.js,
-Python, Java, .NET, and native PostgreSQL development libraries before running
-the complete local workflow.
+Python, PHP, Java, .NET, and native PostgreSQL development libraries before
+running the complete local workflow.
 
 ~~~bash
 docker compose -f bench/compose.yml up -d --build postgres pg-kinetic
