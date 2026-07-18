@@ -197,6 +197,13 @@ impl Proxy {
     }
 
     #[must_use]
+    pub fn with_buffer_pool(config: Config, buffer_pool: ProxyBufferPool) -> Self {
+        let mut proxy = Self::new(config);
+        proxy.buffer_pool = buffer_pool;
+        proxy
+    }
+
+    #[must_use]
     pub fn drain_controller(&self) -> Arc<DrainController> {
         self.lifecycle.drain_controller()
     }

@@ -130,7 +130,7 @@ fn common_forwarding_reuses_session_write_buffers() {
     buffers.append_frontend_frame(b'Q', b"select 2\0");
 
     let current = pool.stats();
-    assert_eq!(current.allocations, initial.allocations + 4);
+    assert_eq!(current.allocations, initial.allocations + 1);
     assert_eq!(current.copies, initial.copies + 2);
     assert_eq!(current.copied_bytes, initial.copied_bytes + 18);
 }
@@ -178,8 +178,8 @@ fn buffer_stats_track_copies_and_growth() {
     let stats = pool.stats();
     assert_eq!(stats.copies, 1);
     assert_eq!(stats.copied_bytes, 64);
-    assert!(stats.allocations > 4);
-    assert!(stats.allocation_bytes >= 32);
+    assert_eq!(stats.allocations, 1);
+    assert!(stats.allocation_bytes >= 69);
 }
 
 #[test]
