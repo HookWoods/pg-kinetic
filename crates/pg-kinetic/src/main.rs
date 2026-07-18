@@ -10,7 +10,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::Config;
 use pg_kinetic::core::benchmark::{BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError};
 use pg_kinetic::core::{
-    lsn::FreshnessStatus, policy::PolicyAction, routing::QueryClass as RoutingQueryClass,
+    lsn::FreshnessStatus,
+    policy::PolicyAction,
+    regression::{RegressionCategory, RegressionPlatform},
+    routing::QueryClass as RoutingQueryClass,
     session::TransactionAccessMode,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
@@ -21,6 +24,10 @@ use pg_kinetic_proxy::benchmark::{
 use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
 use pg_kinetic_proxy::preflight::PreflightRunner;
 use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
+use pg_kinetic_proxy::regression::{
+    load_regression_manifest, redact_sensitive_text, score_benchmark_reports, write_ignored_output,
+    RegressionRunner, RegressionSelection,
+};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -40,6 +47,7 @@ enum Command {
     RoutePreview(RoutePreviewArgs),
     PolicyPreview(PolicyPreviewArgs),
     Benchmark(BenchmarkArgs),
+    Regression(RegressionArgs),
     Profile(ProfileArgs),
     Preflight(PreflightArgs),
 }
@@ -96,6 +104,12 @@ struct BenchmarkArgs {
 }
 
 #[derive(Debug, Args)]
+struct RegressionArgs {
+    #[command(subcommand)]
+    command: RegressionCommand,
+}
+
+#[derive(Debug, Args)]
 struct ProfileArgs {
     #[command(subcommand)]
     command: ProfileCommand,
@@ -115,6 +129,13 @@ enum BenchmarkCommand {
     Validate(BenchmarkValidateArgs),
     Run(BenchmarkRunArgs),
     Compare(BenchmarkCompareArgs),
+    Score(BenchmarkScoreArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum RegressionCommand {
+    List(RegressionListArgs),
+    Run(RegressionRunArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +189,54 @@ struct BenchmarkCompareArgs {
     current: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct BenchmarkScoreArgs {
+    #[arg(long)]
+    baseline: PathBuf,
+
+    #[arg(long)]
+    current: PathBuf,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+
+    #[arg(long)]
+    release: bool,
+}
+
+#[derive(Debug, Args)]
+struct RegressionListArgs {
+    #[arg(long)]
+    manifest: PathBuf,
+
+    #[arg(long, value_enum)]
+    category: Option<RegressionCategory>,
+
+    #[arg(long, value_enum)]
+    platform: Option<RegressionPlatform>,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct RegressionRunArgs {
+    #[arg(long)]
+    manifest: PathBuf,
+
+    #[arg(long, value_enum)]
+    category: Option<RegressionCategory>,
+
+    #[arg(long, value_enum)]
+    platform: Option<RegressionPlatform>,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -196,6 +265,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
         Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
         Some(Command::Benchmark(args)) => return run_benchmark(config, args),
+        Some(Command::Regression(args)) => return run_regression(args),
         Some(Command::Profile(args)) => return run_profile(config, args),
         Some(Command::Preflight(args)) => return run_preflight(config, args),
         None => {}
@@ -307,7 +377,83 @@ fn run_benchmark(_config: Config, args: BenchmarkArgs) -> anyhow::Result<()> {
         BenchmarkCommand::Validate(args) => run_benchmark_validate(args),
         BenchmarkCommand::Run(args) => run_benchmark_run(args),
         BenchmarkCommand::Compare(args) => run_benchmark_compare(args),
+        BenchmarkCommand::Score(args) => run_benchmark_score(args),
     }
+}
+
+fn run_regression(args: RegressionArgs) -> anyhow::Result<()> {
+    match args.command {
+        RegressionCommand::List(args) => run_regression_list(args),
+        RegressionCommand::Run(args) => run_regression_run(args),
+    }
+}
+
+fn run_regression_list(args: RegressionListArgs) -> anyhow::Result<()> {
+    let RegressionListArgs {
+        manifest: manifest_path,
+        category,
+        platform,
+        format,
+    } = args;
+    let manifest = load_regression_manifest(&manifest_path)
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    let selection = RegressionSelection { category, platform };
+    let cases = manifest
+        .cases()
+        .iter()
+        .filter(|case| selection.matches(case))
+        .map(|case| {
+            serde_json::json!({
+                "id": case.id(),
+                "category": case.category().as_str(),
+                "platform": case.platform().as_str(),
+                "timeout_seconds": case.timeout().as_secs(),
+                "services": case
+                    .services()
+                    .iter()
+                    .map(|service| service.as_ref())
+                    .collect::<Vec<_>>(),
+                "success_marker": case.success_marker(),
+                "artifact_policy": case.artifact_policy().as_str(),
+                "artifact_path": case.artifact_path(),
+            })
+        })
+        .collect::<Vec<_>>();
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "ok": true, "cases": cases }))
+                .context("serialize regression case list")?
+        ),
+    }
+    Ok(())
+}
+
+fn run_regression_run(args: RegressionRunArgs) -> anyhow::Result<()> {
+    let RegressionRunArgs {
+        manifest: manifest_path,
+        category,
+        platform,
+        output,
+        format,
+    } = args;
+    let manifest = load_regression_manifest(&manifest_path)
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    let report = RegressionRunner
+        .run(&manifest, RegressionSelection { category, platform })
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    let rendered = report.render_json();
+    if let Some(output) = output {
+        write_ignored_output(&output, &rendered)
+            .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    }
+    match format {
+        OutputFormat::Json => println!("{rendered}"),
+    }
+    if report.has_failures() {
+        process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_profile(_config: Config, args: ProfileArgs) -> anyhow::Result<()> {
@@ -461,6 +607,24 @@ fn run_benchmark_compare(args: BenchmarkCompareArgs) -> anyhow::Result<()> {
         process::exit(1);
     }
 
+    Ok(())
+}
+
+fn run_benchmark_score(args: BenchmarkScoreArgs) -> anyhow::Result<()> {
+    let BenchmarkScoreArgs {
+        baseline,
+        current,
+        format,
+        release,
+    } = args;
+    let report = score_benchmark_reports(&baseline, &current)
+        .map_err(|error| anyhow::anyhow!(redact_sensitive_text(&error.to_string())))?;
+    match format {
+        OutputFormat::Json => println!("{}", report.render_json()),
+    }
+    if release && report.release_failed() {
+        process::exit(1);
+    }
     Ok(())
 }
 

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pg-kinetic regression manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "case"],
+  "properties": {
+    "version": { "const": 1 },
+    "case": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "platform",
+          "timeout_seconds",
+          "services",
+          "command"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "category": {
+            "enum": ["smoke", "protocol", "docs", "benchmark", "compatibility"]
+          },
+          "platform": { "enum": ["linux", "windows", "all"] },
+          "timeout_seconds": { "type": "integer", "minimum": 1 },
+          "services": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "command": { "type": "string", "minLength": 1 },
+          "success_marker": { "type": "string", "minLength": 1 },
+          "artifact_policy": { "enum": ["none", "summary", "large"] },
+          "artifact_path": {
+            "type": "string",
+            "pattern": "^target/(?!private(?:/|$))(?!drafts?(?:/|$))(?!planning(?:/|$))(?!generated-output(?:/|$))(?!.*(?:/(?:private|drafts?|planning|generated-output)(?:/|$))).+"
+          }
+        }
+      }
+    }
+  }
+}

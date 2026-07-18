@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "scenario": {
+    "name": "sample-score"
+  },
+  "results": [
+    {
+      "target": {
+        "comparison": "pg_kinetic"
+      },
+      "metrics": {
+        "p50_ms": 1.0,
+        "p95_ms": 2.0,
+        "p99_ms": 3.0,
+        "p999_ms": 4.0,
+        "throughput_qps": 1000.0,
+        "cpu_per_query": 0.01,
+        "memory_per_client_bytes": 1024.0,
+        "error_rate": 0.0,
+        "checkout_latency_ms": 0.5,
+        "prepared_cache_hit_rate": 0.99
+      }
+    }
+  ]
+}

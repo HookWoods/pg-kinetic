@@ -14,6 +14,8 @@ pub enum PerformanceMetric {
     CpuPerQuery,
     MemoryPerClient,
     ErrorRate,
+    CheckoutLatency,
+    PreparedCacheHitRate,
 }
 
 impl PerformanceMetric {
@@ -28,12 +30,14 @@ impl PerformanceMetric {
             Self::CpuPerQuery => "cpu_per_query",
             Self::MemoryPerClient => "memory_per_client",
             Self::ErrorRate => "error_rate",
+            Self::CheckoutLatency => "checkout_latency",
+            Self::PreparedCacheHitRate => "prepared_cache_hit_rate",
         }
     }
 
     #[must_use]
     pub const fn higher_is_better(self) -> bool {
-        matches!(self, Self::Throughput)
+        matches!(self, Self::Throughput | Self::PreparedCacheHitRate)
     }
 
     #[must_use]
@@ -140,6 +144,33 @@ impl PerformanceBudgetOutcome {
 }
 
 impl fmt::Display for PerformanceBudgetOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum PerformanceScoreOutcome {
+    #[default]
+    Passed,
+    Warning,
+    Failed,
+    MissingBaseline,
+}
+
+impl PerformanceScoreOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "pass",
+            Self::Warning => "warn",
+            Self::Failed => "fail",
+            Self::MissingBaseline => "missing-baseline",
+        }
+    }
+}
+
+impl fmt::Display for PerformanceScoreOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }

@@ -1,0 +1,52 @@
+version = 1
+
+[[case]]
+id = "manifest-contract"
+category = "smoke"
+platform = "all"
+timeout_seconds = 60
+services = []
+command = "cargo test -p pg-kinetic --test regression_manifest"
+success_marker = "test result: ok"
+artifact_policy = "summary"
+
+[[case]]
+id = "protocol-budget-contract"
+category = "protocol"
+platform = "all"
+timeout_seconds = 60
+services = []
+command = "cargo test -p pg-kinetic --test performance_budget"
+success_marker = "test result: ok"
+artifact_policy = "summary"
+
+[[case]]
+id = "documentation-contract"
+category = "docs"
+platform = "all"
+timeout_seconds = 60
+services = []
+command = "cargo test -p pg-kinetic --test regression_manifest"
+success_marker = "test result: ok"
+artifact_policy = "summary"
+
+[[case]]
+id = "performance-score-contract"
+category = "benchmark"
+platform = "all"
+timeout_seconds = 60
+services = []
+command = "cargo test -p pg-kinetic --test performance_score_regression"
+success_marker = "test result: ok"
+artifact_policy = "large"
+artifact_path = "target/regression/performance-score-contract.log"
+
+[[case]]
+id = "linux-compatibility-contract"
+category = "compatibility"
+platform = "linux"
+timeout_seconds = 60
+services = []
+command = "cargo test -p pg-kinetic --test regression_manifest"
+success_marker = "test result: ok"
+artifact_policy = "summary"

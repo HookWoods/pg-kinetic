@@ -18,6 +18,7 @@ pub mod pool;
 pub mod preflight;
 pub mod profile;
 pub mod proxy;
+pub mod regression;
 pub mod reload;
 pub mod routing;
 pub mod runtime_engine;
