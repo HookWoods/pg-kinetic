@@ -23,7 +23,7 @@ cd pg-kinetic
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-This builds the local image, starts PostgreSQL, and exposes pg-kinetic on `localhost:6432`. It does not require a published container image.
+This builds the local image, starts PostgreSQL, and exposes pg-kinetic on `localhost:6432`.
 
 Verify that the proxy is live and ready before pointing an application at it:
 
@@ -69,7 +69,7 @@ docker compose -f deploy/docker-compose.yml down
 | Kubernetes | Rendering and validating the local Helm chart | [Kubernetes deployment](docs/kubernetes.md) |
 | Production rollout | Readiness, drain, migration, and rollback planning | [Production runtime](docs/production-runtime.md) and [Migration](docs/migration.md) |
 
-Public Docker Hub, GHCR, and Helm repository artifacts are published after the first version tag. Until then, build from this repository or use the local chart as described in the installation guide.
+Production Docker installs use `ghcr.io/hookwoods/pg-kinetic:latest` or an immutable release tag. Helm installs use the repository at `https://helm.pgkinetic.dev`.
 
 ## Operator Workflow
 

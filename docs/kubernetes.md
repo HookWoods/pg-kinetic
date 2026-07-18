@@ -1,6 +1,6 @@
 ---
 title: "Kubernetes Deployment"
-description: "Deploy pg-kinetic with the local Helm chart, configure probes and values, understand reload limits, and plan Kubernetes rollback."
+description: "Deploy pg-kinetic with the Helm repository or local chart, configure probes and values, understand reload limits, and plan Kubernetes rollback."
 keywords:
   - pg-kinetic Kubernetes
   - PostgreSQL proxy Helm
@@ -10,11 +10,26 @@ keywords:
 
 # Kubernetes Deployment
 
-pg-kinetic currently ships Kubernetes manifests as a local Helm chart in `charts/pg-kinetic`.
+pg-kinetic ships Kubernetes manifests as a Helm chart. Use the public chart repository for normal installs and the local chart path when you are changing templates.
 
-The chart repository workflow is present, but `https://helm.pgkinetic.dev` is usable only after a version tag publishes the first chart index. Until that release exists, install from the local chart path.
+## Install From The Helm Repository
 
-## Install From The Local Chart
+```bash
+helm repo add pgkinetic https://helm.pgkinetic.dev
+helm repo update
+helm install pg-kinetic pgkinetic/pg-kinetic \
+  --set image.repository=ghcr.io/hookwoods/pg-kinetic \
+  --set image.tag=latest
+```
+
+Use immutable image tags for production rollouts when you want exact rollback targets:
+
+```bash
+helm upgrade --install pg-kinetic pgkinetic/pg-kinetic \
+  --set image.tag=0.1.0
+```
+
+## Test The Local Chart
 
 ```bash
 helm lint ./charts/pg-kinetic
@@ -26,15 +41,6 @@ helm install pg-kinetic ./charts/pg-kinetic \
 ```
 
 Use that local-image form only for a development cluster where `pg-kinetic:local` has been loaded into the node image store. For production clusters, set `image.repository` and `image.tag` to an immutable image that already exists in a registry reachable by the cluster.
-
-After the first chart release exists:
-
-```bash
-helm repo add pgkinetic https://helm.pgkinetic.dev
-helm repo update
-helm install pg-kinetic pgkinetic/pg-kinetic \
-  --set image.tag=0.1.0
-```
 
 ## Deployment Shape
 
@@ -63,8 +69,8 @@ Important values:
 
 | Value | Default | Purpose |
 | --- | --- | --- |
-| `image.repository` | `hookwoods/pg-kinetic` | Container image repository. Override until the first public image exists. |
-| `image.tag` | `0.1.0` | Image tag to deploy. Use only a tag that already exists. |
+| `image.repository` | `ghcr.io/hookwoods/pg-kinetic` | Container image repository. |
+| `image.tag` | `0.1.0` | Image tag to deploy. Override with `latest` for the moving release image, or with an immutable version for controlled rollouts. |
 | `replicaCount` | `2` | Number of proxy pods. |
 | `service.proxyPort` | `6432` | PostgreSQL client-facing service port. |
 | `service.adminPort` | `7000` | Admin listener service port. |

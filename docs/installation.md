@@ -1,6 +1,6 @@
 ---
 title: "Installation"
-description: "Install pg-kinetic from local Docker assets today and prepare for future Docker Hub, GHCR, and Helm chart release workflows."
+description: "Install pg-kinetic from the GHCR container image, Docker Compose, or the pg-kinetic Helm repository."
 keywords:
   - install pg-kinetic
   - Docker PostgreSQL proxy
@@ -10,17 +10,17 @@ keywords:
 
 # Installation
 
-This repository contains local deployment assets for Docker, Docker Compose, and Kubernetes. Public Docker Hub, GHCR, and Helm chart releases are created only after a version tag is pushed.
+Install pg-kinetic from the GitHub Container Registry image or from the Helm chart repository. The local Docker Compose stack remains available for development and smoke testing.
 
-## Current Installation Source
+## Docker
 
-Until the first release tag exists, build the container image from this checkout:
+Pull the release image:
 
 ```bash
-docker build -t pg-kinetic:local .
+docker pull ghcr.io/hookwoods/pg-kinetic:latest
 ```
 
-Run the local image with a mounted config:
+Run the image with a mounted config:
 
 ```bash
 docker run --detach \
@@ -31,13 +31,19 @@ docker run --detach \
   --publish 9090:9090 \
   --publish 9091:9091 \
   --volume "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  pg-kinetic:local \
+  ghcr.io/hookwoods/pg-kinetic:latest \
   --config-file /etc/pg-kinetic/pg-kinetic.toml
+```
+
+Use immutable version tags for production rollouts when you want reproducible deploys:
+
+```bash
+docker pull ghcr.io/hookwoods/pg-kinetic:0.1.0
 ```
 
 ## Docker Compose
 
-The repository includes `deploy/docker-compose.yml`. It starts PostgreSQL, builds `pg-kinetic:local` from the repository root, and mounts `deploy/pg-kinetic.toml`.
+The repository includes `deploy/docker-compose.yml`. It starts PostgreSQL, builds a local pg-kinetic image from the repository root, and mounts `deploy/pg-kinetic.toml`.
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --build
@@ -51,17 +57,16 @@ Clean up:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-## Kubernetes With Local Helm Chart
+## Helm
 
-The repository includes a Helm chart under `charts/pg-kinetic`.
+Add the chart repository and install pg-kinetic:
 
 ```bash
-helm lint ./charts/pg-kinetic
-helm template pg-kinetic ./charts/pg-kinetic
-helm install pg-kinetic ./charts/pg-kinetic \
-  --set image.repository=pg-kinetic \
-  --set image.tag=local \
-  --set image.pullPolicy=Never
+helm repo add pgkinetic https://helm.pgkinetic.dev
+helm repo update
+helm install pg-kinetic pgkinetic/pg-kinetic \
+  --set image.repository=ghcr.io/hookwoods/pg-kinetic \
+  --set image.tag=latest
 ```
 
 The chart renders:
@@ -73,38 +78,21 @@ The chart renders:
 
 The chart does not configure a pre-stop drain hook because the HTTP health server does not implement `/drain`.
 
-## Future Release Images
+## Local Helm Chart
 
-After a version tag matching `v*.*.*` is pushed, the container workflow publishes multi-platform images:
-
-| Registry | Image |
-| --- | --- |
-| Docker Hub | `hookwoods/pg-kinetic:<version>` |
-| GitHub Container Registry | `ghcr.io/hookwoods/pg-kinetic:<version>` |
-
-Use immutable version tags in production once they exist:
+Use the local chart when you are changing chart templates or testing a locally built image:
 
 ```bash
-docker pull hookwoods/pg-kinetic:0.1.0
+helm lint ./charts/pg-kinetic
+helm template pg-kinetic ./charts/pg-kinetic
+helm install pg-kinetic ./charts/pg-kinetic \
+  --set image.repository=pg-kinetic \
+  --set image.tag=local \
+  --set image.pullPolicy=Never
 ```
-
-## Future Helm Repository
-
-The Helm workflow publishes a chart repository for `https://helm.pgkinetic.dev` after a version tag creates the first chart release and chart index.
-
-After that release exists:
-
-```bash
-helm repo add pgkinetic https://helm.pgkinetic.dev
-helm repo update
-helm install pg-kinetic pgkinetic/pg-kinetic \
-  --set image.tag=0.1.0
-```
-
-Until `https://helm.pgkinetic.dev/index.yaml` exists, use the local chart path.
 
 ## Release Publishing
 
-The container workflow runs on tags matching `v*.*.*`. It builds the Dockerfile and publishes `hookwoods/pg-kinetic` and `ghcr.io/hookwoods/pg-kinetic`.
+The container workflow runs when a GitHub Release is published. It builds the Dockerfile and publishes `ghcr.io/hookwoods/pg-kinetic`.
 
-The Helm workflow runs on the same version tags. It packages chart versions, uploads chart archives to GitHub Releases, and updates the chart repository index.
+The Helm workflow runs on the same GitHub Release event. It derives the chart version from the release tag, uploads the chart archive to that release, and updates the chart repository index.

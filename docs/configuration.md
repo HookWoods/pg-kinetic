@@ -236,6 +236,6 @@ Container:
 ```bash
 docker run --rm \
   -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  pg-kinetic:local \
+  ghcr.io/hookwoods/pg-kinetic:latest \
   preflight --config /etc/pg-kinetic/pg-kinetic.toml
 ```

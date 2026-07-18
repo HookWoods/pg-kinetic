@@ -27,7 +27,7 @@ keywords:
           name: 'Is pg-kinetic installed from a published container image today?',
           acceptedAnswer: {
             '@type': 'Answer',
-            text: 'Before the first version tag publishes release artifacts, the current installation path is to build pg-kinetic:local from the repository checkout and run the local Docker Compose or Helm chart assets.',
+            text: 'pg-kinetic can be installed from ghcr.io/hookwoods/pg-kinetic:latest or from the Helm repository at https://helm.pgkinetic.dev. Local Docker Compose remains available for development smoke tests.',
           },
         },
         {
@@ -69,9 +69,9 @@ The proxy keeps clients on the PostgreSQL protocol. Applications connect through
 
 ## Is pg-kinetic installed from a published container image today?
 
-Not yet. Before the first version tag publishes release artifacts, build `pg-kinetic:local` from the repository checkout.
+Yes. Use `ghcr.io/hookwoods/pg-kinetic:latest` for Docker installs and `https://helm.pgkinetic.dev` for Helm installs.
 
-Use the local Docker Compose and Helm chart assets documented in [Installation](./installation.md) and [Quickstart](./quickstart.md). Treat Docker Hub, GitHub Container Registry, and `https://helm.pgkinetic.dev` commands as available only after the corresponding release workflow has completed.
+The local Docker Compose and local chart paths remain useful for development and template changes. See [Installation](./installation.md) and [Quickstart](./quickstart.md).
 
 ## Does pg-kinetic implement an HTTP drain endpoint?
 

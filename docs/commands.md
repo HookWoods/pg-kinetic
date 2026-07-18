@@ -12,7 +12,7 @@ keywords:
 
 The `pg-kinetic` binary can run the proxy or execute operator commands such as preflight, route preview, policy preview, compatibility checks, regression runs, profiling, and benchmark validation.
 
-Examples assume the installed binary or container entrypoint is named `pg-kinetic`. Container examples use the local image from `docker build -t pg-kinetic:local .`.
+Examples assume the installed binary or container entrypoint is named `pg-kinetic`. Container examples use `ghcr.io/hookwoods/pg-kinetic:latest`.
 
 ## Command Model
 
@@ -46,7 +46,7 @@ Container:
 ```bash
 docker run --rm \
   -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  pg-kinetic:local \
+  ghcr.io/hookwoods/pg-kinetic:latest \
   --config-file /etc/pg-kinetic/pg-kinetic.toml
 ```
 
@@ -63,7 +63,7 @@ Container:
 ```bash
 docker run --rm \
   -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  pg-kinetic:local \
+  ghcr.io/hookwoods/pg-kinetic:latest \
   preflight --config /etc/pg-kinetic/pg-kinetic.toml
 ```
 

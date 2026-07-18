@@ -18,7 +18,7 @@ pg-kinetic-core = { path = "../pg-kinetic-core" }
 pg-kinetic-proxy = { path = "../pg-kinetic-proxy" }
 pg-kinetic-wire = { path = "../pg-kinetic-wire" }
 toml = "0.8"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "0.8"
 
 [lints]
