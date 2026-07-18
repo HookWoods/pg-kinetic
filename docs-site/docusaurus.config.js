@@ -24,7 +24,7 @@ const config = {
       ({
         docs: {
           path: '../docs',
-          routeBasePath: 'docs',
+          routeBasePath: '/',
           sidebarPath: require.resolve('./sidebars.js'),
           editUrl: 'https://github.com/hookwoods/pg-kinetic/edit/main/docs/',
         },
@@ -66,8 +66,8 @@ const config = {
           {
             title: 'Documentation',
             items: [
-              { label: 'Guides', to: '/docs/admin' },
-              { label: 'Docs workflow', to: '/docs/docs-site' },
+              { label: 'Guides', to: '/' },
+              { label: 'Docs workflow', to: '/docs-site' },
             ],
           },
           {
