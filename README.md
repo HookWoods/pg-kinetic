@@ -36,6 +36,14 @@ PGPASSWORD=postgres psql -h 127.0.0.1 -p 55432 -U postgres -d pgkinetic -c "sele
 PGPASSWORD=postgres psql -h 127.0.0.1 -p 58432 -U postgres -d pgkinetic -c "select count(*) from accounts;"
 ```
 
+Validate the local performance gate without running load:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File scripts\smoke\performance.ps1
+```
+
+For target setup, report comparison budgets, profile hooks, and admin/metrics inspection, see the [Benchmarking guide](docs/benchmarking.md).
+
 Run simple pgbench baselines:
 
 ```bash

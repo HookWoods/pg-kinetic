@@ -44,7 +44,8 @@ Unset optional fields render as `<none>`.
 | `SHOW RUNTIME` | Runtime lifecycle state, readiness state, selected runtime engine, and process uptime. |
 | `SHOW MIRRORING` | Mirror mode, sample rate, in-flight work, dropped work, and mirrored/skipped/rejected totals. |
 | `SHOW ADAPTIVE` | Adaptive mode, latest recommendation, apply status, and guardrails. |
-| `SHOW BENCHMARKS` | Scenario name, target, comparison, driver, duration, latency percentiles, throughput, error rate, CPU label, and memory label. |
+| `SHOW BENCHMARKS` | Scenario name, target, comparison, driver, duration, latency percentiles, throughput, error rate, CPU label, memory label, target-matrix labels, and comparison outcome. |
+| `SHOW PERFORMANCE` | Regression-budget thresholds and outcomes, profile and process-metric status, process CPU and resident-memory samples, and proxy performance counters. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
 
@@ -63,4 +64,5 @@ Unset optional fields render as `<none>`.
 - Use `SHOW ROUTE MAPS` and `SHOW MIGRATIONS` with the policy guide to confirm that any route or shard override is still within the intended safety envelope.
 - Use `SHOW PINNING` and `SHOW RECOVERY` together to distinguish long-lived state from recovery churn.
 - Use `SHOW RUNTIME`, `SHOW MIRRORING`, `SHOW ADAPTIVE`, and `SHOW BENCHMARKS` with the runtime, mirroring, adaptive, and benchmarking guides to track rollout health.
+- Use `SHOW PERFORMANCE` after a report comparison to review the warning and failure thresholds, observed and baseline values, profile status, and process-metric availability.
 - Use `SHOW SETTINGS` and `SHOW LIMITS` to verify the live configuration after a reload or before a support investigation.

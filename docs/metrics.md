@@ -107,7 +107,8 @@ For policy behavior, pair the routing and sharding metrics below with [docs/poli
 
 | Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
 | --- | --- | --- | --- | --- | --- |
-| `pg_kinetic_benchmark_runs_total` | counter | `engine`, `target`, `outcome` | `1` | Bounded by benchmark engine, comparison target, and run outcome. | Use it to confirm benchmark coverage before comparing results. |
+| `pg_kinetic_benchmark_runs_total` | counter | `engine`, `target`, `outcome` | `1` | Bounded by benchmark engine, comparison target, and run outcome. | Use it to confirm benchmark coverage and report outcome before comparing results. |
+| `pg_kinetic_performance_budget_status` | gauge | `metric`, `outcome` | `1` | Bounded by budget metric and outcome. | A `warning` or `failed` series shows that the latest report exceeded its configured budget. |
 | `pg_kinetic_preflight_findings_total` | counter | `check`, `severity` | `1` | Bounded by preflight check and severity. | A nonzero error series means the configuration did not pass operational validation. |
 
 ## Protocol Timing
@@ -138,6 +139,7 @@ For policy behavior, pair the routing and sharding metrics below with [docs/poli
 - Mirror health: graph `pg_kinetic_mirror_decisions_total`, `pg_kinetic_mirror_in_flight`, and `pg_kinetic_mirror_dropped_total` together.
 - Adaptive apply rate: compare `pg_kinetic_adaptive_recommendations_total` with `pg_kinetic_adaptive_apply_total`.
 - Benchmark coverage: show `pg_kinetic_benchmark_runs_total` by `engine` and `target`.
+- Benchmark budget outcome: show `pg_kinetic_performance_budget_status` by `metric` and `outcome`; investigate non-passing outcomes with `SHOW PERFORMANCE`.
 - Preflight health: chart `pg_kinetic_preflight_findings_total` by `check` and `severity`.
 - Protocol phase latency: graph p95 of `pg_kinetic_protocol_phase_duration_ms` by `phase` and `outcome`, especially `startup`, `auth`, `backend_checkout`, `execute`, `rows`, `reset`, and `cancel`.
 
