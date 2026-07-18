@@ -1,8 +1,8 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use pg_kinetic::core::regression::{
-    RegressionArtifactPolicy, RegressionCase, RegressionCategory, RegressionManifest,
-    RegressionOutcome, RegressionPlatform,
+    RegressionArtifactPolicy, RegressionCase, RegressionCaseSpec, RegressionCategory,
+    RegressionManifest, RegressionOutcome, RegressionPlatform,
 };
 use pg_kinetic_proxy::regression::{
     load_regression_manifest, RegressionRunner, RegressionSelection,
@@ -139,17 +139,17 @@ fn regression_case(
     success_marker: Option<&str>,
     timeout_seconds: u64,
 ) -> RegressionCase {
-    RegressionCase::new(
-        id,
-        RegressionCategory::Smoke,
+    RegressionCase::new(RegressionCaseSpec {
+        id: Arc::from(id),
+        category: RegressionCategory::Smoke,
         platform,
-        Duration::from_secs(timeout_seconds),
-        services,
-        command.into(),
-        success_marker.map(String::from),
-        RegressionArtifactPolicy::None,
-        None::<String>,
-    )
+        timeout: Duration::from_secs(timeout_seconds),
+        services: services.into_iter().map(Arc::from).collect(),
+        command: Arc::from(command.into()),
+        success_marker: success_marker.map(Arc::from),
+        artifact_policy: RegressionArtifactPolicy::None,
+        artifact_path: None,
+    })
     .expect("build regression case")
 }
 

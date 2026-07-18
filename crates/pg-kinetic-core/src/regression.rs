@@ -138,6 +138,19 @@ impl FromStr for RegressionArtifactPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegressionCaseSpec {
+    pub id: Arc<str>,
+    pub category: RegressionCategory,
+    pub platform: RegressionPlatform,
+    pub timeout: Duration,
+    pub services: Vec<Arc<str>>,
+    pub command: Arc<str>,
+    pub success_marker: Option<Arc<str>>,
+    pub artifact_policy: RegressionArtifactPolicy,
+    pub artifact_path: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegressionCase {
     id: Arc<str>,
     category: RegressionCategory,
@@ -151,22 +164,18 @@ pub struct RegressionCase {
 }
 
 impl RegressionCase {
-    pub fn new(
-        id: impl Into<Arc<str>>,
-        category: RegressionCategory,
-        platform: RegressionPlatform,
-        timeout: Duration,
-        services: impl IntoIterator<Item = impl Into<Arc<str>>>,
-        command: impl Into<Arc<str>>,
-        success_marker: Option<impl Into<Arc<str>>>,
-        artifact_policy: RegressionArtifactPolicy,
-        artifact_path: Option<impl Into<Arc<str>>>,
-    ) -> Result<Self, String> {
-        let id = id.into();
-        let command = command.into();
-        let services = services.into_iter().map(Into::into).collect::<Vec<_>>();
-        let success_marker = success_marker.map(Into::into);
-        let artifact_path = artifact_path.map(Into::into);
+    pub fn new(spec: RegressionCaseSpec) -> Result<Self, String> {
+        let RegressionCaseSpec {
+            id,
+            category,
+            platform,
+            timeout,
+            services,
+            command,
+            success_marker,
+            artifact_policy,
+            artifact_path,
+        } = spec;
 
         if id.trim().is_empty() {
             return Err(String::from("regression case id must not be empty"));

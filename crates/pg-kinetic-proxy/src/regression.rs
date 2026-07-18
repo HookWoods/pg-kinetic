@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -15,8 +16,8 @@ use pg_kinetic_core::{
         PerformanceScoreOutcome,
     },
     regression::{
-        RegressionArtifactPolicy, RegressionCase, RegressionCategory, RegressionManifest,
-        RegressionOutcome, RegressionPlatform,
+        RegressionArtifactPolicy, RegressionCase, RegressionCaseSpec, RegressionCategory,
+        RegressionManifest, RegressionOutcome, RegressionPlatform,
     },
 };
 use serde::Deserialize;
@@ -98,17 +99,17 @@ pub fn load_regression_manifest(path: &Path) -> Result<RegressionManifest, Regre
                 .artifact_policy
                 .parse::<RegressionArtifactPolicy>()
                 .map_err(RegressionError::Manifest)?;
-            RegressionCase::new(
-                case.id,
+            RegressionCase::new(RegressionCaseSpec {
+                id: Arc::from(case.id),
                 category,
                 platform,
-                Duration::from_secs(case.timeout_seconds),
-                case.services,
-                case.command,
-                case.success_marker,
+                timeout: Duration::from_secs(case.timeout_seconds),
+                services: case.services.into_iter().map(Arc::from).collect(),
+                command: Arc::from(case.command),
+                success_marker: case.success_marker.map(Arc::from),
                 artifact_policy,
-                case.artifact_path,
-            )
+                artifact_path: case.artifact_path.map(Arc::from),
+            })
             .map_err(RegressionError::Manifest)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -780,7 +781,7 @@ fn redact_url_credentials(value: &mut String) {
     while let Some(scheme_offset) = value[cursor..].find("://") {
         let authority_start = cursor + scheme_offset + 3;
         let authority_end = value[authority_start..]
-            .find(|character: char| matches!(character, '/' | '?' | '#' | ' ' | '\n' | '\r'))
+            .find(['/', '?', '#', ' ', '\n', '\r'])
             .map_or(value.len(), |length| authority_start + length);
         if let Some(at_offset) = value[authority_start..authority_end].rfind('@') {
             let credentials_end = authority_start + at_offset;
