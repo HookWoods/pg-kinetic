@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg-kinetic.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "pg-kinetic.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "pg-kinetic.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: postgres
+      port: {{ .Values.service.proxyPort }}
+      targetPort: postgres
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+    - name: health
+      port: {{ .Values.service.healthPort }}
+      targetPort: health

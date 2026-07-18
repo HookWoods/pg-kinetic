@@ -1,0 +1,21 @@
+services:
+  pg-kinetic:
+    image: hookwoods/pg-kinetic:latest
+    restart: unless-stopped
+    command:
+      - --config-file
+      - /etc/pg-kinetic/pg-kinetic.toml
+    ports:
+      - "6432:6432"
+      - "7000:7000"
+      - "9090:9090"
+      - "9091:9091"
+    volumes:
+      - ./pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro
+      - ./certs:/etc/pg-kinetic/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

@@ -2,6 +2,8 @@
 
 This directory contains the Docusaurus site. The canonical Markdown content remains in [`../docs`](../docs); do not move or duplicate those guides into this project.
 
+The sidebar is manually grouped by audience path and uses Docusaurus generated index pages for major categories. The root page is `../docs/index.mdx`, which uses `DocCardList` to expose the main documentation sections. Installation docs should describe the released container image, Docker Compose, and Helm chart before contributor workflows.
+
 ## Local development
 
 ```bash

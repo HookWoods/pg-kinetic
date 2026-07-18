@@ -1,6 +1,9 @@
-.git
-.idea
-target
-**/target
-node_modules
-**/node_modules
+target/
+docs-site/build/
+.git/
+.idea/
+bench/results/
+bench/profiles/
+node_modules/
+docs-site/node_modules/
+*.log

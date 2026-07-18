@@ -12,6 +12,7 @@ const config = {
 
   onBrokenLinks: 'throw',
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
@@ -36,6 +37,8 @@ const config = {
     ],
   ],
 
+  themes: ['@docusaurus/theme-mermaid'],
+
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
@@ -43,6 +46,9 @@ const config = {
         defaultMode: 'dark',
         disableSwitch: false,
         respectPrefersColorScheme: true,
+      },
+      mermaid: {
+        theme: { light: 'neutral', dark: 'dark' },
       },
       navbar: {
         title: 'pg-kinetic',

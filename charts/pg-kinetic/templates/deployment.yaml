@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg-kinetic.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "pg-kinetic.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "pg-kinetic.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "pg-kinetic.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pg-kinetic.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 65
+      containers:
+        - name: pg-kinetic
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config-file
+            - /etc/pg-kinetic/pg-kinetic.toml
+          {{- if .Values.backendPassword.existingSecret }}
+          env:
+            - name: PG_KINETIC_BACKEND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backendPassword.existingSecret }}
+                  key: {{ .Values.backendPassword.key }}
+          {{- end }}
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.service.proxyPort }}
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+            - name: health
+              containerPort: {{ .Values.service.healthPort }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /drain
+                port: health
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pg-kinetic
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pg-kinetic.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

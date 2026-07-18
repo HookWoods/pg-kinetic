@@ -1,27 +1,88 @@
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
   docsSidebar: [
+    'index',
     {
       type: 'category',
-      label: 'Guides',
+      label: 'Getting Started',
+      link: {
+        type: 'generated-index',
+        title: 'Getting Started',
+        description: 'Install pg-kinetic, choose a deployment target, and understand the first production decisions.',
+        slug: '/getting-started',
+      },
+      collapsed: false,
+      items: ['installation', 'quickstart', 'configuration', 'commands', 'compatibility'],
+    },
+    {
+      type: 'category',
+      label: 'Concepts',
+      link: {
+        type: 'generated-index',
+        title: 'Core Concepts',
+        description: 'How pg-kinetic treats PostgreSQL wire traffic, sessions, routing, pooling, and overload.',
+        slug: '/concepts',
+      },
+      collapsed: false,
+      items: ['architecture', 'transaction-pooling', 'backpressure', 'prepared-statements'],
+    },
+    {
+      type: 'category',
+      label: 'Features',
+      link: {
+        type: 'generated-index',
+        title: 'Features',
+        description: 'Operator-facing features for routing, sharding, policy, mirroring, metrics, and adaptive control.',
+        slug: '/features',
+      },
       items: [
         'admin',
-        'production-runtime',
         'read-routing',
         'sharding',
         'policy',
         'mirroring',
         'adaptive-ops',
-        'benchmarking',
-        'compatibility',
         'metrics',
-        'kubernetes',
       ],
     },
     {
       type: 'category',
+      label: 'Operations',
+      link: {
+        type: 'generated-index',
+        title: 'Operations',
+        description: 'Run pg-kinetic in production with TLS, authentication, health checks, drain, and Kubernetes.',
+        slug: '/operations',
+      },
+      items: [
+        'production-runtime',
+        'tls-and-auth',
+        'health-and-drain',
+        'kubernetes',
+        'troubleshooting',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Benchmarking And Regression',
+      link: {
+        type: 'generated-index',
+        title: 'Benchmarking And Regression',
+        description: 'Maintain performance confidence with benchmark scenarios, compatibility reports, and regression manifests.',
+        slug: '/benchmarking-and-regression',
+      },
+      items: ['benchmarking', 'regression'],
+    },
+    {
+      type: 'category',
       label: 'Contributing',
-      items: ['testing', 'regression', 'docs-site'],
+      link: {
+        type: 'generated-index',
+        title: 'Contributing',
+        description: 'Local validation, documentation workflow, and CI mapping for contributors.',
+        slug: '/contributing',
+      },
+      items: ['testing', 'docs-site'],
     },
   ],
 };

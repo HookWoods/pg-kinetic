@@ -1,0 +1,32 @@
+---
+slug: /
+title: Documentation
+description: pg-kinetic operator documentation for PostgreSQL wire proxying, routing, pooling, sharding, policy, observability, and regression testing.
+---
+
+import DocCardList from '@theme/DocCardList';
+
+# pg-kinetic documentation
+
+pg-kinetic is a PostgreSQL wire proxy for high-concurrency services that need connection pooling, conservative session handling, read routing, policy checks, and performance regression visibility without tying the application to one language driver.
+
+Use these docs as an operator guide. Start with installation, then move through configuration, the runtime model, feature guides, production operations, and validation workflows.
+
+## What pg-kinetic Does
+
+pg-kinetic sits between PostgreSQL clients and PostgreSQL servers. Applications keep speaking the PostgreSQL protocol, while the proxy owns backend checkout, virtual-session safety, route selection, overload handling, and operational inspection.
+
+The current documentation covers:
+
+- connection and transaction pooling behavior
+- virtual sessions, backend pinning, cleanup, and recovery
+- read routing with replica freshness checks and explicit hints
+- sharding route maps and conservative shard-key extraction
+- policy preview, dry-run, deny, route override, and shard override behavior
+- mirroring safety gates and sampling
+- TLS, SCRAM, reload, drain, health, metrics, and Kubernetes operation
+- benchmark scenarios, score regression, compatibility smoke tests, and docs workflow
+
+## Documentation Map
+
+<DocCardList />

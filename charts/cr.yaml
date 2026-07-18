@@ -1,0 +1,5 @@
+owner: hookwoods
+git-repo: pg-kinetic
+pages-branch: gh-pages
+charts-repo: https://helm.pgkinetic.dev
+release-name-template: "{{ .Name }}-{{ .Version }}"

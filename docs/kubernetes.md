@@ -1,39 +1,73 @@
-# Kubernetes deployment
+# Kubernetes Deployment
 
-pg-kinetic can participate in Kubernetes lifecycle management without a controller or custom
-resource. The same probe and drain semantics are also suitable for systemd, Nomad, and other
-process supervisors.
+pg-kinetic is stateless from the Kubernetes control-plane perspective. Each pod owns only its active client and backend sockets; route maps, policy files, TLS material, and user stores are supplied as configuration.
 
-## Deployment shape
+The production Kubernetes path is the published Helm repository at `https://helm.pgkinetic.dev`.
 
-Run one pg-kinetic process per pod and expose separate ports for PostgreSQL traffic, health
-probes, metrics, and the optional admin listener. Keep the health and admin listeners private to
-the pod or cluster network.
+## Helm Install
 
-```yaml
-spec:
-  terminationGracePeriodSeconds: 65
-  containers:
-    - name: pg-kinetic
-      ports:
-        - { name: postgres, containerPort: 6543 }
-        - { name: health, containerPort: 8080 }
-      startupProbe:
-        httpGet: { path: /readyz, port: health }
-        periodSeconds: 2
-        failureThreshold: 15
-      readinessProbe:
-        httpGet: { path: /readyz, port: health }
-        periodSeconds: 2
-      livenessProbe:
-        httpGet: { path: /healthz, port: health }
-        periodSeconds: 10
-      lifecycle:
-        preStop:
-          httpGet: { path: /drain, port: health }
+Add the chart repository:
+
+```bash
+helm repo add pgkinetic https://helm.pgkinetic.dev
+helm repo update
 ```
 
-## Lifecycle settings
+Create a backend-password secret when the config references `PG_KINETIC_BACKEND_PASSWORD`:
+
+```bash
+kubectl create secret generic pg-kinetic-backend \
+  --from-literal=backend-password='replace-me'
+```
+
+Install:
+
+```bash
+helm install pg-kinetic pgkinetic/pg-kinetic \
+  --set image.tag=0.1.0 \
+  --set backendPassword.existingSecret=pg-kinetic-backend
+```
+
+For local chart development, use `helm install pg-kinetic ./charts/pg-kinetic`. Override `values.yaml` for your backend address, TLS paths, admin settings, resource requests, and replica count.
+
+## Deployment Shape
+
+The chart creates:
+
+- a Deployment running one pg-kinetic process per pod
+- a ConfigMap containing `pg-kinetic.toml`
+- a Service exposing PostgreSQL, admin, and health ports
+- readiness and liveness probes
+- a pre-stop drain hook
+- non-root container security defaults
+
+Default service ports:
+
+| Port | Purpose |
+| --- | --- |
+| `6432` | PostgreSQL client traffic |
+| `7000` | PostgreSQL-compatible admin listener |
+| `9090` | Prometheus metrics |
+| `9091` | HTTP health and readiness |
+
+Keep health and admin listeners private to the cluster network unless there is a deliberate operational reason to expose them.
+
+## Helm Values
+
+Important values:
+
+| Value | Purpose |
+| --- | --- |
+| `image.repository` | Container repository. |
+| `image.tag` | Immutable release tag to deploy. |
+| `replicaCount` | Number of proxy pods. |
+| `service.proxyPort` | PostgreSQL client-facing service port. |
+| `service.adminPort` | Admin listener service port. |
+| `service.healthPort` | HTTP health service port. |
+| `backendPassword.existingSecret` | Secret containing the backend password, when required. |
+| `config` | Full `pg-kinetic.toml` rendered into a ConfigMap. |
+
+## Lifecycle Settings
 
 The lifecycle section keeps Kubernetes policy explicit:
 
@@ -48,46 +82,33 @@ startup_backend_checks_enabled = true
 termination_grace_period_seconds = 65
 
 [drain]
-drain_grace_ms = 30000
+drain_timeout_ms = 45000
+reject_new_clients_during_drain = true
 ```
 
-`termination_grace_period_seconds` documents the value that should be copied to the pod spec. It
-should be greater than the drain grace plus the shutdown grace; the default leaves five seconds
-of scheduling margin.
+`termination_grace_period_seconds` documents the value that should be copied to the pod spec. It should be greater than the drain window so the process can reject new traffic, wait for active sessions, and shut down cleanly.
 
-## Probes and drain semantics
+## Probes And Drain Semantics
 
-- The startup probe remains unsuccessful until listeners are initialized and, when enabled,
-  backend pool warmup checks complete.
-- Readiness returns unsuccessful during drain by default, so Services stop sending new sessions
-  before the process exits. Set `readiness_fail_during_drain = false` only when the surrounding
-  supervisor deliberately treats draining as ready.
-- Liveness remains successful throughout normal drain and shutdown coordination. A rollout must
-  not restart a pod merely because it is draining.
-- Calling the configured preStop drain endpoint starts drain with the `pre_stop_hook` reason.
-  Repeated calls are safe and do not restart the grace period.
-- SIGTERM follows the same sequence: stop accepting sessions, wait for drain grace, apply shutdown
-  grace for remaining sessions, then stop.
-- The lifecycle admin snapshot reports the lifecycle state, readiness state, initialized
-  listeners and pools, active sessions, shutdown reason, transition count, and force-close state.
+- The startup path remains unavailable until listeners are initialized and, when enabled, backend pool warmup checks complete.
+- Readiness returns unavailable during drain by default, so Services stop sending new sessions before the process exits.
+- Liveness remains available throughout normal drain and shutdown coordination.
+- Calling the configured pre-stop drain endpoint starts drain with the `pre_stop_hook` reason.
+- Repeated pre-stop calls are safe and do not restart the grace period.
+- SIGTERM follows the same sequence: stop accepting sessions, wait for drain, apply shutdown grace, then stop.
 
-## Rolling restarts
+## Rolling Restarts
 
-Use the preStop hook and keep `terminationGracePeriodSeconds` longer than both runtime grace
-windows. During a rolling restart, pg-kinetic becomes not-ready before waiting for existing
-sessions. Configure a PodDisruptionBudget and Deployment surge/unavailable values according to
-the connection capacity required during that drain window.
+Use the pre-stop hook and keep `terminationGracePeriodSeconds` longer than the configured drain timeout. During a rolling restart, pg-kinetic becomes not-ready before waiting for existing sessions.
 
-## Configuration reload
+Configure a PodDisruptionBudget and Deployment surge/unavailable values according to the connection capacity required during that drain window.
 
-Use the existing file reload mechanism for reloadable routing and policy changes. Lifecycle
-listener addresses, probe wiring, and pod termination values are rollout-time settings; change
-them through a new Deployment revision. A reload does not emulate pod replacement and must not be
-used as a substitute for a drain.
+## Configuration Reload
 
-## Controller-free limitations
+Use the file reload mechanism for reloadable routing and policy changes. Listener addresses, probe wiring, pod termination values, and secret mounts are rollout-time settings; change them through a new Deployment revision.
 
-The built-in behavior manages only the local process. It does not create Services, coordinate
-PodDisruptionBudgets, sequence drains across replicas, mutate Deployment settings, or reconcile
-configuration. Use standard Kubernetes resources or an external deployment system for those
-cluster-level responsibilities.
+Reload does not emulate pod replacement and must not be used as a substitute for drain.
+
+## Operator Status
+
+The repository ships a Helm chart, not a Kubernetes operator. Do not rely on CRDs, controller-managed failover, automatic resharding, or operator-managed config reconciliation. Use ordinary Deployment, Service, ConfigMap, Secret, readiness, and pre-stop primitives.

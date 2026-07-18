@@ -1,7 +1,3 @@
----
-slug: /
----
-
 # Admin Endpoint
 
 pg-kinetic exposes a separate PostgreSQL-compatible admin listener for operational reads.
