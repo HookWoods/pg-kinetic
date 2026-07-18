@@ -338,6 +338,35 @@ async fn client_tls_disable_denies_ssl_request_with_n() {
 }
 
 #[tokio::test]
+async fn client_tls_disable_accepts_plain_startup_after_ssl_denial() {
+    let (proxy_addr, mut events) = spawn_proxy(ClientTlsMode::Disable).await;
+    let mut stream = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+
+    stream
+        .write_all(&ssl_request_packet())
+        .await
+        .expect("ssl request");
+
+    let mut response = [0_u8; 1];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("ssl response");
+    assert_eq!(response, *b"N");
+
+    stream.write_all(&startup_packet()).await.expect("startup");
+    let mut startup_response = [0_u8; 256];
+    let read = time::timeout(Duration::from_secs(1), stream.read(&mut startup_response))
+        .await
+        .expect("startup response timeout")
+        .expect("startup response");
+    assert!(read > 0, "plain startup should reach backend");
+
+    let events = collect_events(&mut events).await;
+    assert!(events.iter().any(|event| event == "backend_startup"));
+}
+
+#[tokio::test]
 async fn client_tls_allow_accepts_plain_startup() {
     let (proxy_addr, mut events) = spawn_proxy(ClientTlsMode::Allow).await;
 

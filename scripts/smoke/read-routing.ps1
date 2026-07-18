@@ -3,11 +3,17 @@ param(
     [int]$Port = 58432,
     [string]$User = "postgres",
     [string]$Database = "pgkinetic",
-    [string]$Password = "postgres"
+    [string]$Password = "postgres",
+    [string]$SslMode = "disable",
+    [string]$GssEncMode = "disable",
+    [int]$ConnectTimeoutSeconds = 10
 )
 
 $ErrorActionPreference = "Stop"
 $env:PGPASSWORD = $Password
+$env:PGSSLMODE = $SslMode
+$env:PGGSSENCMODE = $GssEncMode
+$env:PGCONNECT_TIMEOUT = $ConnectTimeoutSeconds
 
 if (-not (Get-Command psql -ErrorAction SilentlyContinue)) {
     throw "psql is required on PATH for read routing smoke"

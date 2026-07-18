@@ -3,11 +3,17 @@ param(
     [int]$Port = 58432,
     [string]$User = "postgres",
     [string]$Database = "pgkinetic",
-    [string]$Password = "postgres"
+    [string]$Password = "postgres",
+    [string]$SslMode = "disable",
+    [string]$GssEncMode = "disable",
+    [int]$ConnectTimeoutSeconds = 10
 )
 
 $ErrorActionPreference = "Stop"
 $env:PGPASSWORD = $Password
+$env:PGSSLMODE = $SslMode
+$env:PGGSSENCMODE = $GssEncMode
+$env:PGCONNECT_TIMEOUT = $ConnectTimeoutSeconds
 
 $result = psql -h $HostName -p $Port -U $User -d $Database -Atc "select count(*) from accounts;"
 
