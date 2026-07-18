@@ -977,6 +977,7 @@ impl LabelPolicy {
     pub const SOCKET: &'static str = "socket";
     pub const SQLSTATE: &'static str = "sqlstate";
     pub const STATUS: &'static str = "status";
+    pub const STAGE: &'static str = "stage";
     pub const STRATEGY: &'static str = "strategy";
     pub const POLICY: &'static str = "policy";
     pub const LIFECYCLE_STATE: &'static str = "lifecycle_state";
@@ -998,6 +999,7 @@ impl LabelPolicy {
                 | Self::SOCKET
                 | Self::SQLSTATE
                 | Self::STATUS
+                | Self::STAGE
                 | Self::STRATEGY
                 | Self::POLICY
                 | Self::HOOK

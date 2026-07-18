@@ -451,7 +451,15 @@ pub fn redact_debug_value(value: impl AsRef<str>) -> String {
 }
 
 pub fn emit_debug_sample(sampler: &DebugSampler, sample: DebugSample) {
-    let Some(sample) = sampler.sample(sample.session_id, sample) else {
+    emit_debug_sample_with(sampler, sample.session_id, || sample);
+}
+
+pub fn emit_debug_sample_with(
+    sampler: &DebugSampler,
+    session_id: u64,
+    build_sample: impl FnOnce() -> DebugSample,
+) {
+    let Some(sample) = sampler.sample_with(session_id, build_sample) else {
         return;
     };
 

@@ -406,9 +406,10 @@ impl Proxy {
                     let client_snapshot_handle = snapshot_store.client_handle();
                     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
                     client_snapshot_handle.register(session_id);
-                    telemetry::emit_debug_sample(
+                    telemetry::emit_debug_sample_with(
                         &debug_sampler,
-                        DebugSample::client_accepted(
+                        session_id,
+                        || DebugSample::client_accepted(
                             session_id,
                             client_addr,
                             config_snapshot.tls.client_tls_mode.as_str(),
@@ -664,8 +665,7 @@ async fn handle_client(
     }
     backend.release().await;
     startup_timer.finish(MetricOutcome::Ok);
-    telemetry::emit_debug_sample(
-        &debug_sampler,
+    telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
         DebugSample::startup_complete(
             session_id,
             route_key(
@@ -677,8 +677,8 @@ async fn handle_client(
             auth.auth_mode.as_str(),
             client_tls_mode.as_str(),
             MetricOutcome::Ok,
-        ),
-    );
+        )
+    });
     update_client_snapshot(
         &client_snapshot_handle,
         session_id,
@@ -895,8 +895,7 @@ async fn handle_client(
                             }
                         }
 
-                        telemetry::emit_debug_sample(
-                            &debug_sampler,
+                        telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
                             DebugSample::query_complete(
                                 session_id,
                                 route_key(
@@ -914,8 +913,8 @@ async fn handle_client(
                                 },
                                 None,
                                 &[],
-                            ),
-                        );
+                            )
+                        });
                         session.mark_ready_after_copy();
                         let action = cleanup_action(&session, status);
                         metrics::increment_cleanup(action);
@@ -952,20 +951,23 @@ async fn handle_client(
                             CleanupAction::KeepPinned => {
                                 if let Some(reason) = session.pin_reason() {
                                     metrics::increment_pin(reason);
-                                    telemetry::emit_debug_sample(
+                                    telemetry::emit_debug_sample_with(
                                         &debug_sampler,
-                                        DebugSample::pinning(
-                                            session_id,
-                                            route_key(
-                                                &route_database,
-                                                &route_user,
-                                                route_application_name.as_deref(),
-                                                client_addr,
-                                            ),
-                                            reason,
-                                            backend.backend_id(),
-                                            session_started.elapsed(),
-                                        ),
+                                        session_id,
+                                        || {
+                                            DebugSample::pinning(
+                                                session_id,
+                                                route_key(
+                                                    &route_database,
+                                                    &route_user,
+                                                    route_application_name.as_deref(),
+                                                    client_addr,
+                                                ),
+                                                reason,
+                                                backend.backend_id(),
+                                                session_started.elapsed(),
+                                            )
+                                        },
                                     );
                                     record_pinning_snapshot(
                                         &snapshot_store,
@@ -1230,14 +1232,13 @@ async fn checkout_backend(
         CheckoutMode::AllowConnect => PoolCheckoutMode::AllowConnect,
     };
     if matches!(request.target, RoutingTarget::Wait { .. }) {
-        telemetry::emit_debug_sample(
-            &request.debug_sampler,
+        telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
             DebugSample::overload_rejected(
                 request.session_id,
                 request.route.clone(),
                 checkout_mode_label(request.mode),
-            ),
-        );
+            )
+        });
         timer.finish(MetricOutcome::Rejected);
         return Err(CheckoutFailure::Overload(
             "backend checkout is waiting for a replica",
@@ -1246,14 +1247,13 @@ async fn checkout_backend(
     if matches!(request.target, RoutingTarget::Reject { .. }) {
         let (sqlstate, message) = checkout_postgres_error_for_target(&request.target)
             .unwrap_or((CANNOT_CONNECT_NOW_SQLSTATE, REPLICA_UNAVAILABLE_MESSAGE));
-        telemetry::emit_debug_sample(
-            &request.debug_sampler,
+        telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
             DebugSample::overload_rejected(
                 request.session_id,
                 request.route.clone(),
                 checkout_mode_label(request.mode),
-            ),
-        );
+            )
+        });
         timer.finish(MetricOutcome::Rejected);
         return Err(CheckoutFailure::Postgres { sqlstate, message });
     }
@@ -1267,58 +1267,54 @@ async fn checkout_backend(
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
         )) => {
-            telemetry::emit_debug_sample(
-                &request.debug_sampler,
+            telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::overload_rejected(
                     request.session_id,
                     request.route.clone(),
                     checkout_mode_label(request.mode),
-                ),
-            );
+                )
+            });
             timer.finish(MetricOutcome::Rejected);
             return Err(CheckoutFailure::Overload("backend checkout queue is full"));
         }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Timeout,
         )) => {
-            telemetry::emit_debug_sample(
-                &request.debug_sampler,
+            telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::overload_rejected(
                     request.session_id,
                     request.route.clone(),
                     checkout_mode_label(request.mode),
-                ),
-            );
+                )
+            });
             timer.finish(MetricOutcome::Timeout);
             return Err(CheckoutFailure::Overload("backend checkout timed out"));
         }
         Err(crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Closed,
         )) => {
-            telemetry::emit_debug_sample(
-                &request.debug_sampler,
+            telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::backend_checkout(
                     request.session_id,
                     request.route.clone(),
                     checkout_mode_label(request.mode),
                     MetricOutcome::Canceled,
                     started.elapsed(),
-                ),
-            );
+                )
+            });
             timer.finish(MetricOutcome::Canceled);
             return Err(CheckoutFailure::Close);
         }
         Err(crate::pool::PoolError::Connect(error)) => {
-            telemetry::emit_debug_sample(
-                &request.debug_sampler,
+            telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::backend_checkout(
                     request.session_id,
                     request.route.clone(),
                     checkout_mode_label(request.mode),
                     MetricOutcome::Error,
                     started.elapsed(),
-                ),
-            );
+                )
+            });
             timer.finish(MetricOutcome::Error);
             return Err(CheckoutFailure::Fatal(error.context(request.context)));
         }
@@ -1330,16 +1326,15 @@ async fn checkout_backend(
             .map_err(CheckoutFailure::Fatal)?;
     }
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "request", "ok");
-    telemetry::emit_debug_sample(
-        &request.debug_sampler,
+    telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
         DebugSample::backend_checkout(
             request.session_id,
             request.route.clone(),
             checkout_mode_label(request.mode),
             MetricOutcome::Ok,
             started.elapsed(),
-        ),
-    );
+        )
+    });
     timer.finish(MetricOutcome::Ok);
     Ok(backend)
 }
@@ -1947,10 +1942,9 @@ impl ClientSnapshotGuard {
 impl Drop for ClientSnapshotGuard {
     fn drop(&mut self) {
         let _ = self.handle.remove(self.client_id);
-        telemetry::emit_debug_sample(
-            &self.debug_sampler,
-            DebugSample::client_close(self.session_id, self.client_addr, self.started.elapsed()),
-        );
+        telemetry::emit_debug_sample_with(&self.debug_sampler, self.session_id, || {
+            DebugSample::client_close(self.session_id, self.client_addr, self.started.elapsed())
+        });
     }
 }
 
@@ -3059,26 +3053,24 @@ async fn recover_backend(
         Ok(Ok(reuse)) => {
             metrics::increment_recovery(trigger, action, "ok");
             recovery_snapshot_handle.record(trigger, action, MetricOutcome::Ok);
-            telemetry::emit_debug_sample(
-                &debug_sampler,
-                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Ok),
-            );
+            telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
+                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Ok)
+            });
             Ok(reuse)
         }
         Ok(Err(error)) => {
             if buffer_limit_kind(&error).is_some() {
                 metrics::increment_recovery(trigger, action, "buffer_limit");
                 recovery_snapshot_handle.record(trigger, action, MetricOutcome::Discarded);
-                telemetry::emit_debug_sample(
-                    &debug_sampler,
+                telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
                     DebugSample::recovery(
                         session_id,
                         route_key,
                         trigger,
                         action,
                         MetricOutcome::Discarded,
-                    ),
-                );
+                    )
+                });
                 return Ok(false);
             }
             metrics::increment_recovery(trigger, action, "error");
@@ -3089,25 +3081,23 @@ async fn recover_backend(
                 MetricOutcome::Error,
                 error.to_string(),
             );
-            telemetry::emit_debug_sample(
-                &debug_sampler,
-                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Error),
-            );
+            telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
+                DebugSample::recovery(session_id, route_key, trigger, action, MetricOutcome::Error)
+            });
             Err(error)
         }
         Err(_) => {
             metrics::increment_recovery(trigger, action, "timeout");
             recovery_snapshot_handle.record(trigger, action, MetricOutcome::Timeout);
-            telemetry::emit_debug_sample(
-                &debug_sampler,
+            telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
                 DebugSample::recovery(
                     session_id,
                     route_key,
                     trigger,
                     action,
                     MetricOutcome::Timeout,
-                ),
-            );
+                )
+            });
             Ok(false)
         }
     }

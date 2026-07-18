@@ -14,6 +14,7 @@ fn metric_catalog_and_label_validation_use_static_definitions() {
     let catalog = metric_catalog();
     assert_eq!(catalog.as_ptr(), metric_catalog().as_ptr());
     assert!(!catalog.is_empty());
+    assert!(LabelPolicy::allows("stage"));
 
     for descriptor in catalog {
         for label in descriptor.labels {
@@ -30,12 +31,21 @@ fn metric_catalog_and_label_validation_use_static_definitions() {
 }
 
 #[test]
-fn disabled_otel_configuration_needs_no_endpoint() {
-    let disabled = ObservabilityConfig::default();
+fn disabled_otel_configuration_skips_endpoint_setup() {
+    let disabled = ObservabilityConfig {
+        otel_endpoint: Some(String::from("not-a-valid-otlp-endpoint")),
+        ..ObservabilityConfig::default()
+    };
     assert!(disabled.metrics_addr.is_none());
     assert!(!disabled.otel_enabled);
     assert_eq!(disabled.trace_sampling_ratio(), 0.0);
     assert!(build_otel_tracer_provider(&disabled).is_ok());
+
+    let enabled_without_endpoint = ObservabilityConfig {
+        otel_enabled: true,
+        ..ObservabilityConfig::default()
+    };
+    assert!(build_otel_tracer_provider(&enabled_without_endpoint).is_err());
 
     let enabled_metrics = ObservabilityConfig {
         metrics_addr: Some(
