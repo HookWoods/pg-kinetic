@@ -1,0 +1,35 @@
+name: Linux tests
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+      - name: Start local PostgreSQL stack
+        run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+      - name: Run Linux checks
+        run: cargo run -p xtask -- ci-linux
+      - name: Stop local PostgreSQL stack
+        if: always()
+        run: docker compose -f bench/compose.yml down --volumes
