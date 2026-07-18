@@ -4,7 +4,7 @@
 const config = {
   title: 'pg-kinetic',
   tagline: 'PostgreSQL wire proxy documentation',
-  url: 'https://pg-kinetic.dev',
+  url: 'https://docs.pgkinetic.dev',
   baseUrl: '/',
   organizationName: 'hookwoods',
   projectName: 'pg-kinetic',
@@ -39,6 +39,11 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
+      colorMode: {
+        defaultMode: 'dark',
+        disableSwitch: false,
+        respectPrefersColorScheme: true,
+      },
       navbar: {
         title: 'pg-kinetic',
         items: [
