@@ -20,13 +20,21 @@ if "$dry_run"; then
   exit 0
 fi
 
-temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pg-kinetic-sharding-smoke.XXXXXX")"
+if ! CARGO="$(resolve_command cargo)"; then
+  skip "cargo is not available"
+  exit 0
+fi
+
+temp_dir_rel="target/smoke/sharding-$$"
+temp_dir="$REPO_ROOT/$temp_dir_rel"
+mkdir -p "$temp_dir"
 cleanup() {
   rm -rf "$temp_dir"
 }
 trap cleanup EXIT
 
-config_path="$temp_dir/sharding.toml"
+config_path_rel="$temp_dir_rel/sharding.toml"
+config_path="$REPO_ROOT/$config_path_rel"
 cat >"$config_path" <<'CONFIG'
 [sharding]
 sharding_enabled = true
@@ -54,8 +62,8 @@ CONFIG
 
 output="$(
   cd "$REPO_ROOT"
-  cargo run --quiet -p pg-kinetic -- route-preview \
-    --config "$config_path" \
+  "$CARGO" run --quiet -p pg-kinetic -- route-preview \
+    --config "$config_path_rel" \
     --database billing \
     --user reporter \
     --sql "select * from public.orders where tenant_id = 'tenant-a'"

@@ -48,6 +48,10 @@ fn bash_scripts_use_the_shared_contract() {
             "{path} must use the shared Bash helpers"
         );
     }
+
+    let admin_wire = read_repository_file("scripts/lib/admin_wire.py");
+    assert!(admin_wire.contains("startup_packet"));
+    assert!(admin_wire.contains("query_packet"));
 }
 
 #[test]
@@ -121,4 +125,20 @@ fn testing_guide_documents_linux_and_windows_workflows() {
     assert!(guide.contains("## Windows"));
     assert!(guide.contains("cargo run -p xtask -- ci-linux"));
     assert!(guide.contains("scripts/smoke/performance.sh"));
+}
+
+#[test]
+fn xtask_linux_smoke_runs_the_full_smoke_set() {
+    let xtask = read_repository_file("crates/xtask/src/main.rs");
+    for script in [
+        "scripts/smoke/psql.sh",
+        "scripts/smoke/read-routing.sh",
+        "scripts/smoke/compat.sh",
+        "scripts/smoke/runtime.sh",
+        "scripts/smoke/mirroring.sh",
+        "scripts/smoke/sharding.sh",
+        "scripts/smoke/performance.sh",
+    ] {
+        assert!(xtask.contains(script), "smoke-linux must run {script}");
+    }
 }

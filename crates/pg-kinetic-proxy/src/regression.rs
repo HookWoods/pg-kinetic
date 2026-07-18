@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -308,12 +308,7 @@ impl RegressionRunner {
                 break Some(status);
             }
             if started.elapsed() >= case.timeout() {
-                child.kill().map_err(|error| {
-                    RegressionError::Runner(format!(
-                        "stop timed out regression case '{}': {error}",
-                        case.id()
-                    ))
-                })?;
+                terminate_process_tree(&mut child)?;
                 child.wait().map_err(|error| {
                     RegressionError::Runner(format!(
                         "wait for timed out regression case '{}': {error}",
@@ -358,6 +353,36 @@ impl RegressionRunner {
 
         Ok(report(RegressionOutcome::Passed, duration_ms, None))
     }
+}
+
+fn terminate_process_tree(child: &mut Child) -> Result<(), RegressionError> {
+    terminate_descendants(child.id());
+    child.kill().or_else(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            Ok(())
+        } else {
+            Err(RegressionError::Runner(format!(
+                "stop timed out regression process {}: {error}",
+                child.id()
+            )))
+        }
+    })
+}
+
+#[cfg(windows)]
+fn terminate_descendants(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .status();
+}
+
+#[cfg(not(windows))]
+fn terminate_descendants(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-P", pid.as_str()])
+        .status();
 }
 
 pub fn write_ignored_output(path: &Path, contents: &str) -> Result<(), RegressionError> {
@@ -468,6 +493,7 @@ pub struct PerformanceScoreReport {
     baseline: String,
     current: String,
     outcome: PerformanceScoreOutcome,
+    error: Option<String>,
     entries: Vec<PerformanceScoreEntry>,
 }
 
@@ -493,10 +519,14 @@ impl PerformanceScoreReport {
     #[must_use]
     pub fn render_json(&self) -> String {
         json!({
-            "ok": !matches!(self.outcome, PerformanceScoreOutcome::Failed),
+            "ok": matches!(
+                self.outcome,
+                PerformanceScoreOutcome::Passed | PerformanceScoreOutcome::Warning
+            ),
             "outcome": self.outcome.as_str(),
             "baseline": redact_sensitive_text(&self.baseline),
             "current": redact_sensitive_text(&self.current),
+            "error": self.error.as_ref().map(|error| redact_sensitive_text(error)),
             "results": self.entries.iter().map(|entry| json!({
                 "scenario": entry.scenario,
                 "target": entry.target,
@@ -558,6 +588,21 @@ pub fn score_benchmark_reports(
             baseline.scenario.name, current.scenario.name
         )));
     }
+    let baseline_targets = score_target_set(&baseline)?;
+    let current_targets = score_target_set(&current)?;
+    if baseline_targets != current_targets {
+        let error = format!(
+            "incompatible benchmark reports: target sets differ (baseline {:?}, current {:?})",
+            baseline_targets, current_targets
+        );
+        return Ok(PerformanceScoreReport {
+            baseline: baseline_path.display().to_string(),
+            current: current_path.display().to_string(),
+            outcome: PerformanceScoreOutcome::Failed,
+            error: Some(error),
+            entries: Vec::new(),
+        });
+    }
 
     let budgets = score_budgets();
     let mut entries = Vec::new();
@@ -603,8 +648,29 @@ pub fn score_benchmark_reports(
         baseline: baseline_path.display().to_string(),
         current: current_path.display().to_string(),
         outcome,
+        error: None,
         entries,
     })
+}
+
+fn score_target_set(report: &StoredScoreReport) -> Result<BTreeSet<String>, RegressionError> {
+    report
+        .results
+        .iter()
+        .map(|result| {
+            result
+                .target
+                .comparison
+                .parse::<BenchmarkComparison>()
+                .map(|comparison| comparison.as_str().to_owned())
+                .map_err(|_| {
+                    RegressionError::Score(format!(
+                        "report contains unsupported target comparison '{}'",
+                        result.target.comparison
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn load_score_report(path: &Path) -> Result<StoredScoreReport, RegressionError> {

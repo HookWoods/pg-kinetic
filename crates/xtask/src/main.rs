@@ -114,7 +114,31 @@ fn run_standard_command(root: &Path, command: &str, options: &Options) -> Result
             run_command(
                 root,
                 "bash",
+                vec!["scripts/smoke/read-routing.sh"],
+                options.dry_run,
+            )?;
+            run_command(
+                root,
+                "bash",
                 vec!["scripts/smoke/compat.sh"],
+                options.dry_run,
+            )?;
+            run_command(
+                root,
+                "bash",
+                vec!["scripts/smoke/runtime.sh"],
+                options.dry_run,
+            )?;
+            run_command(
+                root,
+                "bash",
+                vec!["scripts/smoke/mirroring.sh"],
+                options.dry_run,
+            )?;
+            run_command(
+                root,
+                "bash",
+                vec!["scripts/smoke/sharding.sh"],
                 options.dry_run,
             )?;
             run_command(
