@@ -24,9 +24,10 @@ if "$dry_run"; then
   exit 0
 fi
 
-report_path="$(temporary_output_path pg-kinetic-performance-smoke json)"
+report_path="bench/results/performance-smoke-$$.json"
+report_file="$REPO_ROOT/$report_path"
 cleanup() {
-  rm -f "$report_path"
+  rm -f "$report_file"
 }
 trap cleanup EXIT
 
@@ -35,11 +36,11 @@ run_from_repo_root bash scripts/bench/run-performance.sh \
   --output "$report_path" \
   --dry-run
 
-if ! grep -q '"ok":true' "$report_path" || ! grep -q '"dry_run":true' "$report_path"; then
+if ! grep -q '"ok":true' "$report_file" || ! grep -q '"dry_run":true' "$report_file"; then
   echo "benchmark smoke did not produce a valid dry-run report" >&2
   exit 1
 fi
-if grep -q 'benchmark-secret' "$report_path"; then
+if grep -q 'benchmark-secret' "$report_file"; then
   echo "benchmark smoke report contains an unredacted credential" >&2
   exit 1
 fi
