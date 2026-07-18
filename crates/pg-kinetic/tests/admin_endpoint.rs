@@ -136,6 +136,35 @@ async fn unknown_command_returns_error_response() {
 }
 
 #[tokio::test]
+async fn show_performance_refreshes_runtime_data_with_numeric_float_defaults() {
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
+    let admin_addr = free_port().await;
+    let (run_handle, _, snapshot_store) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+
+    let frames = admin_query(admin_addr, "SHOW PERFORMANCE").await;
+    let data_rows = frames
+        .iter()
+        .filter(|frame| frame.tag == b'D')
+        .map(data_row_values)
+        .collect::<Vec<_>>();
+    assert_eq!(data_rows.len(), 1);
+
+    for index in [3, 4, 8, 9, 10, 11, 13] {
+        assert_ne!(data_rows[0][index], "unknown");
+    }
+    assert!(snapshot_store
+        .performance_snapshot()
+        .process_sample
+        .is_some());
+    assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
+
+    run_handle.abort();
+    let _ = run_handle.await;
+}
+
+#[tokio::test]
 async fn show_clients_pools_and_servers_return_stable_columns() {
     let backend_hits = Arc::new(AtomicUsize::new(0));
     let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
@@ -200,8 +229,9 @@ async fn show_clients_pools_and_servers_return_stable_columns() {
             "active_backends",
             "idle_backends",
             "waiting_clients",
+            "checkout_lock_wait_ms",
         ],
-        &[vec!["global", "12", "5", "7", "2"]],
+        &[vec!["global", "12", "5", "7", "2", "0.000"]],
     );
 
     let server_frames = admin_query(admin_addr, "SHOW SERVERS").await;
@@ -312,8 +342,10 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "backend_statement_name",
             "materialized_backend_count",
             "invalidation_count",
+            "prepared_cache_hits",
+            "prepared_cache_misses",
         ],
-        &[vec!["11", "stmt_a", "pgk_11_1", "2", "1"]],
+        &[vec!["11", "stmt_a", "pgk_11_1", "2", "1", "0", "0"]],
     );
 
     let pinning_frames = admin_query(admin_addr, "SHOW PINNING").await;

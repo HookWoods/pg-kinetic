@@ -166,7 +166,7 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
     )
     .expect("direct benchmark target");
     let benchmark_scenario = BenchmarkScenario::new(
-        "nightly_latency",
+        "SELECT * FROM sensitive_table -- secret-password",
         BenchmarkDriver::PgBench,
         12_000,
         1_000,
@@ -193,7 +193,7 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             PerformanceRegressionThreshold::Percentage(10.0),
         )],
         regressions: vec![PerformanceRegressionResult::new(
-            "nightly_latency",
+            "SELECT * FROM sensitive_table -- secret-password",
             PerformanceBenchmarkTarget::PgKinetic,
             PerformanceMetric::LatencyP95,
             2.5,
@@ -338,8 +338,8 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             "comparison_outcome",
         ],
         &[vec![
-            "nightly_latency",
-            "primary",
+            "configured",
+            "pg_kinetic",
             "pg_kinetic",
             "pgbench",
             "12000",
@@ -348,8 +348,8 @@ async fn show_runtime_views_cover_telemetry_and_redaction() {
             "3.000",
             "4500.000",
             "0.005",
-            "c7g.large",
-            "4GiB",
+            "redacted",
+            "redacted",
             "simple_query",
             "direct_postgresql,pg_kinetic",
             "failed",
@@ -562,6 +562,7 @@ async fn metric_labels_stay_low_cardinality() {
         idle_clients: 2,
         ..Default::default()
     });
+    proxy_metrics::record_pool_checkout_lock_wait(3.5);
 
     proxy_metrics::record_preflight_finding("tls_files", "warning");
     proxy_metrics::record_preflight_finding("lifecycle_guardrails", "error");
@@ -625,7 +626,7 @@ async fn metric_labels_stay_low_cardinality() {
     assert!(recorder.has_metric(
         "pg_kinetic_benchmark_latency_ms",
         &[
-            ("scenario", "nightly_latency"),
+            ("scenario", "configured"),
             ("target", "pg_kinetic"),
             ("workload", "simple_query"),
             ("driver", "pgbench"),
@@ -635,7 +636,7 @@ async fn metric_labels_stay_low_cardinality() {
     assert!(recorder.has_metric(
         "pg_kinetic_benchmark_throughput_qps",
         &[
-            ("scenario", "nightly_latency"),
+            ("scenario", "configured"),
             ("target", "pg_kinetic"),
             ("workload", "simple_query"),
             ("driver", "pgbench"),
@@ -644,7 +645,7 @@ async fn metric_labels_stay_low_cardinality() {
     assert!(recorder.has_metric(
         "pg_kinetic_benchmark_errors_total",
         &[
-            ("scenario", "nightly_latency"),
+            ("scenario", "configured"),
             ("target", "pg_kinetic"),
             ("workload", "simple_query"),
             ("driver", "pgbench"),

@@ -392,7 +392,10 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.client_snapshots(),
             &state.snapshot_store.route_checkout_snapshots(),
         ),
-        AdminView::Pools => pools_table(&state.snapshot_store.pool_snapshot()),
+        AdminView::Pools => pools_table(
+            &state.snapshot_store.pool_snapshot(),
+            &state.snapshot_store.performance_snapshot(),
+        ),
         AdminView::Servers => servers_table(
             &state.snapshot_store.server_snapshots(),
             &state.snapshot_store.replica_health_snapshots(),
@@ -422,8 +425,14 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.benchmark_run_snapshots(),
             &state.snapshot_store.performance_snapshot(),
         ),
-        AdminView::Performance => performance_table(&state.snapshot_store.performance_snapshot()),
-        AdminView::Prepared => prepared_table(&state.snapshot_store.prepared_snapshot()),
+        AdminView::Performance => {
+            state.snapshot_store.refresh_performance_snapshot();
+            performance_table(&state.snapshot_store.performance_snapshot())
+        }
+        AdminView::Prepared => prepared_table(
+            &state.snapshot_store.prepared_snapshot(),
+            &state.snapshot_store.performance_snapshot(),
+        ),
         AdminView::Pinning => pinning_table(&state.snapshot_store.pinning_snapshots()),
         AdminView::Recovery => recovery_table(&state.snapshot_store.recovery_snapshots()),
         AdminView::Backpressure => {
@@ -512,7 +521,7 @@ fn clients_table(
     )
 }
 
-fn pools_table(pool: &PoolSnapshot) -> AdminTable {
+fn pools_table(pool: &PoolSnapshot, performance: &PerformanceSnapshot) -> AdminTable {
     admin_table(
         AdminView::Pools,
         &[
@@ -521,6 +530,7 @@ fn pools_table(pool: &PoolSnapshot) -> AdminTable {
             ("active_backends", AdminColumnType::Int8),
             ("idle_backends", AdminColumnType::Int8),
             ("waiting_clients", AdminColumnType::Int8),
+            ("checkout_lock_wait_ms", AdminColumnType::Float8),
         ],
         vec![AdminRow::new(vec![
             String::from("global"),
@@ -528,6 +538,7 @@ fn pools_table(pool: &PoolSnapshot) -> AdminTable {
             pool.active_backends.to_string(),
             pool.idle_backends.to_string(),
             pool.waiting_clients.to_string(),
+            optional_metric_value(performance.pool_checkout_lock_wait_ms),
         ])],
     )
 }
@@ -748,8 +759,8 @@ fn benchmarks_table(
         .flat_map(|run| {
             run.results.iter().map(move |result| {
                 AdminRow::new(vec![
-                    run.scenario.name().to_string(),
-                    result.target().label().to_string(),
+                    run.scenario.metric_label().to_string(),
+                    result.target().metric_label().to_string(),
                     result.target().comparison().as_str().to_string(),
                     result.driver().as_str().to_string(),
                     result.duration_ms().to_string(),
@@ -758,8 +769,8 @@ fn benchmarks_table(
                     benchmark_metric_value(result.metrics().p99_ms()),
                     benchmark_metric_value(result.metrics().throughput_qps()),
                     benchmark_metric_value(result.metrics().error_rate()),
-                    result.metrics().cpu_label().to_string(),
-                    result.metrics().memory_label().to_string(),
+                    String::from(pg_kinetic_core::benchmark::REDACTED_BENCHMARK_DETAIL_LABEL),
+                    String::from(pg_kinetic_core::benchmark::REDACTED_BENCHMARK_DETAIL_LABEL),
                     run.scenario.workload().as_str().to_string(),
                     benchmark_matrix_targets(&run.scenario),
                     performance
@@ -850,15 +861,15 @@ fn performance_row(
             |budget| performance_threshold_label(budget.failure_threshold()),
         ),
         regression.map_or_else(
-            || String::from("unknown"),
+            || benchmark_metric_value(0.0),
             |result| benchmark_metric_value(result.observed_value()),
         ),
         regression.map_or_else(
-            || String::from("unknown"),
+            || benchmark_metric_value(0.0),
             |result| {
                 result
                     .baseline_value()
-                    .map_or_else(|| String::from("unknown"), benchmark_metric_value)
+                    .map_or_else(|| benchmark_metric_value(0.0), benchmark_metric_value)
             },
         ),
         regression.map_or_else(
@@ -899,14 +910,14 @@ fn process_metric_value(
 ) -> String {
     sample
         .and_then(|sample| sample.metric(metric).as_f64())
-        .map_or_else(|| String::from("unknown"), benchmark_metric_value)
+        .map_or_else(|| benchmark_metric_value(0.0), benchmark_metric_value)
 }
 
 fn optional_metric_value(value: Option<f64>) -> String {
-    value.map_or_else(|| String::from("unknown"), benchmark_metric_value)
+    value.map_or_else(|| benchmark_metric_value(0.0), benchmark_metric_value)
 }
 
-fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {
+fn prepared_table(prepared: &PreparedSnapshot, performance: &PerformanceSnapshot) -> AdminTable {
     admin_table(
         AdminView::Prepared,
         &[
@@ -915,6 +926,8 @@ fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {
             ("backend_statement_name", AdminColumnType::Text),
             ("materialized_backend_count", AdminColumnType::Int8),
             ("invalidation_count", AdminColumnType::Int8),
+            ("prepared_cache_hits", AdminColumnType::Int8),
+            ("prepared_cache_misses", AdminColumnType::Int8),
         ],
         prepared
             .statements
@@ -926,6 +939,8 @@ fn prepared_table(prepared: &PreparedSnapshot) -> AdminTable {
                     statement.backend_statement_name.clone(),
                     statement.materialized_backend_count.to_string(),
                     statement.invalidation_count.to_string(),
+                    performance.prepared_cache_hits.to_string(),
+                    performance.prepared_cache_misses.to_string(),
                 ])
             })
             .collect(),

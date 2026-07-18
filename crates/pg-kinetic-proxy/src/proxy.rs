@@ -2627,6 +2627,7 @@ fn prepare_frame_for_backend(
             .clone();
         metrics::increment_prepared_event(PreparedEvent::Parse);
         prepared_snapshot_handle.increment_statement_count();
+        prepared_snapshot_handle.increment_cache_miss();
         prepared.mark_materialized(backend_id, &statement);
         publish_prepared_snapshot(prepared, prepared_snapshot_handle);
         timer.finish(MetricOutcome::Ok);
@@ -2640,6 +2641,7 @@ fn prepare_frame_for_backend(
         let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
         if let Some(statement) = prepared.get_for_current_route_map(&statement_name).cloned() {
             metrics::increment_prepared_event(PreparedEvent::Bind);
+            prepared_snapshot_handle.increment_cache_hit();
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
                 prelude.push(build_parse_frame(
@@ -2665,6 +2667,7 @@ fn prepare_frame_for_backend(
     if let Some(DescribeTarget::Statement(statement_name)) = parse_describe_target(&frame)? {
         let timer = PhaseTimer::start(ProtocolPhase::Bind, phase_recorder);
         if let Some(statement) = prepared.get_for_current_route_map(&statement_name).cloned() {
+            prepared_snapshot_handle.increment_cache_hit();
             let mut prelude = Vec::new();
             if !prepared.is_materialized(backend_id, &statement) {
                 prelude.push(build_parse_frame(

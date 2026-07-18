@@ -226,8 +226,8 @@ pub fn record_adaptive_outcome(snapshot: &AdaptiveOutcomeSnapshot) {
 
 pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {
     for result in &snapshot.results {
-        let scenario = snapshot.scenario.name().to_string();
-        let target = result.target().comparison().as_str();
+        let scenario = snapshot.scenario.metric_label();
+        let target = result.target().metric_label();
         let workload = snapshot.scenario.workload().as_str();
         let driver = result.driver().as_str();
         metrics_crate::counter!(
@@ -245,7 +245,7 @@ pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {
         ] {
             metrics_crate::histogram!(
                 ObservabilityMetricName::BenchmarkLatencyMs.as_str(),
-                "scenario" => scenario.clone(),
+                "scenario" => scenario,
                 "target" => target,
                 "workload" => workload,
                 "driver" => driver,
@@ -256,7 +256,7 @@ pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {
 
         metrics_crate::histogram!(
             ObservabilityMetricName::BenchmarkThroughputQps.as_str(),
-            "scenario" => scenario.clone(),
+            "scenario" => scenario,
             "target" => target,
             "workload" => workload,
             "driver" => driver,
@@ -313,30 +313,34 @@ pub fn record_performance_snapshot(snapshot: &PerformanceSnapshot) {
     if let Some(value) = snapshot.memory_per_client_bytes {
         metrics_crate::gauge!(ObservabilityMetricName::MemoryPerClientBytes.as_str()).set(value);
     }
-    if let Some(value) = snapshot.pool_checkout_lock_wait_ms {
-        metrics_crate::histogram!(
-            ObservabilityMetricName::PoolCheckoutLockWaitMs.as_str(),
-            "outcome" => "ok",
-        )
-        .record(value);
-    }
-
-    metrics_crate::counter!(
+    metrics_crate::gauge!(
         ObservabilityMetricName::ProtocolBufferCopiesTotal.as_str(),
         "feature" => "protocol",
     )
-    .increment(snapshot.protocol_buffer_copies);
-    metrics_crate::counter!(ObservabilityMetricName::PreparedCacheHitsTotal.as_str())
-        .increment(snapshot.prepared_cache_hits);
-    metrics_crate::counter!(ObservabilityMetricName::PreparedCacheMissesTotal.as_str())
-        .increment(snapshot.prepared_cache_misses);
-    metrics_crate::counter!(
+    .set(snapshot.protocol_buffer_copies as f64);
+    record_prepared_cache_totals(snapshot.prepared_cache_hits, snapshot.prepared_cache_misses);
+    metrics_crate::gauge!(
         ObservabilityMetricName::ObservabilityHotPathAllocationsTotal.as_str(),
         "feature" => "metrics",
     )
-    .increment(snapshot.observability_hot_path_allocations);
+    .set(snapshot.observability_hot_path_allocations as f64);
     metrics_crate::gauge!(ObservabilityMetricName::IdleClients.as_str())
         .set(snapshot.idle_clients as f64);
+}
+
+pub fn record_pool_checkout_lock_wait(wait_ms: f64) {
+    metrics_crate::histogram!(
+        ObservabilityMetricName::PoolCheckoutLockWaitMs.as_str(),
+        "outcome" => "ok",
+    )
+    .record(wait_ms);
+}
+
+pub fn record_prepared_cache_totals(hits: u64, misses: u64) {
+    metrics_crate::gauge!(ObservabilityMetricName::PreparedCacheHitsTotal.as_str())
+        .set(hits as f64);
+    metrics_crate::gauge!(ObservabilityMetricName::PreparedCacheMissesTotal.as_str())
+        .set(misses as f64);
 }
 
 pub fn record_preflight_finding(check: &str, severity: &str) {

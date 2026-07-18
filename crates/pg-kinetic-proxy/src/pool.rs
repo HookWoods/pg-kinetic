@@ -797,11 +797,11 @@ impl BackendPool {
     ) -> Result<PooledBackend, PoolError> {
         let route_gate_lookup_started = Instant::now();
         let route_gate = self.route_gate(&route);
-        metrics::record_pool_checkout(
-            route_gate_lookup_started.elapsed().as_secs_f64() * 1_000.0,
-            "route_gate_registry",
-            "ok",
-        );
+        let route_gate_lookup_wait_ms = route_gate_lookup_started.elapsed().as_secs_f64() * 1_000.0;
+        if let Some(snapshot_store) = self.snapshot_store() {
+            snapshot_store.record_pool_checkout_lock_wait_ms(route_gate_lookup_wait_ms);
+        }
+        metrics::record_pool_checkout(route_gate_lookup_wait_ms, "route_gate_registry", "ok");
         let started = Instant::now();
         let checkout = async {
             let route_permit = match route_gate.checkout(self.checkout_timeout).await {

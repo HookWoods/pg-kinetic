@@ -2,6 +2,11 @@ use std::{collections::HashSet, fmt, str::FromStr, sync::Arc};
 
 use thiserror::Error;
 
+/// Bounded label used when a benchmark scenario name would otherwise become a
+/// user-controlled Prometheus label or administrative value.
+pub const CONFIGURED_BENCHMARK_SCENARIO_LABEL: &str = "configured";
+pub const REDACTED_BENCHMARK_DETAIL_LABEL: &str = "redacted";
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum BenchmarkComparison {
     #[default]
@@ -175,6 +180,12 @@ impl BenchmarkTarget {
     #[must_use]
     pub const fn comparison(&self) -> BenchmarkComparison {
         self.comparison
+    }
+
+    /// Returns the bounded target dimension safe for metrics and admin output.
+    #[must_use]
+    pub const fn metric_label(&self) -> &'static str {
+        self.comparison.as_str()
     }
 
     #[must_use]
@@ -485,6 +496,12 @@ impl BenchmarkScenario {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Scenario documents permit descriptive names, which are not safe metric labels.
+    #[must_use]
+    pub const fn metric_label(&self) -> &'static str {
+        CONFIGURED_BENCHMARK_SCENARIO_LABEL
     }
 
     #[must_use]

@@ -34,13 +34,16 @@ fn performance_admin_view_and_metrics_follow_the_public_contract() {
     };
     let store = SnapshotStore::new();
     store.set_performance_snapshot(snapshot);
+    let prepared = store.prepared_handle();
+    prepared.increment_cache_hit();
+    prepared.increment_cache_miss();
 
     let stored = store.performance_snapshot();
     assert_eq!(stored.budgets.len(), 1);
     assert_eq!(stored.profile_status, ProfileCaptureStatus::Unavailable);
     assert_eq!(stored.protocol_buffer_copies, 2);
-    assert_eq!(stored.prepared_cache_hits, 7);
-    assert_eq!(stored.prepared_cache_misses, 1);
+    assert_eq!(stored.prepared_cache_hits, 8);
+    assert_eq!(stored.prepared_cache_misses, 2);
 
     let expected = [
         (

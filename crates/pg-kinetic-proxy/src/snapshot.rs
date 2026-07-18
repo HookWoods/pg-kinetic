@@ -25,6 +25,7 @@ use pg_kinetic_core::{
     sharding::{ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan},
 };
 
+use crate::benchmark::collect_process_metrics;
 use crate::config::{
     AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
 };
@@ -941,6 +942,29 @@ impl SnapshotStore {
             .performance = snapshot;
     }
 
+    /// Refreshes the fields backed by the running proxy without inventing unavailable data.
+    pub fn refresh_performance_snapshot(&self) {
+        let process_metrics = collect_process_metrics();
+        let snapshot = {
+            let mut inner = self.inner.write().expect("snapshot store poisoned");
+            if inner.performance.process_sample.is_none() {
+                inner.performance.process_status = process_metrics.status();
+                inner.performance.process_sample = Some(process_metrics.sample().clone());
+            }
+            inner.performance.clone()
+        };
+        metrics::record_performance_snapshot(&snapshot);
+    }
+
+    pub fn record_pool_checkout_lock_wait_ms(&self, wait_ms: f64) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .performance
+            .pool_checkout_lock_wait_ms = Some(wait_ms);
+        metrics::record_pool_checkout_lock_wait(wait_ms);
+    }
+
     #[must_use]
     pub fn performance_snapshot(&self) -> PerformanceSnapshot {
         self.inner
@@ -1590,6 +1614,30 @@ impl PreparedSnapshotHandle {
             .expect("snapshot store poisoned")
             .prepared
             .materialization_count += 1;
+    }
+
+    pub fn increment_cache_hit(&self) {
+        let (hits, misses) = {
+            let mut inner = self.inner.write().expect("snapshot store poisoned");
+            inner.performance.prepared_cache_hits += 1;
+            (
+                inner.performance.prepared_cache_hits,
+                inner.performance.prepared_cache_misses,
+            )
+        };
+        metrics::record_prepared_cache_totals(hits, misses);
+    }
+
+    pub fn increment_cache_miss(&self) {
+        let (hits, misses) = {
+            let mut inner = self.inner.write().expect("snapshot store poisoned");
+            inner.performance.prepared_cache_misses += 1;
+            (
+                inner.performance.prepared_cache_hits,
+                inner.performance.prepared_cache_misses,
+            )
+        };
+        metrics::record_prepared_cache_totals(hits, misses);
     }
 
     pub fn set_statements(&self, statements: Vec<PreparedStatementSnapshot>) {
