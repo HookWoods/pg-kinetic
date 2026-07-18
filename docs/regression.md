@@ -1,3 +1,13 @@
+---
+title: "Regression Workflow"
+description: "Regression workflow for pg-kinetic manifests, runner inputs, performance scoring, compatibility checks, and CI-oriented validation."
+keywords:
+  - pg-kinetic regression
+  - PostgreSQL proxy testing
+  - performance regression
+  - compatibility runner
+---
+
 # Regression Platform
 
 Regression cases live in `regression/manifest.toml`. The checked-in schema at

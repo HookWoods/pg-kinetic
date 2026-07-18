@@ -1,3 +1,13 @@
+---
+title: "Benchmarking"
+description: "Benchmarking workflow for pg-kinetic, including local noise, target baselines, scenario matrices, reports, profiling hooks, and update policy."
+keywords:
+  - pg-kinetic benchmarks
+  - PostgreSQL proxy benchmark
+  - connection pooler performance
+  - benchmark regression
+---
+
 # Benchmarking
 
 pg-kinetic uses versioned scenarios and JSON reports to compare the proxy with direct PostgreSQL, PgBouncer, and PgDog. The same scenario, driver, target matrix, host, and load settings must be used for a baseline and its candidate report.

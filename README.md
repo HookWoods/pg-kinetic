@@ -1,8 +1,8 @@
 # pg-kinetic
 
-pg-kinetic is a low-overhead PostgreSQL wire proxy for high-concurrency applications.
+pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.
 
-It provides PostgreSQL wire proxying, transaction pooling, routing, sharding, policy checks, mirroring, adaptive operations, runtime lifecycle controls, TLS/authentication, health endpoints, admin views, and metrics.
+The repository also contains preview tools for sharding, policy, mirroring, compatibility, benchmarking, and deployment packaging. Preview tooling is documented separately from live traffic behavior.
 
 ## Public Docs
 
@@ -25,6 +25,7 @@ It provides PostgreSQL wire proxying, transaction pooling, routing, sharding, po
 - [Production runtime guide](docs/production-runtime.md)
 - [TLS and authentication](docs/tls-and-auth.md)
 - [Health, readiness, and drain](docs/health-and-drain.md)
+- [Migration and rollback](docs/migration.md)
 - [Kubernetes deployment](docs/kubernetes.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Benchmarking guide](docs/benchmarking.md)
@@ -33,9 +34,15 @@ It provides PostgreSQL wire proxying, transaction pooling, routing, sharding, po
 - [Testing guide](docs/testing.md)
 - [Documentation site workflow](docs-site/README.md)
 
-## Install
+## Current Install Path
 
-Use the published container image for production deployments:
+Build the local container image from this checkout:
+
+```bash
+docker build -t pg-kinetic:local .
+```
+
+Run it with a mounted config:
 
 ```bash
 docker run --rm \
@@ -45,63 +52,19 @@ docker run --rm \
   -p 9090:9090 \
   -p 9091:9091 \
   -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  hookwoods/pg-kinetic:latest \
+  pg-kinetic:local \
   --config-file /etc/pg-kinetic/pg-kinetic.toml
 ```
 
-For Compose:
+Use [Quickstart](docs/quickstart.md) for an end-to-end local check.
 
-```bash
-docker compose -f deploy/docker-compose.yml up -d
-```
+## Future Release Images
 
-For Kubernetes:
+When a version tag matching `v*.*.*` is pushed, the container workflow publishes Docker Hub and GitHub Container Registry images.
 
-```bash
-helm repo add pgkinetic https://helm.pgkinetic.dev
-helm repo update
-helm install pg-kinetic pgkinetic/pg-kinetic \
-  --set image.tag=0.1.0 \
-  --values pg-kinetic-values.yaml
-```
+When the first chart release is published, `https://helm.pgkinetic.dev/index.yaml` becomes the Helm repository index.
 
-See [Installation](docs/installation.md) for Docker, Docker Compose, and Kubernetes options.
-
-## Configure
-
-pg-kinetic reads a TOML configuration file through `--config-file` or `PG_KINETIC_CONFIG_FILE`.
-
-Start from [Configuration](docs/configuration.md), which includes a complete production template and explains every top-level section.
-
-## Operate
-
-Applications connect to the proxy over the PostgreSQL protocol:
-
-```bash
-PGSSLMODE=disable psql "postgres://app_user@127.0.0.1:6432/app_db" -c "select 1;"
-```
-
-Admin views use the PostgreSQL protocol:
-
-```bash
-psql "postgres://admin@127.0.0.1:7000/postgres" -c "SHOW POOLS;"
-psql "postgres://admin@127.0.0.1:7000/postgres" -c "SHOW CLIENTS;"
-```
-
-Health endpoints use HTTP:
-
-```bash
-curl -fsS http://127.0.0.1:9091/healthz
-curl -fsS http://127.0.0.1:9091/readyz
-```
-
-## Release Images
-
-The container workflow publishes multi-platform images to Docker Hub and GitHub Container Registry when a version tag matching `v*.*.*` is pushed.
-
-Tags follow the release version, the major/minor series, and `latest` on version tags.
-
-The Helm workflow publishes chart releases for the same version tags and updates the chart repository index for `https://helm.pgkinetic.dev`.
+Do not treat release image or Helm repository commands as available until the corresponding tag workflow has completed.
 
 ## Validate
 

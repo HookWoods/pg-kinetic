@@ -31,6 +31,8 @@ jobs:
         run: npm ci
       - name: Check Markdown links
         run: bash scripts/docs/check-links.sh
+      - name: Check config documentation coverage
+        run: bash scripts/docs/check-config-coverage.sh
       - name: Build docs site
         working-directory: docs-site
         run: npm run check

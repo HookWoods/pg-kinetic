@@ -1,3 +1,13 @@
+---
+title: "Prepared Statements"
+description: "Prepared statement behavior in pg-kinetic, including cache safety, invalidation, transaction pooling implications, and protocol correctness."
+keywords:
+  - PostgreSQL prepared statements
+  - pg-kinetic prepared cache
+  - wire protocol correctness
+  - connection pooling
+---
+
 # Prepared Statements
 
 Prepared statements improve client performance, but they are also connection-scoped in PostgreSQL. pg-kinetic tracks prepared-statement behavior so transaction pooling does not accidentally reuse a backend with the wrong statement state.

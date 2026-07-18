@@ -1,15 +1,32 @@
+---
+title: "Quickstart"
+description: "Run pg-kinetic locally with Docker Compose, PostgreSQL, health checks, admin views, metrics, and a verified psql query path."
+keywords:
+  - pg-kinetic quickstart
+  - Docker Compose PostgreSQL proxy
+  - Postgres proxy quickstart
+  - psql
+---
+
 # Quickstart
 
-This quickstart runs pg-kinetic as a production-style container in front of an existing PostgreSQL server. It uses the same image and config-file flow as a real deployment.
+This quickstart uses a local Docker image built from this checkout. It does not require a published release image.
 
-## Create A Config File
+## Prerequisites
 
-Create `pg-kinetic.toml`:
+- Docker
+- `psql`
+
+The example starts PostgreSQL and pg-kinetic with Docker Compose. It uses a numeric backend address because `backend_addr` is parsed as a socket address, not a hostname.
+
+## Review The Config
+
+The repository includes `deploy/pg-kinetic.toml`:
 
 ```toml
 [connection]
 listen_addr = "0.0.0.0:6432"
-backend_addr = "postgres.internal:5432"
+backend_addr = "172.30.0.10:5432"
 
 [capacity]
 max_clients = 1000
@@ -29,7 +46,7 @@ query_timeout_ms = 30000
 idle_client_timeout_ms = 300000
 idle_transaction_timeout_ms = 60000
 max_client_buffer_bytes = 1048576
-max_backend_buffer_bytes = 1048576
+max_backend_buffer_bytes = 4194304
 overload_error_code = "53300"
 
 [admin]
@@ -37,6 +54,12 @@ admin_addr = "0.0.0.0:7000"
 admin_require_tls = false
 admin_query_timeout_ms = 2000
 admin_max_clients = 16
+
+[observability]
+metrics_addr = "0.0.0.0:9090"
+debug_trace_sampling_rate = 0.0
+otel_enabled = false
+otel_service_name = "pg-kinetic"
 
 [health]
 health_addr = "0.0.0.0:9091"
@@ -48,51 +71,84 @@ drain_timeout_ms = 45000
 reject_new_clients_during_drain = true
 ```
 
-Replace `postgres.internal:5432` with the address pg-kinetic should use to reach PostgreSQL from inside the container or cluster.
+The sample `backend_addr` points at the PostgreSQL service IP in `deploy/docker-compose.yml`.
 
-## Run The Container
-
-```bash
-docker run --rm \
-  --name pg-kinetic \
-  -p 6432:6432 \
-  -p 7000:7000 \
-  -p 9090:9090 \
-  -p 9091:9091 \
-  -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  hookwoods/pg-kinetic:latest \
-  --config-file /etc/pg-kinetic/pg-kinetic.toml
-```
-
-Applications connect to `localhost:6432` using the PostgreSQL protocol. The admin listener is available on `localhost:7000` when configured, metrics are available on `localhost:9090` when configured, and HTTP health endpoints are available on `localhost:9091`.
-
-## Verify The Proxy
+## Start The Stack
 
 ```bash
-PGSSLMODE=disable psql "postgres://app_user@127.0.0.1:6432/app_db" -c "select 1;"
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Use the same username, database, TLS mode, and password flow your application uses. If client TLS is required, configure the client `sslmode` and certificate material to match [TLS And Authentication](./tls-and-auth.md).
+Compose publishes:
 
-## Inspect Operations
+| Local port | Service |
+| --- | --- |
+| `6432` | pg-kinetic PostgreSQL listener |
+| `7000` | pg-kinetic admin listener |
+| `9090` | metrics endpoint |
+| `9091` | health endpoint |
+| `55432` | direct PostgreSQL backend |
 
-Admin views use the PostgreSQL protocol:
+## Verify Health
 
-```bash
-psql "postgres://admin@127.0.0.1:7000/postgres" -c "SHOW POOLS;"
-psql "postgres://admin@127.0.0.1:7000/postgres" -c "SHOW CLIENTS;"
-```
-
-Health endpoints use HTTP:
+In another terminal:
 
 ```bash
 curl -fsS http://127.0.0.1:9091/healthz
 curl -fsS http://127.0.0.1:9091/readyz
 ```
 
-## Next Steps
+Expected outputs:
 
-- Install with [Docker, Compose, or Kubernetes](./installation.md).
-- Review every supported setting in [Configuration](./configuration.md).
-- Configure [TLS and authentication](./tls-and-auth.md) before exposing pg-kinetic beyond a trusted network.
-- Add readiness and drain behavior from [Health, Readiness, And Drain](./health-and-drain.md).
+```text
+live
+ready
+```
+
+If `/readyz` returns `not_ready`, pg-kinetic could not connect to `backend_addr`.
+
+## Query Through pg-kinetic
+
+Use the PostgreSQL credentials from `deploy/docker-compose.yml`:
+
+```bash
+PGPASSWORD=pgkinetic PGSSLMODE=disable psql "postgres://pgkinetic@127.0.0.1:6432/pgkinetic" -c "select 1;"
+```
+
+Expected output includes:
+
+```text
+ ?column?
+----------
+        1
+```
+
+## Inspect Admin And Metrics
+
+Admin views use the PostgreSQL protocol:
+
+```bash
+PGSSLMODE=disable psql "postgres://admin@127.0.0.1:7000/postgres" -c "SHOW POOLS;"
+```
+
+Metrics are exposed when `metrics_addr` is set:
+
+```bash
+curl -fsS http://127.0.0.1:9090/metrics
+```
+
+## Cleanup
+
+```bash
+docker compose -f deploy/docker-compose.yml down
+```
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `/readyz` returns `not_ready` | Verify `backend_addr` from inside the container network. |
+| `psql` reports SSL negotiation problems | Set `PGSSLMODE=disable` unless client TLS is configured. |
+| `backend_addr` fails config parsing | Use `IP:port`; hostnames are not accepted in this field. |
+| Admin connection fails | Verify `admin_addr` is set and port `7000` is published. |
+| Metrics request fails | Verify `metrics_addr` is set and port `9090` is published. |

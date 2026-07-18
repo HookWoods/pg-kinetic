@@ -2,7 +2,9 @@
 
 This directory contains the Docusaurus site. The canonical Markdown content remains in [`../docs`](../docs); do not move or duplicate those guides into this project.
 
-The sidebar is manually grouped by audience path and uses Docusaurus generated index pages for major categories. The root page is `../docs/index.mdx`, which uses `DocCardList` to expose the main documentation sections. Installation docs should describe the released container image, Docker Compose, and Helm chart before contributor workflows.
+The sidebar is manually grouped by audience path and uses Docusaurus generated index pages for major categories. The root page is `../docs/index.mdx`, which uses `DocCardList` to expose the main documentation sections.
+
+Installation docs must distinguish current local deployment assets from future release images and future Helm repository commands.
 
 ## Local development
 
@@ -23,8 +25,19 @@ From the repository root, validate Markdown links on either platform:
 ```bash
 bash scripts/docs/check-links.sh
 powershell.exe -ExecutionPolicy Bypass -File scripts/docs/check-links.ps1
+bash scripts/docs/check-config-coverage.sh
+powershell.exe -ExecutionPolicy Bypass -File scripts/docs/check-config-coverage.ps1
 ```
 
 ## Version policy
 
 The implicit Docusaurus `current` version tracks the `main` branch. Released versions are cut manually only when a release is published. Do not create placeholder or synthetic versioned documentation.
+
+## Publication gate
+
+Do not treat the site as a final operator reference until:
+
+- search is configured
+- released Docusaurus versions exist
+- command examples are covered by fixture checks
+- config, CLI, and metric catalogs prevent drift from code

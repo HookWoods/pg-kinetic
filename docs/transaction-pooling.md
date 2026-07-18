@@ -1,3 +1,13 @@
+---
+title: "Transaction Pooling And Virtual Sessions"
+description: "Transaction pooling and virtual session behavior in pg-kinetic, including pinning, recovery, backend reuse, and unsafe state handling."
+keywords:
+  - PostgreSQL transaction pooling
+  - pg-kinetic virtual sessions
+  - connection pooling
+  - backend reuse
+---
+
 # Transaction Pooling And Virtual Sessions
 
 Transaction pooling lets many client sessions share fewer backend PostgreSQL connections. pg-kinetic makes this safe by tracking a virtual session for each client and by returning a backend to the pool only when the backend is known to be reusable.

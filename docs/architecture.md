@@ -1,3 +1,13 @@
+---
+title: "Architecture"
+description: "Architecture of the pg-kinetic PostgreSQL wire proxy, including request flow, crate layout, safety model, control planes, and observability."
+keywords:
+  - pg-kinetic architecture
+  - PostgreSQL wire protocol
+  - Rust PostgreSQL proxy
+  - database proxy design
+---
+
 # Architecture
 
 pg-kinetic is built around PostgreSQL wire correctness, conservative backend reuse, and operator-visible decisions. It does not require application driver changes because clients continue speaking the PostgreSQL protocol.
@@ -22,7 +32,7 @@ The proxy parses enough frontend and backend messages to understand transaction 
 | Crate | Responsibility |
 | --- | --- |
 | `pg-kinetic-wire` | PostgreSQL wire protocol parsing and frame helpers. |
-| `pg-kinetic-core` | Shared domain models for sessions, routing, policy, sharding, metrics, benchmark, compatibility, and regression. |
+| `pg-kinetic-core` | Shared domain models for sessions, routing, preview policy/sharding models, metrics, benchmark, compatibility, and regression. |
 | `pg-kinetic-proxy` | Runtime proxy behavior, config loading, admin rendering, benchmarks, profiling, compatibility, regression, and preflight execution. |
 | `pg-kinetic` | CLI entry point and command dispatch. |
 | `xtask` | Repository automation for CI-style local orchestration. |
@@ -33,7 +43,7 @@ pg-kinetic separates the traffic path from operational control surfaces:
 
 - the client listener accepts PostgreSQL application traffic
 - the admin listener accepts PostgreSQL-compatible `SHOW` queries for snapshots
-- the health listener exposes HTTP readiness, liveness, state, and drain endpoints
+- the health listener exposes HTTP readiness, liveness, and state endpoints
 - metrics and traces are emitted from bounded runtime snapshots
 
 This keeps operational reads out of the application traffic pool and avoids requiring a separate SQL extension in PostgreSQL.
@@ -50,7 +60,7 @@ The reuse decision is based on the current client and backend state:
 | Unknown protocol state | Backend is discarded instead of being returned to the pool. |
 | Recovery timeout | Backend is discarded. |
 
-The same conservative model is used by routing, sharding, policy, mirroring, and prepared-statement behavior. Speedups should never weaken PostgreSQL wire correctness.
+The same conservative model is used by live routing and prepared-statement behavior. Sharding, policy, and mirroring have domain models and preview/tooling surfaces, but they are not documented as live traffic features today. Speedups must not weaken PostgreSQL wire correctness.
 
 ## Observability Model
 
@@ -63,4 +73,3 @@ Runtime decisions become visible through:
 - preflight reports for deployment readiness
 
 Operational outputs redact secret-bearing fields and should be safe to attach to CI logs.
-

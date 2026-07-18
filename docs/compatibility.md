@@ -1,9 +1,26 @@
+---
+title: "Compatibility Matrix"
+description: "Compatibility status for PostgreSQL client behavior through pg-kinetic, including supported protocol paths, preview cases, and validation commands."
+keywords:
+  - PostgreSQL client compatibility
+  - pg-kinetic compatibility
+  - PostgreSQL wire compatibility
+  - driver testing
+---
+
 # Compatibility Matrix
 
-pg-kinetic keeps a cross-language compatibility matrix for production
-PostgreSQL clients. The matrix runs the same behavior contract against direct
-PostgreSQL and pg-kinetic so reports can compare proxy behavior with the
-baseline server path.
+pg-kinetic keeps a cross-language compatibility matrix for PostgreSQL clients. The matrix can run the same behavior contract against direct PostgreSQL and pg-kinetic so reports can compare proxy behavior with the baseline server path.
+
+## Current Compatibility Status
+
+| Area | Status |
+| --- | --- |
+| PostgreSQL server versions | Tested only where the local compatibility or CI stack starts PostgreSQL. Do not infer broad version coverage from docs alone. |
+| Simple query protocol | Covered by smoke checks. |
+| Extended query protocol | Covered by prepared-query smoke checks where each driver suite supports it. |
+| COPY, LISTEN/NOTIFY, temp tables, advisory locks | Treated as stateful or pinning-sensitive behavior; not broad compatibility guarantees. |
+| Sharding and policy-denial cases | Preview/opt-in only; not default live proxy compatibility. |
 
 ## Libraries
 
@@ -95,7 +112,8 @@ category for heavier Spring-style coverage.
 - pool reuse
 - server error propagation
 - TLS and authentication paths
-- read routing, primary writes, sharding, and policy-denial cases
+- read routing and primary writes
+- preview-only sharding and policy-denial cases when explicitly selected
 
 Advanced cases require matching local pg-kinetic configuration and remain opt-in
 so the default smoke matrix stays bounded.

@@ -1,14 +1,65 @@
 // @ts-check
 
+const siteUrl = 'https://docs.pgkinetic.dev';
+const repositoryUrl = 'https://github.com/hookwoods/pg-kinetic';
+const socialImage = `${siteUrl}/img/pg-kinetic-og.png`;
+
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'Organization',
+      '@id': `${siteUrl}/#organization`,
+      name: 'pg-kinetic contributors',
+      url: siteUrl,
+      logo: `${siteUrl}/img/favicon.svg`,
+      sameAs: [repositoryUrl],
+    },
+    {
+      '@type': 'WebSite',
+      '@id': `${siteUrl}/#website`,
+      name: 'pg-kinetic Documentation',
+      url: siteUrl,
+      description:
+        'Operator documentation for pg-kinetic, a PostgreSQL wire proxy for pooling, routing, health checks, metrics, and deployment validation.',
+      inLanguage: 'en',
+      publisher: {
+        '@id': `${siteUrl}/#organization`,
+      },
+    },
+    {
+      '@type': 'SoftwareApplication',
+      '@id': `${siteUrl}/#software`,
+      name: 'pg-kinetic',
+      applicationCategory: 'DeveloperApplication',
+      operatingSystem: 'Linux',
+      programmingLanguage: 'Rust',
+      url: siteUrl,
+      codeRepository: repositoryUrl,
+      description:
+        'pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.',
+      softwareRequirements: 'PostgreSQL-compatible client and backend',
+      softwareVersion: 'unreleased source build',
+      downloadUrl: repositoryUrl,
+      installUrl: `${siteUrl}/installation`,
+      author: {
+        '@id': `${siteUrl}/#organization`,
+      },
+      isAccessibleForFree: true,
+    },
+  ],
+};
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'pg-kinetic',
-  tagline: 'PostgreSQL wire proxy documentation',
-  url: 'https://docs.pgkinetic.dev',
+  tagline: 'PostgreSQL wire proxy documentation for operators',
+  url: siteUrl,
   baseUrl: '/',
   organizationName: 'hookwoods',
   projectName: 'pg-kinetic',
   trailingSlash: false,
+  favicon: 'img/favicon.svg',
 
   onBrokenLinks: 'throw',
   markdown: {
@@ -28,12 +79,45 @@ const config = {
           routeBasePath: '/',
           sidebarPath: require.resolve('./sidebars.js'),
           editUrl: 'https://github.com/hookwoods/pg-kinetic/edit/main/docs/',
+          showLastUpdateTime: true,
+          showLastUpdateAuthor: true,
+          lastVersion: 'current',
+          versions: {
+            current: {
+              label: 'Current',
+              path: '/',
+              banner: 'unreleased',
+            },
+          },
+        },
+        sitemap: {
+          lastmod: 'date',
+          changefreq: 'weekly',
+          priority: 0.7,
+          ignorePatterns: ['/search'],
+          filename: 'sitemap.xml',
         },
         blog: false,
         theme: {
           customCss: require.resolve('./src/css/custom.css'),
         },
       }),
+    ],
+  ],
+
+  plugins: [
+    [
+      '@easyops-cn/docusaurus-search-local',
+      {
+        hashed: true,
+        indexDocs: true,
+        indexBlog: false,
+        indexPages: true,
+        docsRouteBasePath: '/',
+        docsDir: '../docs',
+        language: ['en'],
+        highlightSearchTermsOnTargetPage: true,
+      },
     ],
   ],
 
@@ -50,6 +134,29 @@ const config = {
       mermaid: {
         theme: { light: 'neutral', dark: 'dark' },
       },
+      metadata: [
+        {
+          name: 'description',
+          content:
+            'Production-focused pg-kinetic documentation for PostgreSQL proxy deployment, configuration, pooling, routing, health checks, metrics, and regression testing.',
+        },
+        {
+          name: 'keywords',
+          content:
+            'pg-kinetic, PostgreSQL proxy, Postgres connection pooler, PostgreSQL wire protocol, Rust Postgres proxy, PostgreSQL read routing, PostgreSQL metrics, database proxy',
+        },
+        { name: 'robots', content: 'index,follow' },
+        { name: 'googlebot', content: 'index,follow,max-snippet:-1,max-image-preview:large,max-video-preview:-1' },
+        { name: 'bingbot', content: 'index,follow,max-snippet:-1,max-image-preview:large,max-video-preview:-1' },
+        { name: 'twitter:card', content: 'summary_large_image' },
+        { name: 'twitter:title', content: 'pg-kinetic PostgreSQL Wire Proxy Documentation' },
+        {
+          name: 'twitter:description',
+          content:
+            'Install, configure, and operate pg-kinetic for PostgreSQL connection pooling, routing, health checks, metrics, and regression validation.',
+        },
+        { name: 'twitter:image', content: socialImage },
+      ],
       navbar: {
         title: 'pg-kinetic',
         items: [
@@ -58,6 +165,15 @@ const config = {
             sidebarId: 'docsSidebar',
             position: 'left',
             label: 'Documentation',
+          },
+          {
+            type: 'docsVersionDropdown',
+            position: 'right',
+          },
+          {
+            href: 'https://pgkinetic.dev',
+            label: 'Website',
+            position: 'right',
           },
           {
             href: 'https://github.com/hookwoods/pg-kinetic',
@@ -73,6 +189,7 @@ const config = {
             title: 'Documentation',
             items: [
               { label: 'Guides', to: '/' },
+              { label: 'Website', href: 'https://pgkinetic.dev' },
               { label: 'Docs workflow', to: '/docs-site' },
             ],
           },
@@ -89,6 +206,20 @@ const config = {
         copyright: `Copyright ${new Date().getFullYear()} pg-kinetic contributors.`,
       },
     }),
+
+  headTags: [
+    { tagName: 'meta', attributes: { property: 'og:type', content: 'website' } },
+    { tagName: 'meta', attributes: { property: 'og:site_name', content: 'pg-kinetic Documentation' } },
+    { tagName: 'meta', attributes: { property: 'og:image', content: socialImage } },
+    { tagName: 'meta', attributes: { property: 'og:image:width', content: '1200' } },
+    { tagName: 'meta', attributes: { property: 'og:image:height', content: '630' } },
+    { tagName: 'meta', attributes: { property: 'og:image:alt', content: 'pg-kinetic PostgreSQL wire proxy documentation' } },
+    {
+      tagName: 'script',
+      attributes: { type: 'application/ld+json' },
+      innerHTML: JSON.stringify(structuredData),
+    },
+  ],
 };
 
 module.exports = config;

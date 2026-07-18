@@ -1,31 +1,44 @@
 ---
-slug: /
-title: Documentation
-description: pg-kinetic operator documentation for PostgreSQL wire proxying, routing, pooling, sharding, policy, observability, and regression testing.
+title: "pg-kinetic Documentation"
+description: "Operator documentation for pg-kinetic, covering implemented PostgreSQL proxy behavior, preview tooling, deployment assets, and validation workflows."
+keywords:
+  - pg-kinetic
+  - PostgreSQL wire proxy
+  - Postgres connection pooler
+  - database proxy documentation
 ---
 
 import DocCardList from '@theme/DocCardList';
 
 # pg-kinetic documentation
 
-pg-kinetic is a PostgreSQL wire proxy for high-concurrency services that need connection pooling, conservative session handling, read routing, policy checks, and performance regression visibility without tying the application to one language driver.
+pg-kinetic is a PostgreSQL wire proxy. These docs separate implemented runtime behavior from preview tooling so operators can decide what is ready for traffic.
 
-Use these docs as an operator guide. Start with installation, then move through configuration, the runtime model, feature guides, production operations, and validation workflows.
+## Current State
 
-## What pg-kinetic Does
+| Area | Status | Notes |
+| --- | --- | --- |
+| PostgreSQL wire proxy | Works now | The proxy accepts PostgreSQL clients and forwards traffic to a backend. |
+| Transaction pooling and virtual sessions | Works now | Backend reuse is conservative and pins sessions when state is unsafe to replay. |
+| Read routing | Works now with limits | Runtime uses the first configured route. Replica routing depends on the route's replica config and conservative read classification. |
+| Health endpoints | Works now | `GET /healthz`, `GET /readyz`, and `GET /state`; no HTTP drain endpoint. |
+| Admin views | Works now for available snapshots | Some feature-specific views remain empty until the corresponding runtime path records data. |
+| Metrics | Works now for installed collectors | Feature metrics stay zero when that feature path is disabled or preview-only. |
+| TLS and client auth | Works now | Exact modes and failure cases are documented in TLS/auth docs. |
+| Docker and Helm assets | Local assets now | Public images and Helm repository require a version tag workflow. |
+| Sharding | Preview/offline | Route-preview and core models exist; main proxy config does not expose live sharding traffic config. |
+| Policy | Preview/offline | Policy-preview and policy models exist; main proxy config does not expose live policy traffic config. |
+| Mirroring | Disabled in live proxy | The proxy constructs a disabled mirror dispatcher today. |
+| Adaptive operations | Recommendation/simulation | Records recommendations and simulated outcomes; does not mutate live settings. |
+| Kubernetes operator | Not supported | No CRDs or controller exist. |
 
-pg-kinetic sits between PostgreSQL clients and PostgreSQL servers. Applications keep speaking the PostgreSQL protocol, while the proxy owns backend checkout, virtual-session safety, route selection, overload handling, and operational inspection.
+## What To Read First
 
-The current documentation covers:
-
-- connection and transaction pooling behavior
-- virtual sessions, backend pinning, cleanup, and recovery
-- read routing with replica freshness checks and explicit hints
-- sharding route maps and conservative shard-key extraction
-- policy preview, dry-run, deny, route override, and shard override behavior
-- mirroring safety gates and sampling
-- TLS, SCRAM, reload, drain, health, metrics, and Kubernetes operation
-- benchmark scenarios, score regression, compatibility smoke tests, and docs workflow
+1. [Installation](installation.md) explains local Docker, Compose, and Helm assets.
+2. [Quickstart](quickstart.md) runs one local end-to-end check.
+3. [Configuration](configuration.md) documents implemented runtime config fields and precedence.
+4. [Health, Readiness, And Drain](health-and-drain.md) documents the exact HTTP health surface.
+5. [Compatibility](compatibility.md) documents client-driver smoke coverage.
 
 ## Documentation Map
 

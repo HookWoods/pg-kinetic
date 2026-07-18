@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">pg-kinetic</title>
+  <rect width="64" height="64" rx="12" fill="#05080d"/>
+  <path d="M14 38V17h9.5c6.4 0 10.3 3.5 10.3 9.1s-3.9 9.1-10.3 9.1h-3.8V38H14Zm5.7-8h3.5c3.1 0 4.8-1.4 4.8-3.9s-1.7-3.9-4.8-3.9h-3.5V30Z" fill="#f4f7fb"/>
+  <path d="M35 47V24h5.4v8.3L48 24h6.7l-8.8 9.4L55 47h-6.8l-6.1-9.2-1.7 1.8V47H35Z" fill="#62a8ff"/>
+  <circle cx="52" cy="13" r="4" fill="#20f0a0"/>
+</svg>

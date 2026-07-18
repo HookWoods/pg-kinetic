@@ -1,10 +1,20 @@
+---
+title: "Health, Readiness, And Drain"
+description: "Current pg-kinetic HTTP health endpoints, readiness behavior, drain state reporting, Kubernetes probe guidance, and unsupported drain routes."
+keywords:
+  - pg-kinetic health checks
+  - PostgreSQL proxy readiness
+  - Kubernetes probes
+  - drain endpoint
+---
+
 # Health, Readiness, And Drain
 
-Health endpoints let schedulers decide when pg-kinetic is live, ready, or draining. Drain behavior lets rolling restarts stop new work without abruptly cutting active clients.
+This page describes the HTTP health listener that exists in the proxy today.
 
-## Endpoints
+## Current HTTP Endpoints
 
-Bind `health_addr` to enable the HTTP health listener:
+Enable the listener with `health_addr`.
 
 ```toml
 [health]
@@ -13,48 +23,72 @@ readiness_backend_check_interval_ms = 1000
 readiness_timeout_ms = 5000
 ```
 
-Supported endpoints:
+| Endpoint | Method | Status | Body | Meaning |
+| --- | --- | --- | --- | --- |
+| `/healthz` | `GET` | `200` | `live` | The process accepted the health request. |
+| `/readyz` | `GET` | `200` | `ready` | The proxy is accepting clients and the backend probe is ready. |
+| `/readyz` | `GET` | `503` | `not_ready` | The proxy is draining, not accepting clients, or backend probing failed. |
+| `/state` | `GET` | `200` | JSON | Non-secret health snapshot. |
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /healthz` | Process liveness. |
-| `GET /readyz` | Readiness for new traffic. |
-| `GET /state` | Non-secret runtime and backend state. |
-| `POST /drain` | Enter drain mode when pre-stop drain is enabled. |
+All other paths return `404 not_found`. Non-`GET` requests are treated as unknown paths.
 
-`/readyz` returns unavailable while draining or when backend readiness checks fail.
+`POST /drain` and `GET /drain` are not implemented in the HTTP health server. Do not configure Kubernetes pre-stop hooks against `/drain` until the endpoint exists in the proxy.
 
-## Drain Settings
+## State Payload
 
-```toml
-[runtime.lifecycle]
-readiness_fail_during_drain = true
-pre_stop_drain_enabled = true
-pre_stop_drain_endpoint = "/drain"
-termination_grace_period_seconds = 65
+`GET /state` returns:
 
-[drain]
-drain_timeout_ms = 45000
-reject_new_clients_during_drain = true
+```json
+{
+  "process": "live",
+  "ready": "ready",
+  "drain_state": "accepting",
+  "active_clients": 0,
+  "backend_health": "ready"
+}
 ```
 
-During drain, pg-kinetic stops accepting new clients when configured to do so, waits for active work to finish until the drain timeout, then closes remaining connections.
+Fields:
 
-## Kubernetes Shape
+| Field | Values | Notes |
+| --- | --- | --- |
+| `process` | `live` | The current server always reports process liveness as `live` while it can answer. |
+| `ready` | `ready`, `not_ready` | Combines drain acceptance and backend probe status. |
+| `drain_state` | `accepting`, `draining`, `drained` | Comes from the in-process drain controller. |
+| `active_clients` | integer | Number of active client sessions known to the drain controller. |
+| `backend_health` | `ready`, `not_ready`, `degraded`, `live` | Result of the background backend connection probe. |
 
-Use readiness probes against `/readyz`, liveness probes against `/healthz`, and a pre-stop hook that calls `/drain`. The pod termination grace period should be longer than `drain_timeout_ms` so the process has time to finish active sessions.
+## Kubernetes Probes
 
-See [Kubernetes Deployment](./kubernetes.md) for deployment details.
+Use readiness and liveness probes only:
 
-## Operational Signals
+```yaml
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+```
 
-Watch:
+Do not add a pre-stop HTTP hook yet. Current graceful shutdown starts from process signal handling, not an HTTP drain request.
 
-- `pg_kinetic_drain_state`
-- `pg_kinetic_health_status`
-- `pg_kinetic_client_connections`
-- `pg_kinetic_pool_checkout_wait_ms`
-- `pg_kinetic_timeout_total`
+## Failure Modes
 
-If readiness fails outside planned drain windows, inspect backend reachability and route health before restarting all pods.
+| Condition | Result |
+| --- | --- |
+| Backend connection fails or times out | `/readyz` returns `503 not_ready`. |
+| Health listener address is unset | No HTTP health server is started. |
+| Health listener bind fails | Proxy startup fails. |
+| Request path is unknown | HTTP `404 not_found`. |
+| Request method is not `GET` | HTTP `404 not_found`. |
 
+## Operational Checks
+
+```bash
+curl -fsS http://127.0.0.1:9091/healthz
+curl -fsS http://127.0.0.1:9091/readyz
+curl -fsS http://127.0.0.1:9091/state
+```

@@ -1,0 +1,42 @@
+# pg-kinetic
+
+> pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.
+
+Use this file as the compact reference for agents and LLM crawlers. Canonical documentation is hosted at https://docs.pgkinetic.dev/.
+
+## Current Runtime Status
+
+- Implemented runtime behavior: PostgreSQL wire proxying, conservative backend reuse, connection pooling, read-routing primitives, admin `SHOW` views, HTTP health endpoints, Prometheus-style metrics, TLS/authentication controls, Docker Compose assets, and a local Helm chart.
+- Preview or offline tooling: sharding models, policy models, mirroring models, compatibility reports, benchmarks, profiling, and regression workflows.
+- Not implemented as live traffic features today: HTTP `/drain`, Kubernetes operator or CRDs, live sharding traffic configuration, live policy enforcement, and live mirroring traffic.
+- Current installation path before the first release tag: build `pg-kinetic:local` from the repository checkout and use the local Docker Compose or Helm chart assets.
+
+## Canonical Pages
+
+- Overview: https://docs.pgkinetic.dev/
+- Installation: https://docs.pgkinetic.dev/installation
+- Quickstart: https://docs.pgkinetic.dev/quickstart
+- Configuration: https://docs.pgkinetic.dev/configuration
+- CLI reference: https://docs.pgkinetic.dev/commands
+- FAQ: https://docs.pgkinetic.dev/faq
+- Architecture: https://docs.pgkinetic.dev/architecture
+- Transaction pooling: https://docs.pgkinetic.dev/transaction-pooling
+- Backpressure: https://docs.pgkinetic.dev/backpressure
+- Prepared statements: https://docs.pgkinetic.dev/prepared-statements
+- Admin reference: https://docs.pgkinetic.dev/admin
+- Read routing: https://docs.pgkinetic.dev/read-routing
+- Metrics: https://docs.pgkinetic.dev/metrics
+- Health and drain: https://docs.pgkinetic.dev/health-and-drain
+- TLS and authentication: https://docs.pgkinetic.dev/tls-and-auth
+- Kubernetes: https://docs.pgkinetic.dev/kubernetes
+- Benchmarking: https://docs.pgkinetic.dev/benchmarking
+- Regression workflow: https://docs.pgkinetic.dev/regression
+- GitHub repository: https://github.com/hookwoods/pg-kinetic
+
+## Entity Terms
+
+- Product name: pg-kinetic
+- Category: PostgreSQL wire proxy, PostgreSQL connection pooler, database proxy
+- Runtime language: Rust
+- Primary audience: PostgreSQL operators, platform engineers, backend engineers, and database reliability teams
+- Public domain: docs.pgkinetic.dev

@@ -1,3 +1,13 @@
+---
+title: "Testing"
+description: "Testing guide for pg-kinetic contributors, including focused Rust checks, smoke scripts, docs checks, CI workflows, and platform notes."
+keywords:
+  - pg-kinetic testing
+  - Rust PostgreSQL proxy tests
+  - smoke tests
+  - CI validation
+---
+
 # Testing
 
 pg-kinetic keeps platform-neutral Rust checks separate from smoke checks that

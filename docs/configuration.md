@@ -1,45 +1,55 @@
+---
+title: "Configuration"
+description: "Runtime configuration reference for pg-kinetic TOML files, CLI flags, environment variables, reload behavior, TLS, auth, and socket settings."
+keywords:
+  - pg-kinetic configuration
+  - config.toml
+  - PostgreSQL proxy config
+  - TOML reference
+---
+
 # Configuration
 
-pg-kinetic loads configuration from CLI flags, environment variables, or a TOML file. Production deployments should use a mounted `pg-kinetic.toml` plus secret references for credentials.
+pg-kinetic accepts configuration from defaults, a TOML file, environment variables, and CLI flags.
 
-## Loading Configuration
+## Precedence
 
-Run the proxy with:
+1. Built-in defaults are created first.
+2. When `--config-file` or `PG_KINETIC_CONFIG_FILE` is set, pg-kinetic parses that TOML file at startup.
+3. Non-default CLI flags and non-default environment values override the TOML file.
 
-```bash
-pg-kinetic --config-file /etc/pg-kinetic/pg-kinetic.toml
-```
+The merge code compares the base CLI/env config against `Config::default()`. A value equal to the built-in default is not treated as an override.
 
-The container entrypoint is the same binary:
+Unknown TOML fields are not a safe validation mechanism. Use `pg-kinetic preflight --config <path>` and a real startup check before rollout.
 
-```bash
-docker run --rm \
-  -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  hookwoods/pg-kinetic:0.1.0 \
-  --config-file /etc/pg-kinetic/pg-kinetic.toml
-```
-
-Environment variables use the `PG_KINETIC_` prefix. Secrets should be passed by reference, for example with `backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"`.
-
-## Complete Production Template
-
-This template shows every production config section accepted by the main proxy config. Remove sections you do not use, and replace addresses, TLS paths, limits, and credentials for your environment.
+## Minimal Runtime Config
 
 ```toml
 [connection]
 listen_addr = "0.0.0.0:6432"
-backend_addr = "postgres.internal:5432"
+backend_addr = "127.0.0.1:5432"
 
+[health]
+health_addr = "0.0.0.0:9091"
+readiness_backend_check_interval_ms = 1000
+readiness_timeout_ms = 5000
+```
+
+## Route Config
+
+`routes` is parsed from TOML, but the current proxy runtime uses only the first effective route:
+
+```toml
 [[routes]]
 [routes.primary]
-address = "postgres-primary.internal:5432"
+address = "127.0.0.1:5432"
 connect_timeout_ms = 1000
-tls_mode = "require"
+tls_mode = "disable"
 
 [[routes.replicas]]
-address = "postgres-replica-a.internal:5432"
+address = "127.0.0.1:5433"
 connect_timeout_ms = 1000
-tls_mode = "require"
+tls_mode = "disable"
 weight = 1
 
 [routes.read_routing]
@@ -47,177 +57,175 @@ read_routing_mode = "prefer_replica"
 fallback_policy = "primary"
 
 [routes.freshness]
-freshness_policy = "session_write_lsn_and_max_lag"
+freshness_policy = "session_write_lsn"
 max_replica_lag_ms = 1000
 read_after_write_timeout_ms = 500
 
 [routes.ha]
 replica_health_interval_ms = 1000
 replica_health_timeout_ms = 500
-
-[runtime.lifecycle]
-startup_grace_ms = 30000
-shutdown_grace_ms = 30000
-readiness_fail_during_drain = true
-pre_stop_drain_enabled = true
-pre_stop_drain_endpoint = "/drain"
-startup_backend_checks_enabled = true
-termination_grace_period_seconds = 65
-
-[runtime.node]
-node_id = "pg-kinetic-a"
-
-[runtime.engine]
-runtime_engine = "tokio_default"
-experimental_runtime_enabled = false
-
-[runtime.production]
-control_plane_enabled = false
-mirroring_enabled = false
-adaptive_enabled = false
-
-[runtime.production.adaptive]
-adaptive_mode = "recommend"
-adaptive_window_ms = 60000
-adaptive_min_confidence = 0.8
-adaptive_apply_enabled = false
-adaptive_apply_allowlist = []
-adaptive_max_change_percent = 10
-
-[capacity]
-max_clients = 1000
-max_backends = 64
-max_checkout_waiters = 512
-
-[performance]
-checkout_timeout_ms = 500
-recovery_mode = "recover"
-recovery_timeout_ms = 5000
-backend_reset_query = "DISCARD ALL"
-
-[qos]
-max_route_in_flight = 256
-max_route_waiters = 512
-query_timeout_ms = 30000
-idle_client_timeout_ms = 300000
-idle_transaction_timeout_ms = 60000
-max_client_buffer_bytes = 1048576
-max_backend_buffer_bytes = 1048576
-overload_error_code = "53300"
-
-[admin]
-admin_addr = "0.0.0.0:7000"
-admin_require_tls = true
-admin_allowed_user = "pg_kinetic_admin"
-admin_query_timeout_ms = 2000
-admin_max_clients = 16
-
-[observability]
-metrics_addr = "0.0.0.0:9090"
-debug_trace_sampling_rate = 0.0
-otel_enabled = false
-otel_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
-otel_service_name = "pg-kinetic"
-
-[tls]
-client_tls_mode = "require"
-client_cert_path = "/etc/pg-kinetic/certs/client.crt"
-client_key_path = "/etc/pg-kinetic/certs/client.key"
-client_ca_path = "/etc/pg-kinetic/certs/client-ca.crt"
-backend_tls_mode = "verify_full"
-backend_ca_path = "/etc/pg-kinetic/certs/backend-ca.crt"
-backend_server_name = "postgres.internal"
-
-[auth]
-auth_mode = "pass_through"
-auth_users_file = "/etc/pg-kinetic/auth/users.txt"
-backend_user = "pg_kinetic_proxy"
-backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"
-auth_failure_message_mode = "generic"
-
-[reload]
-config_file = "/etc/pg-kinetic/pg-kinetic.toml"
-config_reload_interval_ms = 5000
-reload_enabled = true
-
-[drain]
-drain_timeout_ms = 45000
-reject_new_clients_during_drain = true
-
-[health]
-health_addr = "0.0.0.0:9091"
-readiness_backend_check_interval_ms = 1000
-readiness_timeout_ms = 5000
-
-[socket]
-tcp_nodelay = true
-tcp_keepalive = true
-tcp_keepalive_idle_ms = 30000
-tcp_keepalive_interval_ms = 10000
-tcp_keepalive_retries = 3
-tcp_user_timeout_ms = 30000
-tcp_send_buffer_bytes = 1048576
-tcp_recv_buffer_bytes = 1048576
-strict_socket_option_mode = false
 ```
 
-## Section Reference
+If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 
-| Section | Purpose |
-| --- | --- |
-| `connection` | Client listener and fallback backend address. |
-| `routes` | Explicit primary, replicas, read-routing policy, freshness policy, and replica health checks. |
-| `runtime.lifecycle` | Startup, shutdown, readiness, pre-stop drain, and termination timing. |
-| `runtime.node` | Stable node identity for runtime snapshots and operations. |
-| `runtime.engine` | Runtime engine selection. Experimental engines require an explicit gate. |
-| `runtime.production` | Feature gates for production control-plane, mirroring, and adaptive behavior. |
-| `runtime.production.adaptive` | Recommendation/apply mode and guardrails for adaptive tuning. |
-| `capacity` | Client count, backend pool size, and checkout waiter budget. |
-| `performance` | Checkout timeout, backend recovery mode, recovery timeout, and reset query. |
-| `qos` | Route concurrency, waiters, query/idle timeouts, buffer caps, and overload SQLSTATE. |
-| `admin` | PostgreSQL-compatible admin listener. |
-| `observability` | Metrics listener, trace sampling, and OpenTelemetry export settings. |
-| `tls` | Client and backend TLS mode and certificate paths. |
-| `auth` | Client authentication mode, local user file, and backend credential source. |
-| `reload` | Config file path and reload loop. |
-| `drain` | Graceful drain timeout and new-client behavior. |
-| `health` | HTTP health/readiness address and backend readiness polling. |
-| `socket` | TCP_NODELAY, keepalive, user timeout, buffer sizes, and strict socket option behavior. |
+## Runtime Field Reference
 
-## Important Defaults
+| Field | Type | Default | CLI | Environment | Reload | Failure mode |
+| --- | --- | --- | --- | --- | --- | --- |
+| `connection.listen_addr` | socket address | `127.0.0.1:6543` | `--listen-addr` | `PG_KINETIC_LISTEN_ADDR` | restart | Startup fails if bind fails or value cannot parse. |
+| `connection.backend_addr` | socket address | `127.0.0.1:5432` | `--backend-addr` | `PG_KINETIC_BACKEND_ADDR` | restart | Startup/preflight fails if value cannot parse; readiness fails when backend cannot connect. |
+| `capacity.max_clients` | integer | `10000` | `--max-clients` | `PG_KINETIC_MAX_CLIENTS` | restart | Client admission is capped at this value. |
+| `capacity.max_backends` | integer | `100` | `--max-backends` | `PG_KINETIC_MAX_BACKENDS` | restart | Backend pool is capped at this value. |
+| `capacity.max_checkout_waiters` | integer | `1000` | `--max-checkout-waiters` | `PG_KINETIC_MAX_CHECKOUT_WAITERS` | restart | Excess backend checkout waiters are rejected. |
+| `performance.checkout_timeout_ms` | milliseconds | `1000` | `--checkout-timeout-ms` | `PG_KINETIC_CHECKOUT_TIMEOUT_MS` | restart | Backend checkout times out after this duration. |
+| `performance.recovery_mode` | enum | `recover` | `--recovery-mode` | `PG_KINETIC_RECOVERY_MODE` | restart | Invalid enum fails parse. Values: `recover`, `rollback_only`, `drop`. |
+| `performance.recovery_timeout_ms` | milliseconds | `5000` | `--recovery-timeout-ms` | `PG_KINETIC_RECOVERY_TIMEOUT_MS` | restart | Recovery exceeding this duration discards the backend. |
+| `performance.backend_reset_query` | string | `DISCARD ALL` | `--backend-reset-query` | `PG_KINETIC_BACKEND_RESET_QUERY` | restart | Invalid SQL fails at backend execution time. |
+| `qos.max_route_in_flight` | integer | `100` | `--max-route-in-flight` | `PG_KINETIC_MAX_ROUTE_IN_FLIGHT` | restart | Route concurrency above the cap queues or rejects. |
+| `qos.max_route_waiters` | integer | `1000` | `--max-route-waiters` | `PG_KINETIC_MAX_ROUTE_WAITERS` | restart | Excess route waiters are rejected. |
+| `qos.query_timeout_ms` | milliseconds | `30000` | `--query-timeout-ms` | `PG_KINETIC_QUERY_TIMEOUT_MS` | restart | Query cycle times out after this duration. |
+| `qos.idle_client_timeout_ms` | milliseconds | `300000` | `--idle-client-timeout-ms` | `PG_KINETIC_IDLE_CLIENT_TIMEOUT_MS` | restart | Idle client sessions are closed. |
+| `qos.idle_transaction_timeout_ms` | milliseconds | `60000` | `--idle-transaction-timeout-ms` | `PG_KINETIC_IDLE_TRANSACTION_TIMEOUT_MS` | restart | Idle pinned transactions are closed or recovered. |
+| `qos.max_client_buffer_bytes` | bytes | `1048576` | `--max-client-buffer-bytes` | `PG_KINETIC_MAX_CLIENT_BUFFER_BYTES` | restart | Client buffering above the cap fails the session. |
+| `qos.max_backend_buffer_bytes` | bytes | `4194304` | `--max-backend-buffer-bytes` | `PG_KINETIC_MAX_BACKEND_BUFFER_BYTES` | restart | Backend buffering above the cap fails or discards the backend. |
+| `qos.overload_error_code` | SQLSTATE string | `53300` | `--overload-error-code` | `PG_KINETIC_OVERLOAD_ERROR_CODE` | restart | Invalid SQLSTATE shape can produce invalid client-facing errors. |
+| `admin.admin_addr` | optional socket address | unset | `--admin-addr` | `PG_KINETIC_ADMIN_ADDR` | restart | Startup fails if bind fails. |
+| `admin.admin_require_tls` | bool | `false` | `--admin-require-tls` | `PG_KINETIC_ADMIN_REQUIRE_TLS` | restart | Startup fails when TLS is required but server TLS config cannot load. |
+| `admin.admin_allowed_user` | optional string | unset | `--admin-allowed-user` | `PG_KINETIC_ADMIN_ALLOWED_USER` | restart | Non-matching admin startup user is rejected. |
+| `admin.admin_query_timeout_ms` | milliseconds | `1000` | `--admin-query-timeout-ms` | `PG_KINETIC_ADMIN_QUERY_TIMEOUT_MS` | restart | Admin query handling times out. |
+| `admin.admin_max_clients` | integer | `8` | `--admin-max-clients` | `PG_KINETIC_ADMIN_MAX_CLIENTS` | restart | Excess admin clients wait or are rejected. |
+| `observability.metrics_addr` | optional socket address | unset | `--metrics-addr` | `PG_KINETIC_METRICS_ADDR` | restart | Startup fails if metrics bind fails. |
+| `observability.debug_trace_sampling_rate` | float | `0.0` | `--debug-trace-sampling-rate` | `PG_KINETIC_DEBUG_TRACE_SAMPLING_RATE` | restart | Non-finite values are clamped to `0.0` at use. |
+| `observability.otel_enabled` | bool | `false` | `--otel-enabled` | `PG_KINETIC_OTEL_ENABLED` | restart | Export is disabled when false. |
+| `observability.otel_endpoint` | optional string | unset | `--otel-endpoint` | `PG_KINETIC_OTEL_ENDPOINT` | restart | Invalid endpoint fails at exporter setup/use. |
+| `observability.otel_service_name` | string | `pg-kinetic` | `--otel-service-name` | `PG_KINETIC_OTEL_SERVICE_NAME` | restart | Empty or misleading names affect telemetry identity. |
+| `tls.client_tls_mode` | enum | `disable` | `--client-tls-mode` | `PG_KINETIC_CLIENT_TLS_MODE` | restart | Invalid enum fails parse. Values: `disable`, `allow`, `require`, `verify_client`. |
+| `tls.client_cert_path` | optional path | unset | `--client-cert-path` | `PG_KINETIC_CLIENT_TLS_CERT_PATH` | restart | TLS startup fails if required file cannot load. |
+| `tls.client_key_path` | optional path | unset | `--client-key-path` | `PG_KINETIC_CLIENT_TLS_KEY_PATH` | restart | TLS startup fails if required key cannot load. |
+| `tls.client_ca_path` | optional path | unset | `--client-ca-path` | `PG_KINETIC_CLIENT_TLS_CA_PATH` | restart | Client verification fails if CA cannot load. |
+| `tls.backend_tls_mode` | enum | `disable` | `--backend-tls-mode` | `PG_KINETIC_BACKEND_TLS_MODE` | restart | Invalid enum fails parse. Values: `disable`, `prefer`, `require`, `verify_ca`, `verify_full`. |
+| `tls.backend_ca_path` | optional path | unset | `--backend-ca-path` | `PG_KINETIC_BACKEND_TLS_CA_PATH` | restart | Backend verification fails if CA cannot load. |
+| `tls.backend_server_name` | optional string | unset | `--backend-server-name` | `PG_KINETIC_BACKEND_TLS_SERVER_NAME` | restart | `verify_full` fails when name does not match backend cert. |
+| `auth.auth_mode` | enum | `pass_through` | `--auth-mode` | `PG_KINETIC_AUTH_MODE` | restart | Invalid enum fails parse. Values: `pass_through`, `trust`, `scram_sha_256`. |
+| `auth.auth_users_file` | optional path | unset | `--auth-users-file` | `PG_KINETIC_AUTH_USERS_FILE` | reload asset | Startup/reload fails if the file cannot load. |
+| `auth.backend_user` | optional string | unset | `--backend-user` | `PG_KINETIC_BACKEND_USER` | restart | Backend auth uses configured value when the proxy authenticates separately. |
+| `auth.backend_password_env_var_name` | optional string | unset | `--backend-password-env-var-name` | `PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME` | restart | Backend auth fails when the named environment variable is absent. |
+| `auth.auth_failure_message_mode` | enum | `generic` | `--auth-failure-message-mode` | `PG_KINETIC_AUTH_FAILURE_MESSAGE_MODE` | restart | `detailed` can expose more auth context to clients. |
+| `reload.config_file` | optional path | unset | `--config-file` | `PG_KINETIC_CONFIG_FILE` | restart | Startup/reload fails if file cannot read or parse. |
+| `reload.config_reload_interval_ms` | milliseconds | `5000` | `--config-reload-interval-ms` | `PG_KINETIC_CONFIG_RELOAD_INTERVAL_MS` | restart | Reload loop ticks at this interval. |
+| `reload.reload_enabled` | bool | `false` | `--reload-enabled` | `PG_KINETIC_CONFIG_RELOAD_ENABLED` | restart | Reload loop is disabled when false. |
+| `drain.drain_timeout_ms` | milliseconds | `30000` | `--drain-timeout-ms` | `PG_KINETIC_DRAIN_TIMEOUT_MS` | restart | Shutdown drain waits up to this duration. |
+| `drain.reject_new_clients_during_drain` | bool | `false` | `--reject-new-clients-during-drain` | `PG_KINETIC_REJECT_NEW_CLIENTS_DURING_DRAIN` | restart | New clients are rejected during drain when true. |
+| `health.health_addr` | optional socket address | unset | `--health-addr` | `PG_KINETIC_HEALTH_ADDR` | restart | Startup fails if bind fails. |
+| `health.readiness_backend_check_interval_ms` | milliseconds | `1000` | `--readiness-backend-check-interval-ms` | `PG_KINETIC_READINESS_BACKEND_CHECK_INTERVAL_MS` | restart | Backend health probe interval. |
+| `health.readiness_timeout_ms` | milliseconds | `5000` | `--readiness-timeout-ms` | `PG_KINETIC_READINESS_TIMEOUT_MS` | restart | Backend health probe timeout. |
+| `socket.tcp_nodelay` | bool | `true` | `--tcp-nodelay` | `PG_KINETIC_TCP_NODELAY` | restart | Socket option failure follows strict mode behavior. |
+| `socket.tcp_keepalive` | bool | `false` | `--tcp-keepalive` | `PG_KINETIC_TCP_KEEPALIVE` | restart | Enables TCP keepalive when supported. |
+| `socket.tcp_keepalive_idle_ms` | optional milliseconds | unset | `--tcp-keepalive-idle-ms` | `PG_KINETIC_TCP_KEEPALIVE_IDLE_MS` | restart | Unsupported values fail only in strict mode. |
+| `socket.tcp_keepalive_interval_ms` | optional milliseconds | unset | `--tcp-keepalive-interval-ms` | `PG_KINETIC_TCP_KEEPALIVE_INTERVAL_MS` | restart | Unsupported values fail only in strict mode. |
+| `socket.tcp_keepalive_retries` | optional integer | unset | `--tcp-keepalive-retries` | `PG_KINETIC_TCP_KEEPALIVE_RETRIES` | restart | Unsupported values fail only in strict mode. |
+| `socket.tcp_user_timeout_ms` | optional milliseconds | unset | `--tcp-user-timeout-ms` | `PG_KINETIC_TCP_USER_TIMEOUT_MS` | restart | Unsupported values fail only in strict mode. |
+| `socket.tcp_send_buffer_bytes` | optional bytes | unset | `--tcp-send-buffer-bytes` | `PG_KINETIC_TCP_SEND_BUFFER_BYTES` | restart | Unsupported values fail only in strict mode. |
+| `socket.tcp_recv_buffer_bytes` | optional bytes | unset | `--tcp-recv-buffer-bytes` | `PG_KINETIC_TCP_RECV_BUFFER_BYTES` | restart | Unsupported values fail only in strict mode. |
+| `socket.strict_socket_option_mode` | bool | `false` | `--strict-socket-option-mode` | `PG_KINETIC_STRICT_SOCKET_OPTION_MODE` | restart | Startup fails on unsupported socket options when true. |
 
-| Setting | Default |
-| --- | --- |
-| `connection.listen_addr` | `127.0.0.1:6543` |
-| `connection.backend_addr` | `127.0.0.1:5432` |
-| `capacity.max_clients` | `10000` |
-| `capacity.max_backends` | `100` |
-| `performance.checkout_timeout_ms` | `1000` |
-| `performance.recovery_mode` | `recover` |
-| `qos.overload_error_code` | `53300` |
-| `tls.client_tls_mode` | `disable` |
-| `tls.backend_tls_mode` | `disable` |
-| `auth.auth_mode` | `pass_through` |
-| `socket.tcp_nodelay` | `true` |
+## Runtime Lifecycle Fields
 
-## Mode Values
+| Field | Type | Default | CLI | Environment | Reload | Failure mode |
+| --- | --- | --- | --- | --- | --- | --- |
+| `runtime.lifecycle.startup_grace_ms` | milliseconds | `30000` | `--startup-grace-ms` | `PG_KINETIC_STARTUP_GRACE_MS` | restart | Startup coordination uses this timeout. |
+| `runtime.lifecycle.shutdown_grace_ms` | milliseconds | `30000` | `--shutdown-grace-ms` | `PG_KINETIC_SHUTDOWN_GRACE_MS` | restart | Shutdown coordination uses this timeout. |
+| `runtime.lifecycle.readiness_fail_during_drain` | bool | `true` | `--readiness-fail-during-drain` | `PG_KINETIC_READINESS_FAIL_DURING_DRAIN` | restart | `/readyz` reports not ready during drain when true. |
+| `runtime.lifecycle.pre_stop_drain_enabled` | bool | `true` | `--pre-stop-drain-enabled` | `PG_KINETIC_PRE_STOP_DRAIN_ENABLED` | restart | HTTP `/drain` is not implemented, so do not wire Kubernetes hooks to it yet. |
+| `runtime.lifecycle.pre_stop_drain_endpoint` | string | `/drain` | `--pre-stop-drain-endpoint` | `PG_KINETIC_PRE_STOP_DRAIN_ENDPOINT` | restart | Informational until an HTTP drain endpoint exists. |
+| `runtime.lifecycle.startup_backend_checks_enabled` | bool | `true` | `--startup-backend-checks-enabled` | `PG_KINETIC_STARTUP_BACKEND_CHECKS_ENABLED` | restart | Startup readiness depends on backend checks when true. |
+| `runtime.lifecycle.termination_grace_period_seconds` | seconds | `65` | `--termination-grace-period-seconds` | `PG_KINETIC_TERMINATION_GRACE_PERIOD_SECONDS` | restart | Documents expected supervisor grace period. |
+| `runtime.node.node_id` | string | generated host/process id | `--node-id` | `PG_KINETIC_NODE_ID` | restart | Empty or invalid ids fail parse. |
+| `runtime.engine.runtime_engine` | enum | `tokio_default` | `--runtime-engine` | `PG_KINETIC_RUNTIME_ENGINE` | restart | Experimental engines require `experimental_runtime_enabled = true`. |
+| `runtime.engine.experimental_runtime_enabled` | bool | `false` | `--experimental-runtime-enabled` | `PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED` | restart | Experimental runtime parse fails when false. |
+| `runtime.production.control_plane_enabled` | bool | `false` | `--control-plane-enabled` | `PG_KINETIC_CONTROL_PLANE_ENABLED` | restart | No control-plane runtime is documented as production-ready. |
+| `runtime.production.mirroring_enabled` | bool | `false` | `--mirroring-enabled` | `PG_KINETIC_MIRRORING_ENABLED` | restart | Live proxy still constructs a disabled mirror dispatcher. |
+| `runtime.production.adaptive_enabled` | bool | `false` | `--adaptive-enabled` | `PG_KINETIC_ADAPTIVE_ENABLED` | restart | Starts recommendation/simulation controller when true. |
+| `runtime.production.adaptive_mode` | enum | `recommend` | `--adaptive-mode` | `PG_KINETIC_ADAPTIVE_MODE` | restart | Values are `recommend` and `apply`; apply mode records simulated apply outcomes only. |
+| `runtime.production.adaptive_window_ms` | milliseconds | `60000` | `--adaptive-window-ms` | `PG_KINETIC_ADAPTIVE_WINDOW_MS` | restart | Must be greater than zero. |
+| `runtime.production.adaptive_min_confidence` | float | `0.8` | `--adaptive-min-confidence` | `PG_KINETIC_ADAPTIVE_MIN_CONFIDENCE` | restart | Must be finite and within `0.0..=1.0`. |
+| `runtime.production.adaptive_apply_enabled` | bool | `false` | `--adaptive-apply-enabled` | `PG_KINETIC_ADAPTIVE_APPLY_ENABLED` | restart | Required for `adaptive_mode = "apply"`; does not mutate live settings. |
+| `runtime.production.adaptive_apply_allowlist` | list | `[]` | `--adaptive-apply-allowlist` | `PG_KINETIC_ADAPTIVE_APPLY_ALLOWLIST` | restart | Required and duplicate-free for apply mode. |
+| `runtime.production.adaptive_max_change_percent` | integer | `10` | `--adaptive-max-change-percent` | `PG_KINETIC_ADAPTIVE_MAX_CHANGE_PERCENT` | restart | Must be between `1` and `100`. |
 
-| Setting | Values |
-| --- | --- |
-| `tls.client_tls_mode` | `disable`, `allow`, `require`, `verify_client` |
-| `tls.backend_tls_mode` | `disable`, `prefer`, `require`, `verify_ca`, `verify_full` |
-| `auth.auth_mode` | `pass_through`, `trust`, `scram_sha_256` |
-| `auth.auth_failure_message_mode` | `generic`, `detailed` |
-| `runtime.engine.runtime_engine` | `tokio_default`, `tokio_current_thread`, `experimental_thread_per_core`, `experimental_io_uring` |
-| `performance.recovery_mode` | `recover`, `rollback_only`, `drop` |
-| `routes.read_routing.read_routing_mode` | `off`, `prefer_replica`, `require_replica`, `primary_only` |
-| `routes.read_routing.fallback_policy` | `primary`, `reject`, `wait` |
-| `routes.freshness.freshness_policy` | `none`, `session_write_lsn`, `max_replica_lag`, `session_write_lsn_and_max_lag` |
-| `runtime.production.adaptive.adaptive_mode` | `recommend`, `apply` |
+The internal `apply` and `guardrail` wrappers are flattened by the parser. They are not TOML table names.
+
+Reload compatibility is strict. Any runtime field change, including adaptive runtime scalar fields, is restart-required. Accepted reloads affect new client connections and reloadable assets such as auth user file contents or TLS certificate file contents at unchanged paths; they do not change existing sessions or already checked-out backends.
+
+## Preview Configs Not In Main Runtime
+
+`[sharding]`, `[policy]`, and `[mirror]` examples from preview docs are not part of the main live proxy config contract. Use the preview commands for those models:
+
+```bash
+pg-kinetic route-preview --config preview.toml --database app --user app --sql "select 1"
+pg-kinetic policy-preview --config preview.toml --database app --user app --route primary --shard default --query-class read_candidate
+```
+
+Do not deploy sharding, policy, or mirroring config as live traffic configuration until the proxy runtime exposes and applies those configs.
+
+Sharding preview fields:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `sharding_enabled` | `false` | Enables the offline sharding model for `route-preview`. |
+| `multi_shard_policy` | `reject` | Values are `reject`, `first_match`, and `fan_out`. |
+| `route_map_reload_strict` | `true` | Rejects overlapping route maps without explicit priority. |
+| `route_preview_enabled` | `false` | Marks preview intent; it does not activate live traffic sharding. |
+| `route_maps` | `[]` | Array of route-map entries. |
+| `scope` | required per route map | Scope object such as `database_user`, `application_name`, `schema_table`, or `tenant_key`. |
+| `strategy` | required per route map | Strategy object with kind `hash`, `range`, or `list`. |
+| `targets` | required per route map | Non-empty list of `primary` or `replicas` targets. |
+| `priority` | unset | Required when route maps overlap. |
+
+Policy preview fields:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `policy_mode` | `disabled` | Values include disabled, dry-run, and enforcement modes supported by the parser. |
+| `policy_files` | `[]` | File references for policy documents. |
+| `inline_rules` | `[]` | Inline policy rules for preview and model validation. |
+| `policy_id` | generated default | Rule identifier shown in audit and preview output. |
+| `hook_point` | default policy hook | Hook point evaluated by the preview model. |
+| `action` | required for inline rules | Flattened inline rule action such as allow, deny, require primary, require replica, route override, shard override, or wasm. |
+| `policy_audit.policy_audit_enabled` | `true` | Enables audit event recording when policy paths run. |
+| `policy_audit.policy_audit_sample_rate` | `1.0` | Audit sampling rate. |
+| `policy_wasm.policy_wasm_enabled` | `false` | Required before wasm policy actions are accepted. |
+| `policy_eval_timeout_ms` | implementation default | Policy evaluation timeout. |
+| `policy_max_context_bytes` | implementation default | Redacted policy context size cap. |
+
+Mirror preview fields:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `mirroring_enabled` | `false` | Top-level mirror model flag. Live traffic mirroring is not active today. |
+| `mirror_mode` | `off` | Mirror mode parser value. |
+| `mirror_timeout_ms` | `100` | Mirror task timeout. |
+| `mirror_max_in_flight` | `128` | In-flight mirror task cap. |
+| `target.address` | unset | Mirror target socket address. |
+| `target.isolated` | `false` | Marks the target as isolated from production. |
+| `safety.mirror_writes_enabled` | `false` | Allows write mirroring only when explicitly set. |
+| `safety.mirror_transactions_enabled` | `false` | Allows transaction mirroring only when explicitly set. |
+| `safety.mirror_copy_enabled` | `false` | Allows COPY mirroring only when explicitly set. |
+| `safety.mirror_listen_notify_enabled` | `false` | Allows LISTEN/NOTIFY mirroring only when explicitly set. |
+| `safety.mirror_temp_table_enabled` | `false` | Allows temp-table mirroring only when explicitly set. |
+| `safety.mirror_session_mutation_enabled` | `false` | Allows session-mutation mirroring only when explicitly set. |
+| `safety.mirror_require_isolated_target` | `true` | Rejects unsafe production-target reuse. |
+| `sampling.mirror_sample_rate` | `0.0` | Mirror sample rate. |
+
+## Secrets And TLS
+
+- Keep private keys readable only by the pg-kinetic process user.
+- Mount certificates and user files read-only.
+- Rotate backend passwords by changing the secret value and restarting the process when `backend_password_env_var_name` is used.
+- Use `verify_full` only with `backend_ca_path` and `backend_server_name`.
+- Use `verify_client` only with client cert, key, and CA paths present.
 
 ## Validate Before Rollout
-
-Run preflight against the final mounted config:
 
 ```bash
 pg-kinetic preflight --config /etc/pg-kinetic/pg-kinetic.toml
@@ -228,8 +236,6 @@ Container:
 ```bash
 docker run --rm \
   -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  hookwoods/pg-kinetic:0.1.0 \
+  pg-kinetic:local \
   preflight --config /etc/pg-kinetic/pg-kinetic.toml
 ```
-
-Preflight should run in CI before updating Kubernetes ConfigMaps or Docker Compose mounts.

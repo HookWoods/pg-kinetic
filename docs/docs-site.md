@@ -1,8 +1,18 @@
+---
+title: "Documentation Site"
+description: "How the pg-kinetic Docusaurus documentation site is built, checked, organized, versioned, and gated before public publication."
+keywords:
+  - pg-kinetic docs
+  - Docusaurus documentation
+  - documentation workflow
+  - docs validation
+---
+
 # Documentation Site
 
-The documentation site is a Docusaurus classic site in `docs-site/`. It renders the canonical Markdown files in this `docs/` directory directly, so guides have one source of truth for repository readers and the published site.
+The documentation site is a Docusaurus classic site in `docs-site/`. It renders the canonical Markdown files in this `docs/` directory directly, so guides have one source of truth for repository readers and the deployable site.
 
-The published root route is a docs page, not a marketing landing page. `docs/index.mdx` owns `/` and uses Docusaurus `DocCardList`; `docs-site/sidebars.js` owns the category structure and generated index pages for the main sections.
+The root route is a docs page, not a marketing landing page. `docs/index.mdx` owns `/` and uses Docusaurus `DocCardList`; `docs-site/sidebars.js` owns the category structure and generated index pages for the main sections.
 
 ## Local Workflow
 
@@ -13,7 +23,7 @@ npm install
 npm run start
 ```
 
-Build and check the site before publishing documentation changes:
+Build and check the site before deploying documentation changes:
 
 ```bash
 npm run build
@@ -29,6 +39,10 @@ powershell.exe -ExecutionPolicy Bypass -File scripts/docs/check-links.ps1
 
 ## Content And Versions
 
-Add product guides to `docs/` and add them to `docs-site/sidebars.js` when they are ready to publish. Prefer category links and generated index pages for high-level sections, then use focused docs for installation, configuration, commands, operations, and reference material. Keep operational guidance public and reproducible; do not publish generated reports, credentials, local outputs, or unpublished project material.
+Add product guides to `docs/` and add them to `docs-site/sidebars.js` when they are accurate enough for operators. Prefer category links and generated index pages for high-level sections, then use focused docs for installation, configuration, commands, operations, and reference material. Keep operational guidance public and reproducible; do not publish generated reports, credentials, local outputs, or unpublished project material.
 
 The Docusaurus `current` documentation follows `main`. Cut released versions manually as part of a real release; the site does not maintain placeholder versioned documentation.
+
+## Publication Gate
+
+Do not treat the site as a final operator reference until search, released versions, TOML-example validation, command-example validation, and generated config/CLI/metric references are in place.

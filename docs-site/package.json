@@ -13,6 +13,7 @@
     "@docusaurus/core": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",
     "@docusaurus/theme-mermaid": "^3.10.2",
+    "@easyops-cn/docusaurus-search-local": "^0.55.2",
     "@mdx-js/react": "^3.0.0",
     "@mermaid-js/layout-elk": "^0.1.9",
     "clsx": "^2.1.1",

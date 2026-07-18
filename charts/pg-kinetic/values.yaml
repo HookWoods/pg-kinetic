@@ -104,6 +104,5 @@ config: |
 
   [runtime.lifecycle]
   readiness_fail_during_drain = true
-  pre_stop_drain_enabled = true
-  pre_stop_drain_endpoint = "/drain"
+  pre_stop_drain_enabled = false
   termination_grace_period_seconds = 65

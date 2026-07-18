@@ -1,80 +1,67 @@
-# Mirroring
+---
+title: "Mirroring"
+description: "Current mirroring status in pg-kinetic, including disabled live traffic behavior, model surfaces, validation limits, and production alternatives."
+keywords:
+  - pg-kinetic mirroring
+  - PostgreSQL traffic mirroring
+  - shadow traffic
+  - preview tooling
+---
 
-Mirroring lets pg-kinetic observe or shadow selected traffic without changing the primary request path. The feature is intentionally conservative and defaults to off.
+# Mirroring Status
 
-## Safe Shadow Model
+Mirroring is not active in the live proxy path today. The proxy constructs a disabled mirror dispatcher even when production flags are present.
 
-Mirroring is designed as an observation path:
+Do not deploy pg-kinetic expecting traffic shadowing until the runtime wires mirror config into the request path.
 
-- primary traffic keeps flowing through the production backend path
-- mirrored work is best-effort and bounded by a timeout and an in-flight cap
-- mirror failures do not rewrite the primary routing decision
-- the mirror target should be isolated from the production target
+## What Exists
 
-The admin view `SHOW MIRRORING` summarizes the live mirror mode, sample rate, in-flight work, and outcome counters.
+- mirror domain models
+- mirror safety and sampling config structs
+- mirror outcome recording types
+- admin and metrics surfaces that can display mirror data when a runtime path records it
 
-## Default Behavior
+## What Does Not Work For Live Traffic
 
-The default mirror mode is off.
+- no live traffic is sent to a mirror target
+- mirror target config is not part of the main runtime `Config`
+- `SHOW MIRRORING` can only reflect available in-process snapshots
+- mirror metrics can stay zero because no mirror dispatcher is active
 
-- if mirroring is not enabled, the proxy keeps the mirror path disabled
-- the default sample rate is `0.0`
-- the default safety posture rejects unsafe target reuse
-- the default target isolation check is on
+## Offline-Only Config Shape
 
-The preflight command reports a warning when a mirror document is present but mirroring is still disabled.
+Mirroring has parser and preflight fields, but the live proxy still constructs a disabled dispatcher. This file is useful only for parser/preflight checks:
 
-## Target Isolation
+```toml
+[runtime.production]
+mirroring_enabled = false
 
-Mirror targets should point at a system that can absorb shadow traffic without affecting production.
+[mirror]
+mirroring_enabled = false
+mirror_mode = "off"
+mirror_timeout_ms = 100
+mirror_max_in_flight = 128
+mirror_sample_rate = 0.0
+mirror_writes_enabled = false
+mirror_transactions_enabled = false
+mirror_copy_enabled = false
+mirror_listen_notify_enabled = false
+mirror_temp_table_enabled = false
+mirror_session_mutation_enabled = false
+mirror_require_isolated_target = true
+```
 
-Recommended checks:
+Preflight accepts this as disabled mirroring and reports a warning rather than enabling traffic shadowing.
 
-- use a distinct address for the mirror target
-- set `mirror_target_isolated = true`
-- keep `mirror_require_isolated_target = true`
-- avoid pointing mirror traffic at the same backend address used for production
+## Future Runtime Contract
 
-If the mirror target matches the production target and isolation is not declared, preflight fails.
+A production mirroring feature needs:
 
-## Sampling
+- explicit runtime config in the main `Config`
+- target isolation validation
+- sample-rate enforcement
+- bounded timeout and in-flight limits
+- clear unsupported traffic classes
+- metrics that distinguish skipped, mirrored, timed out, and rejected work
 
-Sampling controls how much eligible traffic is sent to the mirror path.
-
-- `mirror_sample_rate = 0.0` disables sampled mirroring
-- higher rates increase coverage but also increase mirror load
-- the mirror timeout and in-flight limits should stay small enough to protect the production proxy
-
-Use low sample rates first, then raise them only after the mirror target has proven stable.
-
-## Unsupported Traffic
-
-Mirroring is intentionally conservative around stateful or side-effect-heavy traffic.
-
-Treat these as unsupported unless you have explicitly enabled and reviewed them:
-
-- writes
-- explicit transaction control
-- `COPY`
-- `LISTEN/NOTIFY`
-- temporary table mutation
-- session mutation
-
-The mirror safety section exists to keep these classes from slipping into a broad rollout by accident.
-
-## Telemetry And Redaction
-
-Mirror telemetry is summarized, not replayed in full.
-
-- `SHOW MIRRORING` exposes counters and rates, not query text
-- mirror metrics are bounded by mode and outcome
-- preflight only reports the presence of configuration problems
-- no raw SQL, credentials, or backend secrets should be exposed in mirror diagnostics
-
-## Rollout Checklist
-
-- Start with mirroring disabled and confirm the admin view reports `off`.
-- Run preflight on the config that includes the mirror section.
-- Use an isolated target before raising the sample rate.
-- Keep the sample rate low until the mirror target proves stable.
-- Review telemetry for dropped, skipped, rejected, and timed-out mirror work before expanding the rollout.
+Until then, treat mirroring docs and counters as implementation groundwork, not an operator feature.

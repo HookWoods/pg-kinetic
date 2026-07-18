@@ -68,11 +68,6 @@ spec:
               port: health
             periodSeconds: 10
             timeoutSeconds: 2
-          lifecycle:
-            preStop:
-              httpGet:
-                path: /drain
-                port: health
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

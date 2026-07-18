@@ -1,3 +1,13 @@
+---
+title: "Read Routing"
+description: "Read-routing behavior and safety model for pg-kinetic, including primary fallback, replica eligibility, freshness, and route snapshots."
+keywords:
+  - PostgreSQL read routing
+  - pg-kinetic routing
+  - replica reads
+  - database proxy routing
+---
+
 # Read Routing
 
 pg-kinetic can route eligible reads to replicas, but it does so conservatively. The goal is to avoid stale or unsafe reads rather than chase replica utilization at any cost.

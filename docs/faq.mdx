@@ -1,0 +1,117 @@
+---
+title: FAQ
+description: Answers to common pg-kinetic questions about runtime status, installation, health checks, routing, preview features, and releases.
+keywords:
+  - pg-kinetic FAQ
+  - PostgreSQL proxy questions
+  - Postgres connection pooler
+  - PostgreSQL wire proxy
+---
+
+<head>
+  <script type="application/ld+json">
+    {JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'FAQPage',
+      mainEntity: [
+        {
+          '@type': 'Question',
+          name: 'What is pg-kinetic?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.',
+          },
+        },
+        {
+          '@type': 'Question',
+          name: 'Is pg-kinetic installed from a published container image today?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'Before the first version tag publishes release artifacts, the current installation path is to build pg-kinetic:local from the repository checkout and run the local Docker Compose or Helm chart assets.',
+          },
+        },
+        {
+          '@type': 'Question',
+          name: 'Does pg-kinetic implement an HTTP drain endpoint?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'No. The HTTP health server currently implements GET /healthz, GET /readyz, and GET /state. POST /drain and GET /drain are not implemented.',
+          },
+        },
+        {
+          '@type': 'Question',
+          name: 'Are sharding, policy, and mirroring live traffic features?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'No. The repository contains preview and offline tooling for sharding, policy, and mirroring models, but the main proxy runtime does not expose those as live traffic configuration today.',
+          },
+        },
+        {
+          '@type': 'Question',
+          name: 'What should operators validate before rollout?',
+          acceptedAnswer: {
+            '@type': 'Answer',
+            text: 'Operators should run config preflight, verify health and readiness endpoints, check admin and metrics visibility, confirm TLS/authentication behavior, and use compatibility or regression checks for driver-sensitive workloads.',
+          },
+        },
+      ],
+    })}
+  </script>
+</head>
+
+# FAQ
+
+## What is pg-kinetic?
+
+pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.
+
+The proxy keeps clients on the PostgreSQL protocol. Applications connect through pg-kinetic, and pg-kinetic manages backend reuse conservatively so uncertain protocol or session state is pinned, recovered, or discarded instead of being reused unsafely.
+
+## Is pg-kinetic installed from a published container image today?
+
+Not yet. Before the first version tag publishes release artifacts, build `pg-kinetic:local` from the repository checkout.
+
+Use the local Docker Compose and Helm chart assets documented in [Installation](./installation.md) and [Quickstart](./quickstart.md). Treat Docker Hub, GitHub Container Registry, and `https://helm.pgkinetic.dev` commands as available only after the corresponding release workflow has completed.
+
+## Does pg-kinetic implement an HTTP drain endpoint?
+
+No. The HTTP health server currently implements:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/healthz` | `GET` | Process liveness |
+| `/readyz` | `GET` | Readiness and backend probe state |
+| `/state` | `GET` | Non-secret health snapshot |
+
+`POST /drain` and `GET /drain` are not implemented. Kubernetes manifests should use readiness and liveness probes only.
+
+## Are sharding, policy, and mirroring live traffic features?
+
+No. Sharding, policy, and mirroring have domain models and preview or offline commands, but they are not active live-traffic configuration in the main proxy runtime today.
+
+Use:
+
+- [Sharding](./sharding.md) for route-preview behavior
+- [Policy](./policy.md) for policy-preview behavior
+- [Mirroring](./mirroring.md) for current mirror model status
+
+## What configuration format does pg-kinetic use?
+
+pg-kinetic uses TOML configuration. Defaults are created first, an optional config file is parsed next, and non-default CLI or environment values override the file.
+
+Use [Configuration](./configuration.md) as the runtime reference. Important socket fields such as `connection.backend_addr` require `IP:port`; hostnames are not accepted there.
+
+## What should operators validate before rollout?
+
+Run a focused rollout check before sending application traffic:
+
+1. Validate config with `pg-kinetic preflight --config`.
+2. Verify `/healthz`, `/readyz`, and `/state`.
+3. Query admin views such as `SHOW POOLS` and `SHOW CLIENTS`.
+4. Confirm metrics are reachable when `metrics_addr` is configured.
+5. Test client TLS and authentication settings with the same driver mode used by production applications.
+6. Use compatibility or regression checks for driver-sensitive workloads.
+
+## Where should agents and crawlers start?
+
+Use the canonical docs root at `https://docs.pgkinetic.dev/`, the compact agent reference at `https://docs.pgkinetic.dev/llms.txt`, and the repository at `https://github.com/hookwoods/pg-kinetic`.

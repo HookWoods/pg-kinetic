@@ -1,3 +1,13 @@
+---
+title: "Backpressure"
+description: "Backpressure and overload behavior in pg-kinetic, including queue limits, checkout waiters, query timeouts, and client-facing SQLSTATEs."
+keywords:
+  - PostgreSQL backpressure
+  - pg-kinetic overload
+  - connection pool limits
+  - database proxy QoS
+---
+
 # Backpressure And Overload
 
 pg-kinetic uses route-aware backpressure so one noisy path does not consume all backend capacity. Overload should fail predictably instead of letting clients wait forever.

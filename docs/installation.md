@@ -1,27 +1,26 @@
+---
+title: "Installation"
+description: "Install pg-kinetic from local Docker assets today and prepare for future Docker Hub, GHCR, and Helm chart release workflows."
+keywords:
+  - install pg-kinetic
+  - Docker PostgreSQL proxy
+  - Helm PostgreSQL proxy
+  - Postgres connection pooler install
+---
+
 # Installation
 
-pg-kinetic is distributed as a container image and can be deployed with Docker, Docker Compose, or Kubernetes. The production path is image-first; building from source is a contributor workflow, not the normal installation path.
+This repository contains local deployment assets for Docker, Docker Compose, and Kubernetes. Public Docker Hub, GHCR, and Helm chart releases are created only after a version tag is pushed.
 
-## Container Images
+## Current Installation Source
 
-Tagged releases publish multi-architecture Linux images for `linux/amd64` and `linux/arm64`.
-
-| Registry | Image |
-| --- | --- |
-| Docker Hub | `hookwoods/pg-kinetic:<version>` |
-| GitHub Container Registry | `ghcr.io/hookwoods/pg-kinetic:<version>` |
-
-Use an immutable version tag in production:
+Until the first release tag exists, build the container image from this checkout:
 
 ```bash
-docker pull hookwoods/pg-kinetic:0.1.0
+docker build -t pg-kinetic:local .
 ```
 
-`latest` is updated on version tags for convenience, but production manifests should pin an explicit release tag.
-
-## Docker
-
-Run pg-kinetic with a mounted config file:
+Run the local image with a mounted config:
 
 ```bash
 docker run --detach \
@@ -32,78 +31,80 @@ docker run --detach \
   --publish 9090:9090 \
   --publish 9091:9091 \
   --volume "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  hookwoods/pg-kinetic:0.1.0 \
+  pg-kinetic:local \
   --config-file /etc/pg-kinetic/pg-kinetic.toml
 ```
 
 ## Docker Compose
 
-The repository includes `deploy/docker-compose.yml` for a production-shaped compose deployment:
+The repository includes `deploy/docker-compose.yml`. It starts PostgreSQL, builds `pg-kinetic:local` from the repository root, and mounts `deploy/pg-kinetic.toml`.
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-The compose file expects:
+The sample config points at PostgreSQL on `172.30.0.10:5432` inside the Compose network. Use `IP:port` for `backend_addr`; hostnames are not accepted in that field.
 
-- `deploy/pg-kinetic.toml` or an adjusted config mount
-- optional certificate material under `deploy/certs`
+Clean up:
 
-## Kubernetes With Helm
+```bash
+docker compose -f deploy/docker-compose.yml down
+```
 
-The repository includes a Helm chart under `charts/pg-kinetic`. Published chart releases are served from `https://helm.pgkinetic.dev`.
+## Kubernetes With Local Helm Chart
 
-Add the chart repository:
+The repository includes a Helm chart under `charts/pg-kinetic`.
+
+```bash
+helm lint ./charts/pg-kinetic
+helm template pg-kinetic ./charts/pg-kinetic
+helm install pg-kinetic ./charts/pg-kinetic \
+  --set image.repository=pg-kinetic \
+  --set image.tag=local \
+  --set image.pullPolicy=Never
+```
+
+The chart renders:
+
+- a Deployment with non-root container security defaults
+- a ConfigMap containing `pg-kinetic.toml`
+- a ClusterIP Service exposing PostgreSQL, admin, metrics, and health ports
+- readiness and liveness probes
+
+The chart does not configure a pre-stop drain hook because the HTTP health server does not implement `/drain`.
+
+## Future Release Images
+
+After a version tag matching `v*.*.*` is pushed, the container workflow publishes multi-platform images:
+
+| Registry | Image |
+| --- | --- |
+| Docker Hub | `hookwoods/pg-kinetic:<version>` |
+| GitHub Container Registry | `ghcr.io/hookwoods/pg-kinetic:<version>` |
+
+Use immutable version tags in production once they exist:
+
+```bash
+docker pull hookwoods/pg-kinetic:0.1.0
+```
+
+## Future Helm Repository
+
+The Helm workflow publishes a chart repository for `https://helm.pgkinetic.dev` after a version tag creates the first chart release and chart index.
+
+After that release exists:
 
 ```bash
 helm repo add pgkinetic https://helm.pgkinetic.dev
 helm repo update
-```
-
-Create a backend-password secret when the config references `PG_KINETIC_BACKEND_PASSWORD`:
-
-```bash
-kubectl create secret generic pg-kinetic-backend \
-  --from-literal=backend-password='replace-me'
-```
-
-Install the chart:
-
-```bash
 helm install pg-kinetic pgkinetic/pg-kinetic \
-  --set image.tag=0.1.0 \
-  --set backendPassword.existingSecret=pg-kinetic-backend
+  --set image.tag=0.1.0
 ```
 
-For local chart development, use `helm install pg-kinetic ./charts/pg-kinetic`.
-
-The chart creates:
-
-- a Deployment with non-root container security defaults
-- a ConfigMap containing `pg-kinetic.toml`
-- a ClusterIP Service exposing PostgreSQL, admin, and health ports
-- readiness and liveness probes
-- a pre-stop drain hook
-
-For production, override `values.yaml` with your real backend address, TLS settings, auth mode, and resource requests.
-
-## Kubernetes Without Helm
-
-If Helm is not available, render the chart once and apply the generated manifests:
-
-```bash
-helm template pg-kinetic ./charts/pg-kinetic \
-  --set image.tag=0.1.0 \
-  --set backendPassword.existingSecret=pg-kinetic-backend \
-  > pg-kinetic.yaml
-
-kubectl apply -f pg-kinetic.yaml
-```
+Until `https://helm.pgkinetic.dev/index.yaml` exists, use the local chart path.
 
 ## Release Publishing
 
 The container workflow runs on tags matching `v*.*.*`. It builds the Dockerfile and publishes `hookwoods/pg-kinetic` and `ghcr.io/hookwoods/pg-kinetic`.
 
-The workflow uses Docker Buildx, metadata tags, OCI labels, and the GitHub Actions cache.
-
-The Helm workflow runs on the same version tags. It packages chart versions, uploads chart archives to GitHub Releases, and updates the chart repository index for `https://helm.pgkinetic.dev`.
+The Helm workflow runs on the same version tags. It packages chart versions, uploads chart archives to GitHub Releases, and updates the chart repository index.

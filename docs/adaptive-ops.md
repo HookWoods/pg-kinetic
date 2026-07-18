@@ -1,44 +1,67 @@
+---
+title: "Adaptive Operations"
+description: "How pg-kinetic records adaptive runtime recommendations, what apply mode does today, and why active settings are not mutated automatically."
+keywords:
+  - pg-kinetic adaptive operations
+  - PostgreSQL proxy tuning
+  - adaptive control
+  - runtime recommendations
+---
+
 # Adaptive Operations
 
-Adaptive control helps pg-kinetic turn runtime observations into recommendations and, when explicitly allowed, bounded applies.
+Adaptive operations are recommendation and simulation tooling today. The controller records recommendations and proposed before/after values; it does not mutate the active proxy settings.
 
-## Recommendation Mode
+## Current Behavior
 
-Recommendation mode is the default.
+When `adaptive_enabled = true`, the adaptive controller:
 
-- `adaptive_mode = "recommend"` records recommendations without applying them
-- `SHOW ADAPTIVE` surfaces the latest recommendation and the current guardrails
-- `pg_kinetic_adaptive_recommendations_total` tracks the recommendation stream
+- collects runtime signals
+- builds recommendations
+- records recommendation snapshots
+- evaluates configured guardrails
+- records an outcome snapshot
 
-Use recommendation mode until the workload has enough history to justify a change.
+`adaptive_mode = "apply"` does not change live settings. It only changes whether the recorded outcome is accepted, rejected, skipped, or recommended according to the allowlist and guardrails.
 
-## Guarded Apply Mode
+## Config
 
-Apply mode is opt-in and intentionally constrained.
+```toml
+[runtime.production]
+adaptive_enabled = true
+adaptive_mode = "recommend"
+adaptive_window_ms = 60000
+adaptive_min_confidence = 0.8
+adaptive_apply_enabled = false
+adaptive_apply_allowlist = []
+adaptive_max_change_percent = 10
+```
 
-- set `adaptive_mode = "apply"`
-- set `adaptive_apply_enabled = true`
-- provide a non-empty `adaptive_apply_allowlist`
-- keep `adaptive_max_change_percent` within the accepted change envelope
-- keep `adaptive_min_confidence` high enough to filter weak signals
+Adaptive fields are flattened into `[runtime.production]`. Do not put them under `[runtime.production.adaptive]`; that is not the runtime parser contract.
 
-Apply mode refuses unbounded changes, disallowed knobs, duplicate allowlist entries, and changes that exceed the configured percentage cap.
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `adaptive_enabled` | bool | `false` | Starts the adaptive controller when true. |
+| `adaptive_mode` | enum | `recommend` | `recommend` records recommendations; `apply` records accepted/rejected simulated apply outcomes. |
+| `adaptive_window_ms` | integer | `60000` | Controller tick interval. Must be greater than zero. |
+| `adaptive_min_confidence` | float | `0.8` | Rejects recommendations below this confidence. Valid range is `0.0` to `1.0`. |
+| `adaptive_apply_enabled` | bool | `false` | Required for `adaptive_mode = "apply"`. Does not mutate live settings. |
+| `adaptive_apply_allowlist` | list | `[]` | Required and duplicate-free for `adaptive_mode = "apply"`. |
+| `adaptive_max_change_percent` | integer | `10` | Valid range is `1` to `100`. Bounds simulated change size. |
 
-## Using Benchmark Outputs
+## Failure Modes
 
-Benchmark results should be the input to adaptive decisions, not the other way around.
+| Condition | Result |
+| --- | --- |
+| `adaptive_window_ms = 0` | Config parse fails. |
+| `adaptive_min_confidence` outside `0.0..=1.0` | Config parse fails. |
+| `adaptive_mode = "apply"` with `adaptive_apply_enabled = false` | Config parse fails. |
+| `adaptive_mode = "apply"` with an empty allowlist | Config parse fails. |
+| Duplicate allowlist entries | Config parse fails. |
+| Recommendation confidence below threshold | Outcome is rejected. |
+| Recommendation knob not in allowlist | Outcome is rejected. |
+| Recommendation exceeds max change percent | Outcome is rejected. |
 
-- run a benchmark scenario before changing the adaptive mode
-- compare the `pg_kinetic` target against direct PostgreSQL and the other baselines in the same scenario
-- review the JSON output for `p50_ms`, `p95_ms`, `p99_ms`, `throughput_qps`, and `error_rate`
-- keep the benchmark scenario file alongside the decision so later performance work can reproduce it
+## Operator Guidance
 
-Later tuning work should use the same scenario name, driver, and comparison labels so results stay easy to compare.
-
-## Operational Checklist
-
-- Start in recommendation mode.
-- Review `SHOW ADAPTIVE` and the adaptive metrics family before enabling apply.
-- Move to guarded apply only after the benchmark outputs justify the change.
-- Keep the allowlist small and specific.
-- Re-run benchmarks after each applied change so the next decision has a fresh baseline.
+Use adaptive output as a review signal. Change live settings through configuration and a controlled rollout after benchmark or production evidence supports the change.

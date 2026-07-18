@@ -1,3 +1,13 @@
+---
+title: "Troubleshooting"
+description: "Troubleshooting guide for pg-kinetic startup, readiness, TLS, authentication, admin views, metrics, routing, and regression failures."
+keywords:
+  - pg-kinetic troubleshooting
+  - PostgreSQL proxy errors
+  - readiness failures
+  - connection pool debugging
+---
+
 # Troubleshooting
 
 This guide maps common local and production symptoms to the first checks that usually matter.
