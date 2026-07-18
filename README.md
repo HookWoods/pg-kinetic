@@ -154,3 +154,14 @@ Sharding, policy, mirroring, compatibility, benchmarking, and packaging also hav
 - [Testing](docs/testing.md)
 
 The published documentation is available at [docs.pgkinetic.dev](https://docs.pgkinetic.dev).
+
+## Contributing And Security
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening large changes.
+- Report vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
+## License
+
+pg-kinetic is dual-licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+
+Unless explicitly stated otherwise, contributions intentionally submitted for inclusion are licensed as Apache-2.0 OR MIT.
