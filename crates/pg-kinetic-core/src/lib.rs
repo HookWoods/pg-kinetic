@@ -15,6 +15,7 @@ pub mod policy;
 pub mod policy_rule;
 pub mod prepare;
 pub mod recovery;
+pub mod regression;
 pub mod route;
 pub mod routing;
 pub mod runtime;

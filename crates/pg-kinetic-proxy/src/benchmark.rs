@@ -952,6 +952,7 @@ fn stored_metric_value(metrics: &StoredBenchmarkMetrics, metric: PerformanceMetr
         PerformanceMetric::CpuPerQuery => metrics.cpu_per_query,
         PerformanceMetric::MemoryPerClient => metrics.memory_per_client_bytes,
         PerformanceMetric::ErrorRate => metrics.error_rate,
+        PerformanceMetric::CheckoutLatency | PerformanceMetric::PreparedCacheHitRate => None,
     }
 }
 
