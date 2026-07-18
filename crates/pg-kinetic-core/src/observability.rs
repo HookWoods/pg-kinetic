@@ -1158,6 +1158,11 @@ impl LabelPolicy {
     pub const HEALTH: &'static str = "health";
     pub const LAG_STATE: &'static str = "lag_state";
     pub const TRIGGER: &'static str = "trigger";
+    pub const SCENARIO: &'static str = "scenario";
+    pub const WORKLOAD: &'static str = "workload";
+    pub const DRIVER: &'static str = "driver";
+    pub const METRIC: &'static str = "metric";
+    pub const FEATURE: &'static str = "feature";
     #[must_use]
     pub fn allows(label: &str) -> bool {
         matches!(
@@ -1197,6 +1202,11 @@ impl LabelPolicy {
                 | Self::VIEW
                 | Self::STATE
                 | Self::EVENT
+                | Self::SCENARIO
+                | Self::WORKLOAD
+                | Self::DRIVER
+                | Self::METRIC
+                | Self::FEATURE
         )
     }
 }

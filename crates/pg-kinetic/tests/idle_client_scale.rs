@@ -36,7 +36,7 @@ use tokio::{
 
 struct TestProxy {
     address: SocketAddr,
-    buffer_pool: ProxyBufferPool,
+    _buffer_pool: ProxyBufferPool,
     backend_accepts: Arc<AtomicUsize>,
     snapshots: pg_kinetic_proxy::snapshot::SnapshotStore,
     drain: Arc<pg_kinetic_proxy::drain::DrainController>,
@@ -353,7 +353,7 @@ async fn start_proxy(
 
     TestProxy {
         address,
-        buffer_pool,
+        _buffer_pool: buffer_pool,
         backend_accepts,
         snapshots,
         drain,

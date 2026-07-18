@@ -111,14 +111,17 @@ fn collect_open_file_descriptors() -> ProcessMetricValue {
         .map_or(ProcessMetricValue::Unknown, ProcessMetricValue::Integer)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn cpu_time_seconds(clock_ticks: u64, clock_ticks_per_second: u64) -> Option<f64> {
     (clock_ticks_per_second > 0).then(|| clock_ticks as f64 / clock_ticks_per_second as f64)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn resident_memory_bytes(kibibytes: u64) -> Option<u64> {
     kibibytes.checked_mul(1024)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn proc_stat_cpu_ticks(contents: &str) -> Option<u64> {
     let (_, fields) = contents.rsplit_once(") ")?;
     let mut fields = fields.split_whitespace();

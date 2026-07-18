@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::ErrorKind,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -392,11 +393,14 @@ async fn send_query(stream: &mut TcpStream, query: &str) {
 
 async fn expect_connection_close(stream: &mut TcpStream) {
     let mut bytes = Vec::new();
-    let read = time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
+    let close = time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
         .await
-        .expect("wait for close")
-        .expect("read close");
-    assert!(read > 0 || bytes.is_empty());
+        .expect("wait for close");
+    match close {
+        Ok(read) => assert!(read > 0 || bytes.is_empty()),
+        Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("read close: {error}"),
+    }
 }
 
 async fn read_until_ready(stream: &mut TcpStream) -> Vec<BackendFrame> {

@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
