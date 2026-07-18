@@ -18,6 +18,7 @@ pub struct PreparedStatement {
     pub parameter_type_oids: Vec<i32>,
     pub route_map_generation_id: u64,
     pub shard_summary: PreparedShardSummary,
+    pub cache_key: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,8 +41,8 @@ pub struct PreparedCatalog {
     next_statement_id: u64,
     route_map_generation_id: u64,
     statements: HashMap<String, PreparedStatement>,
-    materialized: HashMap<u64, HashMap<String, MaterializedStatement>>,
-    invalidation_counts: HashMap<String, u64>,
+    materialized: HashMap<u64, HashMap<u64, MaterializedStatement>>,
+    invalidation_counts: HashMap<u64, u64>,
 }
 
 impl PreparedCatalog {
@@ -79,21 +80,22 @@ impl PreparedCatalog {
         parameter_type_oids: Vec<i32>,
     ) -> &PreparedStatement {
         let client_name = client_name.into();
-        if let Some(previous_backend_name) = self
+        if let Some(previous_cache_key) = self
             .statements
             .get(&client_name)
-            .map(|statement| statement.backend_name.clone())
+            .map(PreparedStatement::cache_key)
         {
-            self.remove_materialized_statement(&previous_backend_name);
-            self.invalidation_counts.remove(&previous_backend_name);
+            self.remove_materialized_statement(previous_cache_key);
+            self.invalidation_counts.remove(&previous_cache_key);
         }
 
-        let backend_name = if client_name.is_empty() {
-            String::new()
+        let (backend_name, cache_key) = if client_name.is_empty() {
+            (String::new(), 0)
         } else {
-            let name = format!("pgk_{}_{}", self.session_id, self.next_statement_id);
+            let cache_key = self.next_statement_id;
+            let name = format!("pgk_{}_{}", self.session_id, cache_key);
             self.next_statement_id += 1;
-            name
+            (name, cache_key)
         };
 
         self.statements.insert(
@@ -109,6 +111,7 @@ impl PreparedCatalog {
                 } else {
                     PreparedShardSummary::Deferred
                 },
+                cache_key,
             },
         );
 
@@ -130,8 +133,8 @@ impl PreparedCatalog {
 
     pub fn remove(&mut self, client_name: &str) -> Option<PreparedStatement> {
         let removed = self.statements.remove(client_name)?;
-        self.remove_materialized_statement(&removed.backend_name);
-        self.invalidation_counts.remove(&removed.backend_name);
+        self.remove_materialized_statement(removed.cache_key);
+        self.invalidation_counts.remove(&removed.cache_key);
         Some(removed)
     }
 
@@ -141,24 +144,24 @@ impl PreparedCatalog {
             return false;
         }
 
-        if statement.backend_name.is_empty() {
+        if statement.cache_key == 0 {
             return true;
         }
 
         let statement_shard_id = statement.shard_summary.shard_id();
         self.materialized
             .get(&backend_id)
-            .and_then(|names| names.get(&statement.backend_name))
+            .and_then(|statements| statements.get(&statement.cache_key))
             .is_some_and(|materialized| materialized.shard_id.as_ref() == statement_shard_id)
     }
 
     pub fn mark_materialized(&mut self, backend_id: u64, statement: &PreparedStatement) {
-        if statement.backend_name.is_empty() || !self.is_current_route_map(statement) {
+        if statement.cache_key == 0 || !self.is_current_route_map(statement) {
             return;
         }
 
         self.materialized.entry(backend_id).or_default().insert(
-            statement.backend_name.clone(),
+            statement.cache_key,
             MaterializedStatement {
                 shard_id: statement.shard_summary.shard_id().cloned(),
             },
@@ -172,9 +175,9 @@ impl PreparedCatalog {
     ) -> InvalidationScope {
         match sqlstate {
             SqlState::InvalidSqlStatementName => {
-                if let Some(names) = self.materialized.remove(&backend_id) {
-                    for backend_name in names.into_keys() {
-                        self.increment_invalidation_count(&backend_name);
+                if let Some(statements) = self.materialized.remove(&backend_id) {
+                    for cache_key in statements.into_keys() {
+                        self.increment_invalidation_count(cache_key);
                     }
                 }
                 InvalidationScope::Backend
@@ -182,15 +185,11 @@ impl PreparedCatalog {
             SqlState::FeatureNotSupported
             | SqlState::UndefinedTable
             | SqlState::UndefinedColumn => {
-                let backend_names: Vec<String> = self
-                    .materialized
-                    .values()
-                    .flat_map(|names| names.keys().cloned())
-                    .collect();
-                for backend_name in backend_names {
-                    self.increment_invalidation_count(&backend_name);
+                for statements in std::mem::take(&mut self.materialized).into_values() {
+                    for cache_key in statements.into_keys() {
+                        self.increment_invalidation_count(cache_key);
+                    }
                 }
-                self.materialized.clear();
                 InvalidationScope::AllBackends
             }
             _ => InvalidationScope::None,
@@ -209,7 +208,7 @@ impl PreparedCatalog {
                 materialized_backend_count: self.materialized_backend_count(statement),
                 invalidation_count: self
                     .invalidation_counts
-                    .get(&statement.backend_name)
+                    .get(&statement.cache_key)
                     .copied()
                     .unwrap_or_default(),
             })
@@ -226,16 +225,16 @@ impl PreparedCatalog {
     }
 
     fn materialized_backend_count(&self, statement: &PreparedStatement) -> usize {
-        if statement.backend_name.is_empty() {
+        if statement.cache_key == 0 {
             return 0;
         }
 
         let statement_shard_id = statement.shard_summary.shard_id();
         self.materialized
             .values()
-            .filter(|names| {
-                names
-                    .get(&statement.backend_name)
+            .filter(|statements| {
+                statements
+                    .get(&statement.cache_key)
                     .is_some_and(|materialized| {
                         materialized.shard_id.as_ref() == statement_shard_id
                     })
@@ -243,37 +242,33 @@ impl PreparedCatalog {
             .count()
     }
 
-    fn remove_materialized_statement(&mut self, backend_name: &str) {
-        if backend_name.is_empty() {
+    fn remove_materialized_statement(&mut self, cache_key: u64) {
+        if cache_key == 0 {
             return;
         }
 
-        let backend_ids: Vec<u64> = self
-            .materialized
-            .iter_mut()
-            .filter_map(|(backend_id, names)| {
-                names.remove(backend_name);
-                names.is_empty().then_some(*backend_id)
-            })
-            .collect();
-
-        for backend_id in backend_ids {
-            self.materialized.remove(&backend_id);
-        }
+        self.materialized.retain(|_, statements| {
+            statements.remove(&cache_key);
+            !statements.is_empty()
+        });
     }
 
-    fn increment_invalidation_count(&mut self, backend_name: &str) {
-        if backend_name.is_empty() {
+    fn increment_invalidation_count(&mut self, cache_key: u64) {
+        if cache_key == 0 {
             return;
         }
 
-        *self
-            .invalidation_counts
-            .entry(backend_name.to_owned())
-            .or_default() += 1;
+        *self.invalidation_counts.entry(cache_key).or_default() += 1;
     }
 
     fn is_current_route_map(&self, statement: &PreparedStatement) -> bool {
         statement.route_map_generation_id == self.route_map_generation_id
+    }
+}
+
+impl PreparedStatement {
+    #[must_use]
+    pub const fn cache_key(&self) -> u64 {
+        self.cache_key
     }
 }

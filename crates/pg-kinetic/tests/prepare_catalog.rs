@@ -54,6 +54,7 @@ fn can_store_statement_snapshot() {
         parameter_type_oids: vec![],
         route_map_generation_id: 0,
         shard_summary: PreparedShardSummary::Deferred,
+        cache_key: 1,
     };
 
     assert_eq!(snapshot.client_name, "stmt1");
