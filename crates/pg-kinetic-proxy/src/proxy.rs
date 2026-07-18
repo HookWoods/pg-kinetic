@@ -1161,6 +1161,7 @@ async fn handle_client(
                 }
 
                 session_buffers.client_read_mut().clear();
+                session_buffers.trim_empty_buffers();
                 handle_idle_timeout(&mut client, kind).await?;
                 if kind == IdleTimeoutKind::Transaction {
                     return Ok(());

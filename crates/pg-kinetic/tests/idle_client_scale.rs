@@ -183,6 +183,48 @@ async fn idle_transaction_timeout_recycles_and_trims_session_buffers() {
 }
 
 #[tokio::test]
+async fn idle_client_timeout_trims_partial_frame_before_new_activity() {
+    let buffer_pool = test_buffer_pool();
+    let proxy = start_proxy(
+        Duration::from_millis(25),
+        Duration::from_millis(250),
+        buffer_pool.clone(),
+    )
+    .await;
+    let mut client = connect_started_client(proxy.address).await;
+
+    let mut partial_frame = BytesMut::new();
+    partial_frame.put_u8(b'Q');
+    partial_frame.put_i32(4_100);
+    partial_frame.extend_from_slice(&[b'x'; 1_024]);
+    client
+        .write_all(&partial_frame)
+        .await
+        .expect("partial query frame");
+
+    read_until_contains(&mut client, b"idle client timed out").await;
+
+    time::timeout(Duration::from_secs(1), async {
+        loop {
+            if buffer_pool.stats().oversized_buffers_released == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary idle timeout releases the oversized buffer before new activity");
+
+    assert!(
+        client.peer_addr().is_ok(),
+        "client remains connected after timeout"
+    );
+
+    drop(client);
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
 async fn idle_client_timeouts_do_not_repeat_without_client_activity() {
     let proxy = start_proxy(
         Duration::from_millis(25),
