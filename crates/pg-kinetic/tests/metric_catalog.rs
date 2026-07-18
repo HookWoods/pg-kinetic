@@ -57,8 +57,8 @@ fn metric_catalog_is_complete_and_stable() {
             "pg_kinetic_pool_checkout_wait_ms",
             MetricKind::Histogram,
             "ms",
-            &["outcome"][..],
-            "Outcome splits successful, timeout, and canceled waits.",
+            &["stage", "outcome"][..],
+            "Stage is bounded to request, route-gate registry lock lookup, or checkout; outcome splits successful, timeout, canceled, and error waits.",
         ),
         (
             "pg_kinetic_backend_pin_total",

@@ -15,7 +15,7 @@ For policy behavior, pair the routing and sharding metrics below with [docs/poli
 
 | Metric | Type | Labels | Unit | Cardinality notes | Example interpretation |
 | --- | --- | --- | --- | --- | --- |
-| `pg_kinetic_pool_checkout_wait_ms` | histogram | `outcome` | `ms` | Bounded by checkout outcome. | p95 should stay below the checkout timeout; `timeout` and `canceled` shares reveal a starved pool. |
+| `pg_kinetic_pool_checkout_wait_ms` | histogram | `stage`, `outcome` | `ms` | `stage` is fixed to `request`, `route_gate_registry` (including lock lookup), or `checkout`; `outcome` is bounded. | Compare p95 by `stage`; rising registry/lock or checkout time identifies the contended portion, while `timeout` and `canceled` shares reveal a starved pool. |
 | `pg_kinetic_backpressure_events_total` | counter | `route`, `outcome` | `1` | Route labels come from database, user, application name, and query class only. | Rising `rejected` or `timeout` shares point to overload on a specific route. |
 | `pg_kinetic_route_checkout_wait_ms` | histogram | `route`, `outcome` | `ms` | Same route bound as the backpressure counter. | A hot-route p95 isolates noisy neighbors before they spread. |
 | `pg_kinetic_route_in_flight` | gauge | `route`, `scope` | `1` | Route bound plus a fixed `route` scope. | High in-flight with long waits means sustained saturation. |
@@ -118,7 +118,7 @@ For policy behavior, pair the routing and sharding metrics below with [docs/poli
 
 ## Recommended Panels
 
-- Pool checkout wait: graph p95 of `pg_kinetic_pool_checkout_wait_ms` and overlay `timeout` and `canceled` outcomes.
+- Pool checkout wait: graph p95 of `pg_kinetic_pool_checkout_wait_ms` by `stage` and overlay `timeout` and `canceled` outcomes.
 - Route waiting clients: plot `pg_kinetic_route_waiting` by route and add `pg_kinetic_route_in_flight` for queue depth context.
 - Overload rejection rate: chart `rate(pg_kinetic_backpressure_events_total{outcome="rejected"}[5m]) / rate(pg_kinetic_backpressure_events_total[5m])`.
 - Read routing mix: compare `pg_kinetic_route_decisions_total{target_role="replica"}` with `target_role="primary"`.

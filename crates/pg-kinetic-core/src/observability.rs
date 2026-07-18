@@ -242,6 +242,7 @@ pub enum MetricLabel {
     Option,
     Outcome,
     Phase,
+    Stage,
     Reason,
     QueryClass,
     Route,
@@ -281,6 +282,7 @@ impl MetricLabel {
             Self::Option => "option",
             Self::Outcome => "outcome",
             Self::Phase => "phase",
+            Self::Stage => "stage",
             Self::Reason => "reason",
             Self::QueryClass => "query_class",
             Self::Route => "route",
@@ -433,6 +435,7 @@ const SCOPE_MODE_REASON_LABELS: &[MetricLabel] =
 const MODE_LABELS: &[MetricLabel] = &[MetricLabel::Mode];
 const MODE_REASON_LABELS: &[MetricLabel] = &[MetricLabel::Mode, MetricLabel::Reason];
 const OUTCOME_ONLY_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];
+const STAGE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Stage, MetricLabel::Outcome];
 const ENDPOINT_HEALTH_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::Health];
 const ENDPOINT_LAG_LABELS: &[MetricLabel] = &[MetricLabel::Endpoint, MetricLabel::LagState];
 const ENDPOINT_TARGET_ROLE_LABELS: &[MetricLabel] =
@@ -504,9 +507,9 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "pg_kinetic_pool_checkout_wait_ms",
         MetricKind::Histogram,
         "ms",
-        "Backend checkout wait time in milliseconds",
-        OUTCOME_ONLY_LABELS,
-        "Outcome splits successful, timeout, and canceled waits.",
+        "Backend checkout timing in milliseconds by stage and outcome",
+        STAGE_OUTCOME_LABELS,
+        "Stage is bounded to request, route-gate registry lock lookup, or checkout; outcome splits successful, timeout, canceled, and error waits.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_backend_pin_total",
