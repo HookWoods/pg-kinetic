@@ -20,6 +20,31 @@
 
 **Keep PostgreSQL responsive under connection spikes.** pg-kinetic is a drop-in Rust PostgreSQL wire proxy: keep your driver and SQL, then add transaction pooling, route-level backpressure, read routing, and operator-visible health.
 
+## Traffic Flow
+
+```mermaid
+flowchart LR
+  app["Application drivers<br/>PHP / Node / Java / Go / Rust"] --> proxy["pg-kinetic<br/>pooling + backpressure"]
+  proxy --> primary["Primary<br/>writes + unsafe reads"]
+  proxy --> replica["Replica<br/>fresh safe reads"]
+  proxy --> metrics["Prometheus<br/>metrics"]
+  proxy --> admin["Admin listener<br/>SHOW POOLS / SHOW CLIENTS"]
+```
+
+## Operator Snapshot
+
+The admin listener exposes PostgreSQL-protocol views, so operators can inspect pressure without a separate dashboard.
+
+```text
+SHOW POOLS;
+route     state  clients  waiting  primary  replica
+default   ready  128      0        12/64    8/32
+
+SHOW BACKPRESSURE;
+route     queue  checkout_p95  action
+default   0      4ms           accept
+```
+
 ## 🚀 Install
 
 Use the published container image for a configured host:
