@@ -29,33 +29,33 @@ jobs:
       matrix:
         language: [rust, go, java, javascript, python, dotnet, c, cpp]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install native client dependencies
         if: matrix.language == 'c' || matrix.language == 'cpp'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake libpq-dev libpqxx-dev
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: matrix.language == 'go'
         with:
           go-version: "1.24.x"
           cache-dependency-path: compat/go/go.sum
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         if: matrix.language == 'java'
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         if: matrix.language == 'java'
         with:
           gradle-version: current
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: matrix.language == 'javascript'
         with:
           node-version: 22
       - name: Install JavaScript compatibility dependencies
         if: matrix.language == 'javascript'
         run: npm --prefix compat/javascript install
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: matrix.language == 'python'
         with:
           python-version: "3.13"
@@ -64,7 +64,7 @@ jobs:
       - name: Install Python compatibility dependencies
         if: matrix.language == 'python'
         run: python -m pip install -r compat/python/requirements.txt
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         if: matrix.language == 'dotnet'
         with:
           dotnet-version: "8.0.x"
@@ -91,8 +91,8 @@ jobs:
     name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -112,13 +112,13 @@ jobs:
       DATABASE_URL_DIRECT: postgres://postgres:postgres@127.0.0.1:55432/pgkinetic
       DATABASE_URL_PROXY: postgres://postgres:postgres@127.0.0.1:58432/pgkinetic
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: current
       - name: Start compatibility stack
