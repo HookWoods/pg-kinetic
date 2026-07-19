@@ -1,8 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title" fill="none">
-  <title id="title">pg-kinetic</title>
-  <rect width="64" height="64" rx="16" fill="#07111f"/>
-  <path d="M21 15.5h13.2c8.4 0 14 5.3 14 13.1 0 7.9-5.6 13.2-14 13.2H26v8.7" stroke="#5AA2FF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M18 25.5h16.3M18 34h16.3" stroke="#5AA2FF" stroke-width="3" stroke-linecap="round" opacity=".68"/>
-  <path d="M13.5 25.5h4M13.5 34h4" stroke="#8EC0FF" stroke-width="3" stroke-linecap="round"/>
-  <path d="M26 50.5c4.2 2.2 8.9 2.2 13.1 0" stroke="#8EC0FF" stroke-width="3" stroke-linecap="round" opacity=".8"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" fill="none" aria-labelledby="title" role="img" viewBox="0 0 64 64"><title id="title">pg-kinetic</title><rect width="64" height="64" fill="#07111f" rx="16"/><path stroke="#5AA2FF" stroke-linecap="round" stroke-linejoin="round" stroke-width="6" d="M21 15.5h13.2c8.4 0 14 5.3 14 13.1 0 7.9-5.6 13.2-14 13.2H26v8.7"/><path stroke="#5AA2FF" stroke-linecap="round" stroke-width="3" d="M18 25.5h16.3M18 34h16.3" opacity=".68"/><path stroke="#8EC0FF" stroke-linecap="round" stroke-width="3" d="M13.5 25.5h4M13.5 34h4"/><path stroke="#8EC0FF" stroke-linecap="round" stroke-width="3" d="M26 50.5c4.2 2.2 8.9 2.2 13.1 0" opacity=".8"/></svg>
