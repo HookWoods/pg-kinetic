@@ -3591,10 +3591,11 @@ async fn reject_client_during_drain(
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
     let drain_timer = PhaseTimer::start(ProtocolPhase::Drain, phase_recorder);
-    error_response_only(
+    error_response_and_ready_with_state(
         client,
         SqlState::OperatorIntervention.as_str(),
         "proxy is draining",
+        ReadyStatus::Idle,
     )
     .await?;
     drain_timer.finish(MetricOutcome::Rejected);
