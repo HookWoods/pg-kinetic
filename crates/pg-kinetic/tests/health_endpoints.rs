@@ -167,8 +167,8 @@ async fn spawn_proxy(
         auth: AuthConfig {
             auth_mode: AuthMode::PassThrough,
             auth_users_file: None,
-            backend_user: Some(String::from("proxy-user")),
-            backend_password_env_var_name: Some(String::from("TOP_SECRET")),
+            backend_user: None,
+            backend_password_env_var_name: None,
             auth_failure_message_mode: AuthFailureMessageMode::Generic,
         },
         reload: ReloadConfig {
