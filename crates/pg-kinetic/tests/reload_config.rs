@@ -56,6 +56,7 @@ fn base_config() -> Config {
         routes: Vec::new(),
         runtime: Default::default(),
         capacity: Default::default(),
+        pool_lifecycle: Default::default(),
         performance: Default::default(),
         qos: Default::default(),
         admin: Default::default(),

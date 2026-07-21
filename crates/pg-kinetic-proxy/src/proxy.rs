@@ -297,8 +297,13 @@ impl Proxy {
                 .lifecycle
                 .readiness_fail_during_drain,
         );
-        let phase_recorder =
-            telemetry::phase_timing_recorder(effective_config.observability.metrics_addr.is_some());
+        let phase_metrics_enabled = effective_config.observability.metrics_addr.is_some();
+        let phase_timing_sample_rate = effective_config.observability.phase_timing_sample_rate();
+        let reject_phase_recorder = telemetry::sampled_phase_timing_recorder(
+            phase_metrics_enabled,
+            phase_timing_sample_rate,
+            0,
+        );
         let debug_sampler =
             DebugSampler::new(effective_config.observability.trace_sampling_ratio());
         self.snapshot_store
@@ -438,7 +443,8 @@ impl Proxy {
                                 .context("apply draining client socket options")?;
                             let mut client = ClientConnection::new(client);
                             metrics::increment_client_connections();
-                            reject_client_during_drain(&mut client, phase_recorder.as_ref()).await?;
+                            reject_client_during_drain(&mut client, reject_phase_recorder.as_ref())
+                                .await?;
                             tracing::info!(%client_addr, "rejected client during drain");
                         }
                     }
@@ -474,7 +480,8 @@ impl Proxy {
 
                     let Some(client_guard) = self.lifecycle.drain_token().try_enter() else {
                         let mut client = client;
-                        reject_client_during_drain(&mut client, phase_recorder.as_ref()).await?;
+                        reject_client_during_drain(&mut client, reject_phase_recorder.as_ref())
+                            .await?;
                         tracing::info!(%client_addr, "rejected client during drain");
                         continue;
                     };
@@ -495,7 +502,11 @@ impl Proxy {
                             client.has_peer_certificates(),
                         ),
                     );
-                    let phase_recorder = Arc::clone(&phase_recorder);
+                    let phase_recorder = telemetry::sampled_phase_timing_recorder(
+                        phase_metrics_enabled,
+                        phase_timing_sample_rate,
+                        session_id,
+                    );
 
                     let mirror_dispatcher = Arc::clone(&mirror_dispatcher);
                     let buffer_pool = self.buffer_pool.clone();
