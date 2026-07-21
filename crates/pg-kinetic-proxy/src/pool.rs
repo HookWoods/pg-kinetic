@@ -884,30 +884,37 @@ impl BackendPool {
         let route_gate_metrics = route_gate.metrics.clone();
         let route_gate_gate = route_gate.gate.clone();
         let route_gate_gate_for_timeout = route_gate_gate.clone();
+        let checkout_route = route.clone();
         let checkout = async move {
             let route_permit = match route_gate_gate.checkout(self.checkout_timeout).await {
                 Ok(permit) => permit,
                 Err(error) => {
-                    metrics::increment_backpressure_event(&route, backpressure_outcome(error));
+                    metrics::increment_backpressure_event(
+                        &checkout_route,
+                        backpressure_outcome(error),
+                    );
                     metrics::record_route_wait(
-                        &route,
+                        &checkout_route,
                         started.elapsed().as_secs_f64() * 1000.0,
                         backpressure_outcome(error),
                     );
-                    self.record_backpressure_counts(&route, &route_gate_gate);
+                    self.record_backpressure_counts(&checkout_route, &route_gate_gate);
                     return Err(PoolError::Backpressure(error));
                 }
             };
             let permit = match self.gate.checkout(self.checkout_timeout).await {
                 Ok(permit) => permit,
                 Err(error) => {
-                    metrics::increment_backpressure_event(&route, backpressure_outcome(error));
+                    metrics::increment_backpressure_event(
+                        &checkout_route,
+                        backpressure_outcome(error),
+                    );
                     metrics::record_route_wait(
-                        &route,
+                        &checkout_route,
                         started.elapsed().as_secs_f64() * 1000.0,
                         backpressure_outcome(error),
                     );
-                    self.record_backpressure_counts(&route, &route_gate_gate);
+                    self.record_backpressure_counts(&checkout_route, &route_gate_gate);
                     return Err(PoolError::Backpressure(error));
                 }
             };
@@ -920,20 +927,20 @@ impl BackendPool {
             route_gate_metrics
                 .waiting
                 .set(route_gate_gate.waiting() as f64);
-            self.record_backpressure_counts(&route, &route_gate_gate);
+            self.record_backpressure_counts(&checkout_route, &route_gate_gate);
 
             if mode == CheckoutMode::PreferConnect && self.reserve_backend_slot() {
                 match self.connect_reserved_backend().await {
                     Ok(mut backend) => {
                         self.attach_backend_snapshot_store(&mut backend);
-                        backend.mark_checked_out(Some(route.clone()));
+                        backend.mark_checked_out(Some(checkout_route.clone()));
                         self.sync_pool_snapshot();
                         return Ok(PooledBackend {
                             backend: Some(backend),
                             pool: self.clone(),
                             health: Arc::clone(&self.health),
                             _permit: BackpressurePermit::join(route_permit, permit),
-                            route_key: route.clone(),
+                            route_key: checkout_route.clone(),
                             route_gate: route_gate_gate.clone(),
                             requires_startup: true,
                         });
@@ -952,14 +959,14 @@ impl BackendPool {
             };
             if let Some(mut backend) = idle_backend {
                 self.attach_backend_snapshot_store(&mut backend);
-                backend.mark_checked_out(Some(route.clone()));
+                backend.mark_checked_out(Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
                 return Ok(PooledBackend {
                     backend: Some(backend),
                     pool: self.clone(),
                     health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
-                    route_key: route.clone(),
+                    route_key: checkout_route.clone(),
                     route_gate: route_gate_gate.clone(),
                     requires_startup: false,
                 });
@@ -968,7 +975,7 @@ impl BackendPool {
             if mode == CheckoutMode::AllowConnect && self.reserve_backend_slot() {
                 let mut backend = self.connect_reserved_backend().await?;
                 self.attach_backend_snapshot_store(&mut backend);
-                backend.mark_checked_out(Some(route.clone()));
+                backend.mark_checked_out(Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
 
                 return Ok(PooledBackend {
@@ -976,7 +983,7 @@ impl BackendPool {
                     pool: self.clone(),
                     health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
-                    route_key: route.clone(),
+                    route_key: checkout_route.clone(),
                     route_gate: route_gate_gate.clone(),
                     requires_startup: true,
                 });
@@ -987,7 +994,7 @@ impl BackendPool {
                 .await
                 .expect("waiting for an available backend returns one");
             self.attach_backend_snapshot_store(&mut backend);
-            backend.mark_checked_out(Some(route.clone()));
+            backend.mark_checked_out(Some(checkout_route.clone()));
             self.sync_pool_snapshot();
 
             Ok(PooledBackend {
@@ -995,7 +1002,7 @@ impl BackendPool {
                 pool: self.clone(),
                 health: Arc::clone(&self.health),
                 _permit: BackpressurePermit::join(route_permit, permit),
-                route_key: route.clone(),
+                route_key: checkout_route.clone(),
                 route_gate: route_gate_gate.clone(),
                 requires_startup: false,
             })

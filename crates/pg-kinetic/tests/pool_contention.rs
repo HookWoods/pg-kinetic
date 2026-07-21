@@ -63,13 +63,17 @@ fn shard_route_map(shard: &str) -> ShardRouteMap {
 }
 
 fn test_pool(addr: SocketAddr) -> Arc<BackendPool> {
+    test_pool_with_waiters(addr, 16)
+}
+
+fn test_pool_with_waiters(addr: SocketAddr, max_route_waiters: usize) -> Arc<BackendPool> {
     BackendPool::new(
         addr,
         TlsConfig::default(),
         4,
         16,
         4,
-        16,
+        max_route_waiters,
         Duration::from_millis(200),
         "DISCARD ALL",
     )
@@ -283,7 +287,7 @@ async fn route_gate_registry_and_checkout_waits_are_recorded_separately() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_checkouts_do_not_serialize_on_snapshot_store() {
     let (backend_addr, _accepted) = backend_listener().await;
-    let pool = test_pool(backend_addr);
+    let pool = test_pool_with_waiters(backend_addr, 64);
     pool.attach_snapshot_store(SnapshotStore::new());
 
     let mut tasks = tokio::task::JoinSet::new();
