@@ -12,6 +12,10 @@ keywords:
 
 This page describes the HTTP health listener that exists in the proxy today.
 
+Readiness is primary-oriented: it becomes unavailable when the configured primary
+cannot be reached. A failed pooled backend is discarded immediately, so it is not
+returned to service while the probe reports the primary as unavailable.
+
 ## Current HTTP Endpoints
 
 Enable the listener with `health_addr`.
@@ -33,6 +37,12 @@ readiness_timeout_ms = 5000
 All other paths return `404 not_found`. Non-`GET` requests are treated as unknown paths.
 
 `POST /drain` and `GET /drain` are not implemented in the HTTP health server. Do not configure Kubernetes pre-stop hooks against `/drain` until the endpoint exists in the proxy.
+
+Backend failures during a request follow the same conservative boundary as
+readiness. A read may be replayed once only when no backend response byte has
+reached the client. Writes, authentication failures, and responses that have
+started are never replayed. The latter cases discard the backend and return
+SQLSTATE `08006` when the client protocol is still safe to continue.
 
 ## State Payload
 

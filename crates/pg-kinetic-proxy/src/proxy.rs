@@ -95,8 +95,72 @@ use crate::policy::{PolicyEvalInput, PolicyRuntime};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
+const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 const REPLICA_UNAVAILABLE_MESSAGE: &str = "no healthy replica available";
 const POOL_WARMUP_MIN_IDLE_BACKENDS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendFailureKind {
+    Connect,
+    Read,
+    Write,
+    Authentication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryDisposition {
+    Never,
+    RetryBeforeResponse,
+}
+
+#[must_use]
+pub const fn retry_disposition(
+    kind: BackendFailureKind,
+    response_started: bool,
+    request_is_safe_to_replay: bool,
+) -> RetryDisposition {
+    if matches!(kind, BackendFailureKind::Read) && !response_started && request_is_safe_to_replay {
+        RetryDisposition::RetryBeforeResponse
+    } else {
+        RetryDisposition::Never
+    }
+}
+
+#[derive(Debug)]
+struct BackendFailure {
+    kind: BackendFailureKind,
+    response_started: bool,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for BackendFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend {:?} failure: {}",
+            self.kind, self.source
+        )
+    }
+}
+
+impl std::error::Error for BackendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn backend_failure(
+    kind: BackendFailureKind,
+    response_started: bool,
+    source: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    BackendFailure {
+        kind,
+        response_started,
+        source: source.into(),
+    }
+    .into()
+}
 
 #[derive(Debug)]
 pub(crate) struct ClientConnection {
@@ -811,6 +875,7 @@ async fn handle_client(
                 } else {
                     base_checkout_target.clone()
                 };
+                let retry_target = checkout_target.clone();
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
@@ -890,34 +955,81 @@ async fn handle_client(
                     let _ = mirror_dispatcher.dispatch(mirror_task);
                 }
 
-                let simple_query_commands = request_plans
+                let simple_query_commands: Vec<SqlCommand> = request_plans
                     .iter()
                     .filter(|plan| plan.updates_session_state)
                     .map(|plan| plan.command.clone())
                     .collect();
+                let request_is_safe_to_replay =
+                    safe_request_to_replay(&frames, &request_plans, &session);
                 drop(request_plans);
-                let mut progress = QueryProgress::default();
-                let mut state = ForwardCycleState {
-                    session: &mut session,
-                    prepared: &mut prepared,
-                    prepared_snapshot_handle: prepared_snapshot_handle.clone(),
-                    route_application_name: &mut route_application_name,
-                    progress: &mut progress,
+                let mut retry_attempted = false;
+                let (result, progress) = loop {
+                    let mut progress = QueryProgress::default();
+                    let mut state = ForwardCycleState {
+                        session: &mut session,
+                        prepared: &mut prepared,
+                        prepared_snapshot_handle: prepared_snapshot_handle.clone(),
+                        route_application_name: &mut route_application_name,
+                        progress: &mut progress,
+                    };
+                    let result = timeout(
+                        qos.query_timeout(),
+                        forward_message_cycle(
+                            &mut client,
+                            &mut backend,
+                            &mut state,
+                            &frames,
+                            &simple_query_commands,
+                            qos.max_backend_buffer_bytes,
+                            session_buffers,
+                            phase_recorder.as_ref(),
+                        ),
+                    )
+                    .await;
+                    let retry = match &result {
+                        Ok(Err(error)) => error
+                            .downcast_ref::<BackendFailure>()
+                            .map(|failure| {
+                                !retry_attempted
+                                    && retry_disposition(
+                                        failure.kind,
+                                        failure.response_started,
+                                        request_is_safe_to_replay,
+                                    ) == RetryDisposition::RetryBeforeResponse
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if !retry {
+                        break (result, progress);
+                    }
+
+                    backend.mark_failed();
+                    backend.discard();
+                    let Ok(replacement) = checkout_backend(CheckoutBackendRequest {
+                        route_pools: &route_pools,
+                        route: route.clone(),
+                        target: retry_target.clone(),
+                        context: "checkout backend for failure retry",
+                        mode: CheckoutMode::AllowConnect,
+                        session_id,
+                        debug_sampler,
+                        phase_recorder: phase_recorder.as_ref(),
+                        snapshot_store: &snapshot_store,
+                        startup_packet: &backend_startup_packet,
+                        backend_credentials: backend_credentials.as_deref(),
+                        read_after_write_state: session.read_after_write_state(),
+                        record_snapshot: false,
+                        bootstrap_backend: true,
+                    })
+                    .await
+                    else {
+                        return Ok(());
+                    };
+                    backend = replacement;
+                    retry_attempted = true;
                 };
-                let result = timeout(
-                    qos.query_timeout(),
-                    forward_message_cycle(
-                        &mut client,
-                        &mut backend,
-                        &mut state,
-                        frames,
-                        simple_query_commands,
-                        qos.max_backend_buffer_bytes,
-                        session_buffers,
-                        phase_recorder.as_ref(),
-                    ),
-                )
-                .await;
 
                 let client_disconnected_after_ready = matches!(
                     &result,
@@ -1088,7 +1200,22 @@ async fn handle_client(
                         }
 
                         clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
+                        if let Some(failure) = error.downcast_ref::<BackendFailure>() {
+                            backend.mark_failed();
+                            if !failure.response_started {
+                                error_response_and_ready_with_state(
+                                    &mut client,
+                                    CONNECTION_FAILURE_SQLSTATE,
+                                    "backend connection failed before response",
+                                    ReadyStatus::Idle,
+                                )
+                                .await?;
+                            }
+                        }
                         backend.discard();
+                        if error.downcast_ref::<BackendFailure>().is_some() {
+                            return Ok(());
+                        }
                         return Err(error).with_context(|| format!("proxy client {client_addr}"));
                     }
                     Err(_) => {
@@ -1930,6 +2057,21 @@ fn request_plans_for_frames<'a>(
     Ok(plans)
 }
 
+fn safe_request_to_replay(
+    frames: &[FrontendFrame],
+    plans: &[RequestPlan<'_>],
+    session: &VirtualSession,
+) -> bool {
+    !frames.is_empty()
+        && frames
+            .iter()
+            .all(|frame| frame.tag == u8::from(FrontendTag::Query))
+        && plans.len() == 1
+        && plans[0].analysis().query_class().routes_to_replica()
+        && session.pin_reason().is_none()
+        && !session.has_replayable_settings()
+}
+
 fn mirror_sql_command_for_request_plan(request_plan: Option<&RequestPlan<'_>>) -> SqlCommand {
     request_plan
         .map(|plan| plan.command.clone())
@@ -2693,15 +2835,15 @@ async fn forward_message_cycle(
     client: &mut ClientConnection,
     backend: &mut PooledBackend,
     state: &mut ForwardCycleState<'_>,
-    frames: Vec<FrontendFrame>,
-    simple_query_commands: Vec<SqlCommand>,
+    frames: &[FrontendFrame],
+    simple_query_commands: &[SqlCommand],
     max_backend_buffer_bytes: usize,
     buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
-    let mut simple_query_commands = simple_query_commands.into_iter();
+    let mut simple_query_commands = simple_query_commands.iter();
     buffers.clear_backend_write();
     for frame in frames {
         let simple_query_command = if frame.tag == u8::from(FrontendTag::Query) {
@@ -2717,14 +2859,14 @@ async fn forward_message_cycle(
             backend.backend_id(),
             state.prepared,
             &state.prepared_snapshot_handle,
-            frame,
+            frame.clone(),
             phase_recorder,
         )?;
         update_virtual_session_from_frame(
             state.session,
             &plan.frame,
             state.route_application_name,
-            simple_query_command.as_ref(),
+            simple_query_command,
         )?;
 
         for prelude in &plan.prelude {
@@ -2738,7 +2880,13 @@ async fn forward_message_cycle(
         .stream_mut()
         .write_all(buffers.backend_write())
         .await
-        .context("write frontend cycle to backend")?;
+        .map_err(|error| {
+            backend_failure(
+                BackendFailureKind::Write,
+                false,
+                anyhow::Error::new(error).context("write frontend cycle to backend"),
+            )
+        })?;
     execute_timer.finish(MetricOutcome::Ok);
     buffers.clear_backend_write();
 
@@ -2756,9 +2904,19 @@ async fn forward_message_cycle(
             .stream_mut()
             .read_buf(buffers.backend_read_mut())
             .await
-            .context("read backend frame")?;
+            .map_err(|error| {
+                backend_failure(
+                    BackendFailureKind::Read,
+                    state.progress.response_started,
+                    anyhow::Error::new(error).context("read backend frame"),
+                )
+            })?;
         if read == 0 {
-            anyhow::bail!("backend disconnected during response cycle");
+            return Err(backend_failure(
+                BackendFailureKind::Read,
+                state.progress.response_started,
+                anyhow::anyhow!("backend disconnected during response cycle"),
+            ));
         }
 
         buffers.observe_backend_read();

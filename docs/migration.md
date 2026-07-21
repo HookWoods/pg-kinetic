@@ -22,6 +22,12 @@ Use pg-kinetic as a connection-string change first. Keep the original PostgreSQL
 6. Watch connection errors, SQLSTATEs, checkout wait, backend pins, and readiness.
 7. Increase traffic only when the canary has no new driver or session-state errors.
 
+During a single-primary outage, readiness returns `503` and existing backend
+sessions are discarded. A stateless, classified read can be retried once when no
+response byte was sent; writes and uncertain or partially forwarded requests are
+not replayed and surface PostgreSQL connection failure SQLSTATE `08006`. Keep the
+original endpoint available for rollback during this test.
+
 Connection-string change:
 
 ```text

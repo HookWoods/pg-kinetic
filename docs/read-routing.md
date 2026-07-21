@@ -23,6 +23,11 @@ Read routing is safest when all of these are true:
 
 If any of those checks fail, pg-kinetic falls back to the primary or rejects the read, depending on policy.
 
+If the primary connection fails before any response byte is forwarded, a safe
+read may be retried once on a newly checked-out primary connection. This does not
+apply to writes, ambiguous statements, stateful sessions, authentication failures,
+or partially forwarded responses.
+
 ## Conservative Classification
 
 The classifier prefers the primary for anything ambiguous:

@@ -36,6 +36,7 @@ pub struct BackendPool {
     idle: Mutex<VecDeque<Backend>>,
     backend_available: Notify,
     snapshot_store: StdMutex<Option<SnapshotStore>>,
+    health: Arc<AtomicBool>,
     active_backends: AtomicUsize,
     idle_backends: AtomicUsize,
     max_backends: usize,
@@ -49,6 +50,7 @@ pub struct BackendPool {
 pub struct PooledBackend {
     backend: Option<Backend>,
     pool: Arc<BackendPool>,
+    health: Arc<AtomicBool>,
     _permit: BackpressurePermit,
     route_key: RouteKey,
     requires_startup: bool,
@@ -80,7 +82,7 @@ struct BackendPoolRefInner {
     id: u64,
     role: BackendRole,
     weight: usize,
-    healthy: AtomicBool,
+    healthy: Arc<AtomicBool>,
     waiting_hint: AtomicUsize,
     pool: Arc<BackendPool>,
 }
@@ -214,7 +216,7 @@ impl BackendPoolRef {
                 id,
                 role,
                 weight: weight.max(1),
-                healthy: AtomicBool::new(true),
+                healthy: Arc::clone(&pool.health),
                 waiting_hint: AtomicUsize::new(0),
                 pool,
             }),
@@ -763,6 +765,7 @@ impl BackendPool {
             idle: Mutex::new(VecDeque::new()),
             backend_available: Notify::new(),
             snapshot_store: StdMutex::new(None),
+            health: Arc::new(AtomicBool::new(true)),
             active_backends: AtomicUsize::new(0),
             idle_backends: AtomicUsize::new(0),
             max_backends,
@@ -876,6 +879,7 @@ impl BackendPool {
                         return Ok(PooledBackend {
                             backend: Some(backend),
                             pool: self.clone(),
+                            health: Arc::clone(&self.health),
                             _permit: BackpressurePermit::join(route_permit, permit),
                             route_key: route.clone(),
                             requires_startup: true,
@@ -900,6 +904,7 @@ impl BackendPool {
                 return Ok(PooledBackend {
                     backend: Some(backend),
                     pool: self.clone(),
+                    health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
                     route_key: route.clone(),
                     requires_startup: false,
@@ -915,6 +920,7 @@ impl BackendPool {
                 return Ok(PooledBackend {
                     backend: Some(backend),
                     pool: self.clone(),
+                    health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
                     route_key: route.clone(),
                     requires_startup: true,
@@ -932,6 +938,7 @@ impl BackendPool {
             Ok(PooledBackend {
                 backend: Some(backend),
                 pool: self.clone(),
+                health: Arc::clone(&self.health),
                 _permit: BackpressurePermit::join(route_permit, permit),
                 route_key: route.clone(),
                 requires_startup: false,
@@ -1137,6 +1144,10 @@ impl PooledBackend {
             .expect("pooled backend exists until release")
     }
 
+    pub fn mark_failed(&self) {
+        self.health.store(false, Ordering::Release);
+    }
+
     #[must_use]
     pub const fn requires_startup(&self) -> bool {
         self.requires_startup
@@ -1149,6 +1160,7 @@ impl PooledBackend {
             _permit,
             route_key,
             requires_startup: _,
+            ..
         } = self;
 
         if let Some(backend) = backend {
@@ -1167,6 +1179,7 @@ impl PooledBackend {
             _permit,
             route_key,
             requires_startup: _,
+            ..
         } = self;
 
         if let Some(backend) = backend {
