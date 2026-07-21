@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use getrandom::getrandom;
-use hmac::{Hmac, Mac};
+use getrandom::fill;
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -207,7 +207,7 @@ fn validate_scram_key_length(field: &'static str, value: &[u8]) -> Result<(), Se
 
 pub fn generate_nonce() -> Result<String, SecretError> {
     let mut bytes = [0u8; DEFAULT_NONCE_LEN];
-    getrandom(&mut bytes).map_err(|_| SecretError::NonceGeneration)?;
+    fill(&mut bytes).map_err(|_| SecretError::NonceGeneration)?;
     Ok(base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes))
 }
 

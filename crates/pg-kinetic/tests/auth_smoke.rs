@@ -6,7 +6,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::{BufMut, BytesMut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pg_kinetic::{
     config::{
         AuthConfig, AuthFailureMessageMode, AuthMode, BackendTlsMode, CapacityConfig, Config,

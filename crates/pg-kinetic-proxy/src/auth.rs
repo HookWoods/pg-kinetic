@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::BytesMut;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
