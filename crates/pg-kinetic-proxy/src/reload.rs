@@ -59,10 +59,16 @@ pub fn load_auth_users(config: &Config) -> anyhow::Result<Option<Arc<UserStore>>
         .map(|store| store.map(Arc::new))
 }
 
+pub fn load_backend_credential_provider(
+    config: &Config,
+) -> anyhow::Result<Option<Arc<dyn auth::BackendCredentialProvider>>> {
+    auth::load_backend_credential_provider(&config.auth)
+}
+
 pub fn validate_runtime_assets(config: &Config) -> anyhow::Result<()> {
     let _ = load_client_tls_server_config(config)?;
     let _ = load_auth_users(config)?;
-    let _ = auth::load_backend_credentials(&config.auth)?;
+    let _ = load_backend_credential_provider(config)?;
     Ok(())
 }
 

@@ -109,7 +109,7 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `auth.auth_mode` | enum | `pass_through` | `--auth-mode` | `PG_KINETIC_AUTH_MODE` | restart | Invalid enum fails parse. Values: `pass_through`, `trust`, `scram_sha_256`. |
 | `auth.auth_users_file` | optional path | unset | `--auth-users-file` | `PG_KINETIC_AUTH_USERS_FILE` | reload asset | Startup/reload fails if the file cannot load. |
 | `auth.backend_user` | optional string | unset | `--backend-user` | `PG_KINETIC_BACKEND_USER` | restart | Must be paired with `auth.backend_password_env_var_name`; selects the dedicated upstream service role after local client authentication. |
-| `auth.backend_password_env_var_name` | optional string | unset | `--backend-password-env-var-name` | `PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME` | restart | Must be paired with `auth.backend_user`; names the injected service password. Service credentials are invalid with `pass_through`. |
+| `auth.backend_password_env_var_name` | optional string | unset | `--backend-password-env-var-name` | `PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME` | new backend connections | Must be paired with `auth.backend_user`; names the injected service password read by `EnvironmentCredentialProvider`. Service credentials are invalid with `pass_through`. |
 | `auth.auth_failure_message_mode` | enum | `generic` | `--auth-failure-message-mode` | `PG_KINETIC_AUTH_FAILURE_MESSAGE_MODE` | restart | `detailed` can expose more auth context to clients. |
 | `reload.config_file` | optional path | unset | `--config-file` | `PG_KINETIC_CONFIG_FILE` | restart | Startup/reload fails if file cannot read or parse. |
 | `reload.config_reload_interval_ms` | milliseconds | `5000` | `--config-reload-interval-ms` | `PG_KINETIC_CONFIG_RELOAD_INTERVAL_MS` | restart | Reload loop ticks at this interval. |
@@ -155,7 +155,7 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 
 The internal `apply` and `guardrail` wrappers are flattened by the parser. They are not TOML table names.
 
-Reload compatibility is strict. Any runtime field change, including adaptive runtime scalar fields, is restart-required. Accepted reloads affect new client connections and reloadable assets such as auth user file contents or TLS certificate file contents at unchanged paths; they do not change existing sessions or already checked-out backends.
+Reload compatibility is strict. Any runtime field change, including adaptive runtime scalar fields, is restart-required. Accepted reloads affect new client connections and reloadable assets such as auth user file contents or TLS certificate file contents at unchanged paths; they do not change existing sessions or already checked-out backends. Backend service credentials are resolved for each new backend authentication exchange, so rotating the injected environment value takes effect after idle backends are discarded or recycled.
 
 ## Preview Configs Not In Main Runtime
 
@@ -221,7 +221,7 @@ Mirror preview fields:
 
 - Keep private keys readable only by the pg-kinetic process user.
 - Mount certificates and user files read-only.
-- Rotate backend passwords by changing the secret value and restarting the process when `backend_password_env_var_name` is used.
+- Rotate backend passwords by changing the injected secret and recycling idle backends when `backend_password_env_var_name` is used; existing checked-out sessions are unchanged.
 - Use `verify_full` only with `backend_ca_path` and `backend_server_name`.
 - Use `verify_client` only with client cert, key, and CA paths present.
 

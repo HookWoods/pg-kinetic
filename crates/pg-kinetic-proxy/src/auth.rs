@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -8,6 +8,7 @@ use md5::Md5;
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use thiserror::Error;
 
 use crate::{
     config::{AuthConfig, AuthFailureMessageMode, AuthMode},
@@ -29,21 +30,113 @@ const AUTH_FAILURE_SQLSTATE: &str = "28P01";
 const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
 const PASSWORD_MESSAGE_TAG: u8 = b'p';
 
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct BackendCredentials {
+pub struct BackendCredentials {
     username: String,
     password: String,
+    provider: Option<Arc<dyn BackendCredentialProvider>>,
+}
+
+impl std::fmt::Debug for BackendCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackendCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Clone for BackendCredentials {
+    fn clone(&self) -> Self {
+        Self {
+            username: self.username.clone(),
+            password: self.password.clone(),
+            provider: self.provider.clone(),
+        }
+    }
+}
+
+impl PartialEq for BackendCredentials {
+    fn eq(&self, other: &Self) -> bool {
+        self.username == other.username && self.password == other.password
+    }
+}
+
+impl Eq for BackendCredentials {}
+
+impl BackendCredentials {
+    fn with_provider(mut self, provider: Arc<dyn BackendCredentialProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    fn resolve(&self) -> Result<Self, AuthError> {
+        self.provider
+            .as_ref()
+            .map_or_else(|| Ok(self.clone()), |provider| provider.credentials())
+    }
 }
 
 impl BackendCredentials {
     #[must_use]
-    pub(crate) fn username(&self) -> &str {
+    pub fn username(&self) -> &str {
         &self.username
     }
 
     #[must_use]
-    pub(crate) fn password(&self) -> &str {
+    pub fn password(&self) -> &str {
         &self.password
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("auth.backend_user requires auth.backend_password_env_var_name")]
+    MissingPasswordEnvironmentVariableName,
+    #[error("auth.backend_password_env_var_name requires auth.backend_user")]
+    MissingBackendUser,
+    #[error("backend service credentials are incompatible with auth_mode=pass_through")]
+    PassThroughCredentials,
+    #[error("read backend service password from environment")]
+    Environment,
+    #[error("backend service password from environment is empty")]
+    EmptyPassword,
+}
+
+pub trait BackendCredentialProvider: Send + Sync {
+    fn credentials(&self) -> Result<BackendCredentials, AuthError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentCredentialProvider {
+    username: String,
+    password_env_var_name: String,
+}
+
+impl EnvironmentCredentialProvider {
+    pub fn new(username: impl Into<String>, password_env_var_name: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password_env_var_name: password_env_var_name.into(),
+        }
+    }
+}
+
+impl BackendCredentialProvider for EnvironmentCredentialProvider {
+    fn credentials(&self) -> Result<BackendCredentials, AuthError> {
+        let password = std::env::var_os(&self.password_env_var_name)
+            .ok_or(AuthError::Environment)?
+            .into_string()
+            .map_err(|_| AuthError::Environment)?;
+        if password.is_empty() {
+            return Err(AuthError::EmptyPassword);
+        }
+
+        Ok(BackendCredentials {
+            username: self.username.clone(),
+            password,
+            provider: None,
+        })
     }
 }
 
@@ -56,7 +149,7 @@ pub(crate) struct BackendAuthSession {
 
 impl BackendAuthSession {
     pub(crate) fn new(credentials: BackendCredentials) -> anyhow::Result<Self> {
-        Ok(Self::with_nonce(credentials, generate_nonce()?))
+        Ok(Self::with_nonce(credentials.resolve()?, generate_nonce()?))
     }
 
     fn with_nonce(credentials: BackendCredentials, client_nonce: String) -> Self {
@@ -262,32 +355,29 @@ pub enum ClientAuthOutcome {
 pub(crate) fn load_backend_credentials(
     auth: &AuthConfig,
 ) -> anyhow::Result<Option<BackendCredentials>> {
+    let Some(provider) = load_backend_credential_provider(auth)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(provider.credentials()?.with_provider(provider)))
+}
+
+pub(crate) fn load_backend_credential_provider(
+    auth: &AuthConfig,
+) -> anyhow::Result<Option<Arc<dyn BackendCredentialProvider>>> {
     match (
         auth.backend_user.as_deref(),
         auth.backend_password_env_var_name.as_deref(),
     ) {
         (None, None) => Ok(None),
-        (Some(_), None) => anyhow::bail!(
-            "auth.backend_user requires auth.backend_password_env_var_name"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "auth.backend_password_env_var_name requires auth.backend_user"
-        ),
-        (Some(_), Some(_)) if auth.auth_mode == AuthMode::PassThrough => anyhow::bail!(
-            "auth.backend_user and auth.backend_password_env_var_name are incompatible with auth_mode=pass_through"
-        ),
-        (Some(username), Some(password_env_var_name)) => {
-            let password = std::env::var(password_env_var_name)
-                .with_context(|| "read backend service password from environment")?;
-            anyhow::ensure!(
-                !password.is_empty(),
-                "backend service password from environment is empty"
-            );
-            Ok(Some(BackendCredentials {
-                username: username.to_owned(),
-                password,
-            }))
+        (Some(_), None) => Err(AuthError::MissingPasswordEnvironmentVariableName.into()),
+        (None, Some(_)) => Err(AuthError::MissingBackendUser.into()),
+        (Some(_), Some(_)) if auth.auth_mode == AuthMode::PassThrough => {
+            Err(AuthError::PassThroughCredentials.into())
         }
+        (Some(username), Some(password_env_var_name)) => Ok(Some(Arc::new(
+            EnvironmentCredentialProvider::new(username, password_env_var_name),
+        ))),
     }
 }
 
@@ -703,6 +793,7 @@ mod tests {
         BackendCredentials {
             username: String::from("pool_user"),
             password: String::from("pool-password"),
+            provider: None,
         }
     }
 

@@ -36,6 +36,8 @@ export PG_KINETIC_BACKEND_PASSWORD='replace-with-your-secret'
 
 `backend_user` and `backend_password_env_var_name` are an atomic pair. Supplying only one is rejected before the listener starts. They are also rejected with `auth_mode = "pass_through"`: pass-through deliberately preserves PostgreSQL's client-owned authentication exchange and cannot safely impersonate a service role.
 
+The service-role boundary is implemented by `BackendCredentialProvider`. The default `EnvironmentCredentialProvider` reads the configured environment variable when a new backend authentication exchange begins. This keeps provider-specific credential lookup out of pool and wire-protocol code; future providers can implement the same interface without changing those callers.
+
 ## Service-Pool Warm-Up
 
 After the first successful locally authenticated client startup, pg-kinetic asynchronously prepares up to two idle backend sessions for the primary pool, bounded by `capacity.max_backends`. This removes most connection and backend-auth work from the next client checkout without creating more sessions than the configured pool allows.
@@ -66,7 +68,7 @@ Choose a minimally privileged PostgreSQL role for `backend_user`. If PostgreSQL 
 
 ## Rotation And Troubleshooting
 
-Rotate the injected secret and restart pg-kinetic. The password environment value is read during process startup, and existing pooled connections retain the previous PostgreSQL session until they are recycled.
+Rotate the injected secret, then discard or recycle idle pooled backends. New backend connections read the current environment value through `EnvironmentCredentialProvider`; existing checked-out sessions retain their established PostgreSQL authentication until they are released or discarded. The secret value is never logged.
 
 - `auth.backend_user requires auth.backend_password_env_var_name`: configure the password source too.
 - `auth.backend_user and auth.backend_password_env_var_name are incompatible with auth_mode=pass_through`: select local `trust` or `scram_sha_256`, or remove service credentials.
