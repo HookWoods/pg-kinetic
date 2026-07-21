@@ -47,6 +47,48 @@ impl PhaseTimingRecorder for MetricsPhaseTimingRecorder {
     }
 }
 
+#[derive(Clone)]
+pub struct SampledPhaseTimingRecorder {
+    recorder: Arc<dyn PhaseTimingRecorder>,
+    sampler: DebugSampler,
+    session_id: u64,
+}
+
+impl std::fmt::Debug for SampledPhaseTimingRecorder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SampledPhaseTimingRecorder")
+            .field("sampler", &self.sampler)
+            .field("session_id", &self.session_id)
+            .finish()
+    }
+}
+
+impl SampledPhaseTimingRecorder {
+    #[must_use]
+    pub fn new(recorder: Arc<dyn PhaseTimingRecorder>, sample_rate: f64, session_id: u64) -> Self {
+        Self {
+            recorder,
+            sampler: DebugSampler::new(sample_rate),
+            session_id,
+        }
+    }
+}
+
+impl PhaseTimingRecorder for SampledPhaseTimingRecorder {
+    fn record_protocol_phase_duration(
+        &self,
+        phase: ProtocolPhase,
+        outcome: MetricOutcome,
+        duration: Duration,
+    ) {
+        if self.sampler.should_sample(self.session_id) {
+            self.recorder
+                .record_protocol_phase_duration(phase, outcome, duration);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct DisabledPhaseTimingRecorder;
 
@@ -120,6 +162,20 @@ pub fn phase_timing_recorder(enabled: bool) -> Arc<dyn PhaseTimingRecorder> {
     DISABLED_PHASE_TIMING_RECORDER
         .get_or_init(|| Arc::new(DisabledPhaseTimingRecorder))
         .clone()
+}
+
+#[must_use]
+pub fn sampled_phase_timing_recorder(
+    enabled: bool,
+    sample_rate: f64,
+    session_id: u64,
+) -> Arc<dyn PhaseTimingRecorder> {
+    let recorder = phase_timing_recorder(enabled);
+    Arc::new(SampledPhaseTimingRecorder::new(
+        recorder,
+        sample_rate,
+        session_id,
+    ))
 }
 
 pub fn record_protocol_phase_duration(

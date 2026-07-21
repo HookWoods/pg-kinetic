@@ -366,6 +366,18 @@ pub fn record_protocol_phase_duration(
     protocol_phase_histogram(phase, outcome).record(duration.as_secs_f64() * 1_000.0);
 }
 
+pub fn record_protocol_phase_duration_sampled(
+    phase: ProtocolPhase,
+    outcome: MetricOutcome,
+    duration: Duration,
+    sampler: crate::telemetry::DebugSampler,
+    session_id: u64,
+) {
+    if sampler.should_sample(session_id) {
+        record_protocol_phase_duration(phase, outcome, duration);
+    }
+}
+
 fn protocol_phase_histogram(
     phase: ProtocolPhase,
     outcome: MetricOutcome,

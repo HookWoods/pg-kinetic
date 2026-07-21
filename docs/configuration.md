@@ -100,6 +100,7 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `admin.admin_max_clients` | integer | `8` | `--admin-max-clients` | `PG_KINETIC_ADMIN_MAX_CLIENTS` | restart | Excess admin clients wait or are rejected. |
 | `observability.metrics_addr` | optional socket address | unset | `--metrics-addr` | `PG_KINETIC_METRICS_ADDR` | restart | Startup fails if metrics bind fails. |
 | `observability.debug_trace_sampling_rate` | float | `0.0` | `--debug-trace-sampling-rate` | `PG_KINETIC_DEBUG_TRACE_SAMPLING_RATE` | restart | Non-finite values are clamped to `0.0` at use. |
+| `observability.phase_timing_sample_rate` | float | `1.0` | `--phase-timing-sample-rate` | `PG_KINETIC_PHASE_TIMING_SAMPLE_RATE` | restart | Detailed protocol phase histograms are sampled per session; values are clamped to `0.0..=1.0`, and core health, pool, error, and backpressure metrics remain unsampled. |
 | `observability.otel_enabled` | bool | `false` | `--otel-enabled` | `PG_KINETIC_OTEL_ENABLED` | restart | Export is disabled when false. |
 | `observability.otel_endpoint` | optional string | unset | `--otel-endpoint` | `PG_KINETIC_OTEL_ENDPOINT` | restart | Invalid endpoint fails at exporter setup/use. |
 | `observability.otel_service_name` | string | `pg-kinetic` | `--otel-service-name` | `PG_KINETIC_OTEL_SERVICE_NAME` | restart | Empty or misleading names affect telemetry identity. |

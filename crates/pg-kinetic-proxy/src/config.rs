@@ -1721,7 +1721,7 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
@@ -1733,6 +1733,13 @@ pub struct ObservabilityConfig {
         default_value_t = 0.0
     )]
     pub debug_trace_sampling_rate: f64,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_PHASE_TIMING_SAMPLE_RATE",
+        default_value_t = 1.0
+    )]
+    pub phase_timing_sample_rate: f64,
 
     #[arg(long, env = "PG_KINETIC_OTEL_ENABLED")]
     pub otel_enabled: bool,
@@ -1748,11 +1755,33 @@ pub struct ObservabilityConfig {
     pub otel_service_name: String,
 }
 
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_addr: None,
+            debug_trace_sampling_rate: 0.0,
+            phase_timing_sample_rate: 1.0,
+            otel_enabled: false,
+            otel_endpoint: None,
+            otel_service_name: String::from("pg-kinetic"),
+        }
+    }
+}
+
 impl ObservabilityConfig {
     #[must_use]
     pub fn trace_sampling_ratio(&self) -> f64 {
         if self.debug_trace_sampling_rate.is_finite() {
             self.debug_trace_sampling_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    #[must_use]
+    pub fn phase_timing_sample_rate(&self) -> f64 {
+        if self.phase_timing_sample_rate.is_finite() {
+            self.phase_timing_sample_rate.clamp(0.0, 1.0)
         } else {
             0.0
         }
@@ -2682,6 +2711,7 @@ mod tests {
         assert_eq!(config.admin.admin_max_clients, 8);
         assert_eq!(config.observability.metrics_addr, None);
         assert_eq!(config.observability.debug_trace_sampling_rate, 0.0);
+        assert_eq!(config.observability.phase_timing_sample_rate, 1.0);
         assert!(!config.observability.otel_enabled);
         assert_eq!(config.observability.otel_endpoint, None);
         assert_eq!(config.observability.otel_service_name, "pg-kinetic");
@@ -2945,6 +2975,8 @@ mod tests {
             "16",
             "--debug-trace-sampling-rate",
             "0.25",
+            "--phase-timing-sample-rate",
+            "0.75",
             "--otel-enabled",
             "--otel-endpoint",
             "http://otel.example.com:4318",
@@ -3064,6 +3096,7 @@ mod tests {
         assert_eq!(config.admin.admin_query_timeout_ms, 2_222);
         assert_eq!(config.admin.admin_max_clients, 16);
         assert_eq!(config.observability.debug_trace_sampling_rate, 0.25);
+        assert_eq!(config.observability.phase_timing_sample_rate, 0.75);
         assert!(config.observability.otel_enabled);
         assert_eq!(
             config.observability.otel_endpoint,
