@@ -55,7 +55,7 @@ jobs:
       - name: Install JavaScript compatibility dependencies
         if: matrix.language == 'javascript'
         run: npm --prefix compat/javascript install
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: matrix.language == 'python'
         with:
           python-version: "3.13"
