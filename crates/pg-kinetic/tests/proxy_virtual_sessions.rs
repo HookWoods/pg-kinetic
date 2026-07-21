@@ -149,6 +149,7 @@ async fn spawn_proxy_with_recording_backend() -> (SocketAddr, mpsc::Receiver<Str
             max_backends: 1,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
             recovery_mode: RecoveryMode::Recover,

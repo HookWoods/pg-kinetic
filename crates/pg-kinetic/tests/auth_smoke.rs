@@ -388,6 +388,7 @@ async fn spawn_proxy_with_backend_service_auth(
             max_backends: 1,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 250,
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
@@ -521,6 +522,7 @@ async fn spawn_proxy_with_auth(
             max_backends: 1,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 250,
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,

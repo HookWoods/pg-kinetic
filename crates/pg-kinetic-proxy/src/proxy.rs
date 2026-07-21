@@ -2177,18 +2177,20 @@ fn build_route_pools(
     route_config: &RouteConfig,
     snapshot_store: SnapshotStore,
 ) -> RoutePools {
+    let mut lifecycle = config.pool_lifecycle.clone();
+    lifecycle.max_size = lifecycle.max_size.min(config.capacity.max_backends);
     let pool_args = (
         config.tls.clone(),
         config.socket.clone(),
-        config.capacity.max_backends,
         config.capacity.max_checkout_waiters,
         config.qos.max_route_in_flight,
         config.qos.max_route_waiters,
         config.performance.checkout_timeout(),
         config.performance.backend_reset_query.clone(),
+        lifecycle,
     );
 
-    let primary_pool = BackendPool::new_with_socket(
+    let primary_pool = BackendPool::new_with_socket_and_lifecycle(
         route_config.primary.address,
         pool_args.0.clone(),
         pool_args.1.clone(),
@@ -2196,7 +2198,7 @@ fn build_route_pools(
         pool_args.3,
         pool_args.4,
         pool_args.5,
-        pool_args.6,
+        pool_args.6.clone(),
         pool_args.7.clone(),
     );
     let primary = BackendPoolRef::primary(primary_pool);
@@ -2207,7 +2209,7 @@ fn build_route_pools(
         .iter()
         .enumerate()
         .map(|(index, replica)| {
-            let pool = BackendPool::new_with_socket(
+            let pool = BackendPool::new_with_socket_and_lifecycle(
                 replica.address,
                 pool_args.0.clone(),
                 pool_args.1.clone(),
@@ -2215,7 +2217,7 @@ fn build_route_pools(
                 pool_args.3,
                 pool_args.4,
                 pool_args.5,
-                pool_args.6,
+                pool_args.6.clone(),
                 pool_args.7.clone(),
             );
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)

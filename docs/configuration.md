@@ -75,9 +75,9 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `connection.listen_addr` | socket address | `127.0.0.1:6543` | `--listen-addr` | `PG_KINETIC_LISTEN_ADDR` | restart | Startup fails if bind fails or value cannot parse. |
 | `connection.backend_addr` | socket address | `127.0.0.1:5432` | `--backend-addr` | `PG_KINETIC_BACKEND_ADDR` | restart | Startup/preflight fails if value cannot parse; readiness fails when backend cannot connect. |
 | `capacity.max_clients` | integer | `10000` | `--max-clients` | `PG_KINETIC_MAX_CLIENTS` | restart | Client admission is capped at this value. |
-| `capacity.max_backends` | integer | `100` | `--max-backends` | `PG_KINETIC_MAX_BACKENDS` | restart | Backend pool is capped at this value. |
+| `capacity.max_backends` | integer | `100` | `--max-backends` | `PG_KINETIC_MAX_BACKENDS` | restart | Global backend connection cap; each pool is capped by the lower of this value and `pool_max_size`. |
 | `capacity.max_checkout_waiters` | integer | `1000` | `--max-checkout-waiters` | `PG_KINETIC_MAX_CHECKOUT_WAITERS` | restart | Excess backend checkout waiters are rejected. |
-| `pool_max_size` | integer | `100` | `--pool-max-size` | `PG_KINETIC_POOL_MAX_SIZE` | restart | Lifecycle-aware pools never create more than this many backend connections. |
+| `pool_max_size` | integer | `100` | `--pool-max-size` | `PG_KINETIC_POOL_MAX_SIZE` | restart | Lifecycle-aware per-pool cap; each pool is capped by the lower of this value and `capacity.max_backends`. |
 | `pool_min_idle` | integer | `0` | `--pool-min-idle` | `PG_KINETIC_POOL_MIN_IDLE` | restart | Idle reaping never removes connections below this floor. |
 | `pool_idle_timeout_ms` | milliseconds | `1800000` | `--pool-idle-timeout-ms` | `PG_KINETIC_POOL_IDLE_TIMEOUT_MS` | restart | Idle backends older than this bound are eligible for reaping. `0` disables the bound. |
 | `pool_max_lifetime_ms` | milliseconds | `0` | `--pool-max-lifetime-ms` | `PG_KINETIC_POOL_MAX_LIFETIME_MS` | restart | Idle backends older than this lifetime are eligible for reaping. `0` disables the bound. |

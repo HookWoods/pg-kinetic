@@ -1,6 +1,6 @@
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::Duration;
 
@@ -37,6 +37,7 @@ async fn reconnects_with_different_source_ports_reuse_a_bounded_backend_pool() {
             max_backends: 8,
             max_checkout_waiters: 8,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 1_000,
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,

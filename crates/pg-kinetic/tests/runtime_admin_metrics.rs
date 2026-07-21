@@ -754,6 +754,7 @@ fn test_config(
             max_backends: 1,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 250,
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,

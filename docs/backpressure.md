@@ -31,7 +31,7 @@ This makes queueing more useful than a single global counter. A bulk worker can 
 | `max_route_in_flight` | Maximum concurrent checkouts for one route key. |
 | `max_route_waiters` | Maximum queued waiters for one route key. |
 | `max_checkout_waiters` | Global checkout waiter cap. |
-| `pool_max_size` | Maximum number of backend connections in one pool. |
+| `pool_max_size` | Maximum number of backend connections in one pool, also bounded by `max_backends`. |
 | `pool_min_idle` | Minimum idle connections retained by the lifecycle reaper. |
 | `pool_idle_timeout_ms` | Maximum idle age before an idle backend becomes eligible for eviction. |
 | `pool_max_lifetime_ms` | Maximum backend age before an idle backend becomes eligible for eviction. |

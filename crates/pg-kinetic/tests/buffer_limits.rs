@@ -269,6 +269,7 @@ async fn spawn_proxy(backend_mode: BackendMode, qos: QosConfig) -> (SocketAddr, 
             max_backends: 2,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
             recovery_mode: RecoveryMode::Recover,

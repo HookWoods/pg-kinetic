@@ -160,6 +160,9 @@ pub struct Config {
     pub capacity: CapacityConfig,
 
     #[command(flatten)]
+    pub pool_lifecycle: PoolLifecycleConfig,
+
+    #[command(flatten)]
     pub performance: PerformanceConfig,
 
     #[command(flatten)]
@@ -2600,8 +2603,8 @@ where
 mod tests {
     use super::{
         AuthFailureMessageMode, AuthMode, BackendEndpointConfig, BackendTlsMode, ClientTlsMode,
-        Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, ReadRoutingConfig,
-        ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
+        Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, PoolLifecycleConfig,
+        ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
     };
     use crate::snapshot::SettingsSnapshot;
     use clap::Parser;
@@ -2626,6 +2629,7 @@ mod tests {
         assert_eq!(config.capacity.max_clients, 10_000);
         assert_eq!(config.capacity.max_backends, 100);
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
+        assert_eq!(config.pool_lifecycle, PoolLifecycleConfig::default());
         assert_eq!(config.routes.len(), 0);
         assert!(!config.runtime.node.node_id.as_str().is_empty());
         assert_eq!(
@@ -2898,6 +2902,14 @@ mod tests {
             "25",
             "--max-checkout-waiters",
             "12",
+            "--pool-max-size",
+            "8",
+            "--pool-min-idle",
+            "2",
+            "--pool-idle-timeout-ms",
+            "1500",
+            "--pool-max-lifetime-ms",
+            "9000",
             "--checkout-timeout-ms",
             "250",
             "--recovery-mode",
@@ -3006,6 +3018,16 @@ mod tests {
         assert_eq!(config.capacity.max_clients, 500);
         assert_eq!(config.capacity.max_backends, 25);
         assert_eq!(config.capacity.max_checkout_waiters, 12);
+        assert_eq!(config.pool_lifecycle.max_size, 8);
+        assert_eq!(config.pool_lifecycle.min_idle, 2);
+        assert_eq!(
+            config.pool_lifecycle.idle_timeout,
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            config.pool_lifecycle.max_lifetime,
+            Duration::from_millis(9_000)
+        );
         assert_eq!(
             config.performance.checkout_timeout(),
             Duration::from_millis(250)

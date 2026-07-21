@@ -343,6 +343,7 @@ async fn spawn_timeout_proxy(scenario: TimeoutScenario) -> (SocketAddr, mpsc::Re
             max_backends: 2,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
             recovery_mode: RecoveryMode::Recover,
@@ -612,6 +613,7 @@ async fn spawn_proxy_with_backend_and_qos(
             max_backends: 2,
             max_checkout_waiters: 4,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
             recovery_mode: RecoveryMode::Recover,

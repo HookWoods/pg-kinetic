@@ -65,6 +65,7 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
             max_backends: 1,
             max_checkout_waiters: 2,
         },
+        pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
