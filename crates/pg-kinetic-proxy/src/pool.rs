@@ -20,7 +20,7 @@ use crate::{
 };
 use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
-    route::RouteKey,
+    route::{PoolKey, RouteKey},
     routing::BackendRole,
     sharding::ShardId,
 };
@@ -32,7 +32,7 @@ pub struct BackendPool {
     socket: SocketConfig,
     reset_query: Arc<str>,
     gate: BackpressureGate,
-    route_gates: StdRwLock<HashMap<RouteKey, BackpressureGate>>,
+    route_gates: StdRwLock<HashMap<PoolKey, BackpressureGate>>,
     idle: Mutex<VecDeque<Backend>>,
     backend_available: Notify,
     snapshot_store: StdMutex<Option<SnapshotStore>>,
@@ -106,7 +106,7 @@ pub struct RoutePools {
 
 #[derive(Debug, Default)]
 pub struct RoutePoolRegistry {
-    routes: StdRwLock<HashMap<RouteKey, RoutePools>>,
+    routes: StdRwLock<HashMap<PoolKey, RoutePools>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -424,7 +424,7 @@ impl RoutePoolRegistry {
         self.routes
             .write()
             .expect("route registry poisoned")
-            .insert(route, pools);
+            .insert(route.pool_key(), pools);
     }
 
     #[must_use]
@@ -432,7 +432,7 @@ impl RoutePoolRegistry {
         self.routes
             .read()
             .expect("route registry poisoned")
-            .get(route)
+            .get(&route.pool_key())
             .cloned()
     }
 
@@ -1033,11 +1033,12 @@ impl BackendPool {
     }
 
     fn route_gate(&self, route: &RouteKey) -> BackpressureGate {
+        let pool_key = route.pool_key();
         if let Some(route_gate) = self
             .route_gates
             .read()
             .expect("route gates poisoned")
-            .get(route)
+            .get(&pool_key)
             .cloned()
         {
             return route_gate;
@@ -1045,7 +1046,7 @@ impl BackendPool {
 
         let mut route_gates = self.route_gates.write().expect("route gates poisoned");
         route_gates
-            .entry(route.clone())
+            .entry(pool_key)
             .or_insert_with(|| {
                 BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters)
             })

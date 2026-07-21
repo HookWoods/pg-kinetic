@@ -18,6 +18,27 @@ The proxy checks out a backend when a query cycle needs one. When the cycle comp
 
 This model keeps PostgreSQL session semantics visible to applications while reducing the number of server connections needed under high client counts.
 
+## Reconnect Pool Identity
+
+Backend pool identity is based on the database, client-visible user, and
+`application_name`. The client's TCP source address, including its ephemeral
+source port, remains available in route snapshots and diagnostics but does not
+create a new backend pool. Reconnecting clients therefore reuse the same
+bounded pool and remain subject to `max_backends`.
+
+To verify this behavior in the Linux benchmark fixture, run repeated short
+connections through pg-kinetic and query the PostgreSQL session count:
+
+```bash
+for i in $(seq 1 80); do
+  PGPASSWORD=postgres psql -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c "select 1" >/dev/null
+done
+psql -h postgres -U postgres -d pgkinetic -Atc 'select backend_session_count()'
+```
+
+The result must remain within the configured backend pool limit rather than
+growing with the number of reconnecting client source ports.
+
 ## Pinning Reasons
 
 Backends are pinned when the client uses state that cannot be safely moved to a different backend:
@@ -77,4 +98,3 @@ Useful metrics include:
 - `pg_kinetic_backend_cleanup_total`
 - `pg_kinetic_backend_recovery_total`
 - `pg_kinetic_backend_sqlstate_total`
-

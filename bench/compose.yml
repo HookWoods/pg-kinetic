@@ -80,6 +80,7 @@ services:
       PG_KINETIC_BACKEND_USER: postgres
       PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME: PG_KINETIC_BACKEND_PASSWORD
       PG_KINETIC_BACKEND_PASSWORD: postgres
+      PG_KINETIC_MAX_BACKENDS: "8"
       RUST_LOG: info
     volumes:
       - ./pg-kinetic/auth-users.txt:/etc/pg-kinetic/auth-users.txt:ro

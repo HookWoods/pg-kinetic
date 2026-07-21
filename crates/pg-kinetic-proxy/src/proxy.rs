@@ -1623,7 +1623,7 @@ fn route_key(
         database,
         user,
         application_name,
-        Some(SocketAddr::new(client_addr.ip(), 0)),
+        Some(client_addr),
         QueryClass::Default,
     )
 }

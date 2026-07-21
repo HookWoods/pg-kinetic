@@ -10,3 +10,13 @@ VALUES
     ('alice@example.com', 1000),
     ('bob@example.com', 2000)
 ON CONFLICT (email) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION backend_session_count() RETURNS bigint
+LANGUAGE SQL
+STABLE
+AS $$
+    SELECT count(*)
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND application_name <> 'pgbench';
+$$;

@@ -36,6 +36,13 @@ pub struct RouteKey {
     metric_label: Arc<str>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PoolKey {
+    database: Arc<str>,
+    user: Arc<str>,
+    application_name: Option<Arc<str>>,
+}
+
 impl PartialEq for RouteKey {
     fn eq(&self, other: &Self) -> bool {
         self.database == other.database
@@ -101,6 +108,15 @@ impl RouteKey {
     #[must_use]
     pub fn client_addr(&self) -> Option<SocketAddr> {
         self.client_addr
+    }
+
+    #[must_use]
+    pub fn pool_key(&self) -> PoolKey {
+        PoolKey {
+            database: Arc::clone(&self.database),
+            user: Arc::clone(&self.user),
+            application_name: self.application_name.clone(),
+        }
     }
 
     #[must_use]
