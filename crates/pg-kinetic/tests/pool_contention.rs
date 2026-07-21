@@ -26,6 +26,7 @@ use pg_kinetic_proxy::{
     },
     routing::{RoutingReason, RoutingTarget},
     sharding::ShardRouteMapStore,
+    snapshot::SnapshotStore,
 };
 
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
@@ -277,6 +278,30 @@ async fn route_gate_registry_and_checkout_waits_are_recorded_separately() {
         &[("stage", "route_gate_registry"), ("outcome", "ok")]
     ));
     assert!(recorder.has_metric_stage("pg_kinetic_pool_checkout_wait_ms", "checkout"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_checkouts_do_not_serialize_on_snapshot_store() {
+    let (backend_addr, _accepted) = backend_listener().await;
+    let pool = test_pool(backend_addr);
+    pool.attach_snapshot_store(SnapshotStore::new());
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        let pool = pool.clone();
+        tasks.spawn(async move {
+            let backend = pool.checkout(route_key()).await.expect("checkout");
+            backend.release().await;
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.expect("task");
+    }
+
+    pool.with_snapshot_store(|snapshot_store| {
+        let _ = snapshot_store;
+    });
 }
 
 #[test]

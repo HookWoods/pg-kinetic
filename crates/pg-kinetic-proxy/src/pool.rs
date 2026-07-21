@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 
@@ -36,7 +37,7 @@ pub struct BackendPool {
     idle: Mutex<VecDeque<Backend>>,
     backend_lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
     backend_available: Notify,
-    snapshot_store: StdMutex<Option<SnapshotStore>>,
+    snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
     active_backends: AtomicUsize,
     idle_backends: AtomicUsize,
@@ -67,6 +68,7 @@ pub struct PooledBackend {
     health: Arc<AtomicBool>,
     _permit: BackpressurePermit,
     route_key: RouteKey,
+    route_gate: BackpressureGate,
     requires_startup: bool,
 }
 
@@ -811,7 +813,7 @@ impl BackendPool {
             idle: Mutex::new(VecDeque::new()),
             backend_lifecycle: StdMutex::new(HashMap::new()),
             backend_available: Notify::new(),
-            snapshot_store: StdMutex::new(None),
+            snapshot_store: ArcSwapOption::empty(),
             health: Arc::new(AtomicBool::new(true)),
             active_backends: AtomicUsize::new(0),
             idle_backends: AtomicUsize::new(0),
@@ -825,8 +827,8 @@ impl BackendPool {
     }
 
     pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
-        *self.snapshot_store.lock().expect("snapshot store poisoned") =
-            Some(snapshot_store.clone());
+        self.snapshot_store
+            .store(Some(Arc::new(snapshot_store.clone())));
 
         if let Ok(mut idle_backends) = self.idle.try_lock() {
             for backend in idle_backends.iter_mut() {
@@ -877,17 +879,12 @@ impl BackendPool {
         route: RouteKey,
         mode: CheckoutMode,
     ) -> Result<PooledBackend, PoolError> {
-        let route_gate_lookup_started = Instant::now();
         let route_gate = self.route_gate(&route);
-        let route_gate_lookup_wait_ms = route_gate_lookup_started.elapsed().as_secs_f64() * 1_000.0;
-        if let Some(snapshot_store) = self.snapshot_store() {
-            snapshot_store.record_pool_checkout_lock_wait_ms(route_gate_lookup_wait_ms);
-        }
-        metrics::record_pool_checkout(route_gate_lookup_wait_ms, "route_gate_registry", "ok");
         let started = Instant::now();
         let route_gate_metrics = route_gate.metrics.clone();
         let route_gate_gate = route_gate.gate.clone();
-        let checkout = async {
+        let route_gate_gate_for_timeout = route_gate_gate.clone();
+        let checkout = async move {
             let route_permit = match route_gate_gate.checkout(self.checkout_timeout).await {
                 Ok(permit) => permit,
                 Err(error) => {
@@ -897,7 +894,7 @@ impl BackendPool {
                         started.elapsed().as_secs_f64() * 1000.0,
                         backpressure_outcome(error),
                     );
-                    self.record_backpressure_counts(&route);
+                    self.record_backpressure_counts(&route, &route_gate_gate);
                     return Err(PoolError::Backpressure(error));
                 }
             };
@@ -910,7 +907,7 @@ impl BackendPool {
                         started.elapsed().as_secs_f64() * 1000.0,
                         backpressure_outcome(error),
                     );
-                    self.record_backpressure_counts(&route);
+                    self.record_backpressure_counts(&route, &route_gate_gate);
                     return Err(PoolError::Backpressure(error));
                 }
             };
@@ -923,7 +920,7 @@ impl BackendPool {
             route_gate_metrics
                 .waiting
                 .set(route_gate_gate.waiting() as f64);
-            self.record_backpressure_counts(&route);
+            self.record_backpressure_counts(&route, &route_gate_gate);
 
             if mode == CheckoutMode::PreferConnect && self.reserve_backend_slot() {
                 match self.connect_reserved_backend().await {
@@ -937,6 +934,7 @@ impl BackendPool {
                             health: Arc::clone(&self.health),
                             _permit: BackpressurePermit::join(route_permit, permit),
                             route_key: route.clone(),
+                            route_gate: route_gate_gate.clone(),
                             requires_startup: true,
                         });
                     }
@@ -962,6 +960,7 @@ impl BackendPool {
                     health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
                     route_key: route.clone(),
+                    route_gate: route_gate_gate.clone(),
                     requires_startup: false,
                 });
             }
@@ -978,6 +977,7 @@ impl BackendPool {
                     health: Arc::clone(&self.health),
                     _permit: BackpressurePermit::join(route_permit, permit),
                     route_key: route.clone(),
+                    route_gate: route_gate_gate.clone(),
                     requires_startup: true,
                 });
             }
@@ -996,6 +996,7 @@ impl BackendPool {
                 health: Arc::clone(&self.health),
                 _permit: BackpressurePermit::join(route_permit, permit),
                 route_key: route.clone(),
+                route_gate: route_gate_gate.clone(),
                 requires_startup: false,
             })
         };
@@ -1009,7 +1010,7 @@ impl BackendPool {
                     started.elapsed().as_secs_f64() * 1000.0,
                     "timeout",
                 );
-                self.record_backpressure_counts(&route);
+                self.record_backpressure_counts(&route, &route_gate_gate_for_timeout);
                 Err(PoolError::Backpressure(BackpressureError::Timeout))
             }
         };
@@ -1193,36 +1194,43 @@ impl BackendPool {
             return route_gate;
         }
 
+        let started = Instant::now();
         let mut route_gates = self.route_gates.write().expect("route gates poisoned");
         route_gates
             .entry(pool_key)
-            .or_insert_with(|| RouteGateEntry {
-                gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
-                metrics: RouteMetricHandles::resolve(route),
+            .or_insert_with(|| {
+                let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                self.with_snapshot_store(|snapshot_store| {
+                    snapshot_store.record_pool_checkout_lock_wait_ms(wait_ms);
+                });
+                metrics::record_pool_checkout(wait_ms, "route_gate_registry", "ok");
+                RouteGateEntry {
+                    gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
+                    metrics: RouteMetricHandles::resolve(route),
+                }
             })
             .clone()
     }
 
-    fn snapshot_store(&self) -> Option<SnapshotStore> {
-        self.snapshot_store
-            .lock()
-            .expect("snapshot store poisoned")
-            .clone()
+    pub fn with_snapshot_store(&self, f: impl FnOnce(&SnapshotStore)) {
+        if let Some(snapshot_store) = self.snapshot_store.load_full() {
+            f(snapshot_store.as_ref());
+        }
     }
 
     fn attach_backend_snapshot_store(&self, backend: &mut Backend) {
-        if let Some(snapshot_store) = self.snapshot_store() {
-            backend.attach_snapshot_store(snapshot_store);
-        }
+        self.with_snapshot_store(|snapshot_store| {
+            backend.attach_snapshot_store(snapshot_store.clone());
+        });
     }
 
     fn sync_pool_snapshot(&self) {
         let active_backends = self.active_backends.load(Ordering::Acquire);
         let idle_backends = self.idle_backends.load(Ordering::Acquire);
         metrics::record_pool_connections(active_backends, idle_backends);
-        if let Some(snapshot_store) = self.snapshot_store() {
+        self.with_snapshot_store(|snapshot_store| {
             metrics::record_pool_snapshot(
-                &snapshot_store,
+                snapshot_store,
                 PoolSnapshot {
                     configured_backends: self.max_backends,
                     active_backends,
@@ -1238,7 +1246,7 @@ impl BackendPool {
                 active_backends,
                 idle_backends,
             });
-        }
+        });
     }
 
     fn register_backend(&self, backend: &Backend) {
@@ -1255,16 +1263,15 @@ impl BackendPool {
             );
     }
 
-    fn record_backpressure_counts(&self, route: &RouteKey) {
-        if let Some(snapshot_store) = self.snapshot_store() {
-            let route_gate = self.route_gate(route);
+    fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
+        self.with_snapshot_store(|snapshot_store| {
             metrics::record_backpressure_snapshot(
-                &snapshot_store,
+                snapshot_store,
                 route.clone(),
-                route_gate.gate.waiting(),
-                route_gate.gate.in_flight(),
+                gate.waiting(),
+                gate.in_flight(),
             );
-        }
+        });
     }
 
     async fn return_backend(&self, backend: Backend) {
@@ -1335,6 +1342,7 @@ impl PooledBackend {
             pool,
             _permit,
             route_key,
+            route_gate,
             requires_startup: _,
             ..
         } = self;
@@ -1345,7 +1353,7 @@ impl PooledBackend {
         }
 
         drop(_permit);
-        pool.record_backpressure_counts(&route_key);
+        pool.record_backpressure_counts(&route_key, &route_gate);
     }
 
     pub fn discard(self) {
@@ -1354,6 +1362,7 @@ impl PooledBackend {
             pool,
             _permit,
             route_key,
+            route_gate,
             requires_startup: _,
             ..
         } = self;
@@ -1364,7 +1373,7 @@ impl PooledBackend {
         }
 
         drop(_permit);
-        pool.record_backpressure_counts(&route_key);
+        pool.record_backpressure_counts(&route_key, &route_gate);
     }
 }
 

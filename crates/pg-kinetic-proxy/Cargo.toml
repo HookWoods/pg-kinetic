@@ -12,6 +12,7 @@ runtime-experiments = []
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
