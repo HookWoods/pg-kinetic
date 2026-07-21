@@ -91,6 +91,30 @@ fn copy_to_stdout_differs_from_copy_from_stdin() {
 }
 
 #[test]
+fn block_comments_separate_classification_keywords() {
+    assert_eq!(
+        classify_sql("SELECT/*comment*/1"),
+        QueryClass::ReadCandidate
+    );
+    assert_eq!(
+        classify_sql("EXPLAIN/*comment*/SELECT 1"),
+        QueryClass::ReadCandidate
+    );
+    assert_eq!(
+        classify_sql("COPY accounts TO/*comment*/STDOUT"),
+        QueryClass::ReadCandidate
+    );
+    assert_eq!(
+        classify_sql("COPY accounts FROM/*comment*/STDIN"),
+        QueryClass::Write
+    );
+    assert_eq!(
+        classify_sql("BEGIN/*comment*/"),
+        QueryClass::TransactionControl
+    );
+}
+
+#[test]
 fn data_modifying_ctes_are_not_replica_safe() {
     assert!(contains_data_modifying_cte(
         "WITH moved AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT 1"

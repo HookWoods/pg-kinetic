@@ -227,7 +227,7 @@ fn classify_explain(sql: &str) -> QueryClass {
         return QueryClass::Unknown;
     }
 
-    let mut rest = sql["explain".len()..].trim_start();
+    let mut rest = strip_token_separators(&sql["explain".len()..]);
     if rest.starts_with('(') {
         let Some(end) = find_matching_paren(rest) else {
             return QueryClass::Unknown;
@@ -238,7 +238,7 @@ fn classify_explain(sql: &str) -> QueryClass {
             return QueryClass::Unknown;
         }
 
-        rest = rest[end + 1..].trim_start();
+        rest = strip_token_separators(&rest[end + 1..]);
     } else {
         let rest_normalized = normalize(rest);
         if rest_normalized.starts_with("analyze") {
@@ -465,32 +465,38 @@ fn keyword_is(sql: &str, keyword: &str) -> bool {
 fn starts_with_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
     let mut rest = sql;
     for (index, word) in words.iter().enumerate() {
-        rest = rest.trim_start();
+        rest = strip_token_separators(rest);
         let Some(candidate) = rest.get(..word.len()) else {
             return false;
         };
         if !candidate.eq_ignore_ascii_case(word) {
             return false;
         }
-        rest = &rest[word.len()..];
+
+        let after_word = &rest[word.len()..];
         if index + 1 == words.len() {
-            return rest.is_empty() || rest.chars().next().is_some_and(|c| c.is_whitespace());
+            return after_word.is_empty() || starts_with_token_separator(after_word);
         }
+        if !starts_with_token_separator(after_word) {
+            return false;
+        }
+        rest = after_word;
     }
 
     true
 }
 
 fn keyword_is_exact(sql: &str, keyword: &str) -> bool {
-    let trimmed = sql.trim_end();
+    let trimmed = strip_token_separators(sql);
     let Some(candidate) = trimmed.get(..keyword.len()) else {
         return false;
     };
-    candidate.eq_ignore_ascii_case(keyword) && trimmed[keyword.len()..].is_empty()
+    candidate.eq_ignore_ascii_case(keyword)
+        && strip_token_separators(&trimmed[keyword.len()..]).is_empty()
 }
 
 fn keyword_is_followed_by_more(sql: &str, keyword: &str) -> bool {
-    let rest = sql.trim_start();
+    let rest = strip_token_separators(sql);
     let Some(candidate) = rest.get(..keyword.len()) else {
         return false;
     };
@@ -499,7 +505,7 @@ fn keyword_is_followed_by_more(sql: &str, keyword: &str) -> bool {
     }
 
     let rest = &rest[keyword.len()..];
-    rest.chars().next().is_some_and(|c| c.is_whitespace()) && !rest.trim_start().is_empty()
+    starts_with_token_separator(rest) && !strip_token_separators(rest).is_empty()
 }
 
 fn contains_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
@@ -510,7 +516,7 @@ fn contains_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
     let mut index = 0;
     while index < sql.len() {
         let remainder = &sql[index..];
-        let trimmed = remainder.trim_start();
+        let trimmed = strip_token_separators(remainder);
         index += remainder.len() - trimmed.len();
 
         if index >= sql.len() {
@@ -521,14 +527,34 @@ fn contains_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
             return true;
         }
 
-        let token_end = sql[index..]
-            .find(char::is_whitespace)
+        let token_end = find_token_separator(&sql[index..])
             .map(|offset| index + offset)
             .unwrap_or(sql.len());
         index = token_end;
     }
 
     false
+}
+
+fn strip_token_separators(sql: &str) -> &str {
+    strip_leading_comments_and_whitespace(sql)
+}
+
+fn starts_with_token_separator(sql: &str) -> bool {
+    sql.chars().next().is_some_and(char::is_whitespace)
+        || sql.starts_with("--")
+        || sql.starts_with("/*")
+}
+
+fn find_token_separator(sql: &str) -> Option<usize> {
+    [
+        sql.find(char::is_whitespace),
+        sql.find("--"),
+        sql.find("/*"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

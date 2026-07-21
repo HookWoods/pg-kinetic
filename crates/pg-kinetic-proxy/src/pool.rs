@@ -879,7 +879,13 @@ impl BackendPool {
         route: RouteKey,
         mode: CheckoutMode,
     ) -> Result<PooledBackend, PoolError> {
+        let route_gate_started = Instant::now();
         let route_gate = self.route_gate(&route);
+        let route_gate_wait_ms = route_gate_started.elapsed().as_secs_f64() * 1_000.0;
+        self.with_snapshot_store(|snapshot_store| {
+            snapshot_store.record_pool_checkout_lock_wait_ms(route_gate_wait_ms);
+        });
+        metrics::record_pool_checkout(route_gate_wait_ms, "route_gate_registry", "ok");
         let started = Instant::now();
         let route_gate_metrics = route_gate.metrics.clone();
         let route_gate_gate = route_gate.gate.clone();
@@ -1201,20 +1207,12 @@ impl BackendPool {
             return route_gate;
         }
 
-        let started = Instant::now();
         let mut route_gates = self.route_gates.write().expect("route gates poisoned");
         route_gates
             .entry(pool_key)
-            .or_insert_with(|| {
-                let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                self.with_snapshot_store(|snapshot_store| {
-                    snapshot_store.record_pool_checkout_lock_wait_ms(wait_ms);
-                });
-                metrics::record_pool_checkout(wait_ms, "route_gate_registry", "ok");
-                RouteGateEntry {
-                    gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
-                    metrics: RouteMetricHandles::resolve(route),
-                }
+            .or_insert_with(|| RouteGateEntry {
+                gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
+                metrics: RouteMetricHandles::resolve(route),
             })
             .clone()
     }
