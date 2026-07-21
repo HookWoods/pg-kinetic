@@ -44,8 +44,12 @@ services:
   pg-kinetic:
     build:
       context: ..
+      args:
+        PG_KINETIC_BENCH_RUSTFLAGS: ${PG_KINETIC_BENCH_RUSTFLAGS:-}
       dockerfile_inline: |
         FROM rust:1.88-bookworm AS builder
+        ARG PG_KINETIC_BENCH_RUSTFLAGS
+        ENV RUSTFLAGS=$$PG_KINETIC_BENCH_RUSTFLAGS
         WORKDIR /src
         COPY . .
         RUN cargo build --release -p pg-kinetic
@@ -71,4 +75,11 @@ services:
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
       PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"
+      PG_KINETIC_AUTH_MODE: trust
+      PG_KINETIC_AUTH_USERS_FILE: /etc/pg-kinetic/auth-users.txt
+      PG_KINETIC_BACKEND_USER: postgres
+      PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME: PG_KINETIC_BACKEND_PASSWORD
+      PG_KINETIC_BACKEND_PASSWORD: postgres
       RUST_LOG: info
+    volumes:
+      - ./pg-kinetic/auth-users.txt:/etc/pg-kinetic/auth-users.txt:ro

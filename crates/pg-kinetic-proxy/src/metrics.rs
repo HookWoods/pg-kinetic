@@ -1,5 +1,4 @@
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::OnceLock, time::Duration};
 
 use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
 use crate::sharding::RouteMapReloadErrorCode;
@@ -41,6 +40,13 @@ use pg_kinetic_wire::sqlstate::SqlState;
 pub struct MetricsConfig {
     pub listen_addr: Option<SocketAddr>,
 }
+
+const PROTOCOL_PHASE_COUNT: usize = 12;
+const METRIC_OUTCOME_COUNT: usize = 6;
+
+static PROTOCOL_PHASE_HISTOGRAMS: OnceLock<
+    [[OnceLock<metrics_crate::Histogram>; METRIC_OUTCOME_COUNT]; PROTOCOL_PHASE_COUNT],
+> = OnceLock::new();
 
 pub fn install(config: MetricsConfig) -> anyhow::Result<()> {
     if let Some(addr) = config.listen_addr {
@@ -357,12 +363,56 @@ pub fn record_protocol_phase_duration(
     outcome: MetricOutcome,
     duration: Duration,
 ) {
-    metrics_crate::histogram!(
-        ObservabilityMetricName::ProtocolPhaseDuration.as_str(),
-        "phase" => phase.as_str(),
-        "outcome" => outcome.as_str()
-    )
-    .record(duration.as_secs_f64() * 1_000.0);
+    protocol_phase_histogram(phase, outcome).record(duration.as_secs_f64() * 1_000.0);
+}
+
+fn protocol_phase_histogram(
+    phase: ProtocolPhase,
+    outcome: MetricOutcome,
+) -> &'static metrics_crate::Histogram {
+    let histogram =
+        &protocol_phase_histograms()[protocol_phase_index(phase)][metric_outcome_index(outcome)];
+    histogram.get_or_init(|| {
+        metrics_crate::histogram!(
+            ObservabilityMetricName::ProtocolPhaseDuration.as_str(),
+            "phase" => phase.as_str(),
+            "outcome" => outcome.as_str()
+        )
+    })
+}
+
+fn protocol_phase_histograms(
+) -> &'static [[OnceLock<metrics_crate::Histogram>; METRIC_OUTCOME_COUNT]; PROTOCOL_PHASE_COUNT] {
+    PROTOCOL_PHASE_HISTOGRAMS
+        .get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())))
+}
+
+const fn protocol_phase_index(phase: ProtocolPhase) -> usize {
+    match phase {
+        ProtocolPhase::Startup => 0,
+        ProtocolPhase::Auth => 1,
+        ProtocolPhase::TlsHandshake => 2,
+        ProtocolPhase::BackendCheckout => 3,
+        ProtocolPhase::Parse => 4,
+        ProtocolPhase::Bind => 5,
+        ProtocolPhase::Execute => 6,
+        ProtocolPhase::Rows => 7,
+        ProtocolPhase::Drain => 8,
+        ProtocolPhase::Reset => 9,
+        ProtocolPhase::Cancel => 10,
+        ProtocolPhase::Close => 11,
+    }
+}
+
+const fn metric_outcome_index(outcome: MetricOutcome) -> usize {
+    match outcome {
+        MetricOutcome::Ok => 0,
+        MetricOutcome::Error => 1,
+        MetricOutcome::Timeout => 2,
+        MetricOutcome::Rejected => 3,
+        MetricOutcome::Canceled => 4,
+        MetricOutcome::Discarded => 5,
+    }
 }
 
 pub fn record_pool_snapshot(snapshot_store: &SnapshotStore, snapshot: PoolSnapshot) {
@@ -379,7 +429,7 @@ pub fn record_route_checkout_snapshot(snapshot: &RouteCheckoutSnapshot) {
     let reason = decision.reason();
     metrics_crate::counter!(
         ObservabilityMetricName::RouteDecisionsTotal.as_str(),
-        "route" => snapshot.route_key.metric_label(),
+        "route" => snapshot.route_key.metric_label_shared(),
         "target_role" => target_role_label(target_role),
         "query_class" => route_query_class_label(snapshot.route_key.query_class())
     )
@@ -388,7 +438,7 @@ pub fn record_route_checkout_snapshot(snapshot: &RouteCheckoutSnapshot) {
     if let Some(fallback_policy) = fallback_policy_from_reason(reason) {
         metrics_crate::counter!(
             ObservabilityMetricName::RouteFallbacksTotal.as_str(),
-            "route" => snapshot.route_key.metric_label(),
+            "route" => snapshot.route_key.metric_label_shared(),
             "reason" => reason.as_str(),
             "fallback_policy" => fallback_policy.as_str()
         )
@@ -465,7 +515,7 @@ pub fn record_split_brain_warning(endpoint_id: u64, expected_role: BackendRole) 
 pub fn record_read_after_write_wait(route: &RouteKey, wait_ms: f64, outcome: FreshnessStatus) {
     metrics_crate::histogram!(
         ObservabilityMetricName::ReadAfterWriteWaitMs.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "outcome" => freshness_outcome_label(outcome)
     )
     .record(wait_ms);
@@ -474,7 +524,7 @@ pub fn record_read_after_write_wait(route: &RouteKey, wait_ms: f64, outcome: Fre
 pub fn increment_read_after_write_rejection(route: &RouteKey, outcome: FreshnessStatus) {
     metrics_crate::counter!(
         ObservabilityMetricName::ReadAfterWriteRejectionsTotal.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "outcome" => freshness_outcome_label(outcome)
     )
     .increment(1);
@@ -489,7 +539,7 @@ pub fn record_shard_route_decision(
 ) {
     metrics_crate::counter!(
         ObservabilityMetricName::ShardRouteDecisionsTotal.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "shard" => shard_bucket_label(shard),
         "strategy" => strategy.as_str(),
         "reason" => reason.as_str(),
@@ -507,7 +557,7 @@ pub fn record_shard_multi_shard_rejection(
 ) {
     metrics_crate::counter!(
         ObservabilityMetricName::ShardMultiShardRejectionsTotal.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "shard" => shard_bucket_label(shard),
         "policy" => policy.as_str(),
         "reason" => reason.as_str(),
@@ -524,7 +574,7 @@ pub fn record_shard_primary_fallback(
 ) {
     metrics_crate::counter!(
         ObservabilityMetricName::ShardPrimaryFallbacksTotal.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "shard" => shard_bucket_label(shard),
         "policy" => policy.as_str(),
         "outcome" => outcome,
@@ -657,7 +707,7 @@ pub fn increment_sqlstate(sqlstate: SqlState) {
 pub fn increment_backpressure_event(route: &RouteKey, outcome: &'static str) {
     metrics_crate::counter!(
         MetricName::BackpressureEvents.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "outcome" => outcome
     )
     .increment(1);
@@ -666,7 +716,7 @@ pub fn increment_backpressure_event(route: &RouteKey, outcome: &'static str) {
 pub fn record_route_wait(route: &RouteKey, wait_ms: f64, outcome: &'static str) {
     metrics_crate::histogram!(
         MetricName::RouteCheckoutWaitMs.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "outcome" => outcome
     )
     .record(wait_ms);
@@ -675,7 +725,7 @@ pub fn record_route_wait(route: &RouteKey, wait_ms: f64, outcome: &'static str) 
 pub fn record_route_in_flight(route: &RouteKey, in_flight: usize) {
     metrics_crate::gauge!(
         MetricName::RouteInFlight.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "scope" => QueueScope::Route.as_str()
     )
     .set(in_flight as f64);
@@ -684,7 +734,7 @@ pub fn record_route_in_flight(route: &RouteKey, in_flight: usize) {
 pub fn record_route_waiting(route: &RouteKey, waiting: usize) {
     metrics_crate::gauge!(
         MetricName::RouteWaiting.as_str(),
-        "route" => route.metric_label(),
+        "route" => route.metric_label_shared(),
         "scope" => QueueScope::Route.as_str()
     )
     .set(waiting as f64);

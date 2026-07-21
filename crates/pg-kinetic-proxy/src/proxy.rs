@@ -69,6 +69,7 @@ use pg_kinetic_core::{
     shard_extract::{extract_shard_hint, ShardHint},
     sharding::{MultiShardPolicy, ShardId},
     sql::{classify, SetScope, SqlCommand},
+    sql_classify::{analyze_sql, SqlAnalysis},
     virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
 };
 use pg_kinetic_wire::{
@@ -95,6 +96,7 @@ use crate::policy::{PolicyEvalInput, PolicyRuntime};
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
 const REPLICA_UNAVAILABLE_MESSAGE: &str = "no healthy replica available";
+const POOL_WARMUP_MIN_IDLE_BACKENDS: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct ClientConnection {
@@ -231,7 +233,8 @@ impl Proxy {
                 .lifecycle
                 .readiness_fail_during_drain,
         );
-        let phase_recorder = telemetry::shared_phase_timing_recorder();
+        let phase_recorder =
+            telemetry::phase_timing_recorder(effective_config.observability.metrics_addr.is_some());
         let debug_sampler =
             DebugSampler::new(effective_config.observability.trace_sampling_ratio());
         self.snapshot_store
@@ -563,18 +566,19 @@ async fn handle_client(
 
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
+    let mut session_route = route_key(
+        &route_database,
+        &route_user,
+        route_application_name.as_deref(),
+        client_addr,
+    );
     update_client_snapshot(
         &client_snapshot_handle,
         session_id,
         route_database.clone(),
         route_user.clone(),
         route_application_name.clone(),
-        route_key(
-            &route_database,
-            &route_user,
-            route_application_name.as_deref(),
-            client_addr,
-        ),
+        session_route.clone(),
         "startup",
         session_started.elapsed(),
     );
@@ -625,12 +629,7 @@ async fn handle_client(
 
     let mut backend = match checkout_backend(CheckoutBackendRequest {
         route_pools: &route_pools,
-        route: route_key(
-            &route_database,
-            &route_user,
-            route_application_name.as_deref(),
-            client_addr,
-        ),
+        route: session_route.clone(),
         target: RoutingTarget::Primary {
             reason: RoutingReason::Off,
         },
@@ -648,6 +647,7 @@ async fn handle_client(
         backend_credentials: backend_credentials.as_deref(),
         read_after_write_state: ReadAfterWriteState::Disabled,
         record_snapshot: false,
+        bootstrap_backend: false,
     })
     .await
     {
@@ -700,16 +700,21 @@ async fn handle_client(
         return Err(error).with_context(|| format!("proxy client {client_addr}"));
     }
     backend.release().await;
+    schedule_service_backend_pool_warmup(
+        Arc::clone(&route_pools),
+        session_route.clone(),
+        backend_startup_packet.to_vec(),
+        backend_credentials.clone(),
+        snapshot_store.clone(),
+        Arc::clone(&phase_recorder),
+        debug_sampler,
+        session_id,
+    );
     startup_timer.finish(MetricOutcome::Ok);
     telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
         DebugSample::startup_complete(
             session_id,
-            route_key(
-                &route_database,
-                &route_user,
-                route_application_name.as_deref(),
-                client_addr,
-            ),
+            session_route.clone(),
             auth.auth_mode.as_str(),
             client_tls_mode.as_str(),
             MetricOutcome::Ok,
@@ -721,12 +726,7 @@ async fn handle_client(
         route_database.clone(),
         route_user.clone(),
         route_application_name.clone(),
-        route_key(
-            &route_database,
-            &route_user,
-            route_application_name.as_deref(),
-            client_addr,
-        ),
+        session_route.clone(),
         "active",
         session_started.elapsed(),
     );
@@ -770,15 +770,17 @@ async fn handle_client(
             ClientCycle::Frames(frames) => {
                 let current_query_id = mirror_query_id;
                 mirror_query_id = mirror_query_id.wrapping_add(1);
-                let committed_write_transaction =
-                    update_transaction_state_from_frames(&mut session, &frames)
-                        .context("update transaction state before backend checkout")?;
-                let route = route_key(
-                    &route_database,
-                    &route_user,
-                    route_application_name.as_deref(),
-                    client_addr,
-                );
+                let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
+                let request_plans =
+                    request_plans_for_frames(&prepared, &frames, full_routing_analysis)
+                        .context("build request plan before backend checkout")?;
+                let committed_write_transaction = update_transaction_state_from_request_plans(
+                    &mut session,
+                    &request_plans,
+                    full_routing_analysis,
+                )
+                .context("update transaction state before backend checkout")?;
+                let route = session_route.clone();
                 let selection = ReadRoutingSelection {
                     planner: &routing_planner,
                     route_pools: &route_pools,
@@ -786,10 +788,15 @@ async fn handle_client(
                     read_routing_mode: route_read_routing_mode,
                     fallback_policy: route_fallback_policy,
                     session: &session,
-                    prepared: &prepared,
-                    frames: &frames,
+                    request_plan: request_plans.first(),
                 };
-                let base_checkout_target = select_checkout_target(&selection);
+                let base_checkout_target = if full_routing_analysis {
+                    select_checkout_target(&selection)
+                } else {
+                    RoutingTarget::Primary {
+                        reason: RoutingReason::Off,
+                    }
+                };
                 let mirror_route_target = base_checkout_target.clone();
                 let backend_reused = held_backend.is_some();
                 let checkout_target = if backend_reused {
@@ -809,7 +816,7 @@ async fn handle_client(
                 } else {
                     match checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
-                        route,
+                        route: route.clone(),
                         target: checkout_target,
                         context: "checkout backend for cycle",
                         mode: CheckoutMode::AllowConnect,
@@ -821,6 +828,7 @@ async fn handle_client(
                         backend_credentials: backend_credentials.as_deref(),
                         read_after_write_state: session.read_after_write_state(),
                         record_snapshot: true,
+                        bootstrap_backend: true,
                     })
                     .await
                     {
@@ -871,14 +879,9 @@ async fn handle_client(
                     let mirror_task = MirrorTask::new(
                         session_id,
                         current_query_id,
-                        route_key(
-                            &route_database,
-                            &route_user,
-                            route_application_name.as_deref(),
-                            client_addr,
-                        ),
+                        route.clone(),
                         mirror_route_target,
-                        mirror_sql_command_for_frames(&prepared, &frames),
+                        mirror_sql_command_for_request_plan(request_plans.first()),
                         backend_startup_packet.clone().freeze(),
                         replay.clone().unwrap_or_default(),
                         frames.clone(),
@@ -887,6 +890,12 @@ async fn handle_client(
                     let _ = mirror_dispatcher.dispatch(mirror_task);
                 }
 
+                let simple_query_commands = request_plans
+                    .iter()
+                    .filter(|plan| plan.updates_session_state)
+                    .map(|plan| plan.command.clone())
+                    .collect();
+                drop(request_plans);
                 let mut progress = QueryProgress::default();
                 let mut state = ForwardCycleState {
                     session: &mut session,
@@ -902,6 +911,7 @@ async fn handle_client(
                         &mut backend,
                         &mut state,
                         frames,
+                        simple_query_commands,
                         qos.max_backend_buffer_bytes,
                         session_buffers,
                         phase_recorder.as_ref(),
@@ -917,6 +927,8 @@ async fn handle_client(
                 match result {
                     Ok(Ok(ForwardOutcome::Ready(status)))
                     | Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(status))) => {
+                        session_route =
+                            session_route.with_application_name(route_application_name.as_deref());
                         if committed_write_transaction
                             && read_after_write_protection_enabled
                             && status == ReadyStatus::Idle
@@ -936,12 +948,7 @@ async fn handle_client(
                         telemetry::emit_debug_sample_with(&debug_sampler, session_id, || {
                             DebugSample::query_complete(
                                 session_id,
-                                route_key(
-                                    &route_database,
-                                    &route_user,
-                                    route_application_name.as_deref(),
-                                    client_addr,
-                                ),
+                                session_route.clone(),
                                 MetricOutcome::Ok,
                                 0,
                                 match status {
@@ -995,12 +1002,7 @@ async fn handle_client(
                                         || {
                                             DebugSample::pinning(
                                                 session_id,
-                                                route_key(
-                                                    &route_database,
-                                                    &route_user,
-                                                    route_application_name.as_deref(),
-                                                    client_addr,
-                                                ),
+                                                session_route.clone(),
                                                 reason,
                                                 backend.backend_id(),
                                                 session_started.elapsed(),
@@ -1012,12 +1014,7 @@ async fn handle_client(
                                         session_id,
                                         backend.backend_id(),
                                         reason,
-                                        route_key(
-                                            &route_database,
-                                            &route_user,
-                                            route_application_name.as_deref(),
-                                            client_addr,
-                                        ),
+                                        session_route.clone(),
                                         session_started.elapsed(),
                                     );
                                 }
@@ -1057,12 +1054,7 @@ async fn handle_client(
                     Ok(Ok(ForwardOutcome::AbandonedResponse { needs_sync })) => {
                         let reused = recover_backend(
                             &mut backend,
-                            route_key(
-                                &route_database,
-                                &route_user,
-                                route_application_name.as_deref(),
-                                client_addr,
-                            ),
+                            session_route.clone(),
                             session_id,
                             debug_sampler,
                             RecoveryTrigger::AbandonedResponse,
@@ -1108,12 +1100,7 @@ async fn handle_client(
                             &mut pinned_backend,
                             &snapshot_store,
                             session_id,
-                            route_key(
-                                &route_database,
-                                &route_user,
-                                route_application_name.as_deref(),
-                                client_addr,
-                            ),
+                            session_route.clone(),
                             &recovery_snapshot_handle,
                             progress,
                             qos.max_backend_buffer_bytes,
@@ -1140,12 +1127,7 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
-                        route_key(
-                            &route_database,
-                            &route_user,
-                            route_application_name.as_deref(),
-                            client_addr,
-                        ),
+                        session_route.clone(),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
@@ -1165,12 +1147,7 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
-                        route_key(
-                            &route_database,
-                            &route_user,
-                            route_application_name.as_deref(),
-                            client_addr,
-                        ),
+                        session_route.clone(),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
@@ -1199,12 +1176,7 @@ async fn handle_client(
                         &mut pinned_backend,
                         &snapshot_store,
                         session_id,
-                        route_key(
-                            &route_database,
-                            &route_user,
-                            route_application_name.as_deref(),
-                            client_addr,
-                        ),
+                        session_route.clone(),
                         &recovery_snapshot_handle,
                         &qos,
                         phase_recorder.as_ref(),
@@ -1233,6 +1205,7 @@ struct CheckoutBackendRequest<'a> {
     backend_credentials: Option<&'a auth::BackendCredentials>,
     read_after_write_state: ReadAfterWriteState,
     record_snapshot: bool,
+    bootstrap_backend: bool,
 }
 
 async fn checkout_backend(
@@ -1361,7 +1334,7 @@ async fn checkout_backend(
         }
     };
 
-    if request.record_snapshot && backend.requires_startup() {
+    if request.bootstrap_backend && backend.requires_startup() {
         bootstrap_backend(
             &mut backend,
             request.startup_packet,
@@ -1382,6 +1355,64 @@ async fn checkout_backend(
     });
     timer.finish(MetricOutcome::Ok);
     Ok(backend)
+}
+
+fn schedule_service_backend_pool_warmup(
+    route_pools: Arc<RoutePools>,
+    route: RouteKey,
+    startup_packet: Vec<u8>,
+    backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    snapshot_store: SnapshotStore,
+    phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    debug_sampler: DebugSampler,
+    session_id: u64,
+) {
+    let Some(backend_credentials) = backend_credentials else {
+        return;
+    };
+    let target = RoutingTarget::Primary {
+        reason: RoutingReason::Off,
+    };
+    let Some(pool) = route_pools.pool_for_target(&target) else {
+        return;
+    };
+    let desired_idle_backends = POOL_WARMUP_MIN_IDLE_BACKENDS.min(pool.max_backends());
+    if pool.idle_backends() >= desired_idle_backends {
+        return;
+    }
+
+    tokio::spawn(async move {
+        while route_pools
+            .pool_for_target(&target)
+            .is_some_and(|pool| pool.idle_backends() < desired_idle_backends)
+        {
+            let backend = checkout_backend(CheckoutBackendRequest {
+                route_pools: &route_pools,
+                route: route.clone(),
+                target: target.clone(),
+                context: "warm backend pool",
+                mode: CheckoutMode::PreferConnect,
+                session_id,
+                debug_sampler,
+                phase_recorder: phase_recorder.as_ref(),
+                snapshot_store: &snapshot_store,
+                startup_packet: &startup_packet,
+                backend_credentials: Some(backend_credentials.as_ref()),
+                read_after_write_state: ReadAfterWriteState::Disabled,
+                record_snapshot: false,
+                bootstrap_backend: true,
+            })
+            .await;
+
+            match backend {
+                Ok(backend) => backend.release().await,
+                Err(error) => {
+                    tracing::debug!(?error, "backend pool warm-up stopped");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1592,7 +1623,7 @@ fn route_key(
         database,
         user,
         application_name,
-        Some(client_addr),
+        Some(SocketAddr::new(client_addr.ip(), 0)),
         QueryClass::Default,
     )
 }
@@ -1604,18 +1635,22 @@ struct ReadRoutingSelection<'a> {
     read_routing_mode: ReadRoutingMode,
     fallback_policy: FallbackPolicy,
     session: &'a VirtualSession,
-    prepared: &'a PreparedCatalog,
-    frames: &'a [FrontendFrame],
+    request_plan: Option<&'a RequestPlan<'a>>,
 }
 
 fn select_checkout_target(selection: &ReadRoutingSelection<'_>) -> RoutingTarget {
-    let sql = routing_sql_for_frames(selection.prepared, selection.frames);
+    let (sql, analysis) = selection
+        .request_plan
+        .map_or(("", analyze_sql("")), |plan| {
+            (plan.sql.as_ref(), plan.analysis())
+        });
     let health = build_route_health_snapshot(selection.route_pools, selection.snapshot_store);
-    let routing_context = RoutingContext::new(
-        sql.as_ref(),
+    let routing_context = RoutingContext::with_analysis(
+        sql,
         TransactionState::Idle,
         selection.session.read_after_write_state(),
         &health,
+        analysis,
     );
 
     let policy_before_routing_target =
@@ -1801,22 +1836,79 @@ fn build_route_health_snapshot(
     )
 }
 
-fn routing_sql_for_frames<'a>(
+struct RequestPlan<'a> {
+    sql: Cow<'a, str>,
+    command: SqlCommand,
+    analysis: Option<SqlAnalysis>,
+    updates_transaction_state: bool,
+    updates_session_state: bool,
+}
+
+impl<'a> RequestPlan<'a> {
+    fn new(
+        sql: Cow<'a, str>,
+        updates_transaction_state: bool,
+        updates_session_state: bool,
+        needs_analysis: bool,
+    ) -> Self {
+        let command = classify(sql.as_ref());
+        let analysis = needs_analysis.then(|| analyze_sql(sql.as_ref()));
+        Self {
+            sql,
+            command,
+            analysis,
+            updates_transaction_state,
+            updates_session_state,
+        }
+    }
+
+    fn from_prepared(statement: &'a pg_kinetic_core::prepare::PreparedStatement) -> Self {
+        Self {
+            sql: Cow::Borrowed(statement.query.as_str()),
+            command: statement.command().clone(),
+            analysis: Some(statement.analysis()),
+            updates_transaction_state: false,
+            updates_session_state: false,
+        }
+    }
+
+    fn analysis(&self) -> SqlAnalysis {
+        self.analysis
+            .unwrap_or_else(|| analyze_sql(self.sql.as_ref()))
+    }
+}
+
+fn request_plans_for_frames<'a>(
     prepared: &'a PreparedCatalog,
     frames: &'a [FrontendFrame],
-) -> Cow<'a, str> {
+    analyze_sql: bool,
+) -> anyhow::Result<Vec<RequestPlan<'a>>> {
+    let mut plans = Vec::new();
     for frame in frames {
-        if let Some(query) = parse_simple_query(frame).ok().flatten() {
-            return Cow::Borrowed(query);
+        if let Some(query) = parse_simple_query(frame)? {
+            plans.push(RequestPlan::new(
+                Cow::Borrowed(query),
+                true,
+                true,
+                analyze_sql,
+            ));
+            continue;
         }
 
-        if let Some(parse) = parse_parse_message(frame).ok().flatten() {
-            return Cow::Owned(parse.query);
+        if let Some(parse) = parse_parse_message(frame)? {
+            plans.push(RequestPlan::new(
+                Cow::Owned(parse.query),
+                true,
+                false,
+                analyze_sql,
+            ));
+            continue;
         }
 
         if let Some(statement_name) = parse_bind_statement_name(frame).ok().flatten() {
             if let Some(statement) = prepared.get_for_current_route_map(&statement_name) {
-                return Cow::Borrowed(statement.query.as_str());
+                plans.push(RequestPlan::from_prepared(statement));
+                continue;
             }
         }
 
@@ -1827,22 +1919,21 @@ fn routing_sql_for_frames<'a>(
                 .and_then(|describe_target| match describe_target {
                     DescribeTarget::Statement(statement_name) => prepared
                         .get_for_current_route_map(&statement_name)
-                        .map(|statement| statement.query.as_str()),
+                        .map(|statement| statement),
                     _ => None,
                 })
         {
-            return Cow::Borrowed(statement);
+            plans.push(RequestPlan::from_prepared(statement));
         }
     }
 
-    Cow::Borrowed("")
+    Ok(plans)
 }
 
-fn mirror_sql_command_for_frames(
-    prepared: &PreparedCatalog,
-    frames: &[FrontendFrame],
-) -> SqlCommand {
-    classify(routing_sql_for_frames(prepared, frames).as_ref())
+fn mirror_sql_command_for_request_plan(request_plan: Option<&RequestPlan<'_>>) -> SqlCommand {
+    request_plan
+        .map(|plan| plan.command.clone())
+        .unwrap_or(SqlCommand::Query)
 }
 
 fn route_checkout_freshness_outcome(
@@ -2603,14 +2694,25 @@ async fn forward_message_cycle(
     backend: &mut PooledBackend,
     state: &mut ForwardCycleState<'_>,
     frames: Vec<FrontendFrame>,
+    simple_query_commands: Vec<SqlCommand>,
     max_backend_buffer_bytes: usize,
     buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<ForwardOutcome> {
     let needs_sync = should_sync_for_frames(&frames);
     let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
+    let mut simple_query_commands = simple_query_commands.into_iter();
     buffers.clear_backend_write();
     for frame in frames {
+        let simple_query_command = if frame.tag == u8::from(FrontendTag::Query) {
+            Some(
+                simple_query_commands
+                    .next()
+                    .context("missing request plan for simple query")?,
+            )
+        } else {
+            None
+        };
         let plan = prepare_frame_for_backend(
             backend.backend_id(),
             state.prepared,
@@ -2622,6 +2724,7 @@ async fn forward_message_cycle(
             state.session,
             &plan.frame,
             state.route_application_name,
+            simple_query_command.as_ref(),
         )?;
 
         for prelude in &plan.prelude {
@@ -2874,33 +2977,35 @@ fn sync_frame() -> FrontendFrame {
     }
 }
 
-fn update_transaction_state_from_frames(
+fn update_transaction_state_from_request_plans(
     session: &mut VirtualSession,
-    frames: &[FrontendFrame],
+    request_plans: &[RequestPlan<'_>],
+    track_routing_state: bool,
 ) -> anyhow::Result<bool> {
     let mut committed_write_transaction = false;
-    for frame in frames {
-        if let Some(query) = parse_simple_query(frame)? {
-            committed_write_transaction |= update_transaction_state_from_sql(session, query);
-            continue;
-        }
-
-        if let Some(parse) = parse_parse_message(frame)? {
-            committed_write_transaction |= update_transaction_state_from_sql(session, &parse.query);
+    for request_plan in request_plans {
+        if request_plan.updates_transaction_state {
+            committed_write_transaction |= update_transaction_state_from_request_plan(
+                session,
+                request_plan,
+                track_routing_state,
+            );
         }
     }
 
     Ok(committed_write_transaction)
 }
 
-fn update_transaction_state_from_sql(session: &mut VirtualSession, sql: &str) -> bool {
-    let committed_write_transaction = matches!(classify(sql), SqlCommand::Commit)
-        && session
-            .read_routing_transaction_state()
-            .is_some_and(|state| state.primary_forced());
-
-    session.apply_transaction_sql(sql);
-    update_transaction_shard_state_from_sql(session, sql);
+fn update_transaction_state_from_request_plan(
+    session: &mut VirtualSession,
+    request_plan: &RequestPlan<'_>,
+    track_routing_state: bool,
+) -> bool {
+    let committed_write_transaction =
+        session.apply_transaction_sql_with_routing(request_plan.sql.as_ref(), track_routing_state);
+    if track_routing_state {
+        update_transaction_shard_state_from_sql(session, request_plan.sql.as_ref());
+    }
     committed_write_transaction
 }
 
@@ -2945,10 +3050,10 @@ fn update_virtual_session_from_frame(
     session: &mut VirtualSession,
     frame: &FrontendFrame,
     route_application_name: &mut Option<String>,
+    simple_query_command: Option<&SqlCommand>,
 ) -> anyhow::Result<()> {
-    if let Some(query) = parse_simple_query(frame)? {
-        let command = classify(query);
-        match &command {
+    if let Some(command) = simple_query_command {
+        match command {
             SqlCommand::Set {
                 scope: SetScope::Session,
                 key,
@@ -2965,7 +3070,15 @@ fn update_virtual_session_from_frame(
             _ => {}
         }
 
-        session.apply_sql(command);
+        if !matches!(
+            command,
+            SqlCommand::Begin { .. }
+                | SqlCommand::Commit
+                | SqlCommand::Rollback
+                | SqlCommand::SetTransaction { .. }
+        ) {
+            session.apply_sql(command.clone());
+        }
     } else if [
         FrontendTag::Parse,
         FrontendTag::Bind,
@@ -3281,15 +3394,13 @@ async fn error_response_and_ready_with_state(
     ready_status: ReadyStatus,
 ) -> anyhow::Result<()> {
     let error = build_error_response(sqlstate, message);
+    let mut response = BytesMut::with_capacity(error.len() + 6);
+    response.extend_from_slice(&error);
+    response.extend_from_slice(&ready_for_query(ready_status));
     client
-        .write_all(&error)
+        .write_all(&response)
         .await
-        .context("write error response")?;
-    let ready = ready_for_query(ready_status);
-    client
-        .write_all(&ready)
-        .await
-        .context("write ready after error")
+        .context("write error response and ready")
 }
 
 async fn error_response_only(

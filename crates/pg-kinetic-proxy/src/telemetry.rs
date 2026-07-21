@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{mpsc, Arc, OnceLock},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,11 @@ use pg_kinetic_core::{
     security::AuthMode,
     virtual_session::PinReason,
 };
+const PHASE_TIMING_BUFFER_CAPACITY: usize = 65_536;
+
+static SHARED_PHASE_TIMING_RECORDER: OnceLock<Arc<BufferedPhaseTimingRecorder>> = OnceLock::new();
+static DISABLED_PHASE_TIMING_RECORDER: OnceLock<Arc<DisabledPhaseTimingRecorder>> = OnceLock::new();
+
 pub trait PhaseTimingRecorder: Send + Sync {
     fn record_protocol_phase_duration(
         &self,
@@ -41,9 +47,79 @@ impl PhaseTimingRecorder for MetricsPhaseTimingRecorder {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct DisabledPhaseTimingRecorder;
+
+impl PhaseTimingRecorder for DisabledPhaseTimingRecorder {
+    fn record_protocol_phase_duration(
+        &self,
+        _phase: ProtocolPhase,
+        _outcome: MetricOutcome,
+        _duration: Duration,
+    ) {
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BufferedPhaseTimingRecorder {
+    sender: mpsc::SyncSender<ProtocolPhaseTiming>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProtocolPhaseTiming {
+    phase: ProtocolPhase,
+    outcome: MetricOutcome,
+    duration: Duration,
+}
+
+impl PhaseTimingRecorder for BufferedPhaseTimingRecorder {
+    fn record_protocol_phase_duration(
+        &self,
+        phase: ProtocolPhase,
+        outcome: MetricOutcome,
+        duration: Duration,
+    ) {
+        let _ = self.sender.try_send(ProtocolPhaseTiming {
+            phase,
+            outcome,
+            duration,
+        });
+    }
+}
+
 #[must_use]
 pub fn shared_phase_timing_recorder() -> Arc<dyn PhaseTimingRecorder> {
-    Arc::new(MetricsPhaseTimingRecorder)
+    let recorder = SHARED_PHASE_TIMING_RECORDER
+        .get_or_init(|| {
+            let (sender, receiver) =
+                mpsc::sync_channel::<ProtocolPhaseTiming>(PHASE_TIMING_BUFFER_CAPACITY);
+            thread::Builder::new()
+                .name(String::from("pg-kinetic-phase-metrics"))
+                .spawn(move || {
+                    while let Ok(timing) = receiver.recv() {
+                        record_protocol_phase_duration(
+                            timing.phase,
+                            timing.outcome,
+                            timing.duration,
+                        );
+                    }
+                })
+                .expect("spawn phase metrics worker");
+            Arc::new(BufferedPhaseTimingRecorder { sender })
+        })
+        .clone();
+    recorder
+}
+
+#[must_use]
+pub fn phase_timing_recorder(enabled: bool) -> Arc<dyn PhaseTimingRecorder> {
+    if enabled {
+        return shared_phase_timing_recorder();
+    }
+
+    DISABLED_PHASE_TIMING_RECORDER
+        .get_or_init(|| Arc::new(DisabledPhaseTimingRecorder))
+        .clone()
 }
 
 pub fn record_protocol_phase_duration(

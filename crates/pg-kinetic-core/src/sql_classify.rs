@@ -1,5 +1,31 @@
 use crate::routing::{QueryClass, RoutingHint};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlAnalysis {
+    query_class: QueryClass,
+    routing_hint: RoutingHint,
+}
+
+impl SqlAnalysis {
+    #[must_use]
+    pub const fn query_class(self) -> QueryClass {
+        self.query_class
+    }
+
+    #[must_use]
+    pub const fn routing_hint(self) -> RoutingHint {
+        self.routing_hint
+    }
+}
+
+#[must_use]
+pub fn analyze_sql(sql: &str) -> SqlAnalysis {
+    SqlAnalysis {
+        query_class: classify_sql(sql),
+        routing_hint: extract_routing_hint(sql),
+    }
+}
+
 #[must_use]
 pub fn classify_sql(sql: &str) -> QueryClass {
     let sql = strip_leading_comments_and_whitespace(sql);
@@ -306,6 +332,11 @@ fn is_write_statement(normalized: &str) -> bool {
 
 fn split_top_level_statements(sql: &str) -> Vec<&str> {
     let mut statements = Vec::new();
+    for_each_top_level_statement(sql, |statement| statements.push(statement));
+    statements
+}
+
+pub fn for_each_top_level_statement<'a>(sql: &'a str, mut visit: impl FnMut(&'a str)) {
     let mut start = 0;
     let mut state = ScanState::Normal;
     let mut iter = sql.char_indices().peekable();
@@ -326,7 +357,7 @@ fn split_top_level_statements(sql: &str) -> Vec<&str> {
                 ';' => {
                     let statement = sql[start..index].trim();
                     if !statement.is_empty() {
-                        statements.push(statement);
+                        visit(statement);
                     }
                     start = index + ch.len_utf8();
                 }
@@ -366,10 +397,8 @@ fn split_top_level_statements(sql: &str) -> Vec<&str> {
 
     let statement = sql[start..].trim();
     if !statement.is_empty() {
-        statements.push(statement);
+        visit(statement);
     }
-
-    statements
 }
 
 fn find_matching_paren(sql: &str) -> Option<usize> {

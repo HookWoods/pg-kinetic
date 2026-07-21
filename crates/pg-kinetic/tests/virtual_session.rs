@@ -23,6 +23,15 @@ fn commit_releases_transaction_pin() {
 }
 
 #[test]
+fn multi_statement_transaction_releases_transaction_pin() {
+    let mut session = VirtualSession::default();
+
+    session.apply_transaction_sql("begin; update accounts set balance = balance; commit");
+
+    assert_eq!(session.pin_reason(), None);
+}
+
+#[test]
 fn session_setting_records_replayable_setting() {
     let mut session = VirtualSession::default();
 
@@ -33,6 +42,17 @@ fn session_setting_records_replayable_setting() {
         session.replay_sql(),
         vec!["SET application_name = 'api'".to_string()]
     );
+}
+
+#[test]
+fn transaction_command_tracking_does_not_apply_session_settings() {
+    let mut session = VirtualSession::default();
+    let command = classify("set application_name = 'api'");
+
+    session.apply_transaction_command(&command, false);
+
+    assert!(session.replay_sql().is_empty());
+    assert_eq!(session.pin_reason(), None);
 }
 
 #[test]

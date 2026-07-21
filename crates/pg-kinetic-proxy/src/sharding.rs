@@ -178,7 +178,7 @@ pub fn preview_route(
     };
 
     Ok(RoutePreviewSummary {
-        route: route_key.metric_label(),
+        route: route_key.metric_label().to_string(),
         shard_id,
         backend_role,
         reason,

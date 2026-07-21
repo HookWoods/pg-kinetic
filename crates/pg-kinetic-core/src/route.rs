@@ -33,6 +33,7 @@ pub struct RouteKey {
     application_name: Option<Arc<str>>,
     client_addr: Option<SocketAddr>,
     query_class: QueryClass,
+    metric_label: Arc<str>,
 }
 
 impl PartialEq for RouteKey {
@@ -66,12 +67,19 @@ impl RouteKey {
         client_addr: Option<SocketAddr>,
         query_class: QueryClass,
     ) -> Self {
+        let database = database.into();
+        let user = user.into();
+        let application_name = application_name.map(Arc::<str>::from);
+        let metric_label =
+            build_metric_label(&database, &user, application_name.as_deref(), query_class);
+
         Self {
-            database: database.into(),
-            user: user.into(),
-            application_name: application_name.map(Arc::<str>::from),
+            database,
+            user,
+            application_name,
             client_addr,
             query_class,
+            metric_label,
         }
     }
 
@@ -101,13 +109,67 @@ impl RouteKey {
     }
 
     #[must_use]
-    pub fn metric_label(&self) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.database,
-            self.user,
-            self.application_name.as_deref().unwrap_or("<none>"),
-            self.query_class
-        )
+    pub fn with_application_name(&self, application_name: Option<&str>) -> Self {
+        if self.application_name() == application_name {
+            return self.clone();
+        }
+
+        let application_name = application_name.map(Arc::<str>::from);
+        Self {
+            database: Arc::clone(&self.database),
+            user: Arc::clone(&self.user),
+            metric_label: build_metric_label(
+                &self.database,
+                &self.user,
+                application_name.as_deref(),
+                self.query_class,
+            ),
+            application_name,
+            client_addr: self.client_addr,
+            query_class: self.query_class,
+        }
     }
+
+    #[must_use]
+    pub fn with_query_class(&self, query_class: QueryClass) -> Self {
+        if self.query_class == query_class {
+            return self.clone();
+        }
+
+        Self {
+            database: Arc::clone(&self.database),
+            user: Arc::clone(&self.user),
+            application_name: self.application_name.clone(),
+            client_addr: self.client_addr,
+            query_class,
+            metric_label: build_metric_label(
+                &self.database,
+                &self.user,
+                self.application_name.as_deref(),
+                query_class,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn metric_label(&self) -> String {
+        self.metric_label.to_string()
+    }
+
+    #[must_use]
+    pub fn metric_label_shared(&self) -> Arc<str> {
+        Arc::clone(&self.metric_label)
+    }
+}
+
+fn build_metric_label(
+    database: &str,
+    user: &str,
+    application_name: Option<&str>,
+    query_class: QueryClass,
+) -> Arc<str> {
+    Arc::from(format!(
+        "{database}/{user}/{}/{query_class}",
+        application_name.unwrap_or("<none>")
+    ))
 }

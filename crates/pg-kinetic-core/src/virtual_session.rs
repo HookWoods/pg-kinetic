@@ -9,7 +9,7 @@ use crate::{
     },
     sharding::{MultiShardPolicy, ShardId},
     sql::{SetScope, SqlCommand},
-    sql_classify::classify_sql,
+    sql_classify::{classify_sql, for_each_top_level_statement},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,28 +100,41 @@ impl VirtualSession {
     }
 
     pub fn apply_transaction_sql(&mut self, sql: &str) {
-        let normalized = normalize_sql(sql);
-        match normalized.as_str() {
-            "begin" | "start transaction" => {
-                self.begin_transaction(TransactionAccessMode::ReadWrite)
-            }
-            "begin read only" | "start transaction read only" => {
-                self.begin_transaction(TransactionAccessMode::ReadOnly)
-            }
-            "begin read write" | "start transaction read write" => {
-                self.begin_transaction(TransactionAccessMode::ReadWrite)
-            }
-            "commit" | "rollback" => self.end_transaction(),
-            prefix if prefix.starts_with("set transaction read only") => {
-                self.set_transaction_access_mode(TransactionAccessMode::ReadOnly)
-            }
-            prefix if prefix.starts_with("set transaction read write") => {
-                self.set_transaction_access_mode(TransactionAccessMode::ReadWrite)
+        let _ = self.apply_transaction_sql_with_routing(sql, true);
+    }
+
+    pub fn apply_transaction_sql_with_routing(
+        &mut self,
+        sql: &str,
+        track_routing_state: bool,
+    ) -> bool {
+        let mut committed_write_transaction = false;
+        for_each_top_level_statement(sql, |statement| {
+            let command = crate::sql::classify(statement);
+            committed_write_transaction |= matches!(command, SqlCommand::Commit)
+                && self
+                    .read_routing_transaction_state()
+                    .is_some_and(|state| state.primary_forced());
+            self.apply_transaction_command(
+                &command,
+                track_routing_state
+                    && matches!(classify_sql(statement), crate::routing::QueryClass::Write),
+            );
+        });
+        committed_write_transaction
+    }
+
+    pub fn apply_transaction_command(&mut self, command: &SqlCommand, is_write: bool) {
+        match command {
+            SqlCommand::Begin { access_mode } => self.begin_transaction(*access_mode),
+            SqlCommand::Commit | SqlCommand::Rollback => self.end_transaction(),
+            SqlCommand::SetTransaction { access_mode } => {
+                self.set_transaction_access_mode(*access_mode)
             }
             _ => {}
         }
 
-        if matches!(classify_sql(sql), crate::routing::QueryClass::Write) {
+        if is_write {
             self.mark_transaction_write();
         }
     }
@@ -363,15 +376,6 @@ impl VirtualSession {
         self.has_listen = false;
         self.unknown_protocol_state = false;
     }
-}
-
-fn normalize_sql(sql: &str) -> String {
-    sql.trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }
 
 fn is_replayable_setting(key: &str) -> bool {

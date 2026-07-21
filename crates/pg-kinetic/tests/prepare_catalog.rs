@@ -3,6 +3,8 @@ use pg_kinetic::{
     session::PreparedShardSummary,
     wire::sqlstate::SqlState,
 };
+use pg_kinetic_core::routing::{QueryClass, RoutingHint};
+use pg_kinetic_core::{sql::classify, sql_classify::analyze_sql};
 
 #[test]
 fn stores_named_statement_with_internal_name() {
@@ -14,6 +16,11 @@ fn stores_named_statement_with_internal_name() {
     assert_eq!(statement.query, "select $1::int");
     assert_eq!(statement.parameter_type_oids, vec![23]);
     assert_eq!(statement.backend_name, "pgk_42_1");
+    assert_eq!(
+        statement.analysis().query_class(),
+        QueryClass::ReadCandidate
+    );
+    assert_eq!(statement.analysis().routing_hint(), RoutingHint::None);
 }
 
 #[test]
@@ -51,6 +58,8 @@ fn can_store_statement_snapshot() {
         client_name: "stmt1".to_string(),
         backend_name: "pgk_99_1".to_string(),
         query: "select 1".to_string(),
+        analysis: analyze_sql("select 1"),
+        command: classify("select 1"),
         parameter_type_oids: vec![],
         route_map_generation_id: 0,
         shard_summary: PreparedShardSummary::Deferred,

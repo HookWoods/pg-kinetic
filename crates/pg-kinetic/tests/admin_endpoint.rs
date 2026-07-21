@@ -442,8 +442,6 @@ async fn show_settings_and_limits_keep_secrets_out() {
     config.tls.client_ca_path = Some(PathBuf::from("client-ca.pem"));
     config.tls.backend_ca_path = Some(PathBuf::from("backend-ca.pem"));
     config.tls.backend_server_name = Some(String::from("db.example.internal"));
-    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
-    config.auth.backend_user = Some(String::from("proxy_user"));
     config.performance.backend_reset_query = String::from("DISCARD TEMP");
     config.admin.admin_query_timeout_ms = 75;
     config.admin.admin_max_clients = 9;
@@ -490,7 +488,7 @@ async fn show_settings_and_limits_keep_secrets_out() {
             "disable",
             "pass_through",
             "generic",
-            "proxy_user",
+            "<none>",
             "DISCARD TEMP",
             "recover",
             "false",
@@ -520,7 +518,6 @@ async fn show_settings_and_limits_keep_secrets_out() {
         "client-ca.pem",
         "backend-ca.pem",
         "db.example.internal",
-        "PG_KINETIC_BACKEND_PASSWORD",
     ] {
         assert!(
             !settings_text.contains(secret),

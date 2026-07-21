@@ -930,7 +930,7 @@ impl PolicyContextBuilder {
             if let Some(route) = shard_route_decision.route() {
                 fields.push(PolicyContextField::public(
                     "route_key",
-                    route.target().route_key().metric_label(),
+                    route.target().route_key().metric_label().to_string(),
                 ));
                 fields.push(PolicyContextField::public(
                     "route_target_role",

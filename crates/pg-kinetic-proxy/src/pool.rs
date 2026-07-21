@@ -198,6 +198,16 @@ impl BackendPoolRef {
         (self.inner.pool.tls.clone(), self.inner.pool.socket.clone())
     }
 
+    #[must_use]
+    pub fn idle_backends(&self) -> usize {
+        self.inner.pool.idle_backends.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn max_backends(&self) -> usize {
+        self.inner.pool.max_backends()
+    }
+
     fn new(id: u64, role: BackendRole, weight: usize, pool: Arc<BackendPool>) -> Self {
         Self {
             inner: Arc::new(BackendPoolRefInner {
@@ -315,6 +325,15 @@ impl RoutePools {
     #[must_use]
     pub fn selector(&self) -> &ReplicaSelector {
         &self.selector
+    }
+
+    #[must_use]
+    pub fn pool_for_target(&self, target: &RoutingTarget) -> Option<&BackendPoolRef> {
+        match target {
+            RoutingTarget::Primary { .. } => Some(&self.primary),
+            RoutingTarget::Replica { candidate, .. } => self.replica_by_id(candidate.replica_id),
+            RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. } => None,
+        }
     }
 
     pub async fn checkout_primary(
@@ -867,7 +886,14 @@ impl BackendPool {
                 }
             }
 
-            if let Some(mut backend) = self.checkout_idle_backend(false).await {
+            let idle_backend = match self.try_checkout_idle_backend() {
+                Some(backend) => Some(backend),
+                None if self.idle_backends.load(Ordering::Acquire) > 0 => {
+                    self.checkout_idle_backend(false).await
+                }
+                None => None,
+            };
+            if let Some(mut backend) = idle_backend {
                 self.attach_backend_snapshot_store(&mut backend);
                 backend.mark_checked_out(Some(route.clone()));
                 self.sync_pool_snapshot();
@@ -936,8 +962,7 @@ impl BackendPool {
     async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<Backend> {
         loop {
             let notified = self.backend_available.notified();
-            if let Some(backend) = self.idle.lock().await.pop_front() {
-                self.idle_backends.fetch_sub(1, Ordering::AcqRel);
+            if let Some(backend) = self.try_checkout_idle_backend() {
                 return Some(backend);
             }
             if !wait_for_backend {
@@ -945,6 +970,13 @@ impl BackendPool {
             }
             notified.await;
         }
+    }
+
+    fn try_checkout_idle_backend(&self) -> Option<Backend> {
+        let mut idle_backends = self.idle.try_lock().ok()?;
+        let backend = idle_backends.pop_front()?;
+        self.idle_backends.fetch_sub(1, Ordering::AcqRel);
+        Some(backend)
     }
 
     fn reserve_backend_slot(&self) -> bool {
@@ -1271,6 +1303,24 @@ mod tests {
 
         assert!(second.requires_startup());
         wait_for_accepts(&accepted, 2).await;
+    }
+
+    #[test]
+    fn pool_reference_reports_idle_capacity() {
+        let pool = BackendPool::new(
+            "127.0.0.1:5432".parse().expect("backend address"),
+            TlsConfig::default(),
+            3,
+            4,
+            4,
+            4,
+            Duration::from_secs(1),
+            "DISCARD ALL",
+        );
+        let pool_ref = BackendPoolRef::primary(pool);
+
+        assert_eq!(pool_ref.idle_backends(), 0);
+        assert_eq!(pool_ref.max_backends(), 3);
     }
 
     #[tokio::test]

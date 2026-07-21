@@ -1319,6 +1319,18 @@ impl SnapshotStore {
 
     pub fn set_route_checkout_snapshot(&self, snapshot: RouteCheckoutSnapshot) {
         metrics::record_route_checkout_snapshot(&snapshot);
+
+        if self
+            .inner
+            .read()
+            .expect("snapshot store poisoned")
+            .route_checkouts
+            .get(&snapshot.route_key)
+            .is_some_and(|existing| existing == &snapshot)
+        {
+            return;
+        }
+
         self.inner
             .write()
             .expect("snapshot store poisoned")

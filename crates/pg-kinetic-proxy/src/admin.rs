@@ -1550,7 +1550,7 @@ fn shard_health_summary(
 }
 
 fn route_key_value(route_key: &RouteKey) -> String {
-    route_key.metric_label()
+    route_key.metric_label().to_string()
 }
 
 fn duration_millis(duration: std::time::Duration) -> String {

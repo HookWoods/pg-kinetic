@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use crate::{session::PreparedShardSummary, sharding::ShardId};
+use crate::sql_classify::{analyze_sql, SqlAnalysis};
+use crate::{
+    session::PreparedShardSummary,
+    sharding::ShardId,
+    sql::{classify, SqlCommand},
+};
 use pg_kinetic_wire::sqlstate::SqlState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +20,8 @@ pub struct PreparedStatement {
     pub client_name: String,
     pub backend_name: String,
     pub query: String,
+    pub analysis: SqlAnalysis,
+    pub command: SqlCommand,
     pub parameter_type_oids: Vec<i32>,
     pub route_map_generation_id: u64,
     pub shard_summary: PreparedShardSummary,
@@ -80,6 +87,9 @@ impl PreparedCatalog {
         parameter_type_oids: Vec<i32>,
     ) -> &PreparedStatement {
         let client_name = client_name.into();
+        let query = query.into();
+        let analysis = analyze_sql(&query);
+        let command = classify(&query);
         if let Some(previous_cache_key) = self
             .statements
             .get(&client_name)
@@ -103,7 +113,9 @@ impl PreparedCatalog {
             PreparedStatement {
                 client_name: client_name.clone(),
                 backend_name,
-                query: query.into(),
+                query,
+                analysis,
+                command,
                 parameter_type_oids,
                 route_map_generation_id: self.route_map_generation_id,
                 shard_summary: if client_name.is_empty() {
@@ -270,5 +282,15 @@ impl PreparedStatement {
     #[must_use]
     pub const fn cache_key(&self) -> u64 {
         self.cache_key
+    }
+
+    #[must_use]
+    pub const fn analysis(&self) -> SqlAnalysis {
+        self.analysis
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &SqlCommand {
+        &self.command
     }
 }

@@ -288,7 +288,7 @@ impl MirrorTask {
         MirrorTelemetry {
             session_id: self.session_id,
             query_id: self.query_id,
-            route_label: self.route_key.metric_label(),
+            route_label: self.route_key.metric_label().to_string(),
             command_label: sql_command_label(&self.command),
             frame_count: self.frames.len(),
             replay_count: self.replay_frames.len(),

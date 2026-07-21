@@ -59,7 +59,7 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 | `pg_kinetic_runtime_lifecycle_state` | gauge | `state` | live proxy | Runtime lifecycle state. |
 | `pg_kinetic_runtime_readiness_state` | gauge | `state` | live proxy | Runtime readiness state. |
 | `pg_kinetic_runtime_shutdown_total` | counter | `reason` | shutdown path | Shutdown reasons. |
-| `pg_kinetic_protocol_phase_duration_ms` | histogram | `phase`, `outcome` | live proxy | Protocol phase timings. |
+| `pg_kinetic_protocol_phase_duration_ms` | histogram | `phase`, `outcome` | live proxy with `metrics_addr` configured | Protocol phase timings; disabled with the metrics endpoint to avoid hot-path recording overhead when metrics are not exported. |
 
 ## Preview Or Tooling Metrics
 

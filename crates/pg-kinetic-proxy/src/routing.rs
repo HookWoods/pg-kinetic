@@ -4,7 +4,7 @@ use pg_kinetic_core::{
     routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
     session::TransactionState,
     sharding::{ShardRouteDecision, ShardRouteReason},
-    sql_classify::{classify_sql, extract_routing_hint},
+    sql_classify::{analyze_sql, SqlAnalysis},
     virtual_session::ReadAfterWriteState,
 };
 
@@ -130,6 +130,7 @@ pub struct RoutingContext<'a> {
     pub transaction_state: TransactionState,
     pub read_after_write_state: ReadAfterWriteState,
     pub health: &'a RouteHealthSnapshot,
+    analysis: Option<SqlAnalysis>,
 }
 
 impl<'a> RoutingContext<'a> {
@@ -145,7 +146,39 @@ impl<'a> RoutingContext<'a> {
             transaction_state,
             read_after_write_state,
             health,
+            analysis: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_analysis(
+        sql: &'a str,
+        transaction_state: TransactionState,
+        read_after_write_state: ReadAfterWriteState,
+        health: &'a RouteHealthSnapshot,
+        analysis: SqlAnalysis,
+    ) -> Self {
+        Self {
+            sql,
+            transaction_state,
+            read_after_write_state,
+            health,
+            analysis: Some(analysis),
+        }
+    }
+
+    #[must_use]
+    pub fn query_class(&self) -> QueryClass {
+        self.analysis
+            .map(SqlAnalysis::query_class)
+            .unwrap_or_else(|| analyze_sql(self.sql).query_class())
+    }
+
+    #[must_use]
+    pub fn routing_hint(&self) -> RoutingHint {
+        self.analysis
+            .map(SqlAnalysis::routing_hint)
+            .unwrap_or_else(|| analyze_sql(self.sql).routing_hint())
     }
 }
 
@@ -239,8 +272,8 @@ pub fn choose_routing_target(
     planner: &ReadRoutingPlanner,
     context: RoutingContext<'_>,
 ) -> RoutingTarget {
-    let query_class = classify_sql(context.sql);
-    let routing_hint = extract_routing_hint(context.sql);
+    let query_class = context.query_class();
+    let routing_hint = context.routing_hint();
 
     match planner.read_routing_mode {
         ReadRoutingMode::Off => {
@@ -565,8 +598,9 @@ pub fn bridge_shard_route_decision(
     sql: &str,
     planner: &ReadRoutingPlanner,
 ) -> pg_kinetic_core::routing::RoutingDecision {
-    let query_class = classify_sql(sql);
-    let routing_hint = extract_routing_hint(sql);
+    let analysis = analyze_sql(sql);
+    let query_class = analysis.query_class();
+    let routing_hint = analysis.routing_hint();
     let target_role = decision
         .route()
         .map(|route| route.target().backend_role())

@@ -354,8 +354,6 @@ async fn show_settings_redacts_secret_config() {
     config.tls.client_ca_path = Some(PathBuf::from("client-ca.pem"));
     config.tls.backend_ca_path = Some(PathBuf::from("backend-ca.pem"));
     config.tls.backend_server_name = Some(String::from("db.example.internal"));
-    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_BACKEND_PASSWORD"));
-    config.auth.backend_user = Some(String::from("proxy_user"));
     let (run_handle, _, _) = spawn_proxy(config).await;
 
     let settings_frames = admin_query(admin_addr, "SHOW SETTINGS").await;
@@ -366,14 +364,12 @@ async fn show_settings_redacts_secret_config() {
         "client-ca.pem",
         "backend-ca.pem",
         "db.example.internal",
-        "PG_KINETIC_BACKEND_PASSWORD",
     ] {
         assert!(
             !settings_text.contains(secret),
             "secret value leaked into SHOW SETTINGS: {secret}"
         );
     }
-    assert!(settings_text.contains("proxy_user"));
     assert_eq!(backend_hits.load(Ordering::SeqCst), 0);
 
     run_handle.abort();

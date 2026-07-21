@@ -19,7 +19,7 @@ Configure local client authentication and both backend service credential settin
 [auth]
 auth_mode = "scram_sha_256"
 auth_users_file = "/etc/pg-kinetic/auth-users.txt"
-backend_user = "pg_kinetic_pool"
+backend_user = "kinetic_pool"
 backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"
 
 [tls]
@@ -35,6 +35,12 @@ export PG_KINETIC_BACKEND_PASSWORD='replace-with-your-secret'
 ```
 
 `backend_user` and `backend_password_env_var_name` are an atomic pair. Supplying only one is rejected before the listener starts. They are also rejected with `auth_mode = "pass_through"`: pass-through deliberately preserves PostgreSQL's client-owned authentication exchange and cannot safely impersonate a service role.
+
+## Service-Pool Warm-Up
+
+After the first successful locally authenticated client startup, pg-kinetic asynchronously prepares up to two idle backend sessions for the primary pool, bounded by `capacity.max_backends`. This removes most connection and backend-auth work from the next client checkout without creating more sessions than the configured pool allows.
+
+Warm-up is available only with backend service credentials. Pass-through clients still reconnect on demand because their PostgreSQL authentication exchange belongs to the client connection.
 
 ## Supported PostgreSQL Backend Methods
 
