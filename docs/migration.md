@@ -22,6 +22,18 @@ Use pg-kinetic as a connection-string change first. Keep the original PostgreSQL
 6. Watch connection errors, SQLSTATEs, checkout wait, backend pins, and readiness.
 7. Increase traffic only when the canary has no new driver or session-state errors.
 
+For the 1.0.0-rc.1 rehearsal, deploy the immutable image tag
+`ghcr.io/hookwoods/pg-kinetic:1.0.0-rc.1` with Helm chart version `1.0.0-rc.1`
+and record the resolved image digest. Start at 1% traffic. The health probes
+are `/healthz` for liveness and `/readyz` for readiness on port `9091`.
+Allow the configured 45-second drain timeout to complete and use a 65-second
+or longer termination grace period.
+
+Abort after two consecutive five-minute windows when session or checkout
+errors exceed 1%, PostgreSQL connection errors or unexpected SQLSTATEs exceed
+0.1%, p95 latency is more than 25% above baseline and over 250 ms, checkout
+wait p95 exceeds 100 ms, or `/readyz` remains `503` for more than two probes.
+
 During a single-primary outage, readiness returns `503` and existing backend
 sessions are discarded. A stateless, classified read can be retried once when no
 response byte was sent; writes and uncertain or partially forwarded requests are
@@ -96,3 +108,15 @@ Keep pg-kinetic running but remove user traffic. Capture:
 - relevant metrics around the failure window
 
 Use that evidence to decide whether the issue is configuration, unsupported client/session behavior, capacity, or a proxy bug.
+
+Restore direct PostgreSQL by reverting the application connection string to the
+original endpoint, for example:
+
+```text
+postgres://app_user@postgres.example.internal:5432/app_db
+```
+
+Alternatively, restore the previous validated pg-kinetic image tag and Helm
+chart version with `helm upgrade --install ... --version <previous-chart-version>
+--set image.tag=<previous-image-tag>`. Verify `/readyz` and the application
+smoke query before returning traffic.

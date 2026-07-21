@@ -1,0 +1,61 @@
+name: Release candidate rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release candidate tag"
+        required: true
+        default: "v1.0.0-rc.1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release candidate tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" == "v1.0.0-rc.1" ]] || {
+            echo "This workflow rehearses v1.0.0-rc.1 only; got $RELEASE_TAG" >&2
+            exit 1
+          }
+
+      - name: Assert release notes and stable contract
+        run: |
+          bash scripts/release/assert-rc-notes.sh
+          bash scripts/release/assert-contract.sh
+
+      - name: Run stable Linux Docker gates
+        run: bash scripts/release/run-stable-gates.sh
+
+      - name: Build and check deployment rehearsal
+        run: |
+          docker compose -f deploy/docker-compose.yml up --detach --build --wait
+          trap 'docker compose -f deploy/docker-compose.yml down' EXIT
+          curl --fail --show-error --silent http://127.0.0.1:9091/healthz
+          curl --fail --show-error --silent http://127.0.0.1:9091/readyz
+
+      - name: Build documentation site
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload redacted release evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: v1.0.0-rc.1-release-evidence
+          path: target/release-evidence
+          if-no-files-found: warn

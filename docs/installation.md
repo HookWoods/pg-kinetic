@@ -35,10 +35,13 @@ docker run --detach \
   --config-file /etc/pg-kinetic/pg-kinetic.toml
 ```
 
-Use immutable version tags for production rollouts when you want reproducible deploys:
+Use immutable version tags for reproducible deploys. The 1.0 release candidate
+image is `ghcr.io/hookwoods/pg-kinetic:1.0.0-rc.1`; record its digest before
+putting it in service:
 
 ```bash
-docker pull ghcr.io/hookwoods/pg-kinetic:0.1.0
+docker pull ghcr.io/hookwoods/pg-kinetic:1.0.0-rc.1
+docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/hookwoods/pg-kinetic:1.0.0-rc.1
 ```
 
 ## Docker Compose
@@ -66,7 +69,8 @@ helm repo add pgkinetic https://helm.pgkinetic.dev
 helm repo update
 helm install pg-kinetic pgkinetic/pg-kinetic \
   --set image.repository=ghcr.io/hookwoods/pg-kinetic \
-  --set image.tag=latest
+  --set image.tag=1.0.0-rc.1 \
+  --version 1.0.0-rc.1
 ```
 
 The chart renders:
@@ -76,7 +80,10 @@ The chart renders:
 - a ClusterIP Service exposing PostgreSQL, admin, metrics, and health ports
 - readiness and liveness probes
 
-The chart does not configure a pre-stop drain hook because the HTTP health server does not implement `/drain`.
+The chart exposes `/healthz` as the liveness probe and `/readyz` as the
+readiness probe on port `9091`. The HTTP health server does not implement
+`/drain`; use the deployment's termination lifecycle and the configured
+45-second proxy drain timeout instead.
 
 ## Local Helm Chart
 

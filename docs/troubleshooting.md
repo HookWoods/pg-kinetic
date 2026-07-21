@@ -12,6 +12,20 @@ keywords:
 
 This guide maps common local and production symptoms to the first checks that usually matter.
 
+## RC Rollout Abort
+
+During the 1.0.0-rc.1 rehearsal, stop the canary when session or checkout
+errors exceed 1%, PostgreSQL connection errors or unexpected SQLSTATEs exceed
+0.1%, p95 latency is more than 25% above baseline and over 250 ms, checkout
+wait p95 exceeds 100 ms, or `/readyz` returns `503` for more than two
+consecutive probes. These are release abort thresholds, not capacity targets.
+
+Keep the original PostgreSQL endpoint available while investigating. Restore it
+by reverting the application connection string, or restore the prior immutable
+pg-kinetic image tag and Helm chart version. Capture redacted logs, SQLSTATEs,
+probe responses, metrics, and admin snapshots before tearing down the failed
+canary.
+
 ## Client Cannot Connect
 
 Check the listener and TLS/auth mode first:
@@ -111,4 +125,3 @@ cargo test --workspace -j 1
 ```
 
 This is slower but avoids parallel linker pressure on constrained Windows machines.
-
