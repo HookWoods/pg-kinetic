@@ -11,67 +11,26 @@
 
 <p align="center">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-PostgreSQL%20wire%20proxy-f97316?style=flat-square">
-  <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-connection%20pooling-336791?style=flat-square">
+  <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-transaction%20pooling-336791?style=flat-square">
   <img alt="Kubernetes" src="https://img.shields.io/badge/Kubernetes-Helm%20ready-326ce5?style=flat-square">
-  <img alt="Observability" src="https://img.shields.io/badge/Observability-metrics%20%2B%20admin-14b8a6?style=flat-square">
+  <img alt="Observability" src="https://img.shields.io/badge/Observability-Prometheus%20%2B%20admin-14b8a6?style=flat-square">
 </p>
 
 # pg-kinetic
 
-**Keep PostgreSQL responsive under connection spikes.** pg-kinetic is a drop-in Rust PostgreSQL wire proxy: keep your driver and SQL, then add transaction pooling, route-level backpressure, read routing, and operator-visible health.
-
-## Traffic Flow
+**Keep PostgreSQL responsive when connection demand spikes.** pg-kinetic is a Rust PostgreSQL wire proxy that sits between your application and database. Keep your drivers and SQL; add a controlled connection boundary with transaction pooling, predictable overload handling, and conservative replica reads.
 
 ```mermaid
 flowchart LR
-  app["Application drivers<br/>PHP / Node / Java / Go / Rust"] --> proxy["pg-kinetic<br/>pooling + backpressure"]
-  proxy --> primary["Primary<br/>writes + unsafe reads"]
-  proxy --> replica["Replica<br/>fresh safe reads"]
-  proxy --> metrics["Prometheus<br/>metrics"]
-  proxy --> admin["Admin listener<br/>SHOW POOLS / SHOW CLIENTS"]
+  app["Application\ndrivers + SQL"] --> proxy["pg-kinetic\npooling + traffic control"]
+  proxy --> primary["PostgreSQL primary\nwrites + primary reads"]
+  proxy --> replica["PostgreSQL replicas\neligible fresh reads"]
+  proxy -.-> ops["Health · metrics · admin"]
 ```
 
-## Operator Snapshot
+## Start locally
 
-The admin listener exposes PostgreSQL-protocol views, so operators can inspect pressure without a separate dashboard.
-
-```text
-SHOW POOLS;
-route     state  clients  waiting  primary  replica
-default   ready  128      0        12/64    8/32
-
-SHOW BACKPRESSURE;
-route     queue  checkout_p95  action
-default   0      4ms           accept
-```
-
-## 🚀 Install
-
-Use the published container image for a configured host:
-
-```bash
-docker pull ghcr.io/hookwoods/pg-kinetic:latest
-docker run --rm \
-  -v "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
-  ghcr.io/hookwoods/pg-kinetic:latest \
-  --config-file /etc/pg-kinetic/pg-kinetic.toml
-```
-
-Use the Helm repository for Kubernetes:
-
-```bash
-helm repo add pgkinetic https://helm.pgkinetic.dev
-helm repo update
-helm install pg-kinetic pgkinetic/pg-kinetic \
-  --set image.repository=ghcr.io/hookwoods/pg-kinetic \
-  --set image.tag=latest
-```
-
-Use immutable image tags for controlled production rollouts.
-
-## ⚡ Local Smoke Test
-
-Run a complete local stack: PostgreSQL plus pg-kinetic, built from this checkout.
+The quickest way to try pg-kinetic is the included Compose stack. It builds the proxy, starts PostgreSQL, and exposes the proxy on `localhost:6432`.
 
 ```bash
 git clone https://github.com/HookWoods/pg-kinetic.git
@@ -79,114 +38,83 @@ cd pg-kinetic
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-This builds the local image, starts PostgreSQL, and exposes pg-kinetic on `localhost:6432`.
-
-Verify that the proxy is live and ready before pointing an application at it:
+Confirm that the proxy is ready, then run a query through it:
 
 ```bash
-curl -fsS http://127.0.0.1:9091/healthz
 curl -fsS http://127.0.0.1:9091/readyz
 
 PGPASSWORD=pgkinetic PGSSLMODE=disable \
-  psql "postgres://pgkinetic@127.0.0.1:6432/pgkinetic" \
-  -c "select 1;"
+  psql "postgres://pgkinetic@127.0.0.1:6432/pgkinetic" -c "select 1;"
 ```
 
-Expected health responses are `live` and `ready`. The query uses the proxy, not the PostgreSQL container directly.
+Use `docker compose -f deploy/docker-compose.yml down` to stop the stack. The [quickstart](https://docs.pgkinetic.dev/quickstart) includes the local ports, admin connection, and troubleshooting notes.
 
-| Local port | Purpose |
-| --- | --- |
-| `6432` | PostgreSQL listener through pg-kinetic |
-| `7000` | Operator admin listener |
-| `9090` | Prometheus metrics endpoint |
-| `9091` | Liveness and readiness endpoints |
-| `55432` | Direct PostgreSQL access for local comparison |
+## Install
 
-Stop the local stack when you are finished:
+The published container is the default installation path:
 
 ```bash
-docker compose -f deploy/docker-compose.yml down
+docker pull ghcr.io/hookwoods/pg-kinetic:latest
 ```
 
-## ✨ Why pg-kinetic
+Mount your configuration and run the image in the network that can reach PostgreSQL. Pin an immutable release tag for production rollouts.
 
-| Capability | What it gives you |
+```bash
+docker run --detach --name pg-kinetic --restart unless-stopped \
+  --publish 6432:6432 --publish 7000:7000 \
+  --publish 9090:9090 --publish 9091:9091 \
+  --volume "$PWD/pg-kinetic.toml:/etc/pg-kinetic/pg-kinetic.toml:ro" \
+  ghcr.io/hookwoods/pg-kinetic:latest \
+  --config-file /etc/pg-kinetic/pg-kinetic.toml
+```
+
+For Kubernetes, install from the Helm repository:
+
+```bash
+helm repo add pgkinetic https://helm.pgkinetic.dev
+helm repo update
+helm install pg-kinetic pgkinetic/pg-kinetic
+```
+
+See [installation](https://docs.pgkinetic.dev/installation) for a complete deployment reference and [configuration](https://docs.pgkinetic.dev/configuration) for the minimal runtime config.
+
+## What you get
+
+| Capability | Why it matters |
 | --- | --- |
-| 🧭 **Connection boundary** | Accept PostgreSQL wire connections before they consume backend capacity. |
-| 🔒 **Conservative sessions** | Use transaction pooling with explicit handling for session state and prepared statements. |
-| 🚦 **Backpressure** | Bound route queues, checkout waiters, timeouts, and overload behavior. |
-| 📊 **Operator visibility** | Inspect health, readiness, metrics, and PostgreSQL-protocol admin views. |
-| 🧪 **Reviewable changes** | Use compatibility, regression, and benchmark workflows to check behavior. |
+| **Transaction pooling** | Reuse backend connections while conservatively pinning sessions that carry state pg-kinetic cannot safely replay. |
+| **Traffic control** | Bound backend checkout, route concurrency, queues, timeouts, and buffers so overload fails predictably. |
+| **Read routing** | Send eligible, fresh reads to replicas; ambiguous or unsafe work stays on the primary. |
+| **Production visibility** | Expose readiness, Prometheus metrics, and PostgreSQL-protocol admin views for pools, clients, servers, and limits. |
+| **Secure connectivity** | Support client and backend TLS plus pass-through, trust, and SCRAM-SHA-256 authentication modes. |
 
-## 🛣️ From Local Stack To Production
+Point existing PostgreSQL clients at pg-kinetic instead of the backend:
 
-| Stage | Use it for | Start here |
-| --- | --- | --- |
-| 🧰 Local Compose | Development, integration checks, and operator familiarization | [Quickstart](docs/quickstart.md) |
-| 📦 Configured container | A controlled environment with your own PostgreSQL backend | [Installation](docs/installation.md) and [Configuration](docs/configuration.md) |
-| ☸️ Kubernetes | Helm install, render checks, and cluster rollout | [Kubernetes deployment](docs/kubernetes.md) |
-| 🛡️ Production rollout | Readiness, drain, migration, and rollback readiness | [Production runtime](docs/production-runtime.md) and [Migration](docs/migration.md) |
+```text
+postgres://app_user@pg-kinetic:6432/app_db
+```
 
-Production Docker installs use `ghcr.io/hookwoods/pg-kinetic:latest` or an immutable release tag. Helm installs use the repository at `https://helm.pgkinetic.dev`.
+## Ready for traffic, explicit about limits
 
-## 🧑‍💻 Operator Workflow
+The live runtime supports PostgreSQL wire proxying, transaction pooling, route-aware backpressure, conservative read routing, TLS/authentication, health checks, metrics, and admin views.
 
-After the quickstart, these are the usual next steps:
+Sharding, policy, and mirroring currently provide preview or offline tooling only; they are not live traffic features. See [the runtime status](https://docs.pgkinetic.dev), [sharding](https://docs.pgkinetic.dev/sharding), and [policy](https://docs.pgkinetic.dev/policy) before evaluating those paths.
 
-1. Set your PostgreSQL backend and connection limits in `pg-kinetic.toml`.
-2. Verify readiness and run a representative query through port `6432`.
-3. Inspect pool state through the admin listener and scrape metrics from port `9090`.
-4. Exercise timeout, backpressure, and rollback behavior before changing production traffic.
+## Documentation
 
-The [configuration guide](docs/configuration.md), [admin reference](docs/admin.md), [metrics catalog](docs/metrics.md), and [health and drain guide](docs/health-and-drain.md) cover those steps in detail.
-
-## 🧩 Capabilities
-
-| Area | What pg-kinetic provides |
+| Goal | Read next |
 | --- | --- |
-| Connections | PostgreSQL wire protocol proxying, transaction pooling, and virtual session handling |
-| Routing | Read routing and route-aware capacity controls |
-| Reliability | Health, readiness, bounded waiting, timeouts, and explicit overload responses |
-| Observability | PostgreSQL-protocol admin views, Prometheus metrics, and trace configuration |
-| Verification | Compatibility tests, regression workflows, benchmark tooling, and deployment assets |
+| Configure or deploy | [Configuration](https://docs.pgkinetic.dev/configuration) · [Installation](https://docs.pgkinetic.dev/installation) · [Kubernetes](https://docs.pgkinetic.dev/kubernetes) |
+| Pool and route safely | [Transaction pooling](https://docs.pgkinetic.dev/transaction-pooling) · [Read routing](https://docs.pgkinetic.dev/read-routing) · [Backpressure](https://docs.pgkinetic.dev/backpressure) |
+| Operate in production | [Health and drain](https://docs.pgkinetic.dev/health-and-drain) · [Admin](https://docs.pgkinetic.dev/admin) · [Metrics](https://docs.pgkinetic.dev/metrics) |
+| Validate a rollout | [Preflight and commands](https://docs.pgkinetic.dev/commands) · [Production runtime](https://docs.pgkinetic.dev/production-runtime) · [Compatibility](https://docs.pgkinetic.dev/compatibility) |
 
-Sharding, policy, mirroring, compatibility, benchmarking, and packaging also have dedicated documentation. Treat preview tooling separately from the live traffic path when evaluating a deployment.
+Published documentation: [docs.pgkinetic.dev](https://docs.pgkinetic.dev).
 
-## 📚 Documentation
+## Contributing and security
 
-**Get running**
-
-- [Installation](docs/installation.md)
-- [Quickstart](docs/quickstart.md)
-- [Configuration](docs/configuration.md)
-- [CLI reference](docs/commands.md)
-
-**Operate safely**
-
-- [Transaction pooling and virtual sessions](docs/transaction-pooling.md)
-- [Backpressure](docs/backpressure.md)
-- [Prepared statements](docs/prepared-statements.md)
-- [TLS and authentication](docs/tls-and-auth.md)
-- [Health, readiness, and drain](docs/health-and-drain.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
-**Validate changes**
-
-- [Architecture](docs/architecture.md)
-- [Compatibility matrix](docs/compatibility.md)
-- [Regression workflow](docs/regression.md)
-- [Benchmarking](docs/benchmarking.md)
-- [Testing](docs/testing.md)
-
-The published documentation is available at [docs.pgkinetic.dev](https://docs.pgkinetic.dev).
-
-## Contributing And Security
-
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening large changes.
-- Report vulnerabilities privately through [SECURITY.md](SECURITY.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a substantial change. Report vulnerabilities privately through [SECURITY.md](SECURITY.md).
 
 ## License
 
-pg-kinetic is dual-licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
-
-Unless explicitly stated otherwise, contributions intentionally submitted for inclusion are licensed as Apache-2.0 OR MIT.
+pg-kinetic is dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
