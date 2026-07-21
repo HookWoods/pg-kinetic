@@ -2,8 +2,10 @@ use std::{fs, path::Path};
 
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
+use md5::Md5;
+use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -27,11 +29,266 @@ const AUTH_FAILURE_SQLSTATE: &str = "28P01";
 const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
 const PASSWORD_MESSAGE_TAG: u8 = b'p';
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct BackendCredentials {
+    username: String,
+    password: String,
+}
+
+impl BackendCredentials {
+    #[must_use]
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    #[must_use]
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+pub(crate) struct BackendAuthSession {
+    credentials: BackendCredentials,
+    client_nonce: String,
+    client_first_bare: Option<String>,
+    expected_server_signature: Option<[u8; 32]>,
+}
+
+impl BackendAuthSession {
+    pub(crate) fn new(credentials: BackendCredentials) -> anyhow::Result<Self> {
+        Ok(Self::with_nonce(credentials, generate_nonce()?))
+    }
+
+    fn with_nonce(credentials: BackendCredentials, client_nonce: String) -> Self {
+        Self {
+            credentials,
+            client_nonce,
+            client_first_bare: None,
+            expected_server_signature: None,
+        }
+    }
+
+    pub(crate) fn respond(
+        &mut self,
+        request: &[u8],
+        backend_is_tls: bool,
+    ) -> anyhow::Result<Option<BytesMut>> {
+        let code = read_i32(request, 0).context("read backend authentication code")?;
+        match code {
+            0 => Ok(None),
+            3 => {
+                anyhow::ensure!(
+                    backend_is_tls,
+                    "backend requested a cleartext password without TLS"
+                );
+                let mut password = BytesMut::from(self.credentials.password().as_bytes());
+                password.put_u8(0);
+                Ok(Some(password_message(&password)))
+            }
+            5 => Ok(Some(self.md5_response(request)?)),
+            10 => Ok(Some(self.scram_initial_response(request)?)),
+            11 => Ok(Some(self.scram_final_response(request)?)),
+            12 => {
+                self.verify_scram_server_final(request)?;
+                Ok(None)
+            }
+            _ => anyhow::bail!("unsupported backend authentication request code {code}"),
+        }
+    }
+
+    fn md5_response(&self, request: &[u8]) -> anyhow::Result<BytesMut> {
+        anyhow::ensure!(
+            request.len() == 8,
+            "MD5 authentication request has invalid length"
+        );
+        let salt = &request[4..8];
+        let first_digest = Md5::digest(format!(
+            "{}{}",
+            self.credentials.password(),
+            self.credentials.username()
+        ));
+        let first = hex_lower(first_digest.as_ref());
+        let mut second_input = BytesMut::with_capacity(first.len() + salt.len());
+        second_input.extend_from_slice(first.as_bytes());
+        second_input.extend_from_slice(salt);
+        let second_digest = Md5::digest(second_input);
+        let mut response =
+            BytesMut::from(format!("md5{}", hex_lower(second_digest.as_ref())).as_bytes());
+        response.put_u8(0);
+        Ok(password_message(&response))
+    }
+
+    fn scram_initial_response(&mut self, request: &[u8]) -> anyhow::Result<BytesMut> {
+        let mechanisms = std::str::from_utf8(
+            request
+                .get(4..)
+                .context("SCRAM authentication request is missing mechanisms")?,
+        )
+        .context("parse SCRAM authentication mechanisms")?;
+        anyhow::ensure!(
+            mechanisms
+                .split('\0')
+                .any(|mechanism| mechanism == SCRAM_MECHANISM),
+            "backend does not support SCRAM-SHA-256"
+        );
+
+        let client_first_bare = format!(
+            "n={},r={}",
+            scram_escape(self.credentials.username()),
+            self.client_nonce
+        );
+        let client_first = format!("n,,{client_first_bare}");
+        let mut payload = BytesMut::new();
+        payload.extend_from_slice(SCRAM_MECHANISM.as_bytes());
+        payload.put_u8(0);
+        payload.put_i32(client_first.len() as i32);
+        payload.extend_from_slice(client_first.as_bytes());
+        self.client_first_bare = Some(client_first_bare);
+        Ok(password_message(&payload))
+    }
+
+    fn scram_final_response(&mut self, request: &[u8]) -> anyhow::Result<BytesMut> {
+        let server_first = std::str::from_utf8(
+            request
+                .get(4..)
+                .context("SCRAM server-first message is missing")?,
+        )
+        .context("parse SCRAM server-first message")?;
+        let server_nonce = scram_attribute(server_first, 'r')?;
+        anyhow::ensure!(
+            server_nonce.starts_with(&self.client_nonce),
+            "SCRAM server nonce does not extend the client nonce"
+        );
+        let salt = STANDARD
+            .decode(scram_attribute(server_first, 's')?)
+            .context("decode SCRAM salt")?;
+        let iterations = scram_attribute(server_first, 'i')?
+            .parse::<u32>()
+            .context("parse SCRAM iteration count")?;
+        anyhow::ensure!(iterations > 0, "SCRAM iteration count must be positive");
+        let client_first_bare = self
+            .client_first_bare
+            .as_deref()
+            .context("received SCRAM server-first before client-first")?;
+        let final_without_proof = format!("c=biws,r={server_nonce}");
+        let auth_message = format!("{client_first_bare},{server_first},{final_without_proof}");
+
+        let mut salted_password = [0_u8; 32];
+        pbkdf2_hmac::<Sha256>(
+            self.credentials.password().as_bytes(),
+            &salt,
+            iterations,
+            &mut salted_password,
+        );
+        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let stored_key = Sha256::digest(client_key);
+        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let client_proof = xor_arrays(&client_key, &client_signature);
+        let server_key = hmac_sha256(&salted_password, b"Server Key");
+        self.expected_server_signature = Some(hmac_sha256(&server_key, auth_message.as_bytes()));
+
+        let client_final = format!("{final_without_proof},p={}", STANDARD.encode(client_proof));
+        Ok(password_message(client_final.as_bytes()))
+    }
+
+    fn verify_scram_server_final(&mut self, request: &[u8]) -> anyhow::Result<()> {
+        let server_final = std::str::from_utf8(
+            request
+                .get(4..)
+                .context("SCRAM server-final message is missing")?,
+        )
+        .context("parse SCRAM server-final message")?;
+        anyhow::ensure!(
+            !server_final.starts_with("e="),
+            "backend rejected SCRAM authentication: {server_final}"
+        );
+        let expected = self
+            .expected_server_signature
+            .take()
+            .context("received SCRAM server-final before client-final")?;
+        let actual = STANDARD
+            .decode(scram_attribute(server_final, 'v')?)
+            .context("decode SCRAM server signature")?;
+        let matches: bool = actual.as_slice().ct_eq(expected.as_slice()).into();
+        anyhow::ensure!(matches, "backend SCRAM server signature mismatch");
+        Ok(())
+    }
+}
+
+fn password_message(payload: &[u8]) -> BytesMut {
+    let mut message = BytesMut::with_capacity(payload.len() + 5);
+    message.put_u8(PASSWORD_MESSAGE_TAG);
+    message.put_i32((payload.len() + 4) as i32);
+    message.extend_from_slice(payload);
+    message
+}
+
+fn scram_attribute(message: &str, key: char) -> anyhow::Result<&str> {
+    message
+        .split(',')
+        .find_map(|item| item.strip_prefix(&format!("{key}=")))
+        .with_context(|| format!("SCRAM message is missing {key} attribute"))
+}
+
+fn scram_escape(value: &str) -> String {
+    value.replace('=', "=3D").replace(',', "=2C")
+}
+
+fn xor_arrays(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut output = [0_u8; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = left[index] ^ right[index];
+    }
+    output
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientAuthOutcome {
     PassThrough,
     Authenticated,
     Rejected,
+}
+
+pub(crate) fn load_backend_credentials(
+    auth: &AuthConfig,
+) -> anyhow::Result<Option<BackendCredentials>> {
+    match (
+        auth.backend_user.as_deref(),
+        auth.backend_password_env_var_name.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!(
+            "auth.backend_user requires auth.backend_password_env_var_name"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "auth.backend_password_env_var_name requires auth.backend_user"
+        ),
+        (Some(_), Some(_)) if auth.auth_mode == AuthMode::PassThrough => anyhow::bail!(
+            "auth.backend_user and auth.backend_password_env_var_name are incompatible with auth_mode=pass_through"
+        ),
+        (Some(username), Some(password_env_var_name)) => {
+            let password = std::env::var(password_env_var_name)
+                .with_context(|| "read backend service password from environment")?;
+            anyhow::ensure!(
+                !password.is_empty(),
+                "backend service password from environment is empty"
+            );
+            Ok(Some(BackendCredentials {
+                username: username.to_owned(),
+                password,
+            }))
+        }
+    }
 }
 
 pub fn load_user_store(path: Option<&Path>) -> anyhow::Result<UserStore> {
@@ -434,4 +691,101 @@ fn scram_unescape(value: &str) -> anyhow::Result<String> {
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    use super::{BackendAuthSession, BackendCredentials};
+
+    fn credentials() -> BackendCredentials {
+        BackendCredentials {
+            username: String::from("pool_user"),
+            password: String::from("pool-password"),
+        }
+    }
+
+    #[test]
+    fn backend_auth_sends_cleartext_password_only_over_tls() {
+        let mut session = BackendAuthSession::with_nonce(credentials(), String::from("nonce"));
+
+        let response = session
+            .respond(&3_i32.to_be_bytes(), true)
+            .expect("cleartext auth response")
+            .expect("cleartext password frame");
+
+        assert_eq!(response.as_ref(), b"p\0\0\0\x12pool-password\0");
+        assert!(session.respond(&3_i32.to_be_bytes(), false).is_err());
+    }
+
+    #[test]
+    fn backend_auth_sends_the_postgres_md5_password_response() {
+        let mut session = BackendAuthSession::with_nonce(credentials(), String::from("nonce"));
+        let mut request = 5_i32.to_be_bytes().to_vec();
+        request.extend_from_slice(&[1, 2, 3, 4]);
+
+        let response = session
+            .respond(&request, true)
+            .expect("MD5 auth response")
+            .expect("MD5 password frame");
+
+        assert_eq!(
+            response.as_ref(),
+            b"p\0\0\0(md5f0fd7950af7ca2887fd5d036850c905d\0"
+        );
+    }
+
+    #[test]
+    fn backend_auth_completes_scram_and_verifies_the_server_signature() {
+        let mut session = BackendAuthSession::with_nonce(credentials(), String::from("nonce"));
+        let mut initial_request = 10_i32.to_be_bytes().to_vec();
+        initial_request.extend_from_slice(b"SCRAM-SHA-256\0\0");
+
+        let initial = session
+            .respond(&initial_request, true)
+            .expect("SCRAM initial response")
+            .expect("SCRAM initial frame");
+        assert!(initial.ends_with(b"n,,n=pool_user,r=nonce"));
+
+        let mut continue_request = 11_i32.to_be_bytes().to_vec();
+        continue_request.extend_from_slice(b"r=nonce-server,s=c2FsdA==,i=4096");
+        let final_response = session
+            .respond(&continue_request, true)
+            .expect("SCRAM final response")
+            .expect("SCRAM final frame");
+        assert!(final_response.windows(7).any(|window| window == b"c=biws,"));
+
+        let signature = session
+            .expected_server_signature
+            .expect("expected server signature");
+        let mut server_final = 12_i32.to_be_bytes().to_vec();
+        server_final.extend_from_slice(format!("v={}", STANDARD.encode(signature)).as_bytes());
+        assert_eq!(
+            session
+                .respond(&server_final, true)
+                .expect("valid server signature"),
+            None
+        );
+    }
+
+    #[test]
+    fn backend_auth_rejects_an_invalid_scram_server_signature() {
+        let mut session = BackendAuthSession::with_nonce(credentials(), String::from("nonce"));
+        let mut initial_request = 10_i32.to_be_bytes().to_vec();
+        initial_request.extend_from_slice(b"SCRAM-SHA-256\0\0");
+        let _ = session
+            .respond(&initial_request, true)
+            .expect("SCRAM initial response");
+        let mut continue_request = 11_i32.to_be_bytes().to_vec();
+        continue_request.extend_from_slice(b"r=nonce-server,s=c2FsdA==,i=4096");
+        let _ = session
+            .respond(&continue_request, true)
+            .expect("SCRAM final response");
+
+        let error = session
+            .respond(b"\0\0\0\x0cv=not-a-valid-signature", true)
+            .expect_err("invalid server signature must fail");
+        assert!(error.to_string().contains("signature"));
+    }
 }

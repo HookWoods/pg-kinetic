@@ -221,6 +221,8 @@ impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
+        let backend_credentials =
+            auth::load_backend_credentials(&effective_config.auth)?.map(Arc::new);
         self.lifecycle.configure(
             effective_config.drain.drain_timeout(),
             effective_config.runtime.lifecycle.shutdown_grace(),
@@ -430,6 +432,7 @@ impl Proxy {
 
                     let mirror_dispatcher = Arc::clone(&mirror_dispatcher);
                     let buffer_pool = self.buffer_pool.clone();
+                    let backend_credentials = backend_credentials.clone();
 
                     client_tasks.spawn(async move {
                         let _client_guard = client_guard;
@@ -446,6 +449,7 @@ impl Proxy {
                             debug_sampler,
                             mirror_dispatcher,
                             buffer_pool,
+                            backend_credentials,
                         )
                         .await;
                         drop(permit);
@@ -475,6 +479,7 @@ async fn handle_client(
     debug_sampler: DebugSampler,
     mirror_dispatcher: Arc<MirrorDispatcher>,
     buffer_pool: ProxyBufferPool,
+    backend_credentials: Option<Arc<auth::BackendCredentials>>,
 ) -> anyhow::Result<()> {
     let mut session_buffer_lease = buffer_pool.acquire();
     let session_buffers = session_buffer_lease.buffers_mut();
@@ -611,6 +616,13 @@ async fn handle_client(
         }
     }
 
+    let backend_startup_packet = rewrite_backend_startup_user(
+        &startup_packet,
+        backend_credentials
+            .as_deref()
+            .map(auth::BackendCredentials::username),
+    )?;
+
     let mut backend = match checkout_backend(CheckoutBackendRequest {
         route_pools: &route_pools,
         route: route_key(
@@ -623,12 +635,17 @@ async fn handle_client(
             reason: RoutingReason::Off,
         },
         context: "checkout backend for startup",
-        mode: CheckoutMode::AllowConnect,
+        mode: if matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
+            CheckoutMode::PreferConnect
+        } else {
+            CheckoutMode::AllowConnect
+        },
         session_id,
         debug_sampler,
         phase_recorder: phase_recorder.as_ref(),
         snapshot_store: &snapshot_store,
-        startup_packet: &startup_packet,
+        startup_packet: &backend_startup_packet,
+        backend_credentials: backend_credentials.as_deref(),
         read_after_write_state: ReadAfterWriteState::Disabled,
         record_snapshot: false,
     })
@@ -658,11 +675,12 @@ async fn handle_client(
     if let Err(error) = proxy_startup(
         &mut client,
         &mut backend,
-        &startup_packet,
+        &backend_startup_packet,
         qos.max_client_buffer_bytes,
         qos.max_backend_buffer_bytes,
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
         matches!(auth.auth_mode, crate::config::AuthMode::PassThrough),
+        backend_credentials.as_deref(),
         session_buffers,
         phase_recorder.as_ref(),
     )
@@ -799,7 +817,8 @@ async fn handle_client(
                         debug_sampler,
                         phase_recorder: phase_recorder.as_ref(),
                         snapshot_store: &snapshot_store,
-                        startup_packet: &startup_packet,
+                        startup_packet: &backend_startup_packet,
+                        backend_credentials: backend_credentials.as_deref(),
                         read_after_write_state: session.read_after_write_state(),
                         record_snapshot: true,
                     })
@@ -860,7 +879,7 @@ async fn handle_client(
                         ),
                         mirror_route_target,
                         mirror_sql_command_for_frames(&prepared, &frames),
-                        startup_packet.clone().freeze(),
+                        backend_startup_packet.clone().freeze(),
                         replay.clone().unwrap_or_default(),
                         frames.clone(),
                         session.pin_reason(),
@@ -1211,6 +1230,7 @@ struct CheckoutBackendRequest<'a> {
     phase_recorder: &'a dyn telemetry::PhaseTimingRecorder,
     snapshot_store: &'a SnapshotStore,
     startup_packet: &'a [u8],
+    backend_credentials: Option<&'a auth::BackendCredentials>,
     read_after_write_state: ReadAfterWriteState,
     record_snapshot: bool,
 }
@@ -1250,6 +1270,7 @@ async fn checkout_backend(
 
     let pool_mode = match request.mode {
         CheckoutMode::AllowConnect => PoolCheckoutMode::AllowConnect,
+        CheckoutMode::PreferConnect => PoolCheckoutMode::PreferConnect,
     };
     if matches!(request.target, RoutingTarget::Wait { .. }) {
         telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
@@ -1341,9 +1362,13 @@ async fn checkout_backend(
     };
 
     if request.record_snapshot && backend.requires_startup() {
-        bootstrap_backend(&mut backend, request.startup_packet)
-            .await
-            .map_err(CheckoutFailure::Fatal)?;
+        bootstrap_backend(
+            &mut backend,
+            request.startup_packet,
+            request.backend_credentials,
+        )
+        .await
+        .map_err(CheckoutFailure::Fatal)?;
     }
     metrics::record_pool_checkout(started.elapsed().as_secs_f64() * 1000.0, "request", "ok");
     telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
@@ -1362,6 +1387,7 @@ async fn checkout_backend(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckoutMode {
     AllowConnect,
+    PreferConnect,
 }
 
 #[derive(Debug)]
@@ -1508,6 +1534,45 @@ fn startup_route_key(startup_packet: &[u8]) -> anyhow::Result<(String, String, O
     let application_name = startup_parameter(&parameters, "application_name").map(str::to_owned);
 
     Ok((database, user, application_name))
+}
+
+fn rewrite_backend_startup_user(
+    startup_packet: &[u8],
+    backend_user: Option<&str>,
+) -> anyhow::Result<BytesMut> {
+    let Some(backend_user) = backend_user else {
+        return Ok(BytesMut::from(startup_packet));
+    };
+    let StartupPacket::Startup {
+        protocol_major,
+        protocol_minor,
+        parameters,
+    } = parse_startup_packet(startup_packet).context("parse backend startup packet")?
+    else {
+        anyhow::bail!("unexpected startup packet kind");
+    };
+
+    let mut body = BytesMut::new();
+    body.put_i32(((protocol_major as i32) << 16) | (protocol_minor as i32 & 0xffff));
+    let mut has_user = false;
+    for (key, value) in parameters {
+        body.extend_from_slice(key.as_bytes());
+        body.put_u8(0);
+        if key.eq_ignore_ascii_case("user") {
+            body.extend_from_slice(backend_user.as_bytes());
+            has_user = true;
+        } else {
+            body.extend_from_slice(value.as_bytes());
+        }
+        body.put_u8(0);
+    }
+    anyhow::ensure!(has_user, "startup packet missing user");
+    body.put_u8(0);
+
+    let mut packet = BytesMut::with_capacity(body.len() + 4);
+    packet.put_i32((body.len() + 4) as i32);
+    packet.extend_from_slice(&body);
+    Ok(packet)
 }
 
 fn startup_parameter<'a>(parameters: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -1817,6 +1882,7 @@ fn route_checkout_freshness_outcome(
 fn checkout_mode_label(mode: CheckoutMode) -> &'static str {
     match mode {
         CheckoutMode::AllowConnect => "allow_connect",
+        CheckoutMode::PreferConnect => "prefer_connect",
     }
 }
 
@@ -2303,6 +2369,7 @@ async fn proxy_startup(
     max_backend_buffer_bytes: usize,
     forward_backend_auth_requests_to_client: bool,
     emit_auth_ok_when_backend_requires_no_startup: bool,
+    backend_credentials: Option<&auth::BackendCredentials>,
     buffers: &mut SessionBufferSet,
     _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
@@ -2328,6 +2395,10 @@ async fn proxy_startup(
 
     buffers.client_read_mut().clear();
     buffers.backend_read_mut().clear();
+    let mut backend_auth = backend_credentials
+        .cloned()
+        .map(auth::BackendAuthSession::new)
+        .transpose()?;
     loop {
         if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
@@ -2347,6 +2418,19 @@ async fn proxy_startup(
         while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
             if frame.tag == u8::from(BackendTag::Authentication) {
                 let code = auth_request_code(&frame.payload)?;
+                if let Some(backend_auth) = backend_auth.as_mut() {
+                    if let Some(response) =
+                        backend_auth.respond(&frame.payload, backend.backend_mut().is_tls())?
+                    {
+                        backend
+                            .backend_mut()
+                            .stream_mut()
+                            .write_all(&response)
+                            .await
+                            .context("respond to backend authentication request")?;
+                    }
+                    continue;
+                }
                 if code == 0 {
                     if forward_backend_auth_requests_to_client {
                         client
@@ -2384,6 +2468,7 @@ async fn proxy_startup(
                             .write_all(buffers.client_read_mut())
                             .await
                             .context("forward startup auth response")?;
+                        buffers.client_read_mut().clear();
                     }
                 } else {
                     anyhow::bail!(
@@ -2407,6 +2492,7 @@ async fn proxy_startup(
 async fn bootstrap_backend(
     backend: &mut PooledBackend,
     startup_packet: &[u8],
+    backend_credentials: Option<&auth::BackendCredentials>,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
         return Ok(());
@@ -2420,6 +2506,10 @@ async fn bootstrap_backend(
         .context("forward backend startup")?;
 
     let mut backend_buffer = BytesMut::with_capacity(8192);
+    let mut backend_auth = backend_credentials
+        .cloned()
+        .map(auth::BackendAuthSession::new)
+        .transpose()?;
     loop {
         backend
             .backend_mut()
@@ -2431,7 +2521,18 @@ async fn bootstrap_backend(
         while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
             if frame.tag == u8::from(BackendTag::Authentication) {
                 let code = auth_request_code(&frame.payload)?;
-                if code != 0 && auth_request_expects_client_response(&frame.payload)? {
+                if let Some(backend_auth) = backend_auth.as_mut() {
+                    if let Some(response) =
+                        backend_auth.respond(&frame.payload, backend.backend_mut().is_tls())?
+                    {
+                        backend
+                            .backend_mut()
+                            .stream_mut()
+                            .write_all(&response)
+                            .await
+                            .context("respond to backend bootstrap authentication request")?;
+                    }
+                } else if code != 0 && auth_request_expects_client_response(&frame.payload)? {
                     anyhow::bail!("backend authentication exchange requires client response");
                 }
             }

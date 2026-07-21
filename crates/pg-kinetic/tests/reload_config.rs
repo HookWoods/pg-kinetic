@@ -10,7 +10,7 @@ use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
     proxy_runtime::reload::{
         load_auth_users, load_client_tls_server_config, load_effective_config, reload_once,
-        ReloadDecision,
+        validate_runtime_assets, ReloadDecision,
     },
 };
 use tokio::sync::RwLock;
@@ -67,6 +67,40 @@ fn base_config() -> Config {
         health: Default::default(),
         socket: Default::default(),
     }
+}
+
+#[test]
+fn backend_service_auth_requires_a_password_source() {
+    let mut config = base_config();
+    config.auth.auth_mode = AuthMode::Trust;
+    config.auth.backend_user = Some(String::from("pool_user"));
+
+    let error = validate_runtime_assets(&config).expect_err("incomplete credentials must fail");
+
+    assert!(error.to_string().contains("backend_user"));
+}
+
+#[test]
+fn backend_service_auth_requires_a_service_user() {
+    let mut config = base_config();
+    config.auth.auth_mode = AuthMode::Trust;
+    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_POOL_PASSWORD"));
+
+    let error = validate_runtime_assets(&config).expect_err("incomplete credentials must fail");
+
+    assert!(error.to_string().contains("backend_password_env_var_name"));
+}
+
+#[test]
+fn pass_through_auth_rejects_backend_service_credentials() {
+    let mut config = base_config();
+    config.auth.backend_user = Some(String::from("pool_user"));
+    config.auth.backend_password_env_var_name = Some(String::from("PG_KINETIC_POOL_PASSWORD"));
+
+    let error = validate_runtime_assets(&config)
+        .expect_err("pass-through must not use service credentials");
+
+    assert!(error.to_string().contains("pass_through"));
 }
 
 #[allow(clippy::too_many_arguments)]

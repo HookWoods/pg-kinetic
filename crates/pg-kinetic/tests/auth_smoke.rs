@@ -17,6 +17,7 @@ use pg_kinetic::{
     wire::{
         backend::{parse_backend_frame, BackendFrame, ReadyStatus},
         protocol::ProtocolVersion,
+        startup::{parse_startup_packet, StartupPacket},
     },
 };
 use sha2::{Digest, Sha256};
@@ -31,6 +32,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 const SCRAM_VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHlzYWx0$RdRL9M4hIQ6KSGRy8YdcY/rWTt9c53a35goFQzcrGXw=:lNY6toUrz5jlkvLtdJbAj5bXIomZuncUbgsZq5rYF5M=";
 static AUTH_SMOKE_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[derive(Clone, Copy)]
+enum BackendAuthChallenge {
+    Md5,
+    ScramSha256,
+}
 
 #[tokio::test]
 async fn pass_through_mode_keeps_backend_auth_behavior() {
@@ -58,6 +65,70 @@ async fn trust_mode_accepts_configured_user_without_password() {
     assert_eq!(
         collect_events(&mut events).await,
         vec![String::from("backend_accept")]
+    );
+}
+
+#[tokio::test]
+async fn local_auth_uses_the_configured_backend_service_user() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
+    let auth_users_file = write_auth_users_file("alice = trust\n");
+    let (proxy_addr, mut events) = spawn_proxy_with_backend_user(
+        AuthMode::Trust,
+        Some(auth_users_file),
+        String::from("pool_user"),
+    )
+    .await;
+
+    let frames = run_simple_startup(proxy_addr, "alice").await;
+
+    assert!(frames.iter().any(|frame| frame.tag == b'Z'));
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![
+            String::from("backend_accept"),
+            String::from("backend_startup_user:pool_user"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn local_auth_uses_the_service_password_for_backend_md5_authentication() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
+    let auth_users_file = write_auth_users_file("alice = trust\n");
+    let (proxy_addr, mut events) =
+        spawn_proxy_with_backend_service_auth(auth_users_file, BackendAuthChallenge::Md5).await;
+
+    let frames = run_simple_startup(proxy_addr, "alice").await;
+
+    assert!(frames.iter().any(|frame| frame.tag == b'Z'));
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![
+            String::from("backend_accept"),
+            String::from("backend_startup_user:pool_user"),
+            String::from("backend_md5_password"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn local_auth_uses_the_service_password_for_backend_scram_authentication() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
+    let auth_users_file = write_auth_users_file("alice = trust\n");
+    let (proxy_addr, mut events) =
+        spawn_proxy_with_backend_service_auth(auth_users_file, BackendAuthChallenge::ScramSha256)
+            .await;
+
+    let frames = run_simple_startup(proxy_addr, "alice").await;
+
+    assert!(frames.iter().any(|frame| frame.tag == b'Z'));
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![
+            String::from("backend_accept"),
+            String::from("backend_startup_user:pool_user"),
+            String::from("backend_scram_password"),
+        ]
     );
 }
 
@@ -137,6 +208,258 @@ async fn spawn_proxy(
     auth_mode: AuthMode,
     auth_users_file: Option<PathBuf>,
 ) -> (SocketAddr, mpsc::Receiver<String>) {
+    spawn_proxy_with_auth(
+        AuthConfig {
+            auth_mode,
+            auth_users_file,
+            backend_user: None,
+            backend_password_env_var_name: None,
+            auth_failure_message_mode: AuthFailureMessageMode::Generic,
+        },
+        false,
+    )
+    .await
+}
+
+async fn spawn_proxy_with_backend_user(
+    auth_mode: AuthMode,
+    auth_users_file: Option<PathBuf>,
+    backend_user: String,
+) -> (SocketAddr, mpsc::Receiver<String>) {
+    spawn_proxy_with_auth(
+        AuthConfig {
+            auth_mode,
+            auth_users_file,
+            backend_user: Some(backend_user),
+            backend_password_env_var_name: Some(String::from("CARGO_PKG_NAME")),
+            auth_failure_message_mode: AuthFailureMessageMode::Generic,
+        },
+        true,
+    )
+    .await
+}
+
+async fn spawn_proxy_with_backend_service_auth(
+    auth_users_file: PathBuf,
+    challenge: BackendAuthChallenge,
+) -> (SocketAddr, mpsc::Receiver<String>) {
+    let (sender, receiver) = mpsc::channel(16);
+    let backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await.expect("accept backend");
+        sender
+            .send(String::from("backend_accept"))
+            .await
+            .expect("send backend accept");
+
+        let mut startup = [0_u8; 1024];
+        let read = stream.read(&mut startup).await.expect("read startup");
+        let StartupPacket::Startup { parameters, .. } =
+            parse_startup_packet(&startup[..read]).expect("parse backend startup")
+        else {
+            panic!("expected backend startup packet");
+        };
+        let user = parameters
+            .iter()
+            .find(|(key, _)| key == "user")
+            .map(|(_, value)| value.as_str())
+            .expect("backend startup user");
+        sender
+            .send(format!("backend_startup_user:{user}"))
+            .await
+            .expect("send backend startup user");
+
+        match challenge {
+            BackendAuthChallenge::Md5 => {
+                let mut md5_request = BytesMut::new();
+                md5_request.put_u8(b'R');
+                md5_request.put_i32(12);
+                md5_request.put_i32(5);
+                md5_request.extend_from_slice(&[1, 2, 3, 4]);
+                stream
+                    .write_all(&md5_request)
+                    .await
+                    .expect("write MD5 request");
+
+                let payload = read_frontend_password_payload(&mut stream).await;
+                assert!(payload.starts_with(b"md5"));
+                assert_eq!(payload.last(), Some(&0));
+                sender
+                    .send(String::from("backend_md5_password"))
+                    .await
+                    .expect("send backend MD5 password");
+            }
+            BackendAuthChallenge::ScramSha256 => {
+                let mut request = BytesMut::new();
+                request.put_u8(b'R');
+                request.put_i32(4 + 4 + "SCRAM-SHA-256".len() as i32 + 2);
+                request.put_i32(10);
+                request.extend_from_slice(b"SCRAM-SHA-256\0\0");
+                stream
+                    .write_all(&request)
+                    .await
+                    .expect("write SCRAM authentication request");
+
+                let initial = read_frontend_password_payload(&mut stream).await;
+                let mechanism_end = initial
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .expect("SCRAM mechanism terminator");
+                assert_eq!(&initial[..mechanism_end], b"SCRAM-SHA-256");
+                let initial_len = i32::from_be_bytes(
+                    initial[mechanism_end + 1..mechanism_end + 5]
+                        .try_into()
+                        .expect("SCRAM initial length"),
+                ) as usize;
+                let client_first = std::str::from_utf8(
+                    &initial[mechanism_end + 5..mechanism_end + 5 + initial_len],
+                )
+                .expect("client first");
+                let client_first_bare = client_first
+                    .strip_prefix("n,,")
+                    .expect("SCRAM client first prefix");
+                let client_nonce = client_first_bare
+                    .split(',')
+                    .find_map(|item| item.strip_prefix("r="))
+                    .expect("client nonce");
+                let server_first = format!("r={client_nonce}server,s=c2FsdA==,i=4096");
+                let mut continue_request = BytesMut::new();
+                continue_request.put_u8(b'R');
+                continue_request.put_i32((8 + server_first.len()) as i32);
+                continue_request.put_i32(11);
+                continue_request.extend_from_slice(server_first.as_bytes());
+                stream
+                    .write_all(&continue_request)
+                    .await
+                    .expect("write SCRAM server first");
+
+                let final_response = read_frontend_password_payload(&mut stream).await;
+                let final_response = std::str::from_utf8(&final_response).expect("SCRAM final");
+                assert!(final_response.starts_with("c=biws,"));
+                let final_without_proof = final_response
+                    .rsplit_once(",p=")
+                    .map(|(without_proof, _)| without_proof)
+                    .expect("SCRAM client proof");
+                let password = std::env::var("CARGO_PKG_NAME").expect("service password");
+                let salted_password = pbkdf2_hmac_sha256(password.as_bytes(), b"salt", 4096);
+                let server_key = hmac_sha256(&salted_password, b"Server Key");
+                let auth_message =
+                    format!("{client_first_bare},{server_first},{final_without_proof}");
+                let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
+                let server_final = format!("v={}", STANDARD.encode(server_signature));
+                let mut final_request = BytesMut::new();
+                final_request.put_u8(b'R');
+                final_request.put_i32((8 + server_final.len()) as i32);
+                final_request.put_i32(12);
+                final_request.extend_from_slice(server_final.as_bytes());
+                stream
+                    .write_all(&final_request)
+                    .await
+                    .expect("write SCRAM server final");
+                sender
+                    .send(String::from("backend_scram_password"))
+                    .await
+                    .expect("send backend SCRAM password");
+            }
+        }
+        stream
+            .write_all(&auth_ok_ready())
+            .await
+            .expect("write startup response");
+    });
+
+    let listen = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let listen_addr = listen.local_addr().expect("listen addr");
+    drop(listen);
+
+    let config = Config {
+        connection: ConnectionConfig {
+            listen_addr,
+            backend_addr,
+        },
+        routes: Vec::new(),
+        runtime: Default::default(),
+        capacity: CapacityConfig {
+            max_clients: 10,
+            max_backends: 1,
+            max_checkout_waiters: 4,
+        },
+        performance: PerformanceConfig {
+            checkout_timeout_ms: 250,
+            recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
+            recovery_timeout_ms: 1_000,
+            backend_reset_query: String::from("DISCARD ALL"),
+        },
+        qos: QosConfig {
+            max_route_in_flight: 100,
+            max_route_waiters: 1_000,
+            query_timeout_ms: 30_000,
+            idle_client_timeout_ms: 300_000,
+            idle_transaction_timeout_ms: 60_000,
+            max_client_buffer_bytes: 1_048_576,
+            max_backend_buffer_bytes: 4_194_304,
+            overload_error_code: String::from("53300"),
+        },
+        admin: Default::default(),
+        observability: ObservabilityConfig {
+            metrics_addr: None,
+            ..Default::default()
+        },
+        tls: TlsConfig {
+            client_tls_mode: pg_kinetic::config::ClientTlsMode::Disable,
+            client_cert_path: None,
+            client_key_path: None,
+            client_ca_path: None,
+            backend_tls_mode: BackendTlsMode::Disable,
+            backend_ca_path: None,
+            backend_server_name: None,
+        },
+        auth: AuthConfig {
+            auth_mode: AuthMode::Trust,
+            auth_users_file: Some(auth_users_file),
+            backend_user: Some(String::from("pool_user")),
+            backend_password_env_var_name: Some(String::from("CARGO_PKG_NAME")),
+            auth_failure_message_mode: AuthFailureMessageMode::Generic,
+        },
+        reload: ReloadConfig::default(),
+        drain: DrainConfig::default(),
+        health: HealthConfig::default(),
+        socket: SocketConfig::default(),
+    };
+
+    tokio::spawn(async move {
+        let _ = Proxy::new(config).run().await;
+    });
+    time::sleep(Duration::from_millis(50)).await;
+
+    (listen_addr, receiver)
+}
+
+async fn read_frontend_password_payload(stream: &mut TcpStream) -> Vec<u8> {
+    let mut header = [0_u8; 5];
+    stream
+        .read_exact(&mut header)
+        .await
+        .expect("read password response header");
+    assert_eq!(header[0], b'p');
+    let payload_len =
+        i32::from_be_bytes(header[1..5].try_into().expect("frame length")) as usize - 4;
+    let mut payload = vec![0_u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .expect("read password response payload");
+    payload
+}
+
+async fn spawn_proxy_with_auth(
+    auth: AuthConfig,
+    record_backend_startup_user: bool,
+) -> (SocketAddr, mpsc::Receiver<String>) {
     let (sender, receiver) = mpsc::channel(16);
     let backend = TcpListener::bind("127.0.0.1:0")
         .await
@@ -154,7 +477,23 @@ async fn spawn_proxy(
                     .expect("send backend accept");
 
                 let mut startup = [0_u8; 1024];
-                let _ = stream.read(&mut startup).await.expect("read startup");
+                let read = stream.read(&mut startup).await.expect("read startup");
+                if record_backend_startup_user {
+                    let StartupPacket::Startup { parameters, .. } =
+                        parse_startup_packet(&startup[..read]).expect("parse backend startup")
+                    else {
+                        panic!("expected backend startup packet");
+                    };
+                    let user = parameters
+                        .iter()
+                        .find(|(key, _)| key == "user")
+                        .map(|(_, value)| value.as_str())
+                        .expect("backend startup user");
+                    sender
+                        .send(format!("backend_startup_user:{user}"))
+                        .await
+                        .expect("send backend startup user");
+                }
                 stream
                     .write_all(&auth_ok_ready())
                     .await
@@ -212,13 +551,7 @@ async fn spawn_proxy(
             backend_ca_path: None,
             backend_server_name: None,
         },
-        auth: AuthConfig {
-            auth_mode,
-            auth_users_file,
-            backend_user: None,
-            backend_password_env_var_name: None,
-            auth_failure_message_mode: AuthFailureMessageMode::Generic,
-        },
+        auth,
         reload: ReloadConfig::default(),
         drain: DrainConfig::default(),
         health: HealthConfig::default(),

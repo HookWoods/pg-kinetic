@@ -108,8 +108,8 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `tls.backend_server_name` | optional string | unset | `--backend-server-name` | `PG_KINETIC_BACKEND_TLS_SERVER_NAME` | restart | `verify_full` fails when name does not match backend cert. |
 | `auth.auth_mode` | enum | `pass_through` | `--auth-mode` | `PG_KINETIC_AUTH_MODE` | restart | Invalid enum fails parse. Values: `pass_through`, `trust`, `scram_sha_256`. |
 | `auth.auth_users_file` | optional path | unset | `--auth-users-file` | `PG_KINETIC_AUTH_USERS_FILE` | reload asset | Startup/reload fails if the file cannot load. |
-| `auth.backend_user` | optional string | unset | `--backend-user` | `PG_KINETIC_BACKEND_USER` | restart | Backend auth uses configured value when the proxy authenticates separately. |
-| `auth.backend_password_env_var_name` | optional string | unset | `--backend-password-env-var-name` | `PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME` | restart | Backend auth fails when the named environment variable is absent. |
+| `auth.backend_user` | optional string | unset | `--backend-user` | `PG_KINETIC_BACKEND_USER` | restart | Must be paired with `auth.backend_password_env_var_name`; selects the dedicated upstream service role after local client authentication. |
+| `auth.backend_password_env_var_name` | optional string | unset | `--backend-password-env-var-name` | `PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME` | restart | Must be paired with `auth.backend_user`; names the injected service password. Service credentials are invalid with `pass_through`. |
 | `auth.auth_failure_message_mode` | enum | `generic` | `--auth-failure-message-mode` | `PG_KINETIC_AUTH_FAILURE_MESSAGE_MODE` | restart | `detailed` can expose more auth context to clients. |
 | `reload.config_file` | optional path | unset | `--config-file` | `PG_KINETIC_CONFIG_FILE` | restart | Startup/reload fails if file cannot read or parse. |
 | `reload.config_reload_interval_ms` | milliseconds | `5000` | `--config-reload-interval-ms` | `PG_KINETIC_CONFIG_RELOAD_INTERVAL_MS` | restart | Reload loop ticks at this interval. |

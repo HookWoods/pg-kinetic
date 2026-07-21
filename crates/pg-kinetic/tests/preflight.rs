@@ -98,6 +98,28 @@ fn preflight_loads_config_without_starting_proxy_listeners() {
 }
 
 #[test]
+fn preflight_rejects_service_credentials_with_pass_through_auth() {
+    let config = write_file(
+        "service-auth-pass-through",
+        &base_config(
+            "127.0.0.1:0",
+            "127.0.0.1:5432",
+            r#"
+[auth]
+auth_mode = "pass_through"
+backend_user = "pool_user"
+backend_password_env_var_name = "PG_KINETIC_POOL_PASSWORD"
+"#,
+        ),
+    );
+
+    let report = PreflightRunner::new(&config).run();
+
+    assert!(report.has_errors());
+    assert!(report.render_json().contains("pass_through"));
+}
+
+#[test]
 fn preflight_validates_tls_files_when_configured() {
     let valid_config = write_file(
         "tls-valid",

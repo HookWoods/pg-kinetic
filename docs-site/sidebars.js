@@ -57,6 +57,7 @@ const sidebars = {
       items: [
         'production-runtime',
         'tls-and-auth',
+        'backend-service-auth',
         'health-and-drain',
         'migration',
         'kubernetes',

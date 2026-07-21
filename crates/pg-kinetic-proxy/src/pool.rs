@@ -66,6 +66,7 @@ pub enum PoolError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckoutMode {
     AllowConnect,
+    PreferConnect,
     ReuseOnly,
 }
 
@@ -217,6 +218,9 @@ impl BackendPoolRef {
     ) -> Result<PooledBackend, PoolError> {
         match mode {
             CheckoutMode::AllowConnect => self.inner.pool.checkout_primary(route).await,
+            CheckoutMode::PreferConnect => {
+                self.inner.pool.checkout_primary_prefer_connect(route).await
+            }
             CheckoutMode::ReuseOnly => self.inner.pool.checkout_primary_reusable(route).await,
         }
     }
@@ -790,6 +794,14 @@ impl BackendPool {
             .await
     }
 
+    pub async fn checkout_primary_prefer_connect(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.checkout_with_mode(route, CheckoutMode::PreferConnect)
+            .await
+    }
+
     async fn checkout_with_mode(
         self: &Arc<Self>,
         route: RouteKey,
@@ -836,7 +848,26 @@ impl BackendPool {
             metrics::record_route_waiting(&route, route_gate.waiting());
             self.record_backpressure_counts(&route);
 
-            if let Some(mut backend) = self.checkout_idle_backend(mode).await {
+            if mode == CheckoutMode::PreferConnect && self.reserve_backend_slot() {
+                match self.connect_reserved_backend().await {
+                    Ok(mut backend) => {
+                        self.attach_backend_snapshot_store(&mut backend);
+                        backend.mark_checked_out(Some(route.clone()));
+                        self.sync_pool_snapshot();
+                        return Ok(PooledBackend {
+                            backend: Some(backend),
+                            pool: self.clone(),
+                            _permit: BackpressurePermit::join(route_permit, permit),
+                            route_key: route.clone(),
+                            requires_startup: true,
+                        });
+                    }
+                    Err(PoolError::Connect(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if let Some(mut backend) = self.checkout_idle_backend(false).await {
                 self.attach_backend_snapshot_store(&mut backend);
                 backend.mark_checked_out(Some(route.clone()));
                 self.sync_pool_snapshot();
@@ -849,11 +880,25 @@ impl BackendPool {
                 });
             }
 
-            let mut backend =
-                Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket)
-                    .await
-                    .map_err(PoolError::Connect)?;
-            self.active_backends.fetch_add(1, Ordering::AcqRel);
+            if mode == CheckoutMode::AllowConnect && self.reserve_backend_slot() {
+                let mut backend = self.connect_reserved_backend().await?;
+                self.attach_backend_snapshot_store(&mut backend);
+                backend.mark_checked_out(Some(route.clone()));
+                self.sync_pool_snapshot();
+
+                return Ok(PooledBackend {
+                    backend: Some(backend),
+                    pool: self.clone(),
+                    _permit: BackpressurePermit::join(route_permit, permit),
+                    route_key: route.clone(),
+                    requires_startup: true,
+                });
+            }
+
+            let mut backend = self
+                .checkout_idle_backend(true)
+                .await
+                .expect("waiting for an available backend returns one");
             self.attach_backend_snapshot_store(&mut backend);
             backend.mark_checked_out(Some(route.clone()));
             self.sync_pool_snapshot();
@@ -863,7 +908,7 @@ impl BackendPool {
                 pool: self.clone(),
                 _permit: BackpressurePermit::join(route_permit, permit),
                 route_key: route.clone(),
-                requires_startup: true,
+                requires_startup: false,
             })
         };
 
@@ -888,17 +933,45 @@ impl BackendPool {
         result
     }
 
-    async fn checkout_idle_backend(&self, mode: CheckoutMode) -> Option<Backend> {
+    async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<Backend> {
         loop {
             let notified = self.backend_available.notified();
             if let Some(backend) = self.idle.lock().await.pop_front() {
                 self.idle_backends.fetch_sub(1, Ordering::AcqRel);
                 return Some(backend);
             }
-            if mode == CheckoutMode::AllowConnect {
+            if !wait_for_backend {
                 return None;
             }
             notified.await;
+        }
+    }
+
+    fn reserve_backend_slot(&self) -> bool {
+        let mut active_backends = self.active_backends.load(Ordering::Acquire);
+        loop {
+            if active_backends >= self.max_backends {
+                return false;
+            }
+            match self.active_backends.compare_exchange_weak(
+                active_backends,
+                active_backends + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => active_backends = observed,
+            }
+        }
+    }
+
+    async fn connect_reserved_backend(&self) -> Result<Backend, PoolError> {
+        match Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await {
+            Ok(backend) => Ok(backend),
+            Err(error) => {
+                self.discard_backend();
+                Err(PoolError::Connect(error))
+            }
         }
     }
 
@@ -995,6 +1068,7 @@ impl BackendPool {
 
     fn discard_backend(&self) {
         self.active_backends.fetch_sub(1, Ordering::AcqRel);
+        self.backend_available.notify_waiters();
         self.sync_pool_snapshot();
     }
 }
@@ -1097,10 +1171,14 @@ mod tests {
     }
 
     fn test_pool(addr: SocketAddr) -> Arc<BackendPool> {
+        test_pool_with_capacity(addr, 1)
+    }
+
+    fn test_pool_with_capacity(addr: SocketAddr, max_backends: usize) -> Arc<BackendPool> {
         BackendPool::new(
             addr,
             TlsConfig::default(),
-            1,
+            max_backends,
             1,
             1,
             1,
@@ -1171,6 +1249,28 @@ mod tests {
         assert_eq!(replica_accepts.load(Ordering::Relaxed), 0);
         assert_eq!(pools.primary().role(), BackendRole::Primary);
         assert_eq!(pools.replicas().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefer_connect_opens_a_new_backend_while_capacity_remains() {
+        let (addr, accepted) = backend_listener().await;
+        let pool = test_pool_with_capacity(addr, 2);
+        let route = route_key("startup");
+
+        let first = pool
+            .checkout_primary(route.clone())
+            .await
+            .expect("first checkout");
+        assert!(first.requires_startup());
+        first.release().await;
+
+        let second = pool
+            .checkout_primary_prefer_connect(route)
+            .await
+            .expect("preferred checkout");
+
+        assert!(second.requires_startup());
+        wait_for_accepts(&accepted, 2).await;
     }
 
     #[tokio::test]

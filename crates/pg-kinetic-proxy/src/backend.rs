@@ -118,6 +118,11 @@ impl Backend {
         self.addr
     }
 
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        self.stream.is_tls()
+    }
+
     pub fn attach_snapshot_store(&mut self, snapshot_store: SnapshotStore) {
         self.snapshot_store = Some(snapshot_store);
     }
@@ -161,6 +166,13 @@ enum BackendConnectStream {
 pub enum BackendStream {
     Plain(TcpStream),
     Tls(ClientTlsStream<TcpStream>),
+}
+
+impl BackendStream {
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
 }
 
 impl AsyncRead for BackendStream {

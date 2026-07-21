@@ -88,6 +88,8 @@ The proxy reads the backend password from the named environment variable. If the
 
 Rotate the secret by updating the orchestration secret/environment and restarting pg-kinetic. Changing the env var name itself is restart-required.
 
+For the required pairing, supported PostgreSQL backend authentication methods, TLS rule for cleartext passwords, and role design, see [Backend Service Authentication](backend-service-auth.md).
+
 ## SSL Fallback For Clients
 
 PostgreSQL clients often use `sslmode` or `PGSSLMODE` to decide whether they send an `SSLRequest`.

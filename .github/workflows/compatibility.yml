@@ -75,6 +75,8 @@ jobs:
         run: cargo run -p xtask -- compat --list
       - name: Start compatibility stack
         run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+      - name: Verify pg-kinetic accepts queries
+        run: docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
       - name: Load compatibility fixtures
         run: cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
       - name: Run direct smoke
@@ -83,6 +85,9 @@ jobs:
         run: cargo run -p xtask -- compat --language ${{ matrix.language }} --target pg-kinetic --smoke
       - name: Run paired smoke comparison
         run: cargo run -p xtask -- compat --language ${{ matrix.language }} --smoke
+      - name: Dump compatibility service logs
+        if: failure()
+        run: docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres
       - name: Stop compatibility stack
         if: always()
         run: docker compose -f bench/compose.yml down --volumes
@@ -123,10 +128,15 @@ jobs:
           gradle-version: current
       - name: Start compatibility stack
         run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+      - name: Verify pg-kinetic accepts queries
+        run: docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
       - name: Load compatibility fixtures
         run: cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
       - name: Run framework compatibility path
         run: cargo run -p xtask -- compat --category framework
+      - name: Dump compatibility service logs
+        if: failure()
+        run: docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres
       - name: Stop compatibility stack
         if: always()
         run: docker compose -f bench/compose.yml down --volumes

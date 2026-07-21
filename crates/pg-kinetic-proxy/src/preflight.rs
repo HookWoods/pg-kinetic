@@ -141,6 +141,10 @@ impl PreflightRunner {
             }
         }
 
+        if let Err(error) = auth::load_backend_credentials(&config.auth) {
+            report.add_error(PreflightCheck::AuthUsers, error.to_string());
+        }
+
         if config.auth.auth_mode == AuthMode::PassThrough {
             report.add_warning(
                 PreflightCheck::AuthUsers,
