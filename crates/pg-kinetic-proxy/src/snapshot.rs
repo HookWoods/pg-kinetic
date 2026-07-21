@@ -78,6 +78,16 @@ pub struct PoolSnapshot {
     pub waiting_clients: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PoolLifecycleSnapshot {
+    pub max_size: usize,
+    pub min_idle: usize,
+    pub idle_timeout: Duration,
+    pub max_lifetime: Duration,
+    pub active_backends: usize,
+    pub idle_backends: usize,
+}
+
 impl PoolSnapshot {
     #[must_use]
     pub const fn new(configured_backends: usize, active_backends: usize) -> Self {
@@ -784,6 +794,7 @@ pub struct SnapshotStore {
 struct SnapshotStoreInner {
     clients: BTreeMap<u64, ClientSnapshot>,
     pool: PoolSnapshot,
+    pool_lifecycle: PoolLifecycleSnapshot,
     servers: BTreeMap<u64, ServerSnapshot>,
     replica_health: BTreeMap<u64, ReplicaHealthSnapshot>,
     prepared: PreparedSnapshot,
@@ -1052,6 +1063,22 @@ impl SnapshotStore {
             .read()
             .expect("snapshot store poisoned")
             .pool
+            .clone()
+    }
+
+    pub fn set_pool_lifecycle_snapshot(&self, snapshot: PoolLifecycleSnapshot) {
+        self.inner
+            .write()
+            .expect("snapshot store poisoned")
+            .pool_lifecycle = snapshot;
+    }
+
+    #[must_use]
+    pub fn pool_lifecycle_snapshot(&self) -> PoolLifecycleSnapshot {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .pool_lifecycle
             .clone()
     }
 

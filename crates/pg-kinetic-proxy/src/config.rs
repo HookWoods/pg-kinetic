@@ -1547,6 +1547,71 @@ pub struct CapacityConfig {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
+pub struct PoolLifecycleConfig {
+    #[arg(
+        long = "pool-max-size",
+        env = "PG_KINETIC_POOL_MAX_SIZE",
+        default_value_t = 100
+    )]
+    pub max_size: usize,
+
+    #[arg(
+        long = "pool-min-idle",
+        env = "PG_KINETIC_POOL_MIN_IDLE",
+        default_value_t = 0
+    )]
+    pub min_idle: usize,
+
+    #[arg(
+        long = "pool-idle-timeout-ms",
+        env = "PG_KINETIC_POOL_IDLE_TIMEOUT_MS",
+        default_value = "1800000",
+        value_parser = parse_duration_ms
+    )]
+    #[serde(
+        deserialize_with = "deserialize_duration_ms",
+        serialize_with = "serialize_duration_ms"
+    )]
+    pub idle_timeout: Duration,
+
+    #[arg(
+        long = "pool-max-lifetime-ms",
+        env = "PG_KINETIC_POOL_MAX_LIFETIME_MS",
+        default_value = "0",
+        value_parser = parse_duration_ms
+    )]
+    #[serde(
+        deserialize_with = "deserialize_duration_ms",
+        serialize_with = "serialize_duration_ms"
+    )]
+    pub max_lifetime: Duration,
+}
+
+impl PoolLifecycleConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_size == 0 {
+            return Err(String::from("pool_max_size must be greater than zero"));
+        }
+        if self.min_idle > self.max_size {
+            return Err(String::from("pool_min_idle cannot exceed pool_max_size"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for PoolLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            max_size: 100,
+            min_idle: 0,
+            idle_timeout: Duration::from_millis(1_800_000),
+            max_lifetime: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[serde(default)]
 pub struct PerformanceConfig {
     #[arg(long, env = "PG_KINETIC_CHECKOUT_TIMEOUT_MS", default_value_t = 1_000)]
     pub checkout_timeout_ms: u64,
@@ -2272,6 +2337,29 @@ where
 {
     let value = String::deserialize(deserializer)?;
     parse_policy_mode(&value).map_err(serde::de::Error::custom)
+}
+
+fn parse_duration_ms(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .map_err(|error| format!("invalid duration in milliseconds: {error}"))
+}
+
+fn deserialize_duration_ms<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64::deserialize(deserializer)
+        .map(Duration::from_millis)
+        .map_err(serde::de::Error::custom)
+}
+
+fn serialize_duration_ms<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_u64(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 fn serialize_policy_mode<S>(mode: &PolicyMode, serializer: S) -> Result<S::Ok, S::Error>

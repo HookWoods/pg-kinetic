@@ -77,6 +77,10 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `capacity.max_clients` | integer | `10000` | `--max-clients` | `PG_KINETIC_MAX_CLIENTS` | restart | Client admission is capped at this value. |
 | `capacity.max_backends` | integer | `100` | `--max-backends` | `PG_KINETIC_MAX_BACKENDS` | restart | Backend pool is capped at this value. |
 | `capacity.max_checkout_waiters` | integer | `1000` | `--max-checkout-waiters` | `PG_KINETIC_MAX_CHECKOUT_WAITERS` | restart | Excess backend checkout waiters are rejected. |
+| `pool_max_size` | integer | `100` | `--pool-max-size` | `PG_KINETIC_POOL_MAX_SIZE` | restart | Lifecycle-aware pools never create more than this many backend connections. |
+| `pool_min_idle` | integer | `0` | `--pool-min-idle` | `PG_KINETIC_POOL_MIN_IDLE` | restart | Idle reaping never removes connections below this floor. |
+| `pool_idle_timeout_ms` | milliseconds | `1800000` | `--pool-idle-timeout-ms` | `PG_KINETIC_POOL_IDLE_TIMEOUT_MS` | restart | Idle backends older than this bound are eligible for reaping. `0` disables the bound. |
+| `pool_max_lifetime_ms` | milliseconds | `0` | `--pool-max-lifetime-ms` | `PG_KINETIC_POOL_MAX_LIFETIME_MS` | restart | Idle backends older than this lifetime are eligible for reaping. `0` disables the bound. |
 | `performance.checkout_timeout_ms` | milliseconds | `1000` | `--checkout-timeout-ms` | `PG_KINETIC_CHECKOUT_TIMEOUT_MS` | restart | Backend checkout times out after this duration. |
 | `performance.recovery_mode` | enum | `recover` | `--recovery-mode` | `PG_KINETIC_RECOVERY_MODE` | restart | Invalid enum fails parse. Values: `recover`, `rollback_only`, `drop`. |
 | `performance.recovery_timeout_ms` | milliseconds | `5000` | `--recovery-timeout-ms` | `PG_KINETIC_RECOVERY_TIMEOUT_MS` | restart | Recovery exceeding this duration discards the backend. |

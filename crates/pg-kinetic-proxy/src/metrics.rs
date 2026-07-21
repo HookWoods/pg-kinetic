@@ -419,6 +419,16 @@ pub fn record_pool_snapshot(snapshot_store: &SnapshotStore, snapshot: PoolSnapsh
     snapshot_store.set_pool_snapshot(snapshot);
 }
 
+pub fn record_pool_connections(active: usize, idle: usize) {
+    for (state, value) in [("active", active), ("idle", idle)] {
+        metrics_crate::gauge!("pg_kinetic_pool_connections", "state" => state).set(value as f64);
+    }
+}
+
+pub fn record_pool_eviction(reason: &'static str) {
+    metrics_crate::counter!("pg_kinetic_pool_evictions_total", "reason" => reason).increment(1);
+}
+
 pub fn record_server_snapshot(snapshot_store: &SnapshotStore, snapshot: ServerSnapshot) {
     snapshot_store.set_server_snapshot(snapshot);
 }
@@ -975,6 +985,14 @@ fn describe_metrics() {
     for descriptor in metric_catalog() {
         describe_metric(descriptor);
     }
+    metrics_crate::describe_counter!(
+        "pg_kinetic_pool_evictions_total",
+        "Pooled backend evictions by lifecycle reason."
+    );
+    metrics_crate::describe_gauge!(
+        "pg_kinetic_pool_connections",
+        "Current pooled backend connections by state."
+    );
 }
 
 fn describe_metric(descriptor: &MetricDescriptor) {

@@ -31,6 +31,10 @@ This makes queueing more useful than a single global counter. A bulk worker can 
 | `max_route_in_flight` | Maximum concurrent checkouts for one route key. |
 | `max_route_waiters` | Maximum queued waiters for one route key. |
 | `max_checkout_waiters` | Global checkout waiter cap. |
+| `pool_max_size` | Maximum number of backend connections in one pool. |
+| `pool_min_idle` | Minimum idle connections retained by the lifecycle reaper. |
+| `pool_idle_timeout_ms` | Maximum idle age before an idle backend becomes eligible for eviction. |
+| `pool_max_lifetime_ms` | Maximum backend age before an idle backend becomes eligible for eviction. |
 | `checkout_timeout_ms` | Maximum backend checkout wait. |
 | `query_timeout_ms` | Maximum time for an assigned query cycle. |
 | `idle_client_timeout_ms` | Maximum idle client lifetime. |
@@ -57,6 +61,8 @@ Watch these signals together:
 - `pg_kinetic_route_waiting`
 - `pg_kinetic_timeout_total`
 - `pg_kinetic_buffer_limit_total`
+- `pg_kinetic_pool_connections{state="active"}` and `pg_kinetic_pool_connections{state="idle"}`
+- `pg_kinetic_pool_evictions_total`
 
 Admin views:
 
@@ -67,4 +73,3 @@ SHOW PERFORMANCE;
 ```
 
 Sustained route waiters usually means capacity, query latency, or traffic isolation needs attention. A short spike during deploy or failover can be normal if readiness and drain behavior recover quickly.
-

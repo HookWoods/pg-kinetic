@@ -14,9 +14,9 @@ use tokio::time::timeout;
 use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
     backend::Backend,
-    config::{SocketConfig, TlsConfig},
+    config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
     metrics,
-    snapshot::{PoolSnapshot, SnapshotStore},
+    snapshot::{PoolLifecycleSnapshot, PoolSnapshot, SnapshotStore},
 };
 use pg_kinetic_core::{
     backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
@@ -34,6 +34,7 @@ pub struct BackendPool {
     gate: BackpressureGate,
     route_gates: StdRwLock<HashMap<PoolKey, BackpressureGate>>,
     idle: Mutex<VecDeque<Backend>>,
+    backend_lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
     backend_available: Notify,
     snapshot_store: StdMutex<Option<SnapshotStore>>,
     health: Arc<AtomicBool>,
@@ -44,6 +45,13 @@ pub struct BackendPool {
     route_max_in_flight: usize,
     route_max_waiters: usize,
     checkout_timeout: Duration,
+    lifecycle: PoolLifecycleConfig,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BackendLifecycle {
+    created_at: tokio::time::Instant,
+    last_released_at: tokio::time::Instant,
 }
 
 #[derive(Debug)]
@@ -755,24 +763,58 @@ impl BackendPool {
         checkout_timeout: Duration,
         reset_query: impl Into<Arc<str>>,
     ) -> Arc<Self> {
+        let mut lifecycle = PoolLifecycleConfig::default();
+        lifecycle.max_size = max_backends;
+        Self::new_with_socket_and_lifecycle(
+            backend_addr,
+            tls,
+            socket,
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            checkout_timeout,
+            reset_query,
+            lifecycle,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_socket_and_lifecycle(
+        backend_addr: SocketAddr,
+        tls: TlsConfig,
+        socket: SocketConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        reset_query: impl Into<Arc<str>>,
+        lifecycle: PoolLifecycleConfig,
+    ) -> Arc<Self> {
+        assert!(
+            lifecycle.validate().is_ok(),
+            "invalid pool lifecycle config"
+        );
         Arc::new(Self {
             backend_addr,
             tls,
             socket,
             reset_query: reset_query.into(),
-            gate: BackpressureGate::new(max_backends, max_waiters),
+            gate: BackpressureGate::new(lifecycle.max_size, max_waiters),
             route_gates: StdRwLock::new(HashMap::new()),
             idle: Mutex::new(VecDeque::new()),
+            backend_lifecycle: StdMutex::new(HashMap::new()),
             backend_available: Notify::new(),
             snapshot_store: StdMutex::new(None),
             health: Arc::new(AtomicBool::new(true)),
             active_backends: AtomicUsize::new(0),
             idle_backends: AtomicUsize::new(0),
-            max_backends,
+            max_backends: lifecycle.max_size,
             max_waiters,
             route_max_in_flight,
             route_max_waiters,
             checkout_timeout,
+            lifecycle,
         })
     }
 
@@ -1006,7 +1048,10 @@ impl BackendPool {
 
     async fn connect_reserved_backend(&self) -> Result<Backend, PoolError> {
         match Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await {
-            Ok(backend) => Ok(backend),
+            Ok(backend) => {
+                self.register_backend(&backend);
+                Ok(backend)
+            }
             Err(error) => {
                 self.discard_backend();
                 Err(PoolError::Connect(error))
@@ -1017,6 +1062,90 @@ impl BackendPool {
     #[must_use]
     pub const fn max_backends(&self) -> usize {
         self.max_backends
+    }
+
+    #[must_use]
+    pub const fn lifecycle_config(&self) -> &PoolLifecycleConfig {
+        &self.lifecycle
+    }
+
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.active_backends.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn idle_count(&self) -> usize {
+        self.idle_backends.load(Ordering::Acquire)
+    }
+
+    pub async fn reap_idle(&self) {
+        let now = tokio::time::Instant::now();
+        let mut idle = self.idle.lock().await;
+        let mut retained = VecDeque::with_capacity(idle.len());
+        let mut evicted = Vec::new();
+        while let Some(backend) = idle.pop_front() {
+            let lifecycle = self
+                .backend_lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .get(&backend.id())
+                .copied();
+            let eviction_reason = lifecycle.and_then(|lifecycle| {
+                (self.lifecycle.idle_timeout != Duration::ZERO
+                    && now.duration_since(lifecycle.last_released_at)
+                        >= self.lifecycle.idle_timeout)
+                    .then_some("idle_timeout")
+                    .or_else(|| {
+                        (self.lifecycle.max_lifetime != Duration::ZERO
+                            && now.duration_since(lifecycle.created_at)
+                                >= self.lifecycle.max_lifetime)
+                            .then_some("max_lifetime")
+                    })
+            });
+            if let Some(reason) = eviction_reason {
+                if retained.len() + idle.len() >= self.lifecycle.min_idle {
+                    evicted.push((backend, reason));
+                } else {
+                    retained.push_back(backend);
+                }
+            } else {
+                retained.push_back(backend);
+            }
+        }
+        *idle = retained;
+        drop(idle);
+
+        for (backend, reason) in evicted {
+            backend.mark_discarded();
+            self.backend_lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .remove(&backend.id());
+            self.active_backends.fetch_sub(1, Ordering::AcqRel);
+            metrics::record_pool_eviction(reason);
+        }
+        self.idle_backends
+            .store(self.idle.lock().await.len(), Ordering::Release);
+        self.backend_available.notify_waiters();
+        self.sync_pool_snapshot();
+    }
+
+    pub fn start_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let pool = Arc::clone(self);
+        let interval = [pool.lifecycle.idle_timeout, pool.lifecycle.max_lifetime]
+            .into_iter()
+            .filter(|duration| *duration != Duration::ZERO)
+            .min()
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_millis(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                pool.reap_idle().await;
+            }
+        })
     }
 
     #[must_use]
@@ -1074,17 +1203,42 @@ impl BackendPool {
     }
 
     fn sync_pool_snapshot(&self) {
+        let active_backends = self.active_backends.load(Ordering::Acquire);
+        let idle_backends = self.idle_backends.load(Ordering::Acquire);
+        metrics::record_pool_connections(active_backends, idle_backends);
         if let Some(snapshot_store) = self.snapshot_store() {
             metrics::record_pool_snapshot(
                 &snapshot_store,
                 PoolSnapshot {
                     configured_backends: self.max_backends,
-                    active_backends: self.active_backends.load(Ordering::Acquire),
-                    idle_backends: self.idle_backends.load(Ordering::Acquire),
+                    active_backends,
+                    idle_backends,
                     waiting_clients: self.gate.waiting(),
                 },
             );
+            snapshot_store.set_pool_lifecycle_snapshot(PoolLifecycleSnapshot {
+                max_size: self.lifecycle.max_size,
+                min_idle: self.lifecycle.min_idle,
+                idle_timeout: self.lifecycle.idle_timeout,
+                max_lifetime: self.lifecycle.max_lifetime,
+                active_backends,
+                idle_backends,
+            });
         }
+    }
+
+    fn register_backend(&self, backend: &Backend) {
+        let now = tokio::time::Instant::now();
+        self.backend_lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .insert(
+                backend.id(),
+                BackendLifecycle {
+                    created_at: now,
+                    last_released_at: now,
+                },
+            );
     }
 
     fn record_backpressure_counts(&self, route: &RouteKey) {
@@ -1100,6 +1254,14 @@ impl BackendPool {
     }
 
     async fn return_backend(&self, backend: Backend) {
+        if let Some(lifecycle) = self
+            .backend_lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .get_mut(&backend.id())
+        {
+            lifecycle.last_released_at = tokio::time::Instant::now();
+        }
         self.idle.lock().await.push_back(backend);
         self.idle_backends.fetch_add(1, Ordering::AcqRel);
         self.backend_available.notify_one();

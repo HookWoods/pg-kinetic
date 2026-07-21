@@ -31,6 +31,8 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 | --- | --- | --- | --- | --- |
 | `pg_kinetic_client_connections_total` | counter | none | live proxy | Increments for accepted client connections. |
 | `pg_kinetic_pool_checkout_wait_ms` | histogram | `stage`, `outcome` | live proxy | Measures checkout stages and outcomes. |
+| `pg_kinetic_pool_connections` | gauge | `state` | lifecycle-aware pool | Current backend connections by `state`: `active` or `idle`. |
+| `pg_kinetic_pool_evictions_total` | counter | `reason` | lifecycle-aware pool | Idle backend evictions by `reason`: `idle_timeout` or `max_lifetime`. |
 | `pg_kinetic_backpressure_events_total` | counter | `route`, `outcome` | live proxy | Records route overload, timeout, and cancellation outcomes. |
 | `pg_kinetic_route_checkout_wait_ms` | histogram | `route`, `outcome` | live proxy | Measures per-route wait time. |
 | `pg_kinetic_route_in_flight` | gauge | `route`, `scope` | live proxy | Shows route in-flight work. |
@@ -78,6 +80,7 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 - `/readyz` returns `503` or `pg_kinetic_health_status{kind="ready"}` is not ready.
 - `pg_kinetic_backpressure_events_total{outcome="rejected"}` increases.
 - `pg_kinetic_pool_checkout_wait_ms` p95 rises for `stage="checkout"`.
+- `pg_kinetic_pool_connections{state="idle"}` approaches the configured minimum or `pg_kinetic_pool_evictions_total` rises unexpectedly.
 - `pg_kinetic_tls_failures_total` or `pg_kinetic_auth_failures_total` increases after a rollout.
 - `pg_kinetic_config_reload_total{outcome="rejected"}` increases.
 - `pg_kinetic_split_brain_warnings_total` is nonzero.
