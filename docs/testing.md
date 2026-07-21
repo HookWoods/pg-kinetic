@@ -21,10 +21,13 @@ Python, PHP, Java, .NET, and native PostgreSQL development libraries before
 running the complete local workflow.
 
 ~~~bash
-docker compose -f bench/compose.yml up -d --build postgres pg-kinetic
-cargo run -p xtask -- ci-linux
+bash scripts/release/run-stable-gates.sh
 ~~~
 
+The stable release gate runs formatting, locked workspace tests, a fresh Linux
+Docker PostgreSQL and pg-kinetic stack, a `psql 'select 1'` proxy check, and
+direct/proxy compatibility smoke. It writes the ignored
+`target/release-evidence/summary.json` and retains Compose logs when it fails.
 The Linux smoke target runs the psql check, compatibility smoke clients, and
 the deterministic performance smoke. scripts/smoke/psql.sh exits successfully
 with a stable SKIP marker when psql is unavailable. The compatibility runner
@@ -71,7 +74,8 @@ cargo test -p pg-kinetic --test linux_smoke_scripts
 cargo test --workspace -j 1
 ~~~
 
-The ci-linux command remains useful as a dry run on Windows. Run its full form
+The stable release gate is Linux-only because its Docker run is the reproducible
+release evidence. The ci-linux command remains useful as a dry run on Windows. Run its full form
 only when Bash, the local stack, and all compatibility runtimes are available.
 
 ## Xtask Commands
@@ -103,3 +107,6 @@ ci-linux`, docs checks, regression manifest listing, smoke dry-runs, benchmark
 scenario validation, and the deterministic sample score comparison. Pull
 requests use the live compatibility smoke matrix. Heavy framework and
 ORM suites stay bounded by manual or scheduled compatibility jobs.
+
+The stable-gate workflow additionally runs `scripts/release/assert-contract.sh`
+and uploads `target/release-evidence/summary.json` and failure Compose logs.

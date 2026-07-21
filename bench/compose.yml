@@ -18,6 +18,7 @@ services:
       retries: 30
 
   pgbouncer:
+    profiles: [comparison]
     image: edoburu/pgbouncer:v1.25.2-p0
     depends_on:
       postgres:
@@ -29,6 +30,7 @@ services:
       - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
 
   pgdog:
+    profiles: [comparison]
     image: ghcr.io/pgdogdev/pgdog:v0.1.46
     depends_on:
       postgres:
@@ -73,6 +75,7 @@ services:
       - "59091:9091"
       - "19090:9090"
     environment:
+      PG_KINETIC_RUNTIME_ENGINE: tokio_default
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
       PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"

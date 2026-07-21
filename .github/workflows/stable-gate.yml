@@ -1,0 +1,40 @@
+name: Stable gate
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "compat/**"
+      - "regression/**"
+      - "bench/compose.yml"
+      - "scripts/release/**"
+      - "docs/**"
+      - "docs-site/**"
+      - ".github/workflows/stable-gate.yml"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run stable release gates
+        run: bash scripts/release/run-stable-gates.sh
+      - name: Assert stable contract
+        run: bash scripts/release/assert-contract.sh
+      - name: Upload stable release evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stable-release-evidence
+          path: target/release-evidence
+          if-no-files-found: error

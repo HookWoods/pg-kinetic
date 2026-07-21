@@ -74,7 +74,9 @@ jobs:
       - name: List suites
         run: cargo run -p xtask -- compat --list
       - name: Start compatibility stack
-        run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+        run: |
+          docker compose -f bench/compose.yml down --volumes --remove-orphans
+          docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
       - name: Verify pg-kinetic accepts queries
         run: docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
       - name: Load compatibility fixtures
@@ -87,7 +89,17 @@ jobs:
         run: cargo run -p xtask -- compat --language ${{ matrix.language }} --smoke
       - name: Dump compatibility service logs
         if: failure()
-        run: docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres
+        run: |
+          mkdir -p target/release-evidence/compatibility
+          docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres \
+            | tee target/release-evidence/compatibility/compose.log
+      - name: Upload compatibility evidence
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: compatibility-evidence-${{ matrix.language }}
+          path: target/release-evidence/compatibility
+          if-no-files-found: error
       - name: Stop compatibility stack
         if: always()
         run: docker compose -f bench/compose.yml down --volumes
@@ -127,7 +139,9 @@ jobs:
         with:
           gradle-version: current
       - name: Start compatibility stack
-        run: docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+        run: |
+          docker compose -f bench/compose.yml down --volumes --remove-orphans
+          docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
       - name: Verify pg-kinetic accepts queries
         run: docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
       - name: Load compatibility fixtures
@@ -136,7 +150,17 @@ jobs:
         run: cargo run -p xtask -- compat --category framework
       - name: Dump compatibility service logs
         if: failure()
-        run: docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres
+        run: |
+          mkdir -p target/release-evidence/compatibility
+          docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres \
+            | tee target/release-evidence/compatibility/compose.log
+      - name: Upload compatibility evidence
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: compatibility-framework-evidence
+          path: target/release-evidence/compatibility
+          if-no-files-found: error
       - name: Stop compatibility stack
         if: always()
         run: docker compose -f bench/compose.yml down --volumes

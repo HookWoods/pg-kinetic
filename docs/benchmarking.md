@@ -10,19 +10,19 @@ keywords:
 
 # Benchmarking
 
-pg-kinetic uses versioned scenarios and JSON reports to compare the proxy with direct PostgreSQL, PgBouncer, and PgDog. The same scenario, driver, target matrix, host, and load settings must be used for a baseline and its candidate report.
+pg-kinetic uses versioned scenarios and JSON reports to compare the proxy with direct PostgreSQL and, for directional local experiments, other poolers. The same scenario, driver, target matrix, host, and load settings must be used for a baseline and its candidate report. These comparisons do not claim PgBouncer, PgDog, RDS Proxy, or Hyperdrive feature parity.
 
 ## Local Targets
 
-Start the local target matrix before collecting measurements:
+Start only the targets needed for one measurement run:
 
 ```powershell
-docker compose -f bench/compose.yml up -d --build postgres pgbouncer pgdog pg-kinetic
+docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
 ```
 
-The compose stack exposes direct PostgreSQL on `55432`, PgBouncer on `56432`, PgDog on `57432`, and pg-kinetic on `58432`. Verify that the stack is ready with a `psql` query before collecting a baseline or candidate. Stop it after the run with `docker compose -f bench/compose.yml down`.
+The stable compose stack exposes direct PostgreSQL on `55432` and pg-kinetic on `58432`. PgBouncer and PgDog are opt-in comparison services; start one with `--profile comparison`, never alongside a target that is being measured. Verify the selected target with `psql` before collecting a baseline or candidate. Stop it after every target with `docker compose -f bench/compose.yml down --volumes --remove-orphans` so PostgreSQL state and competing poolers cannot affect the next run.
 
-The benchmark scenarios use their own target DSNs. For a host-side workload driver, set them to the compose ports (`55432`, `56432`, `57432`, and `58432`) before collecting measurements; the checked-in scenario ports model an internal target matrix. Do not commit credentials in reports. The runner redacts DSN credentials in JSON output.
+The benchmark scenarios use their own target DSNs. For a host-side workload driver, set them to the selected compose port (`55432`, `56432`, `57432`, or `58432`) before collecting measurements; the checked-in scenario ports model an internal target matrix. Do not commit credentials or generated benchmark output in the repository. The runner redacts DSN credentials in JSON output.
 
 ## Scenario Format
 
@@ -93,12 +93,12 @@ Collect at least three live runs for a baseline update and review the median wit
 Use this workflow for checked-in performance baselines:
 
 1. Validate the scenario and target matrix with `benchmark validate`.
-2. Start the local target matrix and verify direct PostgreSQL, PgBouncer, PgDog, and pg-kinetic are reachable.
-3. Collect repeated live reports under `bench/results/` with the PowerShell or Bash wrapper for the current platform.
+2. Start one target at a time and verify it with `psql`; tear down the stack with volumes between targets.
+3. Collect repeated live reports under ignored `bench/results/` with the PowerShell or Bash wrapper for the current platform.
 4. Compare the reviewed candidate against the existing baseline with `compare-performance`.
 5. Commit only the reviewed baseline file under `bench/baselines/` or `regression/baselines/`; leave raw run output in ignored result directories.
 
-Keep the same target labels and target set when updating a baseline. Adding or removing `direct_postgresql`, `pgbouncer`, `pgdog`, or `pg_kinetic` is a scenario change and needs review before the performance score gate can be trusted.
+Keep the same target labels and target set when updating a baseline. Adding or removing `direct_postgresql`, `pgbouncer`, `pgdog`, or `pg_kinetic` is a scenario change and needs review before the performance score gate can be trusted. PgBouncer and PgDog results are directional context only and do not expand the stable product contract.
 
 ## Profiles And Process Hooks
 
@@ -137,6 +137,16 @@ bash scripts/bench/profile-performance.sh \
 `flamegraph` requires `cargo-flamegraph`; `perf` is available only on Linux. Tool absence is reported as skipped, so it is visible without making the local smoke gate platform-dependent. Benchmark reports also include process CPU time, resident memory, and open-file-descriptor collection status where the host supports them. Windows reports these process measurements as unavailable.
 
 Inspect the current process and budget snapshot through the admin listener with `SHOW PERFORMANCE;`. Use `SHOW BENCHMARKS;` to inspect the recorded scenario and target measurements. See [the admin reference](admin.md) and [the metrics catalog](metrics.md) for the available fields and monitoring series.
+
+## Release Evidence
+
+The release claim requires a reproducible Linux Docker run. Run the stable gate from the repository root:
+
+```bash
+bash scripts/release/run-stable-gates.sh
+```
+
+The gate runs formatting, the locked workspace tests, a fresh PostgreSQL and pg-kinetic stack, a `psql 'select 1'` proxy check, and direct/proxy compatibility smoke. It writes the ignored `target/release-evidence/summary.json`; failures retain timestamped Compose logs. macOS runs are useful for development, but their timings and capacity observations are directional only.
 
 ## Local Gates
 
