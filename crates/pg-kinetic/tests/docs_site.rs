@@ -26,7 +26,7 @@ fn docusaurus_uses_canonical_docs_and_current_version_policy() {
         "keep the site on the reviewed Docusaurus release"
     );
     assert!(config.contains("path: '../docs'"));
-    assert!(config.contains("routeBasePath: 'docs'"));
+    assert!(config.contains("routeBasePath: '/'"));
     assert!(config.contains("onBrokenLinks: 'throw'"));
     assert!(config.contains("markdown:"));
     assert!(config.contains("onBrokenMarkdownLinks: 'throw'"));

@@ -19,9 +19,10 @@ observations are directional only.
 ## Supported PostgreSQL Targets
 
 The 1.0 release claim covers PostgreSQL **16 and 18**, the versions exercised by
-the deployment and Linux compatibility stacks. The proxy speaks the PostgreSQL
-wire protocol, but no support claim is made for another server version until it
-has a matching compatibility run.
+the deployment and Linux compatibility stacks. pg-kinetic is a single-primary
+PostgreSQL proxy for this release. The proxy speaks the PostgreSQL wire
+protocol, but no support claim is made for another server version until it has a
+matching compatibility run.
 
 The contract covers ordinary PostgreSQL databases reachable through a single
 primary endpoint, with optional healthy replicas used only for eligible reads.

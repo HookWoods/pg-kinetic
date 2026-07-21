@@ -83,5 +83,5 @@ fn contract_contains_no_credentials_or_local_paths() {
 fn contract() -> toml::Value {
     let contents = std::fs::read_to_string(workspace_path("compat/common/contract.toml"))
         .expect("read contract");
-    contents.parse::<toml::Value>().expect("contract parses")
+    toml::from_str::<toml::Value>(&contents).expect("contract parses")
 }

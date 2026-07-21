@@ -187,9 +187,7 @@ fn public_integration_surfaces_exclude_roadmap_labels() {
 fn manifest_cases() -> Vec<Value> {
     let contents =
         std::fs::read_to_string(workspace_path("regression/manifest.toml")).expect("read manifest");
-    let value = contents
-        .parse::<toml::Value>()
-        .expect("manifest parses as TOML");
+    let value = toml::from_str::<toml::Value>(&contents).expect("manifest parses as TOML");
     serde_json::to_value(value["case"].clone())
         .expect("manifest cases convert to JSON")
         .as_array()
