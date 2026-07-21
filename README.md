@@ -96,7 +96,7 @@ postgres://app_user@pg-kinetic:6432/app_db
 
 ## Ready for traffic, explicit about limits
 
-The live runtime supports PostgreSQL wire proxying, transaction pooling, route-aware backpressure, conservative read routing, TLS/authentication, health checks, metrics, and admin views.
+The stable 1.0 runtime contract covers PostgreSQL wire proxying, transaction pooling, route-aware backpressure, conservative read routing, TLS/authentication, health checks, metrics, admin views, and single-primary recovery. See the [stable release contract](https://docs.pgkinetic.dev/release-contract) for exact support and validation claims.
 
 Sharding, policy, and mirroring currently provide preview or offline tooling only; they are not live traffic features. See [the runtime status](https://docs.pgkinetic.dev), [sharding](https://docs.pgkinetic.dev/sharding), and [policy](https://docs.pgkinetic.dev/policy) before evaluating those paths.
 
@@ -107,7 +107,7 @@ Sharding, policy, and mirroring currently provide preview or offline tooling onl
 | Configure or deploy | [Configuration](https://docs.pgkinetic.dev/configuration) · [Installation](https://docs.pgkinetic.dev/installation) · [Kubernetes](https://docs.pgkinetic.dev/kubernetes) |
 | Pool and route safely | [Transaction pooling](https://docs.pgkinetic.dev/transaction-pooling) · [Read routing](https://docs.pgkinetic.dev/read-routing) · [Backpressure](https://docs.pgkinetic.dev/backpressure) |
 | Operate in production | [Health and drain](https://docs.pgkinetic.dev/health-and-drain) · [Admin](https://docs.pgkinetic.dev/admin) · [Metrics](https://docs.pgkinetic.dev/metrics) |
-| Validate a rollout | [Preflight and commands](https://docs.pgkinetic.dev/commands) · [Production runtime](https://docs.pgkinetic.dev/production-runtime) · [Compatibility](https://docs.pgkinetic.dev/compatibility) |
+| Validate a rollout | [Release contract](https://docs.pgkinetic.dev/release-contract) · [Preflight and commands](https://docs.pgkinetic.dev/commands) · [Production runtime](https://docs.pgkinetic.dev/production-runtime) · [Compatibility](https://docs.pgkinetic.dev/compatibility) |
 
 Published documentation: [docs.pgkinetic.dev](https://docs.pgkinetic.dev).
 

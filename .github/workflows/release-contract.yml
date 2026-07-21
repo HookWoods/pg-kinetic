@@ -1,0 +1,33 @@
+name: Release contract
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "docs/compatibility.md"
+      - "docs/production-runtime.md"
+      - "docs/release-contract.md"
+      - "docs-site/**"
+      - "scripts/release/assert-contract.sh"
+      - ".github/workflows/release-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: Check release contract assertions
+        run: bash scripts/release/assert-contract.sh
+      - name: Install documentation dependencies
+        run: npm --prefix docs-site ci
+      - name: Build documentation site
+        run: npm --prefix docs-site run build

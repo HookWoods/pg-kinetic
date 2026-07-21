@@ -13,6 +13,8 @@ keywords:
 
 pg-kinetic keeps a cross-language compatibility matrix for PostgreSQL clients. The matrix can run the same behavior contract against direct PostgreSQL and pg-kinetic so reports can compare proxy behavior with the baseline server path.
 
+The stable 1.0 support boundary is defined in the [Stable 1.0 Release Contract](./release-contract.md). It covers PostgreSQL 16 and 18 as tested release targets; other server versions require a matching compatibility run before a support claim is made.
+
 ## Current Compatibility Status
 
 | Area | Status |
@@ -88,8 +90,9 @@ strings when a language runner needs a non-default address.
 
 ## Reports
 
-Every suite emits normalized JSON with `language`, `library`, `version`,
-`target`, `outcome`, `duration_ms`, `skip_reason`, and `error_summary`. Missing
+Every suite emits normalized JSON with the stable fields `language`, `library`,
+`version`, `target`, `outcome`, `skip_reason`, and `error_summary`. Reports may
+also include `duration_ms` and suite-specific case details. Missing
 toolchains, unavailable services, and unsupported library features are `skip`
 outcomes with stable reasons; they are never converted to synthetic passes.
 

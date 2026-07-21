@@ -12,6 +12,10 @@ keywords:
 
 pg-kinetic runtime behavior is centered on lifecycle state, readiness state, shutdown coordination, health endpoints, and admin snapshots.
 
+For the exact stable 1.0 support boundary, PostgreSQL targets, authentication,
+TLS, pooling, recovery, compatibility, and preview exclusions, see the [Stable
+1.0 Release Contract](./release-contract.md).
+
 ## Lifecycle States
 
 `SHOW RUNTIME` can report:
@@ -57,7 +61,7 @@ experimental_runtime_enabled = false
 
 | Engine | Status |
 | --- | --- |
-| `tokio_default` | default |
+| `tokio_default` | default and stable |
 | `tokio_current_thread` | stable option |
 | `experimental_thread_per_core` | requires `experimental_runtime_enabled = true` |
 | `experimental_io_uring` | requires `experimental_runtime_enabled = true` |

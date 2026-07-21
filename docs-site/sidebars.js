@@ -12,7 +12,7 @@ const sidebars = {
         slug: '/getting-started',
       },
       collapsed: false,
-      items: ['installation', 'quickstart', 'configuration', 'commands', 'compatibility', 'faq'],
+      items: ['installation', 'quickstart', 'configuration', 'commands', 'release-contract', 'compatibility', 'faq'],
     },
     {
       type: 'category',
