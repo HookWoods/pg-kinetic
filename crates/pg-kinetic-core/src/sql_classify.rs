@@ -130,6 +130,11 @@ pub fn has_multiple_statements(sql: &str) -> bool {
 #[must_use]
 pub fn contains_data_modifying_cte(sql: &str) -> bool {
     let normalized = normalize(strip_leading_comments_and_whitespace(sql));
+    contains_data_modifying_cte_normalized(&normalized)
+}
+
+#[must_use]
+pub(crate) fn contains_data_modifying_cte_normalized(normalized: &str) -> bool {
     if !normalized.starts_with("with ") && normalized != "with" {
         return false;
     }
@@ -161,54 +166,56 @@ fn classify_multi_statement(statements: &[&str]) -> QueryClass {
 
 fn classify_single_statement(sql: &str) -> QueryClass {
     let sql = strip_leading_comments_and_whitespace(sql);
-    let normalized = normalize(sql);
 
-    if normalized.is_empty() {
+    if sql.is_empty() {
         return QueryClass::Unknown;
     }
 
-    if normalized.starts_with("explain") {
+    if keyword_is(sql, "explain") {
         return classify_explain(sql);
     }
 
-    if normalized.starts_with("with ") || normalized == "with" {
-        return if contains_data_modifying_cte(sql) {
+    if keyword_is(sql, "with") {
+        let normalized = normalize(sql);
+        return if contains_data_modifying_cte_normalized(&normalized) {
             QueryClass::Write
         } else {
             QueryClass::Unknown
         };
     }
 
-    if is_transaction_control(&normalized) {
+    if is_transaction_control(sql) {
         return QueryClass::TransactionControl;
     }
 
-    if is_session_mutation(&normalized) {
+    if is_session_mutation(sql) {
         return QueryClass::SessionMutation;
     }
 
-    if normalized.starts_with("copy ") {
-        return classify_copy(&normalized);
+    if keyword_is(sql, "copy") {
+        return classify_copy(sql);
     }
 
-    if normalized.starts_with("select") {
-        if contains_data_modifying_cte(sql) || contains_select_side_effects(&normalized) {
+    if keyword_is(sql, "select") {
+        let normalized = normalize(sql);
+        if contains_data_modifying_cte_normalized(&normalized)
+            || contains_select_side_effects(&normalized)
+        {
             return QueryClass::Write;
         }
 
         return QueryClass::ReadCandidate;
     }
 
-    if normalized.starts_with("values") || normalized.starts_with("table ") || normalized == "table"
-    {
+    if keyword_is(sql, "values") || keyword_is(sql, "table") {
         return QueryClass::ReadCandidate;
     }
 
-    if normalized.starts_with("show ") || normalized == "show" {
+    if keyword_is(sql, "show") {
         return QueryClass::ReadCandidate;
     }
 
-    if is_write_statement(&normalized) {
+    if is_write_statement(sql) {
         return QueryClass::Write;
     }
 
@@ -216,10 +223,7 @@ fn classify_single_statement(sql: &str) -> QueryClass {
 }
 
 fn classify_explain(sql: &str) -> QueryClass {
-    let sql = strip_leading_comments_and_whitespace(sql);
-    let normalized = normalize(sql);
-
-    if !normalized.starts_with("explain") {
+    if !keyword_is(sql, "explain") {
         return QueryClass::Unknown;
     }
 
@@ -250,10 +254,10 @@ fn classify_explain(sql: &str) -> QueryClass {
     }
 }
 
-fn classify_copy(normalized: &str) -> QueryClass {
-    if normalized.contains(" from stdin") {
+fn classify_copy(sql: &str) -> QueryClass {
+    if contains_words_ignore_ascii_case(sql, &["from", "stdin"]) {
         QueryClass::Write
-    } else if normalized.contains(" to stdout") {
+    } else if contains_words_ignore_ascii_case(sql, &["to", "stdout"]) {
         QueryClass::ReadCandidate
     } else {
         QueryClass::Write
@@ -272,62 +276,46 @@ fn contains_select_side_effects(normalized: &str) -> bool {
         || normalized.contains("set_config(")
 }
 
-fn is_transaction_control(normalized: &str) -> bool {
-    normalized == "begin"
-        || normalized.starts_with("begin ")
-        || normalized == "commit"
-        || normalized == "rollback"
-        || normalized == "abort"
-        || normalized == "end"
-        || normalized.starts_with("start transaction")
-        || normalized.starts_with("set transaction ")
-        || normalized.starts_with("savepoint ")
-        || normalized.starts_with("release savepoint")
-        || normalized.starts_with("rollback to")
+fn is_transaction_control(sql: &str) -> bool {
+    starts_with_words_ignore_ascii_case(sql, &["begin"])
+        || keyword_is_exact(sql, "commit")
+        || keyword_is_exact(sql, "rollback")
+        || keyword_is_exact(sql, "abort")
+        || keyword_is_exact(sql, "end")
+        || starts_with_words_ignore_ascii_case(sql, &["start", "transaction"])
+        || starts_with_words_ignore_ascii_case(sql, &["set", "transaction"])
+        || keyword_is_followed_by_more(sql, "savepoint")
+        || starts_with_words_ignore_ascii_case(sql, &["release", "savepoint"])
+        || starts_with_words_ignore_ascii_case(sql, &["rollback", "to"])
 }
 
-fn is_session_mutation(normalized: &str) -> bool {
-    normalized.starts_with("set ")
-        || normalized.starts_with("reset ")
-        || normalized.starts_with("discard ")
-        || normalized.starts_with("listen ")
-        || normalized.starts_with("unlisten ")
-        || normalized.starts_with("notify ")
-        || normalized.starts_with("lock ")
-        || normalized.starts_with("declare ")
+fn is_session_mutation(sql: &str) -> bool {
+    keyword_is_followed_by_more(sql, "set")
+        || keyword_is_followed_by_more(sql, "reset")
+        || keyword_is_followed_by_more(sql, "discard")
+        || keyword_is_followed_by_more(sql, "listen")
+        || keyword_is_followed_by_more(sql, "unlisten")
+        || keyword_is_followed_by_more(sql, "notify")
+        || keyword_is_followed_by_more(sql, "lock")
+        || keyword_is_followed_by_more(sql, "declare")
 }
 
-fn is_write_statement(normalized: &str) -> bool {
-    normalized.starts_with("insert ")
-        || normalized == "insert"
-        || normalized.starts_with("update ")
-        || normalized == "update"
-        || normalized.starts_with("delete ")
-        || normalized == "delete"
-        || normalized.starts_with("merge ")
-        || normalized == "merge"
-        || normalized.starts_with("truncate ")
-        || normalized == "truncate"
-        || normalized.starts_with("create ")
-        || normalized == "create"
-        || normalized.starts_with("alter ")
-        || normalized == "alter"
-        || normalized.starts_with("drop ")
-        || normalized == "drop"
-        || normalized.starts_with("call ")
-        || normalized == "call"
-        || normalized.starts_with("do ")
-        || normalized == "do"
-        || normalized.starts_with("vacuum ")
-        || normalized == "vacuum"
-        || normalized.starts_with("analyze ")
-        || normalized == "analyze"
-        || normalized.starts_with("reindex ")
-        || normalized == "reindex"
-        || normalized.starts_with("grant ")
-        || normalized == "grant"
-        || normalized.starts_with("revoke ")
-        || normalized == "revoke"
+fn is_write_statement(sql: &str) -> bool {
+    keyword_is(sql, "insert")
+        || keyword_is(sql, "update")
+        || keyword_is(sql, "delete")
+        || keyword_is(sql, "merge")
+        || keyword_is(sql, "truncate")
+        || keyword_is(sql, "create")
+        || keyword_is(sql, "alter")
+        || keyword_is(sql, "drop")
+        || keyword_is(sql, "call")
+        || keyword_is(sql, "do")
+        || keyword_is(sql, "vacuum")
+        || keyword_is(sql, "analyze")
+        || keyword_is(sql, "reindex")
+        || keyword_is(sql, "grant")
+        || keyword_is(sql, "revoke")
 }
 
 fn split_top_level_statements(sql: &str) -> Vec<&str> {
@@ -470,6 +458,79 @@ fn normalize(sql: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn keyword_is(sql: &str, keyword: &str) -> bool {
+    starts_with_words_ignore_ascii_case(sql, &[keyword])
+}
+
+fn starts_with_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
+    let mut rest = sql;
+    for (index, word) in words.iter().enumerate() {
+        rest = rest.trim_start();
+        let Some(candidate) = rest.get(..word.len()) else {
+            return false;
+        };
+        if !candidate.eq_ignore_ascii_case(word) {
+            return false;
+        }
+        rest = &rest[word.len()..];
+        if index + 1 == words.len() {
+            return rest.is_empty() || rest.chars().next().is_some_and(|c| c.is_whitespace());
+        }
+    }
+
+    true
+}
+
+fn keyword_is_exact(sql: &str, keyword: &str) -> bool {
+    let trimmed = sql.trim_end();
+    let Some(candidate) = trimmed.get(..keyword.len()) else {
+        return false;
+    };
+    candidate.eq_ignore_ascii_case(keyword) && trimmed[keyword.len()..].is_empty()
+}
+
+fn keyword_is_followed_by_more(sql: &str, keyword: &str) -> bool {
+    let rest = sql.trim_start();
+    let Some(candidate) = rest.get(..keyword.len()) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+
+    let rest = &rest[keyword.len()..];
+    rest.chars().next().is_some_and(|c| c.is_whitespace()) && !rest.trim_start().is_empty()
+}
+
+fn contains_words_ignore_ascii_case(sql: &str, words: &[&str]) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+
+    let mut index = 0;
+    while index < sql.len() {
+        let remainder = &sql[index..];
+        let trimmed = remainder.trim_start();
+        index += remainder.len() - trimmed.len();
+
+        if index >= sql.len() {
+            return false;
+        }
+
+        if starts_with_words_ignore_ascii_case(&sql[index..], words) {
+            return true;
+        }
+
+        let token_end = sql[index..]
+            .find(char::is_whitespace)
+            .map(|offset| index + offset)
+            .unwrap_or(sql.len());
+        index = token_end;
+    }
+
+    false
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanState {
     Normal,
@@ -477,4 +538,39 @@ enum ScanState {
     DoubleQuote,
     LineComment,
     BlockComment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classification_matches_for_mixed_case_and_whitespace() {
+        for (sql, expected) in [
+            ("  SELECT 1", QueryClass::ReadCandidate),
+            ("\n\tselect * from t", QueryClass::ReadCandidate),
+            (
+                "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+                QueryClass::Write,
+            ),
+            (
+                "WiTh  x  aS  (uPdAtE t SET a=1) select 1",
+                QueryClass::Write,
+            ),
+            ("EXPLAIN ANALYZE SELECT 1", QueryClass::Unknown),
+            ("BEGIN", QueryClass::TransactionControl),
+        ] {
+            assert_eq!(classify_sql(sql), expected, "sql: {sql}");
+        }
+    }
+
+    #[test]
+    fn normalize_is_not_called_twice_for_selects() {
+        assert!(contains_data_modifying_cte_normalized(
+            "with x as (insert into t values (1)) select 1"
+        ));
+        assert!(!contains_data_modifying_cte_normalized(
+            "with x as (select 1) select * from x"
+        ));
+    }
 }

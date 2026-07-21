@@ -24,6 +24,25 @@ fn classifies_explain_select_as_read_only_candidate() {
 }
 
 #[test]
+fn classifies_mixed_case_and_whitespace_like_existing_queries() {
+    for (sql, expected) in [
+        ("  SELECT 1", QueryClass::ReadCandidate),
+        ("\n\tselect * from t", QueryClass::ReadCandidate),
+        (
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+            QueryClass::Write,
+        ),
+        (
+            "WiTh  x  aS  (uPdAtE t SET a=1) select 1",
+            QueryClass::Write,
+        ),
+        ("BEGIN", QueryClass::TransactionControl),
+    ] {
+        assert_eq!(classify_sql(sql), expected, "sql: {sql}");
+    }
+}
+
+#[test]
 fn classifies_write_and_unsafe_statements() {
     for sql in [
         "INSERT INTO t VALUES (1)",
