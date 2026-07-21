@@ -53,16 +53,22 @@ fn write_auth_users_file(name: &str, contents: &str) -> PathBuf {
 }
 
 fn run_preflight(config: &Path) -> std::process::Output {
-    Command::new(binary_path())
-        .args([
-            "preflight",
-            "--config",
-            config.to_str().expect("config path"),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("run preflight")
+    run_preflight_with_env(config, &[])
+}
+
+fn run_preflight_with_env(config: &Path, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(binary_path());
+    command.args([
+        "preflight",
+        "--config",
+        config.to_str().expect("config path"),
+        "--format",
+        "json",
+    ]);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("run preflight")
 }
 
 fn base_config(listen_addr: &str, backend_addr: &str, extra_sections: &str) -> String {
@@ -408,6 +414,7 @@ fn preflight_redacts_secrets() {
 [auth]
 auth_mode = "scram_sha_256"
 auth_users_file = "{}"
+backend_user = "pool_user"
 backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"
 "#,
                 toml_path(&auth_users_file)
@@ -415,7 +422,10 @@ backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"
         ),
     );
 
-    let output = run_preflight(&config);
+    let output = run_preflight_with_env(
+        &config,
+        &[("PG_KINETIC_BACKEND_PASSWORD", "secret-password")],
+    );
 
     assert!(
         output.status.success(),
@@ -426,4 +436,5 @@ backend_password_env_var_name = "PG_KINETIC_BACKEND_PASSWORD"
     assert!(stdout.contains("\"ok\":true"));
     assert!(!stdout.contains(SCRAM_VERIFIER));
     assert!(!stdout.contains("PG_KINETIC_BACKEND_PASSWORD"));
+    assert!(!stdout.contains("secret-password"));
 }
