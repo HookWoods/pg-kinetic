@@ -6,7 +6,10 @@ use std::{
 use pg_kinetic::{
     config::ObservabilityConfig,
     core::observability::{metric_catalog, LabelPolicy},
-    proxy_runtime::telemetry::{build_otel_tracer_provider, DebugSample, DebugSampler},
+    proxy_runtime::telemetry::{
+        build_otel_tracer_provider, sampled_phase_timing_recorder, DebugSample, DebugSampler,
+        PhaseTimer,
+    },
 };
 
 #[test]
@@ -94,4 +97,15 @@ fn debug_sampling_is_deterministic_and_skips_unsampled_construction() {
             Default::default(),
         ))
         .is_some());
+}
+
+#[test]
+fn disabled_phase_recorder_skips_clock_reads() {
+    use pg_kinetic::core::observability::{MetricOutcome, ProtocolPhase};
+
+    let recorder = sampled_phase_timing_recorder(true, 0.0, 42);
+    assert!(!recorder.is_enabled());
+
+    let timer = PhaseTimer::start(ProtocolPhase::Execute, recorder.as_ref());
+    assert_eq!(timer.finish(MetricOutcome::Ok), std::time::Duration::ZERO);
 }
