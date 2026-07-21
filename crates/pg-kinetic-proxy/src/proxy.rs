@@ -1,4 +1,5 @@
 use std::{
+    io::IoSlice,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -8,7 +9,7 @@ use std::{
 };
 
 use anyhow::Context;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -204,6 +205,56 @@ impl ClientConnection {
             ClientTransport::Plain(stream) => stream.write_all(bytes).await,
             ClientTransport::Tls(stream) => stream.write_all(bytes).await,
         }
+    }
+
+    pub(crate) async fn write_all_vectored(
+        &mut self,
+        slices: &[IoSlice<'_>],
+    ) -> std::io::Result<()> {
+        if slices.is_empty() {
+            return Ok(());
+        }
+
+        let mut slice_index = 0;
+        let mut slice_offset = 0;
+
+        while slice_index < slices.len() {
+            let mut remaining_slices = Vec::with_capacity(slices.len() - slice_index);
+            let first_slice = &slices[slice_index].as_ref()[slice_offset..];
+            remaining_slices.push(IoSlice::new(first_slice));
+            for slice in &slices[slice_index + 1..] {
+                remaining_slices.push(IoSlice::new(slice.as_ref()));
+            }
+
+            let written = match self.inner.as_mut().expect("client stream present") {
+                ClientTransport::Plain(stream) => stream.write_vectored(&remaining_slices).await?,
+                ClientTransport::Tls(stream) => stream.write_vectored(&remaining_slices).await?,
+            };
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write vectored bytes",
+                ));
+            }
+
+            let mut remaining = written;
+            while remaining > 0 {
+                let current_slice_len = slices[slice_index].len() - slice_offset;
+                if remaining < current_slice_len {
+                    slice_offset += remaining;
+                    remaining = 0;
+                } else {
+                    remaining -= current_slice_len;
+                    slice_index += 1;
+                    slice_offset = 0;
+                    if slice_index >= slices.len() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn shutdown(&mut self) -> std::io::Result<()> {
@@ -2938,8 +2989,8 @@ async fn forward_message_cycle(
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
-        buffers.clear_client_write();
         let mut ready = None;
+        let mut forwarded_frames: Vec<([u8; 5], Bytes)> = Vec::new();
         while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
             state.progress.response_started = true;
             if let Some(sqlstate) = frame.sqlstate() {
@@ -2959,28 +3010,35 @@ async fn forward_message_cycle(
                 state.session.mark_failed_transaction();
             }
 
-            buffers.append_backend_frame(frame.tag, &frame.payload);
             if let Some(status) = frame.ready_status() {
                 ready = Some(status);
             }
+            let mut header = [0_u8; 5];
+            header[0] = frame.tag;
+            header[1..].copy_from_slice(&((frame.payload.len() + 4) as i32).to_be_bytes());
+            forwarded_frames.push((header, frame.payload));
         }
 
-        if !buffers.client_write().is_empty()
-            && client.write_all(buffers.client_write()).await.is_err()
-        {
-            buffers.clear_client_write();
-            buffers.trim_empty_buffers();
-            if let Some(status) = ready {
-                rows_timer.finish(MetricOutcome::Canceled);
-                return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
+        if !forwarded_frames.is_empty() {
+            let mut client_write = Vec::with_capacity(forwarded_frames.len() * 2);
+            for (header, payload) in &forwarded_frames {
+                client_write.push(IoSlice::new(header));
+                client_write.push(IoSlice::new(payload.as_ref()));
             }
 
-            rows_timer.finish(MetricOutcome::Canceled);
-            return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
+            if client.write_all_vectored(&client_write).await.is_err() {
+                buffers.trim_empty_buffers();
+                if let Some(status) = ready {
+                    rows_timer.finish(MetricOutcome::Canceled);
+                    return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
+                }
+
+                rows_timer.finish(MetricOutcome::Canceled);
+                return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
+            }
         }
 
         if let Some(status) = ready {
-            buffers.clear_client_write();
             buffers.trim_empty_buffers();
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));

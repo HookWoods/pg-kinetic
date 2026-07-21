@@ -41,6 +41,10 @@ struct BufferCounters {
     allocation_bytes: AtomicU64,
     copies: AtomicU64,
     copied_bytes: AtomicU64,
+    frontend_to_backend_copies: AtomicU64,
+    frontend_to_backend_copied_bytes: AtomicU64,
+    backend_to_client_copies: AtomicU64,
+    backend_to_client_copied_bytes: AtomicU64,
     oversized_buffers_released: AtomicU64,
 }
 
@@ -52,6 +56,10 @@ pub struct ProxyBufferStats {
     pub allocation_bytes: u64,
     pub copies: u64,
     pub copied_bytes: u64,
+    pub frontend_to_backend_copies: u64,
+    pub frontend_to_backend_copied_bytes: u64,
+    pub backend_to_client_copies: u64,
+    pub backend_to_client_copied_bytes: u64,
     pub oversized_buffers_released: u64,
 }
 
@@ -127,6 +135,22 @@ impl ProxyBufferPool {
             allocation_bytes: self.counters.allocation_bytes.load(Ordering::Relaxed),
             copies: self.counters.copies.load(Ordering::Relaxed),
             copied_bytes: self.counters.copied_bytes.load(Ordering::Relaxed),
+            frontend_to_backend_copies: self
+                .counters
+                .frontend_to_backend_copies
+                .load(Ordering::Relaxed),
+            frontend_to_backend_copied_bytes: self
+                .counters
+                .frontend_to_backend_copied_bytes
+                .load(Ordering::Relaxed),
+            backend_to_client_copies: self
+                .counters
+                .backend_to_client_copies
+                .load(Ordering::Relaxed),
+            backend_to_client_copied_bytes: self
+                .counters
+                .backend_to_client_copied_bytes
+                .load(Ordering::Relaxed),
             oversized_buffers_released: self
                 .counters
                 .oversized_buffers_released
@@ -226,7 +250,7 @@ impl SessionBufferSet {
 
     pub fn append_frontend_frame(&mut self, tag: u8, payload: &[u8]) {
         append_frame(&mut self.backend_write, tag, payload);
-        self.record_copy(payload.len());
+        self.record_frontend_copy(payload.len());
         observe_capacity(
             &self.backend_write,
             &mut self.backend_write_capacity,
@@ -236,7 +260,7 @@ impl SessionBufferSet {
 
     pub fn append_backend_frame(&mut self, tag: u8, payload: &[u8]) {
         append_frame(&mut self.client_write, tag, payload);
-        self.record_copy(payload.len());
+        self.record_backend_copy(payload.len());
         observe_capacity(
             &self.client_write,
             &mut self.client_write_capacity,
@@ -323,6 +347,26 @@ impl SessionBufferSet {
         self.counters.copies.fetch_add(1, Ordering::Relaxed);
         self.counters
             .copied_bytes
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+    }
+
+    fn record_frontend_copy(&self, payload_len: usize) {
+        self.record_copy(payload_len);
+        self.counters
+            .frontend_to_backend_copies
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .frontend_to_backend_copied_bytes
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+    }
+
+    fn record_backend_copy(&self, payload_len: usize) {
+        self.record_copy(payload_len);
+        self.counters
+            .backend_to_client_copies
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .backend_to_client_copied_bytes
             .fetch_add(payload_len as u64, Ordering::Relaxed);
     }
 
