@@ -220,10 +220,10 @@ impl ClientConnection {
 
         while slice_index < slices.len() {
             let mut remaining_slices = Vec::with_capacity(slices.len() - slice_index);
-            let first_slice = &slices[slice_index].as_ref()[slice_offset..];
+            let first_slice = &slices[slice_index][slice_offset..];
             remaining_slices.push(IoSlice::new(first_slice));
             for slice in &slices[slice_index + 1..] {
-                remaining_slices.push(IoSlice::new(slice.as_ref()));
+                remaining_slices.push(IoSlice::new(slice));
             }
 
             let written = match self.inner.as_mut().expect("client stream present") {
