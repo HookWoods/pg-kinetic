@@ -131,6 +131,16 @@ impl TestRecorder {
         self.registrations.lock().expect("lock recorder").clear();
     }
 
+    fn histogram_key_count(&self, name: &str) -> usize {
+        let prefix = format!("{name}|");
+        self.registrations
+            .lock()
+            .expect("lock recorder")
+            .keys()
+            .filter(|signature| signature.starts_with(&prefix))
+            .count()
+    }
+
     fn has_metric(&self, name: &str, labels: &[(&str, &str)]) -> bool {
         self.registrations
             .lock()
@@ -267,6 +277,22 @@ async fn route_gate_registry_and_checkout_waits_are_recorded_separately() {
         &[("stage", "route_gate_registry"), ("outcome", "ok")]
     ));
     assert!(recorder.has_metric_stage("pg_kinetic_pool_checkout_wait_ms", "checkout"));
+}
+
+#[test]
+fn route_metric_handles_reuse_registry_entries() {
+    let recorder = install_metrics_recorder();
+    recorder.clear();
+
+    let route = route_key();
+    let handles = pg_kinetic_proxy::metrics::RouteMetricHandles::resolve(&route);
+    handles.route_wait_ok.record(1.0);
+    handles.route_wait_ok.record(2.0);
+
+    assert_eq!(
+        recorder.histogram_key_count("pg_kinetic_route_checkout_wait_ms"),
+        1
+    );
 }
 
 #[tokio::test]

@@ -48,6 +48,43 @@ static PROTOCOL_PHASE_HISTOGRAMS: OnceLock<
     [[OnceLock<metrics_crate::Histogram>; METRIC_OUTCOME_COUNT]; PROTOCOL_PHASE_COUNT],
 > = OnceLock::new();
 
+#[derive(Clone, Debug)]
+pub struct RouteMetricHandles {
+    pub checkout_wait_ok: metrics_crate::Histogram,
+    pub route_wait_ok: metrics_crate::Histogram,
+    pub in_flight: metrics_crate::Gauge,
+    pub waiting: metrics_crate::Gauge,
+}
+
+impl RouteMetricHandles {
+    #[must_use]
+    pub fn resolve(route: &RouteKey) -> Self {
+        let route_label = route.metric_label_shared();
+        Self {
+            checkout_wait_ok: metrics_crate::histogram!(
+                MetricName::PoolCheckoutWaitMs.as_str(),
+                "stage" => "checkout",
+                "outcome" => "ok"
+            ),
+            route_wait_ok: metrics_crate::histogram!(
+                MetricName::RouteCheckoutWaitMs.as_str(),
+                "route" => route_label.clone(),
+                "outcome" => "ok"
+            ),
+            in_flight: metrics_crate::gauge!(
+                MetricName::RouteInFlight.as_str(),
+                "route" => route_label.clone(),
+                "scope" => QueueScope::Route.as_str()
+            ),
+            waiting: metrics_crate::gauge!(
+                MetricName::RouteWaiting.as_str(),
+                "route" => route_label,
+                "scope" => QueueScope::Route.as_str()
+            ),
+        }
+    }
+}
+
 pub fn install(config: MetricsConfig) -> anyhow::Result<()> {
     if let Some(addr) = config.listen_addr {
         PrometheusBuilder::new()

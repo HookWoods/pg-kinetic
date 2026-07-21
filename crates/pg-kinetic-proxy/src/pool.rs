@@ -15,7 +15,7 @@ use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
     backend::Backend,
     config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
-    metrics,
+    metrics::{self, RouteMetricHandles},
     snapshot::{PoolLifecycleSnapshot, PoolSnapshot, SnapshotStore},
 };
 use pg_kinetic_core::{
@@ -32,7 +32,7 @@ pub struct BackendPool {
     socket: SocketConfig,
     reset_query: Arc<str>,
     gate: BackpressureGate,
-    route_gates: StdRwLock<HashMap<PoolKey, BackpressureGate>>,
+    route_gates: StdRwLock<HashMap<PoolKey, RouteGateEntry>>,
     idle: Mutex<VecDeque<Backend>>,
     backend_lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
     backend_available: Notify,
@@ -52,6 +52,12 @@ pub struct BackendPool {
 struct BackendLifecycle {
     created_at: tokio::time::Instant,
     last_released_at: tokio::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+struct RouteGateEntry {
+    gate: BackpressureGate,
+    metrics: RouteMetricHandles,
 }
 
 #[derive(Debug)]
@@ -879,8 +885,10 @@ impl BackendPool {
         }
         metrics::record_pool_checkout(route_gate_lookup_wait_ms, "route_gate_registry", "ok");
         let started = Instant::now();
+        let route_gate_metrics = route_gate.metrics.clone();
+        let route_gate_gate = route_gate.gate.clone();
         let checkout = async {
-            let route_permit = match route_gate.checkout(self.checkout_timeout).await {
+            let route_permit = match route_gate_gate.checkout(self.checkout_timeout).await {
                 Ok(permit) => permit,
                 Err(error) => {
                     metrics::increment_backpressure_event(&route, backpressure_outcome(error));
@@ -907,9 +915,14 @@ impl BackendPool {
                 }
             };
 
-            metrics::record_route_wait(&route, started.elapsed().as_secs_f64() * 1000.0, "ok");
-            metrics::record_route_in_flight(&route, route_gate.in_flight());
-            metrics::record_route_waiting(&route, route_gate.waiting());
+            let wait_ms = started.elapsed().as_secs_f64() * 1000.0;
+            route_gate_metrics.route_wait_ok.record(wait_ms);
+            route_gate_metrics
+                .in_flight
+                .set(route_gate_gate.in_flight() as f64);
+            route_gate_metrics
+                .waiting
+                .set(route_gate_gate.waiting() as f64);
             self.record_backpressure_counts(&route);
 
             if mode == CheckoutMode::PreferConnect && self.reserve_backend_slot() {
@@ -1168,7 +1181,7 @@ impl BackendPool {
         &self.reset_query
     }
 
-    fn route_gate(&self, route: &RouteKey) -> BackpressureGate {
+    fn route_gate(&self, route: &RouteKey) -> RouteGateEntry {
         let pool_key = route.pool_key();
         if let Some(route_gate) = self
             .route_gates
@@ -1183,8 +1196,9 @@ impl BackendPool {
         let mut route_gates = self.route_gates.write().expect("route gates poisoned");
         route_gates
             .entry(pool_key)
-            .or_insert_with(|| {
-                BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters)
+            .or_insert_with(|| RouteGateEntry {
+                gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
+                metrics: RouteMetricHandles::resolve(route),
             })
             .clone()
     }
@@ -1247,8 +1261,8 @@ impl BackendPool {
             metrics::record_backpressure_snapshot(
                 &snapshot_store,
                 route.clone(),
-                route_gate.waiting(),
-                route_gate.in_flight(),
+                route_gate.gate.waiting(),
+                route_gate.gate.in_flight(),
             );
         }
     }
