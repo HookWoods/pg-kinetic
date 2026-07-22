@@ -2191,6 +2191,15 @@ impl Config {
             && self.routes == next.routes
             && self.pools == next.pools
             && self.capacity == next.capacity
+            && self.pool_lifecycle == next.pool_lifecycle
+            && self.performance == next.performance
+            && self.qos.max_route_in_flight == next.qos.max_route_in_flight
+            && self.qos.max_route_waiters == next.qos.max_route_waiters
+            && self.qos.idle_client_timeout_ms == next.qos.idle_client_timeout_ms
+            && self.qos.idle_transaction_timeout_ms == next.qos.idle_transaction_timeout_ms
+            && self.qos.max_client_buffer_bytes == next.qos.max_client_buffer_bytes
+            && self.qos.max_backend_buffer_bytes == next.qos.max_backend_buffer_bytes
+            && self.qos.overload_error_code == next.qos.overload_error_code
             && self.admin == next.admin
             && self.observability == next.observability
             && self.tls.client_tls_mode == next.tls.client_tls_mode
@@ -2838,6 +2847,32 @@ mod tests {
         assert_eq!(config.socket.tcp_send_buffer_bytes, None);
         assert_eq!(config.socket.tcp_recv_buffer_bytes, None);
         assert!(!config.socket.strict_socket_option_mode);
+    }
+
+    #[test]
+    fn reload_compatibility_rejects_restart_required_pool_settings() {
+        let current = Config::default();
+
+        let mut next = current.clone();
+        next.pool_lifecycle.max_size += 1;
+        assert!(!current.is_reload_compatible_with(&next));
+
+        let mut next = current.clone();
+        next.performance.checkout_timeout_ms += 1;
+        assert!(!current.is_reload_compatible_with(&next));
+
+        let mut next = current.clone();
+        next.qos.max_route_in_flight += 1;
+        assert!(!current.is_reload_compatible_with(&next));
+    }
+
+    #[test]
+    fn reload_compatibility_allows_query_timeout_changes() {
+        let current = Config::default();
+        let mut next = current.clone();
+        next.qos.query_timeout_ms += 1;
+
+        assert!(current.is_reload_compatible_with(&next));
     }
 
     #[test]

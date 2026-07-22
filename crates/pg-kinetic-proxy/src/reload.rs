@@ -87,9 +87,9 @@ pub async fn reload_once_with_pools(
     route_pool_registry: Option<&Arc<RoutePoolRegistry>>,
 ) -> anyhow::Result<ReloadDecision> {
     let next_config = load_effective_config(base)?;
-    let current_config = active_config.read().await.clone();
+    let mut current_config = active_config.write().await;
 
-    if next_config == current_config {
+    if next_config == *current_config {
         return Ok(ReloadDecision::Unchanged);
     }
 
@@ -98,7 +98,8 @@ pub async fn reload_once_with_pools(
     }
 
     validate_runtime_assets(&next_config)?;
-    *active_config.write().await = next_config;
+    *current_config = next_config;
+    drop(current_config);
     if let Some(route_pool_registry) = route_pool_registry.filter(|registry| !registry.is_empty()) {
         route_pool_registry.retire_idle_backends().await;
     } else if let Some(route_pools) = route_pools {

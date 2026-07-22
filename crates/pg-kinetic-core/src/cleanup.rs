@@ -7,6 +7,7 @@ pub enum CleanupAction {
     ResetThenReuse,
     KeepPinned,
     RollbackThenReuse,
+    RollbackThenKeepPinned,
     Discard,
 }
 
@@ -25,6 +26,7 @@ impl CleanupAction {
             Self::ResetThenReuse => "reset_then_reuse",
             Self::KeepPinned => "keep_pinned",
             Self::RollbackThenReuse => "rollback_then_reuse",
+            Self::RollbackThenKeepPinned => "rollback_then_keep_pinned",
             Self::Discard => "discard",
         }
     }
@@ -41,7 +43,10 @@ pub fn cleanup_action(
     }
 
     match backend_status {
-        ReadyStatus::FailedTransaction => CleanupAction::RollbackThenReuse,
+        ReadyStatus::FailedTransaction => match mode {
+            PoolMode::Session => CleanupAction::RollbackThenKeepPinned,
+            PoolMode::Transaction => CleanupAction::RollbackThenReuse,
+        },
         ReadyStatus::InTransaction => CleanupAction::KeepPinned,
         ReadyStatus::Idle => match mode {
             PoolMode::Session => CleanupAction::KeepPinned,
@@ -85,6 +90,25 @@ mod tests {
         assert_eq!(
             cleanup_action(&session, ReadyStatus::Idle, PoolMode::Session),
             CleanupAction::Discard
+        );
+    }
+
+    #[test]
+    fn session_mode_rolls_back_failed_transactions_without_releasing_backend() {
+        let mut session = VirtualSession::default();
+        session.mark_failed_transaction();
+
+        assert_eq!(
+            cleanup_action(&session, ReadyStatus::FailedTransaction, PoolMode::Session),
+            CleanupAction::RollbackThenKeepPinned
+        );
+        assert_eq!(
+            cleanup_action(
+                &session,
+                ReadyStatus::FailedTransaction,
+                PoolMode::Transaction
+            ),
+            CleanupAction::RollbackThenReuse
         );
     }
 }

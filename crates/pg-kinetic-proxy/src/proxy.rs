@@ -1914,6 +1914,18 @@ async fn handle_client(
                                 )
                                 .await;
                             }
+                            CleanupAction::RollbackThenKeepPinned => {
+                                execute_simple_query(
+                                    &mut backend,
+                                    "ROLLBACK",
+                                    qos.max_backend_buffer_bytes,
+                                )
+                                .await
+                                .context("rollback failed transaction")?;
+                                session.apply_sql(classify("rollback"));
+                                pinned_backend.mark_pinned(backend.backend_id());
+                                held_backend = Some(backend);
+                            }
                             CleanupAction::Discard => {
                                 clear_pinned_backend(
                                     &mut pinned_backend,
