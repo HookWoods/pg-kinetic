@@ -69,7 +69,7 @@ pub struct PooledBackend {
     backend: Option<Backend>,
     pool: Arc<BackendPool>,
     health: Arc<AtomicBool>,
-    _permit: BackpressurePermit,
+    permit: Option<BackpressurePermit>,
     route_key: RouteKey,
     route_gate: BackpressureGate,
     requires_startup: bool,
@@ -1075,7 +1075,7 @@ impl BackendPool {
                                 backend: Some(backend),
                                 pool: self.clone(),
                                 health: Arc::clone(&self.health),
-                                _permit: BackpressurePermit::join(route_permit, permit),
+                                permit: Some(BackpressurePermit::join(route_permit, permit)),
                                 route_key: checkout_route.clone(),
                                 route_gate: route_gate_gate.clone(),
                                 requires_startup: true,
@@ -1102,7 +1102,7 @@ impl BackendPool {
                     backend: Some(backend),
                     pool: self.clone(),
                     health: Arc::clone(&self.health),
-                    _permit: BackpressurePermit::join(route_permit, permit),
+                    permit: Some(BackpressurePermit::join(route_permit, permit)),
                     route_key: checkout_route.clone(),
                     route_gate: route_gate_gate.clone(),
                     requires_startup: false,
@@ -1120,7 +1120,7 @@ impl BackendPool {
                         backend: Some(backend),
                         pool: self.clone(),
                         health: Arc::clone(&self.health),
-                        _permit: BackpressurePermit::join(route_permit, permit),
+                        permit: Some(BackpressurePermit::join(route_permit, permit)),
                         route_key: checkout_route.clone(),
                         route_gate: route_gate_gate.clone(),
                         requires_startup: true,
@@ -1151,7 +1151,7 @@ impl BackendPool {
                 backend: Some(backend),
                 pool: self.clone(),
                 health: Arc::clone(&self.health),
-                _permit: BackpressurePermit::join(route_permit, permit),
+                permit: Some(BackpressurePermit::join(route_permit, permit)),
                 route_key: checkout_route.clone(),
                 route_gate: route_gate_gate.clone(),
                 requires_startup: false,
@@ -1572,44 +1572,38 @@ impl PooledBackend {
         self.requires_startup
     }
 
-    pub async fn release(self) {
-        let Self {
-            backend,
-            pool,
-            _permit,
-            route_key,
-            route_gate,
-            requires_startup: _,
-            ..
-        } = self;
-
-        if let Some(backend) = backend {
-            backend.mark_idle(Some(route_key.clone()));
-            pool.return_backend(backend).await;
+    pub async fn release(mut self) {
+        if let Some(backend) = self.backend.take() {
+            backend.mark_idle(Some(self.route_key.clone()));
+            self.pool.return_backend(backend).await;
         }
 
-        drop(_permit);
-        pool.record_backpressure_counts(&route_key, &route_gate);
+        self.permit.take();
+        self.pool
+            .record_backpressure_counts(&self.route_key, &self.route_gate);
     }
 
-    pub fn discard(self) {
-        let Self {
-            backend,
-            pool,
-            _permit,
-            route_key,
-            route_gate,
-            requires_startup: _,
-            ..
-        } = self;
-
-        if let Some(backend) = backend {
+    pub fn discard(mut self) {
+        if let Some(backend) = self.backend.take() {
             backend.mark_discarded();
-            pool.discard_backend(backend.id());
+            self.pool.discard_backend(backend.id());
         }
 
-        drop(_permit);
-        pool.record_backpressure_counts(&route_key, &route_gate);
+        self.permit.take();
+        self.pool
+            .record_backpressure_counts(&self.route_key, &self.route_gate);
+    }
+}
+
+impl Drop for PooledBackend {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.take() {
+            backend.mark_discarded();
+            self.pool.discard_backend(backend.id());
+            self.permit.take();
+            self.pool
+                .record_backpressure_counts(&self.route_key, &self.route_gate);
+        }
     }
 }
 

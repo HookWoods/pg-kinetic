@@ -146,6 +146,41 @@ async fn global_capacity_release_wakes_a_different_pool() {
     waiting_accepted.notified().await;
 }
 
+#[tokio::test]
+async fn dropping_held_backend_releases_global_capacity() {
+    let (held_address, held_accepted) = backend_listener().await;
+    let (waiting_address, waiting_accepted) = backend_listener().await;
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let available = Arc::new(tokio::sync::Notify::new());
+    let held_pool = limited_pool(held_address, Arc::clone(&slots), Arc::clone(&available));
+    let waiting_pool = limited_pool(waiting_address, Arc::clone(&slots), Arc::clone(&available));
+    let held_route = RouteKey::new("held-session", "user", None, None, QueryClass::Default);
+    let waiting_route = RouteKey::new("waiting-session", "user", None, None, QueryClass::Default);
+
+    let held_backend = held_pool
+        .checkout_primary(held_route)
+        .await
+        .expect("held session checkout");
+    held_accepted.notified().await;
+
+    let waiting = tokio::spawn(async move {
+        waiting_pool
+            .checkout_primary(waiting_route)
+            .await
+            .expect("checkout after held backend drop")
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!waiting.is_finished());
+
+    drop(held_backend);
+    let waiting_backend = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("drop releases global capacity")
+        .expect("waiting checkout task succeeds");
+    waiting_backend.discard();
+    waiting_accepted.notified().await;
+}
+
 #[test]
 fn unmatched_database_user_has_no_pool_and_duplicate_config_is_rejected() {
     let registry = RoutePoolRegistry::new();
