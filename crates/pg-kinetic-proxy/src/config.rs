@@ -2126,8 +2126,6 @@ impl Config {
             && self.tls.backend_ca_path == next.tls.backend_ca_path
             && self.tls.backend_server_name == next.tls.backend_server_name
             && self.auth.auth_mode == next.auth.auth_mode
-            && self.auth.backend_user == next.auth.backend_user
-            && self.auth.backend_password_env_var_name == next.auth.backend_password_env_var_name
             && self.auth.auth_failure_message_mode == next.auth.auth_failure_message_mode
             && self.reload == next.reload
             && self.drain == next.drain

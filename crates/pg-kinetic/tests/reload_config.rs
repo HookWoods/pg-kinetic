@@ -9,8 +9,8 @@ use std::{
 use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
     proxy_runtime::reload::{
-        load_auth_users, load_client_tls_server_config, load_effective_config, reload_once,
-        validate_runtime_assets, ReloadDecision,
+        load_auth_users, load_backend_credential_provider, load_client_tls_server_config,
+        load_effective_config, reload_once, validate_runtime_assets, ReloadDecision,
     },
 };
 use tokio::sync::RwLock;
@@ -182,6 +182,29 @@ tcp_user_timeout_ms = 3_333
 tcp_send_buffer_bytes = 4_444
 tcp_recv_buffer_bytes = 5_555
 strict_socket_option_mode = true
+"#,
+    )
+}
+
+fn service_auth_file_config(
+    listen_addr: SocketAddr,
+    backend_addr: SocketAddr,
+    backend_user: &str,
+    backend_password_env_var_name: &str,
+) -> String {
+    format!(
+        r#"
+[connection]
+listen_addr = "{listen_addr}"
+backend_addr = "{backend_addr}"
+
+[auth]
+auth_mode = "trust"
+backend_user = "{backend_user}"
+backend_password_env_var_name = "{backend_password_env_var_name}"
+
+[reload]
+reload_enabled = true
 "#,
     )
 }
@@ -361,6 +384,63 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
     assert!(load_client_tls_server_config(&updated_config)
         .expect("tls config")
         .is_some());
+}
+
+#[tokio::test]
+async fn safe_reload_applies_backend_service_credential_source_changes() {
+    let initial_env = "PG_KINETIC_RELOAD_PASSWORD_INITIAL";
+    let rotated_env = "PG_KINETIC_RELOAD_PASSWORD_ROTATED";
+    std::env::set_var(initial_env, "initial-secret");
+    std::env::set_var(rotated_env, "rotated-secret");
+
+    let mut config = base_config();
+    let config_file = write_temp_file(
+        "service-auth-config",
+        ".toml",
+        &service_auth_file_config(
+            "127.0.0.1:6543".parse().expect("listen"),
+            "127.0.0.1:5432".parse().expect("backend"),
+            "proxy_user",
+            initial_env,
+        ),
+    );
+    config.reload.config_file = Some(config_file.clone());
+
+    let effective = load_effective_config(&config).expect("initial load");
+    let active_config = Arc::new(RwLock::new(effective.clone()));
+    let initial_credentials = load_backend_credential_provider(&effective)
+        .expect("initial provider")
+        .expect("initial service auth")
+        .credentials()
+        .expect("initial credentials");
+    assert_eq!(initial_credentials.username(), "proxy_user");
+    assert_eq!(initial_credentials.password(), "initial-secret");
+
+    fs::write(
+        &config_file,
+        service_auth_file_config(
+            "127.0.0.1:6543".parse().expect("listen"),
+            "127.0.0.1:5432".parse().expect("backend"),
+            "proxy_user_rotated",
+            rotated_env,
+        ),
+    )
+    .expect("overwrite config file");
+
+    let decision = reload_once(&config, &active_config).await.expect("reload");
+
+    assert_eq!(decision, ReloadDecision::Applied);
+    let updated_config = active_config.read().await.clone();
+    let rotated_credentials = load_backend_credential_provider(&updated_config)
+        .expect("rotated provider")
+        .expect("rotated service auth")
+        .credentials()
+        .expect("rotated credentials");
+    assert_eq!(rotated_credentials.username(), "proxy_user_rotated");
+    assert_eq!(rotated_credentials.password(), "rotated-secret");
+
+    std::env::remove_var(initial_env);
+    std::env::remove_var(rotated_env);
 }
 
 #[tokio::test]

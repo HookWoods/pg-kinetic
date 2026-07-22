@@ -430,6 +430,13 @@ impl RoutePools {
             }
         }
     }
+
+    pub async fn retire_idle_backends(&self) {
+        self.primary.inner.pool.retire_idle_backends().await;
+        for replica in &self.replicas {
+            replica.inner.pool.retire_idle_backends().await;
+        }
+    }
 }
 
 impl RoutePoolRegistry {
@@ -1210,6 +1217,30 @@ impl BackendPool {
         }
         self.idle_backends
             .store(self.idle.lock().await.len(), Ordering::Release);
+        self.backend_available.notify_waiters();
+        self.sync_pool_snapshot();
+    }
+
+    pub async fn retire_idle_backends(&self) {
+        let mut idle = self.idle.lock().await;
+        let retired: Vec<_> = idle.drain(..).collect();
+        drop(idle);
+
+        for backend in retired {
+            backend.mark_discarded();
+            self.backend_lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .remove(&backend.id());
+            self.backend_global_permits
+                .lock()
+                .expect("backend global permits poisoned")
+                .remove(&backend.id());
+            self.active_backends.fetch_sub(1, Ordering::AcqRel);
+            metrics::record_pool_eviction("reload");
+        }
+
+        self.idle_backends.store(0, Ordering::Release);
         self.backend_available.notify_waiters();
         self.sync_pool_snapshot();
     }

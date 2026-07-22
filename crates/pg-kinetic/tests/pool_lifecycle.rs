@@ -99,3 +99,19 @@ async fn minimum_idle_connections_are_preserved() {
 
     assert_eq!(pool.idle_count(), 1);
 }
+
+#[tokio::test]
+async fn reload_retirement_discards_idle_backends() {
+    let address = backend_listener().await;
+    let pool = pool(address, lifecycle(2, 0, 0));
+    let backend = pool.checkout(route_key()).await.expect("checkout backend");
+    backend.release().await;
+
+    assert_eq!(pool.idle_count(), 1);
+    assert_eq!(pool.active_count(), 1);
+
+    pool.retire_idle_backends().await;
+
+    assert_eq!(pool.idle_count(), 0);
+    assert_eq!(pool.active_count(), 0);
+}

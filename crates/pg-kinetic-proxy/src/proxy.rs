@@ -312,7 +312,6 @@ pub(crate) struct ShardContext {
     pub client_slots: Arc<Semaphore>,
     pub lifecycle: LifecycleController,
     pub buffer_pool: ProxyBufferPool,
-    pub backend_credentials: Option<Arc<auth::BackendCredentials>>,
     pub mirror_dispatcher: Arc<MirrorDispatcher>,
     pub routing_planner: ReadRoutingPlanner,
     pub reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
@@ -326,7 +325,6 @@ pub(crate) struct ShardContext {
 
 struct ProxyRuntimeState {
     effective_config: Config,
-    backend_credentials: Option<Arc<auth::BackendCredentials>>,
     phase_metrics_enabled: bool,
     phase_timing_sample_rate: f64,
     reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
@@ -337,6 +335,12 @@ struct ProxyRuntimeState {
     mirror_dispatcher: Arc<MirrorDispatcher>,
     route_pools: Arc<RoutePools>,
     routing_planner: ReadRoutingPlanner,
+}
+
+fn session_backend_credentials(
+    config: &Config,
+) -> anyhow::Result<Option<Arc<auth::BackendCredentials>>> {
+    auth::load_backend_credentials(&config.auth).map(|credentials| credentials.map(Arc::new))
 }
 
 impl Proxy {
@@ -402,6 +406,7 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
+            Arc::clone(&state.route_pools),
             &state.route_config,
             Arc::clone(&drain),
             self.lifecycle.clone(),
@@ -422,7 +427,6 @@ impl Proxy {
             client_slots: Arc::clone(&self.client_slots),
             lifecycle: self.lifecycle.clone(),
             buffer_pool: self.buffer_pool.clone(),
-            backend_credentials: state.backend_credentials.clone(),
             mirror_dispatcher: Arc::clone(&state.mirror_dispatcher),
             routing_planner: state.routing_planner,
             reject_phase_recorder: Arc::clone(&state.reject_phase_recorder),
@@ -502,18 +506,12 @@ impl Proxy {
             let startup_tx = startup_tx.clone();
             let shard_result_tx = shard_result_tx.clone();
             let shutdown_completion = shutdown_completion_rx.clone();
-            let route_pools = Arc::new(build_route_pools(
-                &state.effective_config,
-                &state.route_config,
-                self.snapshot_store.clone(),
-                Some(Arc::clone(&self.backend_slots)),
-            ));
+            let route_pools = Arc::clone(&state.route_pools);
             let active_config = Arc::clone(&state.active_config);
             let snapshot_store = self.snapshot_store.clone();
             let client_slots = Arc::clone(&self.client_slots);
             let lifecycle = self.lifecycle.clone();
             let buffer_pool = self.buffer_pool.clone();
-            let backend_credentials = state.backend_credentials.clone();
             let mirror_dispatcher = Arc::clone(&state.mirror_dispatcher);
             let routing_planner = state.routing_planner;
             let reject_phase_recorder = Arc::clone(&state.reject_phase_recorder);
@@ -582,7 +580,6 @@ impl Proxy {
                             client_slots,
                             lifecycle,
                             buffer_pool,
-                            backend_credentials,
                             mirror_dispatcher,
                             routing_planner,
                             reject_phase_recorder,
@@ -635,6 +632,7 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
+            Arc::clone(&state.route_pools),
             &state.route_config,
             Arc::clone(&drain),
             self.lifecycle.clone(),
@@ -729,8 +727,6 @@ impl Proxy {
     async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
-        let backend_credentials =
-            auth::load_backend_credentials(&effective_config.auth)?.map(Arc::new);
         self.lifecycle.configure(
             effective_config.drain.drain_timeout(),
             effective_config.runtime.lifecycle.shutdown_grace(),
@@ -781,7 +777,6 @@ impl Proxy {
 
         Ok(ProxyRuntimeState {
             effective_config,
-            backend_credentials,
             phase_metrics_enabled,
             phase_timing_sample_rate,
             reject_phase_recorder,
@@ -852,6 +847,7 @@ async fn run_control_plane(
     effective_config: &Config,
     base_config: Config,
     active_config: Arc<RwLock<Config>>,
+    route_pools: Arc<RoutePools>,
     route_config: &RouteConfig,
     drain: Arc<DrainController>,
     lifecycle: LifecycleController,
@@ -895,7 +891,7 @@ async fn run_control_plane(
         let reload_config = effective_config.reload.clone();
         let active_config = Arc::clone(&active_config);
         Some(tokio::spawn(async move {
-            reload::spawn_reload_loop(base_config, reload_config, active_config).await;
+            reload::spawn_reload_loop(base_config, reload_config, active_config, route_pools).await;
         }))
     } else {
         None
@@ -1098,7 +1094,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
 
                 let mirror_dispatcher = Arc::clone(&ctx.mirror_dispatcher);
                 let buffer_pool = ctx.buffer_pool.clone();
-                let backend_credentials = ctx.backend_credentials.clone();
+                let backend_credentials = session_backend_credentials(&config_snapshot)?;
                 let routing_planner = ctx.routing_planner;
                 let debug_sampler = ctx.debug_sampler;
 

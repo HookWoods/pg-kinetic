@@ -12,6 +12,7 @@ use crate::{
     auth,
     config::{ClientTlsMode, Config, PolicyConfig, ReloadConfig},
     policy::{PolicyReloadResult, PolicyStore},
+    pool::RoutePools,
     sharding::RouteMapReloadResult,
     snapshot::{PolicyReloadSnapshot, RouteMapReloadSnapshot, SnapshotStore},
     tls,
@@ -76,6 +77,14 @@ pub async fn reload_once(
     base: &Config,
     active_config: &Arc<RwLock<Config>>,
 ) -> anyhow::Result<ReloadDecision> {
+    reload_once_with_pools(base, active_config, None).await
+}
+
+pub async fn reload_once_with_pools(
+    base: &Config,
+    active_config: &Arc<RwLock<Config>>,
+    route_pools: Option<&Arc<RoutePools>>,
+) -> anyhow::Result<ReloadDecision> {
     let next_config = load_effective_config(base)?;
     let current_config = active_config.read().await.clone();
 
@@ -89,6 +98,9 @@ pub async fn reload_once(
 
     validate_runtime_assets(&next_config)?;
     *active_config.write().await = next_config;
+    if let Some(route_pools) = route_pools {
+        route_pools.retire_idle_backends().await;
+    }
     Ok(ReloadDecision::Applied)
 }
 
@@ -117,6 +129,7 @@ pub async fn spawn_reload_loop(
     base: Config,
     reload_config: ReloadConfig,
     active_config: Arc<RwLock<Config>>,
+    route_pools: Arc<RoutePools>,
 ) {
     if base.reload.config_file.is_none() {
         return;
@@ -128,7 +141,7 @@ pub async fn spawn_reload_loop(
 
     loop {
         ticker.tick().await;
-        match reload_once(&base, &active_config).await {
+        match reload_once_with_pools(&base, &active_config, Some(&route_pools)).await {
             Ok(ReloadDecision::Applied) => {
                 metrics_crate::counter!("pg_kinetic_config_reload_total", "outcome" => "applied")
                     .increment(1);

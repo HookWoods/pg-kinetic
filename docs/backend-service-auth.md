@@ -68,7 +68,12 @@ Choose a minimally privileged PostgreSQL role for `backend_user`. If PostgreSQL 
 
 ## Rotation And Troubleshooting
 
-Rotate the injected secret, then discard or recycle idle pooled backends. New backend connections read the current environment value through `EnvironmentCredentialProvider`; existing checked-out sessions retain their established PostgreSQL authentication until they are released or discarded. The secret value is never logged.
+Rotate the injected secret and reload configuration when the service user or
+environment-variable name changes. A successful reload accepts those credential
+source changes and retires idle pooled backends so new backend connections read
+the current value through `EnvironmentCredentialProvider`. Existing checked-out
+sessions retain their established PostgreSQL authentication until they are
+released or discarded. The secret value is never logged.
 
 - `auth.backend_user requires auth.backend_password_env_var_name`: configure the password source too.
 - `auth.backend_user and auth.backend_password_env_var_name are incompatible with auth_mode=pass_through`: select local `trust` or `scram_sha_256`, or remove service credentials.
