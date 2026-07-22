@@ -167,6 +167,7 @@ async fn handle_session(
     {
         StartupRead::Packet(packet) => packet,
         StartupRead::ClientClosed => return Ok(()),
+        StartupRead::Cancel { .. } => return Ok(()),
         StartupRead::TimedOut => {
             error_response_and_ready(
                 client,

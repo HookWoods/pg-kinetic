@@ -42,6 +42,7 @@ impl From<FrontendTag> for u8 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendTag {
     Authentication,
+    BackendKeyData,
     CommandComplete,
     DataRow,
     ErrorResponse,
@@ -53,6 +54,7 @@ impl From<BackendTag> for u8 {
     fn from(tag: BackendTag) -> Self {
         match tag {
             BackendTag::Authentication => b'R',
+            BackendTag::BackendKeyData => b'K',
             BackendTag::CommandComplete => b'C',
             BackendTag::DataRow => b'D',
             BackendTag::ErrorResponse => b'E',

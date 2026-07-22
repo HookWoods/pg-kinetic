@@ -59,6 +59,16 @@ pub fn encode_parameter_status(name: &str, value: &str) -> BytesMut {
 }
 
 #[must_use]
+pub fn encode_backend_key_data(process_id: i32, secret_key: i32) -> BytesMut {
+    let mut frame = BytesMut::with_capacity(13);
+    frame.put_u8(u8::from(BackendTag::BackendKeyData));
+    frame.put_i32(12);
+    frame.put_i32(process_id);
+    frame.put_i32(secret_key);
+    frame
+}
+
+#[must_use]
 pub fn parse_parameter_status(payload: &[u8]) -> Option<(String, String)> {
     let mut parts = payload.split(|byte| *byte == 0);
     let name = parts.next()?;
@@ -160,6 +170,12 @@ mod tests {
             parse_parameter_status(&frame[5..]),
             Some((String::from("server_version"), String::from("16.4")))
         );
+    }
+
+    #[test]
+    fn backend_key_data_encodes_wire_frame() {
+        let frame = encode_backend_key_data(7, 9);
+        assert_eq!(&frame[..], &[b'K', 0, 0, 0, 12, 0, 0, 0, 7, 0, 0, 0, 9]);
     }
 
     #[test]

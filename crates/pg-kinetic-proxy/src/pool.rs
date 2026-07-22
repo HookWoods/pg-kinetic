@@ -1432,6 +1432,13 @@ impl PooledBackend {
             .id()
     }
 
+    #[must_use]
+    pub fn backend(&self) -> &Backend {
+        self.backend
+            .as_ref()
+            .expect("pooled backend exists until release")
+    }
+
     pub fn backend_mut(&mut self) -> &mut Backend {
         self.backend
             .as_mut()

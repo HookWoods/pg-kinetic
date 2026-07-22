@@ -29,6 +29,7 @@ use crate::{
     adaptive::AdaptiveController,
     admin, auth,
     buffers::{ProxyBufferPool, SessionBufferSet},
+    cancel,
     config::{Config, RouteConfig},
     drain::DrainController,
     health,
@@ -79,8 +80,8 @@ use pg_kinetic_core::{
 };
 use pg_kinetic_wire::{
     backend::{
-        build_error_response, encode_parameter_status, parse_backend_frame, parse_parameter_status,
-        BackendFrame, ReadyStatus,
+        build_error_response, encode_backend_key_data, encode_parameter_status,
+        parse_backend_frame, parse_parameter_status, BackendFrame, ReadyStatus,
     },
     error::WireError,
     frame::{parse_frontend_frame, FrontendFrame},
@@ -297,6 +298,7 @@ pub struct Proxy {
     backend_slots: Arc<Semaphore>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
+    cancel_registry: Arc<cancel::CancelRegistry>,
 }
 
 struct ControlPlaneHandles {
@@ -317,6 +319,7 @@ pub(crate) struct ShardContext {
     pub buffer_pool: ProxyBufferPool,
     pub mirror_dispatcher: Arc<MirrorDispatcher>,
     pub routing_planner: ReadRoutingPlanner,
+    pub cancel_registry: Arc<cancel::CancelRegistry>,
     pub reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     pub debug_sampler: DebugSampler,
     pub phase_metrics_enabled: bool,
@@ -367,6 +370,7 @@ impl Proxy {
             backend_slots,
             lifecycle,
             snapshot_store,
+            cancel_registry: Arc::new(cancel::CancelRegistry::default()),
         }
     }
 
@@ -432,6 +436,7 @@ impl Proxy {
             buffer_pool: self.buffer_pool.clone(),
             mirror_dispatcher: Arc::clone(&state.mirror_dispatcher),
             routing_planner: state.routing_planner,
+            cancel_registry: Arc::clone(&self.cancel_registry),
             reject_phase_recorder: Arc::clone(&state.reject_phase_recorder),
             debug_sampler: state.debug_sampler,
             phase_metrics_enabled: state.phase_metrics_enabled,
@@ -517,6 +522,7 @@ impl Proxy {
             let buffer_pool = self.buffer_pool.clone();
             let mirror_dispatcher = Arc::clone(&state.mirror_dispatcher);
             let routing_planner = state.routing_planner;
+            let cancel_registry = Arc::clone(&self.cancel_registry);
             let reject_phase_recorder = Arc::clone(&state.reject_phase_recorder);
             let debug_sampler = state.debug_sampler;
             let phase_metrics_enabled = state.phase_metrics_enabled;
@@ -585,6 +591,7 @@ impl Proxy {
                             buffer_pool,
                             mirror_dispatcher,
                             routing_planner,
+                            cancel_registry,
                             reject_phase_recorder,
                             debug_sampler,
                             phase_metrics_enabled,
@@ -1100,6 +1107,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                 let backend_credentials = session_backend_credentials(&config_snapshot)?;
                 let routing_planner = ctx.routing_planner;
                 let debug_sampler = ctx.debug_sampler;
+                let cancel_registry = Arc::clone(&ctx.cancel_registry);
 
                 client_tasks.spawn(async move {
                     let _client_guard = client_guard;
@@ -1117,6 +1125,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                         mirror_dispatcher,
                         buffer_pool,
                         backend_credentials,
+                        cancel_registry,
                     )
                     .await;
                     drop(permit);
@@ -1172,6 +1181,7 @@ async fn handle_client(
     mirror_dispatcher: Arc<MirrorDispatcher>,
     buffer_pool: ProxyBufferPool,
     backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    cancel_registry: Arc<cancel::CancelRegistry>,
 ) -> anyhow::Result<()> {
     let mut session_buffer_lease = buffer_pool.acquire();
     let session_buffers = session_buffer_lease.buffers_mut();
@@ -1246,12 +1256,26 @@ async fn handle_client(
             record_buffer_limit(BufferBudgetKind::Client);
             return Ok(());
         }
+        Ok(StartupRead::Cancel {
+            process_id,
+            secret_key,
+        }) => {
+            startup_timer.finish(MetricOutcome::Canceled);
+            if let Some(target) = cancel_registry.lookup((process_id, secret_key)) {
+                if let Err(error) = cancel::forward_cancel(target).await {
+                    tracing::debug!(%error, "cancel forwarding failed");
+                }
+            }
+            return Ok(());
+        }
         Err(error) => {
             startup_timer.finish(MetricOutcome::Error);
             return Err(error);
         }
     };
     session_buffers.observe_client_read();
+    let client_key = cancel_registry.issue_client_key()?;
+    let _cancel_session = CancelSessionGuard::new(Arc::clone(&cancel_registry), client_key);
 
     let (route_database, route_user, mut route_application_name) =
         startup_route_key(&startup_packet)?;
@@ -1372,6 +1396,7 @@ async fn handle_client(
         backend_credentials.as_deref(),
         session_buffers,
         phase_recorder.as_ref(),
+        client_key,
     )
     .await
     {
@@ -1543,6 +1568,7 @@ async fn handle_client(
                         Err(CheckoutFailure::Fatal(error)) => return Err(error),
                     }
                 };
+                bind_cancel_target(cancel_registry.as_ref(), client_key, &backend);
 
                 let replay =
                     if should_replay_session(&session, &pinned_backend, backend.backend_id()) {
@@ -1631,7 +1657,11 @@ async fn handle_client(
                     }
 
                     backend.mark_failed();
-                    backend.discard();
+                    discard_backend_with_cancel_unbind(
+                        cancel_registry.as_ref(),
+                        client_key,
+                        backend,
+                    );
                     let Ok(replacement) = checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
                         route: route.clone(),
@@ -1653,6 +1683,7 @@ async fn handle_client(
                         return Ok(());
                     };
                     backend = replacement;
+                    bind_cancel_target(cancel_registry.as_ref(), client_key, &backend);
                     retry_attempted = true;
                 };
 
@@ -1713,7 +1744,12 @@ async fn handle_client(
                                     &snapshot_store,
                                     session_id,
                                 );
-                                backend.release().await;
+                                release_backend_with_cancel_unbind(
+                                    cancel_registry.as_ref(),
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
                             }
                             CleanupAction::ResetThenReuse => {
                                 let reset_timer = PhaseTimer::start(
@@ -1733,7 +1769,12 @@ async fn handle_client(
                                     &snapshot_store,
                                     session_id,
                                 );
-                                backend.release().await;
+                                release_backend_with_cancel_unbind(
+                                    cancel_registry.as_ref(),
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
                             }
                             CleanupAction::KeepPinned => {
                                 if let Some(reason) = session.pin_reason() {
@@ -1777,7 +1818,12 @@ async fn handle_client(
                                     &snapshot_store,
                                     session_id,
                                 );
-                                backend.release().await;
+                                release_backend_with_cancel_unbind(
+                                    cancel_registry.as_ref(),
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
                             }
                             CleanupAction::Discard => {
                                 clear_pinned_backend(
@@ -1785,7 +1831,11 @@ async fn handle_client(
                                     &snapshot_store,
                                     session_id,
                                 );
-                                backend.discard();
+                                discard_backend_with_cancel_unbind(
+                                    cancel_registry.as_ref(),
+                                    client_key,
+                                    backend,
+                                );
                             }
                         }
 
@@ -1810,22 +1860,39 @@ async fn handle_client(
                         .context("recover abandoned response")?;
                         clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
                         if reused {
-                            backend.release().await;
+                            release_backend_with_cancel_unbind(
+                                cancel_registry.as_ref(),
+                                client_key,
+                                backend,
+                            )
+                            .await;
                         } else {
-                            backend.discard();
+                            discard_backend_with_cancel_unbind(
+                                cancel_registry.as_ref(),
+                                client_key,
+                                backend,
+                            );
                         }
                         return Ok(());
                     }
                     Ok(Ok(ForwardOutcome::BufferLimitExceeded)) => {
                         clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
-                        backend.discard();
+                        discard_backend_with_cancel_unbind(
+                            cancel_registry.as_ref(),
+                            client_key,
+                            backend,
+                        );
                         return Ok(());
                     }
                     Ok(Err(error)) => {
                         if let Some(kind) = buffer_limit_kind(&error) {
                             record_buffer_limit(kind);
                             clear_pinned_backend(&mut pinned_backend, &snapshot_store, session_id);
-                            backend.discard();
+                            discard_backend_with_cancel_unbind(
+                                cancel_registry.as_ref(),
+                                client_key,
+                                backend,
+                            );
                             return Ok(());
                         }
 
@@ -1842,13 +1909,18 @@ async fn handle_client(
                                 .await?;
                             }
                         }
-                        backend.discard();
+                        discard_backend_with_cancel_unbind(
+                            cancel_registry.as_ref(),
+                            client_key,
+                            backend,
+                        );
                         if error.downcast_ref::<BackendFailure>().is_some() {
                             return Ok(());
                         }
                         return Err(error).with_context(|| format!("proxy client {client_addr}"));
                     }
                     Err(_) => {
+                        cancel_registry.unbind(client_key);
                         let continue_client = handle_query_timeout(
                             &mut client,
                             &performance,
@@ -1876,6 +1948,7 @@ async fn handle_client(
             }
             ClientCycle::Terminate => {
                 if let Some(backend) = held_backend.take() {
+                    cancel_registry.unbind(client_key);
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -1896,6 +1969,7 @@ async fn handle_client(
             }
             ClientCycle::IdleTimeout(kind) => {
                 if let Some(backend) = held_backend.take() {
+                    cancel_registry.unbind(client_key);
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -1925,6 +1999,7 @@ async fn handle_client(
             ClientCycle::BufferLimitExceeded => {
                 record_buffer_limit(BufferBudgetKind::Client);
                 if let Some(backend) = held_backend.take() {
+                    cancel_registry.unbind(client_key);
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -3080,6 +3155,58 @@ struct QueryProgress {
     response_started: bool,
 }
 
+struct CancelSessionGuard {
+    registry: Arc<cancel::CancelRegistry>,
+    key: (i32, i32),
+}
+
+impl CancelSessionGuard {
+    fn new(registry: Arc<cancel::CancelRegistry>, key: (i32, i32)) -> Self {
+        Self { registry, key }
+    }
+}
+
+impl Drop for CancelSessionGuard {
+    fn drop(&mut self) {
+        self.registry.remove_session(self.key);
+    }
+}
+
+fn bind_cancel_target(
+    registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    backend: &PooledBackend,
+) {
+    if let Some((process_id, secret_key)) = backend.backend().key_data() {
+        registry.bind(
+            client_key,
+            cancel::CancelTarget {
+                backend_addr: backend.backend().addr(),
+                process_id,
+                secret_key,
+            },
+        );
+    }
+}
+
+async fn release_backend_with_cancel_unbind(
+    registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    backend: PooledBackend,
+) {
+    registry.unbind(client_key);
+    backend.release().await;
+}
+
+fn discard_backend_with_cancel_unbind(
+    registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    backend: PooledBackend,
+) {
+    registry.unbind(client_key);
+    backend.discard();
+}
+
 pub(crate) async fn read_startup_packet(
     client: &mut ClientConnection,
     client_tls_mode: crate::config::ClientTlsMode,
@@ -3165,8 +3292,14 @@ async fn read_startup_packet_with_buffer(
                 Ok(StartupPacket::Startup { .. }) if client_tls_required && !client.is_tls() => {
                     anyhow::bail!("client TLS is required");
                 }
-                Ok(StartupPacket::CancelRequest { .. }) => {
-                    anyhow::bail!("cancel requests are not supported during startup");
+                Ok(StartupPacket::CancelRequest {
+                    process_id,
+                    secret_key,
+                }) => {
+                    return Ok(StartupRead::Cancel {
+                        process_id,
+                        secret_key,
+                    });
                 }
                 Ok(StartupPacket::Startup { .. }) => return Ok(StartupRead::Packet(packet)),
                 Err(error) => return Err(error).context("parse startup packet"),
@@ -3223,6 +3356,7 @@ async fn reject_startup_encryption_request(client: &mut ClientConnection) -> any
 #[derive(Debug)]
 pub(crate) enum StartupRead {
     Packet(BytesMut),
+    Cancel { process_id: i32, secret_key: i32 },
     ClientClosed,
     TimedOut,
     BufferLimitExceeded,
@@ -3240,11 +3374,13 @@ async fn proxy_startup(
     backend_credentials: Option<&auth::BackendCredentials>,
     buffers: &mut SessionBufferSet,
     _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+    client_key: (i32, i32),
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
         let startup_response = synthetic_startup_ready(
             emit_auth_ok_when_backend_requires_no_startup,
             backend.backend_mut().parameter_status(),
+            client_key,
         );
         client
             .write_all(&startup_response)
@@ -3266,6 +3402,7 @@ async fn proxy_startup(
         .cloned()
         .map(auth::BackendAuthSession::new)
         .transpose()?;
+    let mut sent_backend_key_data = false;
     loop {
         if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
@@ -3344,6 +3481,21 @@ async fn proxy_startup(
                 }
             } else {
                 capture_backend_parameter_status(backend, &frame);
+                if capture_backend_key_data(backend, &frame) {
+                    client
+                        .write_all(&encode_backend_key_data(client_key.0, client_key.1))
+                        .await
+                        .context("write synthetic backend key data")?;
+                    sent_backend_key_data = true;
+                    continue;
+                }
+                if frame.ready_status().is_some() && !sent_backend_key_data {
+                    client
+                        .write_all(&encode_backend_key_data(client_key.0, client_key.1))
+                        .await
+                        .context("write synthetic backend key data")?;
+                    sent_backend_key_data = true;
+                }
                 client
                     .write_all(&encode_backend_frame(&frame))
                     .await
@@ -3405,6 +3557,7 @@ async fn bootstrap_backend(
                 }
             } else {
                 capture_backend_parameter_status(backend, &frame);
+                capture_backend_key_data(backend, &frame);
             }
 
             if frame.ready_status() == Some(ReadyStatus::Idle) {
@@ -3432,6 +3585,7 @@ fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
 fn synthetic_startup_ready(
     include_authentication_ok: bool,
     parameter_status: &[(String, String)],
+    client_key: (i32, i32),
 ) -> BytesMut {
     let mut bytes = BytesMut::new();
     if include_authentication_ok {
@@ -3442,6 +3596,7 @@ fn synthetic_startup_ready(
     for (name, value) in parameter_status {
         bytes.extend_from_slice(&encode_parameter_status(name, value));
     }
+    bytes.extend_from_slice(&encode_backend_key_data(client_key.0, client_key.1));
     let ready = ready_for_query_idle();
     bytes.extend_from_slice(&ready);
     bytes
@@ -3455,6 +3610,22 @@ fn capture_backend_parameter_status(backend: &mut PooledBackend, frame: &Backend
     if let Some((name, value)) = parse_parameter_status(&frame.payload) {
         backend.backend_mut().push_parameter_status(name, value);
     }
+}
+
+fn capture_backend_key_data(backend: &mut PooledBackend, frame: &BackendFrame) -> bool {
+    if frame.tag != u8::from(BackendTag::BackendKeyData) {
+        return false;
+    }
+
+    if frame.payload.len() == 8 {
+        let process_id =
+            i32::from_be_bytes(frame.payload[0..4].try_into().expect("process id bytes"));
+        let secret_key =
+            i32::from_be_bytes(frame.payload[4..8].try_into().expect("secret key bytes"));
+        backend.backend_mut().set_key_data(process_id, secret_key);
+    }
+
+    true
 }
 
 fn ready_for_query_idle() -> BytesMut {

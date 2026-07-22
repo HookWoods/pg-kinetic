@@ -34,6 +34,7 @@ pub struct Backend {
     connected_at: Instant,
     snapshot_store: Option<SnapshotStore>,
     parameter_status: Vec<(String, String)>,
+    key_data: Option<(i32, i32)>,
 }
 
 impl Backend {
@@ -68,6 +69,7 @@ impl Backend {
                 connected_at: Instant::now(),
                 snapshot_store: None,
                 parameter_status: Vec::new(),
+                key_data: None,
             });
         }
 
@@ -108,6 +110,7 @@ impl Backend {
             connected_at: Instant::now(),
             snapshot_store: None,
             parameter_status: Vec::new(),
+            key_data: None,
         })
     }
 
@@ -163,6 +166,15 @@ impl Backend {
         } else {
             self.parameter_status.push((name, value));
         }
+    }
+
+    #[must_use]
+    pub const fn key_data(&self) -> Option<(i32, i32)> {
+        self.key_data
+    }
+
+    pub fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.key_data = Some((process_id, secret_key));
     }
 
     fn publish_snapshot(&self, state: &'static str, route_key: Option<RouteKey>) {
