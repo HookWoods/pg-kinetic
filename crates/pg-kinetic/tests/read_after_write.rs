@@ -372,6 +372,7 @@ async fn spawn_proxy(
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 1_000,
             backend_reset_query: String::from("DISCARD ALL"),

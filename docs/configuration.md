@@ -82,6 +82,7 @@ If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 | `pool_idle_timeout_ms` | milliseconds | `1800000` | `--pool-idle-timeout-ms` | `PG_KINETIC_POOL_IDLE_TIMEOUT_MS` | restart | Idle backends older than this bound are eligible for reaping. `0` disables the bound. |
 | `pool_max_lifetime_ms` | milliseconds | `0` | `--pool-max-lifetime-ms` | `PG_KINETIC_POOL_MAX_LIFETIME_MS` | restart | Idle backends older than this lifetime are eligible for reaping. `0` disables the bound. |
 | `performance.checkout_timeout_ms` | milliseconds | `1000` | `--checkout-timeout-ms` | `PG_KINETIC_CHECKOUT_TIMEOUT_MS` | restart | Backend checkout times out after this duration. |
+| `performance.pool_mode` | enum | `transaction` | `--pool-mode` | `PG_KINETIC_POOL_MODE` | restart | Values are `transaction` and `session`. Session mode dedicates a checked-out backend to a client until disconnect. |
 | `performance.recovery_mode` | enum | `recover` | `--recovery-mode` | `PG_KINETIC_RECOVERY_MODE` | restart | Invalid enum fails parse. Values: `recover`, `rollback_only`, `drop`. |
 | `performance.recovery_timeout_ms` | milliseconds | `5000` | `--recovery-timeout-ms` | `PG_KINETIC_RECOVERY_TIMEOUT_MS` | restart | Recovery exceeding this duration discards the backend. |
 | `performance.backend_reset_query` | string | `DISCARD ALL` | `--backend-reset-query` | `PG_KINETIC_BACKEND_RESET_QUERY` | restart | Invalid SQL fails at backend execution time. |

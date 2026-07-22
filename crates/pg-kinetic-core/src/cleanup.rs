@@ -10,6 +10,13 @@ pub enum CleanupAction {
     Discard,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PoolMode {
+    #[default]
+    Transaction,
+    Session,
+}
+
 impl CleanupAction {
     #[must_use]
     pub const fn metric_label(self) -> &'static str {
@@ -24,7 +31,11 @@ impl CleanupAction {
 }
 
 #[must_use]
-pub fn cleanup_action(session: &VirtualSession, backend_status: ReadyStatus) -> CleanupAction {
+pub fn cleanup_action(
+    session: &VirtualSession,
+    backend_status: ReadyStatus,
+    mode: PoolMode,
+) -> CleanupAction {
     if session.pin_reason() == Some(PinReason::UnknownProtocolState) {
         return CleanupAction::Discard;
     }
@@ -32,14 +43,48 @@ pub fn cleanup_action(session: &VirtualSession, backend_status: ReadyStatus) -> 
     match backend_status {
         ReadyStatus::FailedTransaction => CleanupAction::RollbackThenReuse,
         ReadyStatus::InTransaction => CleanupAction::KeepPinned,
-        ReadyStatus::Idle => {
-            if session.pin_reason().is_some() {
-                CleanupAction::KeepPinned
-            } else if session.has_replayable_settings() {
-                CleanupAction::ResetThenReuse
-            } else {
-                CleanupAction::Reuse
+        ReadyStatus::Idle => match mode {
+            PoolMode::Session => CleanupAction::KeepPinned,
+            PoolMode::Transaction => {
+                if session.pin_reason().is_some() {
+                    CleanupAction::KeepPinned
+                } else if session.has_replayable_settings() {
+                    CleanupAction::ResetThenReuse
+                } else {
+                    CleanupAction::Reuse
+                }
             }
-        }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtual_session::VirtualSession;
+
+    #[test]
+    fn session_mode_keeps_the_backend_pinned_between_queries() {
+        let session = VirtualSession::default();
+
+        assert_eq!(
+            cleanup_action(&session, ReadyStatus::Idle, PoolMode::Session),
+            CleanupAction::KeepPinned
+        );
+        assert_eq!(
+            cleanup_action(&session, ReadyStatus::Idle, PoolMode::Transaction),
+            CleanupAction::Reuse
+        );
+    }
+
+    #[test]
+    fn session_mode_discards_unknown_protocol_state() {
+        let mut session = VirtualSession::default();
+        session.mark_unknown_protocol_state();
+
+        assert_eq!(
+            cleanup_action(&session, ReadyStatus::Idle, PoolMode::Session),
+            CleanupAction::Discard
+        );
     }
 }

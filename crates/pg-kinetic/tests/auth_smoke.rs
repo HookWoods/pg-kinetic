@@ -391,6 +391,7 @@ async fn spawn_proxy_with_backend_service_auth(
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 250,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 1_000,
             backend_reset_query: String::from("DISCARD ALL"),
@@ -525,6 +526,7 @@ async fn spawn_proxy_with_auth(
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 250,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 1_000,
             backend_reset_query: String::from("DISCARD ALL"),

@@ -277,6 +277,7 @@ async fn spawn_proxy_with_backend(
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode,
             recovery_timeout_ms,
             backend_reset_query: "DISCARD ALL".to_string(),

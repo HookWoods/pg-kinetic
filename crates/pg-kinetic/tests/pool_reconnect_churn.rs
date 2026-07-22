@@ -40,6 +40,7 @@ async fn reconnects_with_different_source_ports_reuse_a_bounded_backend_pool() {
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 1_000,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 5_000,
             backend_reset_query: "DISCARD ALL".to_owned(),

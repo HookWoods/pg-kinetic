@@ -306,6 +306,7 @@ fn proxy_config(listen_addr: SocketAddr, backend_addr: SocketAddr) -> Config {
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 5_000,
             backend_reset_query: "DISCARD ALL".to_string(),

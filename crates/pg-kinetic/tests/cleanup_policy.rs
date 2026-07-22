@@ -1,5 +1,5 @@
 use pg_kinetic::{
-    cleanup::{cleanup_action, CleanupAction},
+    cleanup::{cleanup_action, CleanupAction, PoolMode},
     sql::classify,
     virtual_session::VirtualSession,
     wire::backend::ReadyStatus,
@@ -10,7 +10,7 @@ fn idle_unpinned_backend_can_be_reused() {
     let session = VirtualSession::default();
 
     assert_eq!(
-        cleanup_action(&session, ReadyStatus::Idle),
+        cleanup_action(&session, ReadyStatus::Idle, PoolMode::Transaction),
         CleanupAction::Reuse
     );
 }
@@ -21,7 +21,7 @@ fn open_transaction_backend_stays_pinned() {
     session.apply_sql(classify("begin"));
 
     assert_eq!(
-        cleanup_action(&session, ReadyStatus::InTransaction),
+        cleanup_action(&session, ReadyStatus::InTransaction, PoolMode::Transaction),
         CleanupAction::KeepPinned
     );
 }
@@ -33,7 +33,11 @@ fn failed_transaction_requires_rollback() {
     session.mark_failed_transaction();
 
     assert_eq!(
-        cleanup_action(&session, ReadyStatus::FailedTransaction),
+        cleanup_action(
+            &session,
+            ReadyStatus::FailedTransaction,
+            PoolMode::Transaction
+        ),
         CleanupAction::RollbackThenReuse
     );
 }
@@ -44,7 +48,7 @@ fn replayable_settings_require_backend_reset_before_reuse() {
     session.apply_sql(classify("set application_name = 'api'"));
 
     assert_eq!(
-        cleanup_action(&session, ReadyStatus::Idle),
+        cleanup_action(&session, ReadyStatus::Idle, PoolMode::Transaction),
         CleanupAction::ResetThenReuse
     );
 }
@@ -55,7 +59,7 @@ fn unknown_protocol_state_discards_backend() {
     session.mark_unknown_protocol_state();
 
     assert_eq!(
-        cleanup_action(&session, ReadyStatus::Idle),
+        cleanup_action(&session, ReadyStatus::Idle, PoolMode::Transaction),
         CleanupAction::Discard
     );
 }

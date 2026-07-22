@@ -1733,7 +1733,7 @@ async fn handle_client(
                             if status == ReadyStatus::Idle && prepared.has_named_statements() {
                                 CleanupAction::KeepPinned
                             } else {
-                                cleanup_action(&session, status)
+                                cleanup_action(&session, status, performance.pool_mode.into())
                             };
                         metrics::increment_cleanup(action);
 

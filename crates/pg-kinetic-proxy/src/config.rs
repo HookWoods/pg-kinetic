@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
     adaptive::{AdaptiveMode, TunableKnob},
+    cleanup::PoolMode as CorePoolMode,
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
     mirror::MirrorMode,
     policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
@@ -120,6 +121,24 @@ impl From<AuthMode> for CoreAuthMode {
             AuthMode::PassThrough => Self::PassThrough,
             AuthMode::Trust => Self::Trust,
             AuthMode::ScramSha256 => Self::ScramSha256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum PoolMode {
+    #[default]
+    Transaction,
+    Session,
+}
+
+impl From<PoolMode> for CorePoolMode {
+    fn from(mode: PoolMode) -> Self {
+        match mode {
+            PoolMode::Transaction => Self::Transaction,
+            PoolMode::Session => Self::Session,
         }
     }
 }
@@ -1631,6 +1650,14 @@ pub struct PerformanceConfig {
     pub checkout_timeout_ms: u64,
 
     #[arg(
+        long = "pool-mode",
+        env = "PG_KINETIC_POOL_MODE",
+        value_enum,
+        default_value_t = PoolMode::Transaction
+    )]
+    pub pool_mode: PoolMode,
+
+    #[arg(
         long,
         env = "PG_KINETIC_RECOVERY_MODE",
         value_enum,
@@ -2159,6 +2186,7 @@ impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             checkout_timeout_ms: 1_000,
+            pool_mode: PoolMode::Transaction,
             recovery_mode: RecoveryMode::Recover,
             recovery_timeout_ms: 5_000,
             backend_reset_query: String::from("DISCARD ALL"),
@@ -2642,7 +2670,7 @@ mod tests {
     use super::{
         AuthFailureMessageMode, AuthMode, BackendEndpointConfig, BackendTlsMode, ClientTlsMode,
         Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, PoolLifecycleConfig,
-        ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
+        PoolMode, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
     };
     use crate::snapshot::SettingsSnapshot;
     use clap::Parser;
@@ -2694,6 +2722,7 @@ mod tests {
             config.performance.checkout_timeout(),
             Duration::from_secs(1)
         );
+        assert_eq!(config.performance.pool_mode, PoolMode::Transaction);
         assert_eq!(
             config.performance.recovery_mode,
             pg_kinetic_core::recovery::RecoveryMode::Recover
@@ -2968,6 +2997,8 @@ mod tests {
             "9000",
             "--checkout-timeout-ms",
             "250",
+            "--pool-mode",
+            "session",
             "--recovery-mode",
             "drop",
             "--recovery-timeout-ms",
@@ -3090,6 +3121,7 @@ mod tests {
             config.performance.checkout_timeout(),
             Duration::from_millis(250)
         );
+        assert_eq!(config.performance.pool_mode, PoolMode::Session);
         assert_eq!(
             config.performance.recovery_mode,
             pg_kinetic_core::recovery::RecoveryMode::Drop

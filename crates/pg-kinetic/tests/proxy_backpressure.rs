@@ -346,6 +346,7 @@ async fn spawn_timeout_proxy(scenario: TimeoutScenario) -> (SocketAddr, mpsc::Re
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode: RecoveryMode::Recover,
             recovery_timeout_ms: 50,
             backend_reset_query: "DISCARD ALL".to_string(),
@@ -616,6 +617,7 @@ async fn spawn_proxy_with_backend_and_qos(
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode: RecoveryMode::Recover,
             recovery_timeout_ms: 1_000,
             backend_reset_query: "DISCARD ALL".to_string(),

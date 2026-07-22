@@ -4,10 +4,14 @@ use std::time::Duration;
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{
-        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
+        CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, PoolMode,
+        QosConfig,
     },
     proxy::Proxy,
-    wire::protocol::{FrontendTag, ProtocolVersion},
+    wire::{
+        backend::{parse_backend_frame, ReadyStatus},
+        protocol::{FrontendTag, ProtocolVersion},
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -68,6 +72,7 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
         pool_lifecycle: Default::default(),
         performance: PerformanceConfig {
             checkout_timeout_ms: 100,
+            pool_mode: Default::default(),
             recovery_mode: pg_kinetic::recovery::RecoveryMode::Recover,
             recovery_timeout_ms: 5_000,
             backend_reset_query: "DISCARD ALL".to_string(),
@@ -107,15 +112,72 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
     assert!(second.windows(6).any(|bytes| bytes == b"SELECT"));
 }
 
-async fn run_fake_client(addr: SocketAddr) -> Vec<u8> {
-    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
-    stream
-        .write_all(&startup_packet())
+#[tokio::test]
+async fn session_mode_gives_each_client_a_dedicated_backend() {
+    let backend = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("write startup");
+        .expect("bind backend");
+    let backend_addr = backend.local_addr().expect("backend addr");
 
-    let mut auth = [0_u8; 128];
-    let _ = stream.read(&mut auth).await.expect("read auth");
+    tokio::spawn(async move {
+        let mut next_backend_id = 1_usize;
+        loop {
+            let (mut stream, _) = backend.accept().await.expect("accept backend");
+            let backend_id = next_backend_id;
+            next_backend_id += 1;
+            tokio::spawn(async move {
+                let mut startup = [0_u8; 1024];
+                let _ = stream.read(&mut startup).await.expect("read startup");
+                stream
+                    .write_all(&auth_ok_ready())
+                    .await
+                    .expect("auth ready");
+
+                loop {
+                    let mut query = [0_u8; 1024];
+                    let read = stream.read(&mut query).await.expect("read query");
+                    if read == 0 {
+                        break;
+                    }
+
+                    stream
+                        .write_all(&select_value_ready(&backend_id.to_string()))
+                        .await
+                        .expect("query ready");
+                }
+            });
+        }
+    });
+
+    let listen = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+    let listen_addr = listen.local_addr().expect("listen addr");
+    drop(listen);
+
+    let mut config = Config::default();
+    config.connection.listen_addr = listen_addr;
+    config.connection.backend_addr = backend_addr;
+    config.capacity.max_clients = 10;
+    config.capacity.max_backends = 4;
+    config.pool_lifecycle.max_size = 4;
+    config.performance.pool_mode = PoolMode::Session;
+
+    tokio::spawn(async move {
+        let _ = Proxy::new(config).run().await;
+    });
+    time::sleep(Duration::from_millis(25)).await;
+
+    let mut first = connect_fake_client(listen_addr).await;
+    let mut second = connect_fake_client(listen_addr).await;
+    let first_backend = query_backend_id(&mut first).await;
+    let second_backend = query_backend_id(&mut second).await;
+
+    assert_ne!(first_backend, second_backend);
+    assert_eq!(first_backend, query_backend_id(&mut first).await);
+    assert_eq!(second_backend, query_backend_id(&mut second).await);
+}
+
+async fn run_fake_client(addr: SocketAddr) -> Vec<u8> {
+    let mut stream = connect_fake_client(addr).await;
 
     stream
         .write_all(&query_packet("select 1"))
@@ -126,6 +188,79 @@ async fn run_fake_client(addr: SocketAddr) -> Vec<u8> {
     let read = stream.read(&mut response).await.expect("read response");
     response.truncate(read);
     response
+}
+
+async fn connect_fake_client(addr: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
+    stream
+        .write_all(&startup_packet())
+        .await
+        .expect("write startup");
+
+    read_until_ready(&mut stream).await;
+    stream
+}
+
+async fn query_backend_id(stream: &mut TcpStream) -> usize {
+    stream
+        .write_all(&query_packet("select backend_id"))
+        .await
+        .expect("write query");
+
+    read_single_data_row_value(stream)
+        .await
+        .parse()
+        .expect("backend id")
+}
+
+async fn read_until_ready(stream: &mut TcpStream) {
+    let mut buffer = BytesMut::new();
+    loop {
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
+            if frame.ready_status() == Some(ReadyStatus::Idle) {
+                return;
+            }
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = time::timeout(Duration::from_secs(1), stream.read(&mut chunk))
+            .await
+            .expect("read proxy response")
+            .expect("read proxy response");
+        assert!(read > 0, "proxy closed before ReadyForQuery");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn read_single_data_row_value(stream: &mut TcpStream) -> String {
+    let mut buffer = BytesMut::new();
+    let mut value = None;
+    loop {
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
+            if frame.tag == b'D' {
+                let payload = frame.payload.as_ref();
+                assert_eq!(&payload[0..2], &[0, 1]);
+                let len = i32::from_be_bytes(payload[2..6].try_into().expect("value len"));
+                assert!(len >= 0);
+                value = Some(
+                    std::str::from_utf8(&payload[6..6 + len as usize])
+                        .expect("utf8 value")
+                        .to_owned(),
+                );
+            }
+            if frame.ready_status() == Some(ReadyStatus::Idle) {
+                return value.expect("data row");
+            }
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = time::timeout(Duration::from_secs(1), stream.read(&mut chunk))
+            .await
+            .expect("read proxy response")
+            .expect("read proxy response");
+        assert!(read > 0, "proxy closed before ReadyForQuery");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn startup_packet() -> Vec<u8> {
@@ -160,6 +295,10 @@ fn auth_ok_ready() -> Vec<u8> {
 }
 
 fn select_one_ready() -> Vec<u8> {
+    select_value_ready("1")
+}
+
+fn select_value_ready(value: &str) -> Vec<u8> {
     let mut bytes = BytesMut::new();
     bytes.put_u8(b'T');
     bytes.put_i32(33);
@@ -172,10 +311,10 @@ fn select_one_ready() -> Vec<u8> {
     bytes.put_i32(-1);
     bytes.put_i16(0);
     bytes.put_u8(b'D');
-    bytes.put_i32(11);
+    bytes.put_i32((value.len() + 10) as i32);
     bytes.put_i16(1);
-    bytes.put_i32(1);
-    bytes.extend_from_slice(b"1");
+    bytes.put_i32(value.len() as i32);
+    bytes.extend_from_slice(value.as_bytes());
     bytes.put_u8(b'C');
     bytes.put_i32(13);
     bytes.extend_from_slice(b"SELECT 1\0");

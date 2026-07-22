@@ -18,6 +18,12 @@ The proxy checks out a backend when a query cycle needs one. When the cycle comp
 
 This model keeps PostgreSQL session semantics visible to applications while reducing the number of server connections needed under high client counts.
 
+## Pool Modes
+
+`pool_mode = "transaction"` is the default. In transaction mode, pg-kinetic returns an idle, safe backend to the pool after each completed query cycle and pins only when the virtual session carries state that cannot be safely replayed.
+
+`pool_mode = "session"` keeps the checked-out backend dedicated to the client after the first query until that client disconnects. This is useful for migrations that depend on broad PostgreSQL session state, but it reduces multiplexing: practical concurrent client capacity is bounded by `capacity.max_backends` and the per-pool cap.
+
 ## Reconnect Pool Identity
 
 Backend pool identity is based on the database, client-visible user, and
