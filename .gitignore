@@ -13,4 +13,5 @@ docs-site/.docusaurus/
 .DS_Store
 Thumbs.db
 bench/results/
+bench/profiles/
 .idea/

@@ -126,6 +126,7 @@ fn benchmark_scripts_preserve_the_product_command_contract() {
     assert!(profile.contains("profile run"));
     assert!(profile.contains("flamegraph"));
     assert!(profile.contains("perf"));
+    assert!(profile.contains("ebpf"));
 }
 
 #[test]

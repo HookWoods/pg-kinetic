@@ -148,7 +148,17 @@ bash scripts/bench/profile-performance.sh \
   --output bench/profiles/simple-query-flamegraph.svg
 ```
 
-`flamegraph` requires `cargo-flamegraph`; `perf` is available only on Linux. Tool absence is reported as skipped, so it is visible without making the local smoke gate platform-dependent. Benchmark reports also include process CPU time, resident memory, and open-file-descriptor collection status where the host supports them. Windows reports these process measurements as unavailable.
+Linux hosts with `bpftrace` can run the same wrapper with `--kind ebpf` to collect lightweight syscall and scheduler-switch counters while the benchmark command runs:
+
+```bash
+bash scripts/bench/profile-performance.sh \
+  --kind ebpf \
+  --scenario bench/scenarios/benchmark-simple-query.toml \
+  --target pg-kinetic \
+  --output bench/profiles/simple-query-ebpf.txt
+```
+
+`flamegraph` requires `cargo-flamegraph`; `perf` and `ebpf` are available only on Linux. `ebpf` requires `bpftrace` and host permissions for BPF tracing, usually root or equivalent capabilities. Tool absence is reported as skipped, so it is visible without making the local smoke gate platform-dependent. Benchmark reports also include process CPU time, resident memory, and open-file-descriptor collection status where the host supports them. Windows reports these process measurements as unavailable.
 
 Inspect the current process and budget snapshot through the admin listener with `SHOW PERFORMANCE;`. Use `SHOW BENCHMARKS;` to inspect the recorded scenario and target measurements. See [the admin reference](admin.md) and [the metrics catalog](metrics.md) for the available fields and monitoring series.
 

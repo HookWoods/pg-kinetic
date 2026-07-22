@@ -44,8 +44,8 @@ while (($# > 0)); do
   esac
 done
 
-if [[ "$KIND" != "flamegraph" && "$KIND" != "perf" ]]; then
-  echo "--kind must be flamegraph or perf" >&2
+if [[ "$KIND" != "flamegraph" && "$KIND" != "perf" && "$KIND" != "ebpf" ]]; then
+  echo "--kind must be flamegraph, perf, or ebpf" >&2
   exit 2
 fi
 

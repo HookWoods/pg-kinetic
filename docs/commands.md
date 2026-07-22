@@ -33,7 +33,7 @@ All commands share the global runtime flags documented in [Configuration](./conf
 | `regression list` | List regression cases from a manifest. | JSON list | `0` | nonzero on manifest or filter error |
 | `regression run` | Run selected regression cases. | JSON report and optional file | `0` when no selected case fails | nonzero on runner error or failed case |
 | `profile validate` | Report local profiling tool availability. | JSON status map | `0` | nonzero on unexpected validation error |
-| `profile run` | Run a selected profiler for a benchmark scenario. | JSON report | `0` when profiler run succeeds | nonzero on invalid scenario, unavailable tool, or profiler failure |
+| `profile run` | Run a selected profiler for a benchmark scenario. | JSON report | `0` when profiler run succeeds or an optional profiler is skipped | nonzero on invalid scenario or profiler execution failure |
 
 ## Run The Proxy
 
@@ -248,6 +248,7 @@ Flags:
 ```bash
 pg-kinetic profile validate
 pg-kinetic profile run --scenario bench/scenarios/benchmark-simple-query.toml --kind flamegraph
+pg-kinetic profile run --scenario bench/scenarios/benchmark-simple-query.toml --kind ebpf
 ```
 
 Supported profile tools are validated locally because platform support differs between Windows, Linux, and developer machines.
@@ -257,6 +258,6 @@ Flags:
 | Command | Flags |
 | --- | --- |
 | `profile validate` | No command-specific flags. |
-| `profile run` | Required `--scenario path` and `--kind flamegraph|perf`; optional `--target name` default `pg-kinetic`; optional `--output path`. |
+| `profile run` | Required `--scenario path` and `--kind flamegraph|perf|ebpf`; optional `--target name` default `pg-kinetic`; optional `--output path`. |
 
 Common failures: profiler executable missing, OS support missing, invalid benchmark scenario, or output path not writable.

@@ -695,6 +695,7 @@ fn default_profile_output(scenario: &Path, kind: ProfileTool) -> PathBuf {
     let extension = match kind {
         ProfileTool::Flamegraph => "svg",
         ProfileTool::Perf => "data",
+        ProfileTool::Ebpf => "txt",
     };
     PathBuf::from("bench").join("profiles").join(format!(
         "{scenario_name}-{}.{}",
@@ -1085,8 +1086,9 @@ fn parse_profile_tool(value: &str) -> Result<ProfileTool, String> {
     match value {
         "flamegraph" => Ok(ProfileTool::Flamegraph),
         "perf" => Ok(ProfileTool::Perf),
+        "ebpf" => Ok(ProfileTool::Ebpf),
         _ => Err(format!(
-            "invalid profile kind '{value}', expected one of: flamegraph, perf"
+            "invalid profile kind '{value}', expected one of: flamegraph, perf, ebpf"
         )),
     }
 }

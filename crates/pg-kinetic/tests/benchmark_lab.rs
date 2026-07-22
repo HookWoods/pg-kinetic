@@ -599,6 +599,7 @@ fn profile_validate_command_reports_optional_tool_availability_without_profiling
     assert!(stdout.contains("\"ok\":true"));
     assert!(stdout.contains("\"flamegraph\""));
     assert!(stdout.contains("\"perf\""));
+    assert!(stdout.contains("\"ebpf\""));
 }
 
 #[test]
