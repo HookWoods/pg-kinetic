@@ -16,3 +16,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
 pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
     pg_kinetic_proxy::run_thread_per_core(config)
 }
+
+pub fn run_io_uring(config: config::Config) -> anyhow::Result<()> {
+    pg_kinetic_proxy::run_io_uring(config)
+}

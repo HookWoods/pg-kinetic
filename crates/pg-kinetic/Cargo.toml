@@ -7,6 +7,7 @@ readme.workspace = true
 
 [features]
 default = []
+io-uring = ["pg-kinetic-proxy/io-uring"]
 policy-wasm = ["pg-kinetic-proxy/policy-wasm"]
 runtime-experiments = ["pg-kinetic-proxy/runtime-experiments"]
 

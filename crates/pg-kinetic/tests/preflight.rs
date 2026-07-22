@@ -126,6 +126,39 @@ backend_password_env_var_name = "PG_KINETIC_POOL_PASSWORD"
 }
 
 #[test]
+fn preflight_reports_unavailable_runtime_engine() {
+    let config = write_file(
+        "unavailable-runtime-engine",
+        &base_config(
+            "127.0.0.1:0",
+            "127.0.0.1:5432",
+            r#"
+[runtime.engine]
+runtime_engine = "experimental_io_uring"
+experimental_runtime_enabled = true
+"#,
+        ),
+    );
+
+    let report = PreflightRunner::new(&config).run();
+    let runtime_errors = report
+        .errors()
+        .into_iter()
+        .filter(|finding| finding.check == PreflightCheck::RuntimeEngine)
+        .count();
+
+    if cfg!(all(
+        target_os = "linux",
+        feature = "runtime-experiments",
+        feature = "io-uring"
+    )) {
+        assert_eq!(runtime_errors, 0, "{report:?}");
+    } else {
+        assert!(runtime_errors > 0, "{report:?}");
+    }
+}
+
+#[test]
 fn preflight_validates_tls_files_when_configured() {
     let valid_config = write_file(
         "tls-valid",

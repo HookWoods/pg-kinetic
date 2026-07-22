@@ -374,9 +374,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         RuntimeEngine::ExperimentalIoUring => {
-            anyhow::bail!(
-                "experimental_io_uring is Linux-only and is not implemented in this build"
-            );
+            pg_kinetic::run_io_uring(config).context("pg-kinetic io_uring runtime failed")
         }
     }
 }

@@ -66,6 +66,13 @@ experimental_runtime_enabled = false
 | `experimental_thread_per_core` | requires `experimental_runtime_enabled = true` |
 | `experimental_io_uring` | requires `experimental_runtime_enabled = true` |
 
+`experimental_io_uring` is a Linux-only plaintext pass-through experiment. It
+requires the `io-uring` cargo feature and currently rejects client TLS, backend
+TLS, and pg-kinetic-managed authentication modes. Use it only for isolated
+benchmarking against a trusted backend that performs its own PostgreSQL
+authentication. `tokio_default` and `experimental_thread_per_core` remain the
+runtime engines for the full pooled/authenticated proxy surface.
+
 ## Preflight
 
 ```bash

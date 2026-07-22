@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::{
     auth,
     config::{AuthMode, Config, MirrorConfig, PolicyConfig, ShardingConfig, TlsConfig},
+    runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector},
     tls,
 };
 
@@ -50,6 +51,7 @@ impl PreflightRunner {
             }
         };
 
+        self.validate_runtime_engine(&config, &mut report);
         self.validate_tls(&config.tls, &mut report);
         self.validate_auth(&config, &mut report);
         self.validate_route_maps(&contents, &mut report);
@@ -59,6 +61,27 @@ impl PreflightRunner {
         self.validate_adaptive(&config, &mut report);
 
         report
+    }
+
+    fn validate_runtime_engine(&self, config: &Config, report: &mut PreflightReport) {
+        let selector = RuntimeEngineSelector::new(config.runtime.engine.runtime_engine)
+            .with_experiment(RuntimeEngineExperiment::new(
+                config.runtime.engine.experimental_runtime_enabled,
+            ));
+
+        if let Err(error) = selector.validate() {
+            report.add_error(PreflightCheck::RuntimeEngine, error.to_string());
+        }
+
+        if config.runtime.engine.runtime_engine
+            == pg_kinetic_core::runtime::RuntimeEngine::ExperimentalIoUring
+            && !cfg!(feature = "io-uring")
+        {
+            report.add_error(
+                PreflightCheck::RuntimeEngine,
+                "runtime engine 'experimental_io_uring' requires the io-uring cargo feature",
+            );
+        }
     }
 
     fn validate_tls(&self, tls_config: &TlsConfig, report: &mut PreflightReport) {
@@ -274,6 +297,7 @@ impl PreflightRunner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreflightCheck {
     ConfigLoad,
+    RuntimeEngine,
     TlsFiles,
     AuthUsers,
     RouteMaps,
@@ -288,6 +312,7 @@ impl PreflightCheck {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ConfigLoad => "config_load",
+            Self::RuntimeEngine => "runtime_engine",
             Self::TlsFiles => "tls_files",
             Self::AuthUsers => "auth_users",
             Self::RouteMaps => "route_maps",

@@ -9,6 +9,7 @@ pub mod config;
 pub mod control;
 pub mod drain;
 pub mod health;
+pub mod io_uring;
 pub mod lifecycle;
 pub mod metrics;
 pub mod mirror;
@@ -45,4 +46,8 @@ pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
         listen_addr: config.observability.metrics_addr,
     })?;
     proxy::Proxy::new(config).run_thread_per_core()
+}
+
+pub fn run_io_uring(config: config::Config) -> anyhow::Result<()> {
+    io_uring::run(config)
 }
