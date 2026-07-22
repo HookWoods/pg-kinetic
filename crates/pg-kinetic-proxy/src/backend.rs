@@ -33,6 +33,7 @@ pub struct Backend {
     addr: SocketAddr,
     connected_at: Instant,
     snapshot_store: Option<SnapshotStore>,
+    parameter_status: Vec<(String, String)>,
 }
 
 impl Backend {
@@ -66,6 +67,7 @@ impl Backend {
                 addr,
                 connected_at: Instant::now(),
                 snapshot_store: None,
+                parameter_status: Vec::new(),
             });
         }
 
@@ -105,6 +107,7 @@ impl Backend {
             addr,
             connected_at: Instant::now(),
             snapshot_store: None,
+            parameter_status: Vec::new(),
         })
     }
 
@@ -143,6 +146,23 @@ impl Backend {
 
     pub fn stream_mut(&mut self) -> &mut BackendStream {
         &mut self.stream
+    }
+
+    #[must_use]
+    pub fn parameter_status(&self) -> &[(String, String)] {
+        &self.parameter_status
+    }
+
+    pub fn push_parameter_status(&mut self, name: String, value: String) {
+        if let Some((_, existing_value)) = self
+            .parameter_status
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == name)
+        {
+            *existing_value = value;
+        } else {
+            self.parameter_status.push((name, value));
+        }
     }
 
     fn publish_snapshot(&self, state: &'static str, route_key: Option<RouteKey>) {

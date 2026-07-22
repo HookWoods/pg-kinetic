@@ -78,7 +78,10 @@ use pg_kinetic_core::{
     virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
 };
 use pg_kinetic_wire::{
-    backend::{build_error_response, parse_backend_frame, BackendFrame, ReadyStatus},
+    backend::{
+        build_error_response, encode_parameter_status, parse_backend_frame, parse_parameter_status,
+        BackendFrame, ReadyStatus,
+    },
     error::WireError,
     frame::{parse_frontend_frame, FrontendFrame},
     message::{
@@ -3239,11 +3242,10 @@ async fn proxy_startup(
     _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<()> {
     if !backend.requires_startup() {
-        let startup_response = if emit_auth_ok_when_backend_requires_no_startup {
-            synthetic_startup_ready()
-        } else {
-            ready_for_query_idle()
-        };
+        let startup_response = synthetic_startup_ready(
+            emit_auth_ok_when_backend_requires_no_startup,
+            backend.backend_mut().parameter_status(),
+        );
         client
             .write_all(&startup_response)
             .await
@@ -3341,6 +3343,7 @@ async fn proxy_startup(
                     );
                 }
             } else {
+                capture_backend_parameter_status(backend, &frame);
                 client
                     .write_all(&encode_backend_frame(&frame))
                     .await
@@ -3400,6 +3403,8 @@ async fn bootstrap_backend(
                 } else if code != 0 && auth_request_expects_client_response(&frame.payload)? {
                     anyhow::bail!("backend authentication exchange requires client response");
                 }
+            } else {
+                capture_backend_parameter_status(backend, &frame);
             }
 
             if frame.ready_status() == Some(ReadyStatus::Idle) {
@@ -3424,14 +3429,32 @@ fn encode_backend_frame(frame: &BackendFrame) -> BytesMut {
     encoded
 }
 
-fn synthetic_startup_ready() -> BytesMut {
-    let ready = ready_for_query_idle();
+fn synthetic_startup_ready(
+    include_authentication_ok: bool,
+    parameter_status: &[(String, String)],
+) -> BytesMut {
     let mut bytes = BytesMut::new();
-    bytes.put_u8(u8::from(BackendTag::Authentication));
-    bytes.put_i32(8);
-    bytes.put_i32(0);
+    if include_authentication_ok {
+        bytes.put_u8(u8::from(BackendTag::Authentication));
+        bytes.put_i32(8);
+        bytes.put_i32(0);
+    }
+    for (name, value) in parameter_status {
+        bytes.extend_from_slice(&encode_parameter_status(name, value));
+    }
+    let ready = ready_for_query_idle();
     bytes.extend_from_slice(&ready);
     bytes
+}
+
+fn capture_backend_parameter_status(backend: &mut PooledBackend, frame: &BackendFrame) {
+    if frame.tag != u8::from(BackendTag::ParameterStatus) {
+        return;
+    }
+
+    if let Some((name, value)) = parse_parameter_status(&frame.payload) {
+        backend.backend_mut().push_parameter_status(name, value);
+    }
 }
 
 fn ready_for_query_idle() -> BytesMut {
