@@ -786,6 +786,9 @@ impl Proxy {
 
     async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
+        effective_config
+            .validate_pool_configs()
+            .map_err(anyhow::Error::msg)?;
         reload::validate_runtime_assets(&effective_config)?;
         self.lifecycle.configure(
             effective_config.drain.drain_timeout(),
@@ -3035,13 +3038,12 @@ fn build_route_pool_selector(
     global_backend_slots: Arc<Semaphore>,
 ) -> (RoutePoolSelector, Arc<RoutePools>) {
     if config.pools.is_empty() {
-        let global_backend_available = Arc::new(tokio::sync::Notify::new());
         let default_pools = Arc::new(build_route_pools(
             config,
             default_route_config,
             snapshot_store,
             Some(global_backend_slots),
-            Some(global_backend_available),
+            None,
         ));
         return (
             RoutePoolSelector::default(Arc::clone(&default_pools)),

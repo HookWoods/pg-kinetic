@@ -185,10 +185,24 @@ async fn run_fake_client(addr: SocketAddr) -> Vec<u8> {
         .await
         .expect("write query");
 
-    let mut response = vec![0_u8; 1024];
-    let read = stream.read(&mut response).await.expect("read response");
-    response.truncate(read);
-    response
+    let mut buffer = BytesMut::new();
+    let mut response = Vec::new();
+    loop {
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse response") {
+            if frame.ready_status() == Some(ReadyStatus::Idle) {
+                return response;
+            }
+        }
+
+        let mut chunk = [0_u8; 1024];
+        let read = time::timeout(Duration::from_secs(1), stream.read(&mut chunk))
+            .await
+            .expect("read response")
+            .expect("read response");
+        assert!(read > 0, "proxy closed before ReadyForQuery");
+        response.extend_from_slice(&chunk[..read]);
+        buffer.extend_from_slice(&chunk[..read]);
+    }
 }
 
 async fn connect_fake_client(addr: SocketAddr) -> TcpStream {

@@ -937,16 +937,27 @@ where
     D: serde::Deserializer<'de>,
 {
     let pools = Vec::<PoolConfig>::deserialize(deserializer)?;
+    validate_pool_configs(&pools).map_err(serde::de::Error::custom)?;
+    Ok(pools)
+}
+
+fn validate_pool_configs(pools: &[PoolConfig]) -> Result<(), String> {
     let mut identities = HashSet::with_capacity(pools.len());
-    for pool in &pools {
+    for pool in pools {
+        if pool.max_backends == Some(0) {
+            return Err(format!(
+                "pool max_backends must be greater than zero for database/user {}/{}",
+                pool.database, pool.user
+            ));
+        }
         if !identities.insert((&pool.database, &pool.user)) {
-            return Err(serde::de::Error::custom(format!(
+            return Err(format!(
                 "duplicate pool for database/user {}/{}",
                 pool.database, pool.user
-            )));
+            ));
         }
     }
-    Ok(pools)
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2170,6 +2181,10 @@ impl Config {
         }
     }
 
+    pub fn validate_pool_configs(&self) -> Result<(), String> {
+        validate_pool_configs(&self.pools)
+    }
+
     #[must_use]
     pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
         self.connection == next.connection
@@ -3377,6 +3392,28 @@ mod tests {
             "127.0.0.1:5433".parse().expect("valid socket")
         );
         assert_eq!(config.pools[0].max_backends, Some(7));
+    }
+
+    #[test]
+    fn rejects_zero_pool_max_backends() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [connection]
+            listen_addr = "127.0.0.1:6543"
+            backend_addr = "127.0.0.1:5432"
+
+            [[pools]]
+            database = "db_a"
+            user = "user_a"
+            backend_addr = "127.0.0.1:5433"
+            max_backends = 0
+            "#,
+        )
+        .expect_err("zero pool capacity must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("max_backends must be greater than zero"));
     }
 
     #[test]
