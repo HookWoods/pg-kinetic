@@ -547,6 +547,9 @@ pub struct RuntimeEngineConfig {
         default_value_t = false
     )]
     pub experimental_runtime_enabled: bool,
+
+    #[arg(long, env = "PG_KINETIC_RUNTIME_SHARDS")]
+    pub runtime_shards: Option<usize>,
 }
 
 impl RuntimeEngineConfig {
@@ -558,6 +561,10 @@ impl RuntimeEngineConfig {
             ));
         }
 
+        if self.runtime_shards == Some(0) {
+            return Err(String::from("runtime_shards must be greater than zero"));
+        }
+
         Ok(())
     }
 }
@@ -567,6 +574,7 @@ impl Default for RuntimeEngineConfig {
         Self {
             runtime_engine: RuntimeEngine::TokioDefault,
             experimental_runtime_enabled: false,
+            runtime_shards: None,
         }
     }
 }
@@ -585,6 +593,7 @@ impl<'de> Deserialize<'de> for RuntimeEngineConfig {
             )]
             runtime_engine: RuntimeEngine,
             experimental_runtime_enabled: bool,
+            runtime_shards: Option<usize>,
         }
 
         impl Default for RawRuntimeEngineConfig {
@@ -592,6 +601,7 @@ impl<'de> Deserialize<'de> for RuntimeEngineConfig {
                 Self {
                     runtime_engine: default_runtime_engine(),
                     experimental_runtime_enabled: false,
+                    runtime_shards: None,
                 }
             }
         }
@@ -600,6 +610,7 @@ impl<'de> Deserialize<'de> for RuntimeEngineConfig {
         let config = Self {
             runtime_engine: raw.runtime_engine,
             experimental_runtime_enabled: raw.experimental_runtime_enabled,
+            runtime_shards: raw.runtime_shards,
         };
         config.validate().map_err(serde::de::Error::custom)?;
         Ok(config)
@@ -2666,6 +2677,7 @@ mod tests {
             pg_kinetic_core::runtime::RuntimeEngine::TokioDefault
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
+        assert_eq!(config.runtime.engine.runtime_shards, None);
         assert_eq!(config.runtime.lifecycle.startup_grace_ms, 30_000);
         assert_eq!(config.drain.drain_grace(), Duration::from_secs(30));
         assert_eq!(config.runtime.lifecycle.shutdown_grace_ms, 30_000);
@@ -2831,10 +2843,23 @@ mod tests {
             [runtime.engine]
             runtime_engine = "experimental_thread_per_core"
             experimental_runtime_enabled = true
+            runtime_shards = 2
             "#,
         )
         .expect("explicitly gated experimental runtime parses");
         assert!(config.runtime.engine.runtime_engine.is_experimental());
+        assert_eq!(config.runtime.engine.runtime_shards, Some(2));
+
+        let error = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "experimental_thread_per_core"
+            experimental_runtime_enabled = true
+            runtime_shards = 0
+            "#,
+        )
+        .expect_err("zero runtime shards are rejected");
+        assert!(error.to_string().contains("runtime_shards"));
     }
 
     #[test]
@@ -2858,6 +2883,8 @@ mod tests {
             "90",
             "--control-plane-enabled",
             "--mirroring-enabled",
+            "--runtime-shards",
+            "2",
             "--adaptive-enabled",
         ])
         .expect("runtime flags parse");
@@ -2879,6 +2906,7 @@ mod tests {
         );
         assert!(config.runtime.production.control_plane_enabled);
         assert!(config.runtime.production.mirroring_enabled);
+        assert_eq!(config.runtime.engine.runtime_shards, Some(2));
         assert!(config.runtime.production.adaptive_enabled);
     }
 

@@ -16,6 +16,7 @@ arc-swap = "1"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+core_affinity = "0.8"
 hmac = "0.13"
 md-5 = "0.11"
 opentelemetry = "0.32"

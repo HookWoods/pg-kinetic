@@ -44,8 +44,8 @@ use crate::{
     reload,
     snapshot::{
         ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
-        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot, SettingsSnapshot,
-        SnapshotStore,
+        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot,
+        RuntimeShardSnapshot, SettingsSnapshot, SnapshotStore,
     },
     socket,
     telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
@@ -68,7 +68,7 @@ use pg_kinetic_core::{
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
-    runtime::ShutdownReason,
+    runtime::{RuntimeLifecycleState, ShutdownReason},
     session::PinReason as SessionPinReason,
     session::TransactionState,
     shard_extract::{extract_shard_hint, ShardHint},
@@ -319,6 +319,23 @@ pub(crate) struct ShardContext {
     pub phase_metrics_enabled: bool,
     pub phase_timing_sample_rate: f64,
     pub shutdown_completion: watch::Receiver<Option<ShutdownOutcome>>,
+    pub runtime_shard_core_id: Option<usize>,
+    pub runtime_shard_observability: bool,
+}
+
+struct ProxyRuntimeState {
+    effective_config: Config,
+    backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    phase_metrics_enabled: bool,
+    phase_timing_sample_rate: f64,
+    reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    debug_sampler: DebugSampler,
+    active_config: Arc<RwLock<Config>>,
+    route_config: RouteConfig,
+    mirror_outcome_recorder: MirrorOutcomeRecorder,
+    mirror_dispatcher: Arc<MirrorDispatcher>,
+    route_pools: Arc<RoutePools>,
+    routing_planner: ReadRoutingPlanner,
 }
 
 impl Proxy {
@@ -366,6 +383,342 @@ impl Proxy {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
+        let state = self.initialize_runtime_state().await?;
+
+        let listener = TcpListener::bind(state.effective_config.connection.listen_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "bind listener {}",
+                    state.effective_config.connection.listen_addr
+                )
+            })?;
+
+        let drain = self.lifecycle.drain_controller();
+        let _control_plane_handles = run_control_plane(
+            &state.effective_config,
+            self.config.clone(),
+            Arc::clone(&state.active_config),
+            &state.route_config,
+            Arc::clone(&drain),
+            self.lifecycle.clone(),
+            self.snapshot_store.clone(),
+            state.mirror_outcome_recorder.clone(),
+        )
+        .await?;
+
+        tracing::info!(listen_addr = %state.effective_config.connection.listen_addr, "listening");
+
+        let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
+        let shard_context = ShardContext {
+            shard_id: 0,
+            listener,
+            route_pools: Arc::clone(&state.route_pools),
+            active_config: Arc::clone(&state.active_config),
+            snapshot_store: self.snapshot_store.clone(),
+            client_slots: Arc::clone(&self.client_slots),
+            lifecycle: self.lifecycle.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+            backend_credentials: state.backend_credentials.clone(),
+            mirror_dispatcher: Arc::clone(&state.mirror_dispatcher),
+            routing_planner: state.routing_planner,
+            reject_phase_recorder: Arc::clone(&state.reject_phase_recorder),
+            debug_sampler: state.debug_sampler,
+            phase_metrics_enabled: state.phase_metrics_enabled,
+            phase_timing_sample_rate: state.phase_timing_sample_rate,
+            shutdown_completion: shutdown_completion_rx,
+            runtime_shard_core_id: None,
+            runtime_shard_observability: false,
+        };
+        let mut shard = Box::pin(run_shard(shard_context));
+        let mut shutdown = Box::pin(wait_for_shutdown_signal());
+        let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
+        let mut shutdown_coordinator = None;
+        let mut shutdown_completion: Pin<Box<dyn Future<Output = ShutdownOutcome> + Send>> =
+            Box::pin(std::future::pending());
+        let mut shutdown_started = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut shard => return result,
+                result = &mut shutdown, if !shutdown_started => {
+                    let reason = result.context("wait for shutdown signal")?;
+                    if self.lifecycle.begin_drain(reason) {
+                        tracing::info!("received shutdown signal; beginning drain");
+                    }
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
+                }
+                _ = &mut drain_start_wait, if !shutdown_started => {
+                    self.lifecycle.begin_drain(ShutdownReason::AdminRequest);
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
+                }
+                outcome = &mut shutdown_completion, if shutdown_started => {
+                    let _ = shutdown_completion_tx.send(Some(outcome));
+                    if let Some(coordinator) = shutdown_coordinator.take() {
+                        coordinator.complete();
+                    }
+                    return shard.await;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "runtime-experiments")]
+    pub fn run_thread_per_core(self) -> anyhow::Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build thread-per-core control runtime")?
+            .block_on(self.run_thread_per_core_inner())
+    }
+
+    #[cfg(feature = "runtime-experiments")]
+    async fn run_thread_per_core_inner(self) -> anyhow::Result<()> {
+        let state = self.initialize_runtime_state().await?;
+        let listen_addr =
+            resolve_runtime_listen_addr(state.effective_config.connection.listen_addr)?;
+        let shard_count = resolve_runtime_shard_count(&state.effective_config)?;
+        let core_assignments = runtime_shard_core_assignments(shard_count);
+        let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel();
+        let (shard_result_tx, mut shard_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut shard_threads = Vec::with_capacity(shard_count);
+
+        for (shard_id, core_id) in core_assignments.into_iter().enumerate() {
+            let startup_tx = startup_tx.clone();
+            let shard_result_tx = shard_result_tx.clone();
+            let shutdown_completion = shutdown_completion_rx.clone();
+            let route_pools = Arc::clone(&state.route_pools);
+            let active_config = Arc::clone(&state.active_config);
+            let snapshot_store = self.snapshot_store.clone();
+            let client_slots = Arc::clone(&self.client_slots);
+            let lifecycle = self.lifecycle.clone();
+            let buffer_pool = self.buffer_pool.clone();
+            let backend_credentials = state.backend_credentials.clone();
+            let mirror_dispatcher = Arc::clone(&state.mirror_dispatcher);
+            let routing_planner = state.routing_planner;
+            let reject_phase_recorder = Arc::clone(&state.reject_phase_recorder);
+            let debug_sampler = state.debug_sampler;
+            let phase_metrics_enabled = state.phase_metrics_enabled;
+            let phase_timing_sample_rate = state.phase_timing_sample_rate;
+            let core_label = core_id.map(|core| core.id);
+            let thread_name = match core_label {
+                Some(core_id) => format!("pg-kinetic-shard-{shard_id}-core-{core_id}"),
+                None => format!("pg-kinetic-shard-{shard_id}"),
+            };
+
+            let thread = std::thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    if let Some(core_id) = core_id {
+                        if !core_affinity::set_for_current(core_id) {
+                            tracing::warn!(
+                                shard_id,
+                                core_id = core_id.id,
+                                "failed to pin runtime shard; continuing unpinned"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(shard_id, "no CPU affinity target for runtime shard");
+                    }
+
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let message = format!(
+                                "build current-thread runtime for shard {shard_id}: {error}"
+                            );
+                            let _ = startup_tx.send(Err(message.clone()));
+                            let _ = shard_result_tx.send((shard_id, Err(anyhow::anyhow!(message))));
+                            return;
+                        }
+                    };
+
+                    let startup_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let startup_sent_by_future = Arc::clone(&startup_sent);
+                    let startup_tx_by_future = startup_tx.clone();
+                    let result = runtime.block_on(async move {
+                        let listener = socket::bind_reuseport_listener(listen_addr, 1024)
+                            .with_context(|| {
+                                format!("bind reuseport listener for shard {shard_id}")
+                            })?;
+                        snapshot_store.set_runtime_shard_snapshot(RuntimeShardSnapshot::new(
+                            shard_id,
+                            core_label,
+                            RuntimeLifecycleState::Ready,
+                            0,
+                            0,
+                        ));
+                        startup_sent_by_future.store(true, Ordering::Release);
+                        let _ = startup_tx_by_future.send(Ok(shard_id));
+                        let shard_context = ShardContext {
+                            shard_id,
+                            listener,
+                            route_pools,
+                            active_config,
+                            snapshot_store,
+                            client_slots,
+                            lifecycle,
+                            buffer_pool,
+                            backend_credentials,
+                            mirror_dispatcher,
+                            routing_planner,
+                            reject_phase_recorder,
+                            debug_sampler,
+                            phase_metrics_enabled,
+                            phase_timing_sample_rate,
+                            shutdown_completion,
+                            runtime_shard_core_id: core_label,
+                            runtime_shard_observability: true,
+                        };
+                        run_shard(shard_context).await
+                    });
+
+                    if !startup_sent.load(Ordering::Acquire) {
+                        let _ = startup_tx.send(Err(format!(
+                            "runtime shard {shard_id} failed before startup completed"
+                        )));
+                    }
+                    let _ = shard_result_tx.send((shard_id, result));
+                })
+                .with_context(|| format!("spawn runtime shard thread {shard_id}"))?;
+            shard_threads.push(thread);
+        }
+
+        drop(startup_tx);
+        drop(shard_result_tx);
+
+        for _ in 0..shard_count {
+            match startup_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("wait for runtime shard startup")?
+            {
+                Ok(shard_id) => {
+                    tracing::debug!(shard_id, "runtime shard listener started");
+                }
+                Err(message) => {
+                    self.lifecycle.begin_drain(ShutdownReason::StartupFailure);
+                    let coordinator = ShutdownCoordinator::new(self.lifecycle.clone());
+                    let outcome = coordinator.coordinate().await;
+                    let _ = shutdown_completion_tx.send(Some(outcome));
+                    coordinator.complete();
+                    join_runtime_shards(shard_threads)?;
+                    anyhow::bail!(message);
+                }
+            }
+        }
+
+        let drain = self.lifecycle.drain_controller();
+        let _control_plane_handles = run_control_plane(
+            &state.effective_config,
+            self.config.clone(),
+            Arc::clone(&state.active_config),
+            &state.route_config,
+            Arc::clone(&drain),
+            self.lifecycle.clone(),
+            self.snapshot_store.clone(),
+            state.mirror_outcome_recorder.clone(),
+        )
+        .await?;
+
+        tracing::info!(
+            listen_addr = %listen_addr,
+            shards = shard_count,
+            "thread-per-core runtime listening"
+        );
+
+        let mut shutdown = Box::pin(wait_for_shutdown_signal());
+        let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
+        let mut shutdown_coordinator = None;
+        let mut shutdown_completion: Pin<Box<dyn Future<Output = ShutdownOutcome> + Send>> =
+            Box::pin(std::future::pending());
+        let mut shutdown_started = false;
+        let mut shard_failure = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                result = shard_result_rx.recv() => {
+                    if let Some((shard_id, result)) = result {
+                        match result {
+                            Ok(()) => {
+                                if !shutdown_started {
+                                    shard_failure = Some(anyhow::anyhow!("runtime shard {shard_id} exited before shutdown"));
+                                    self.lifecycle.begin_drain(ShutdownReason::RuntimeFailure);
+                                    start_shutdown_coordinator(
+                                        self.lifecycle.clone(),
+                                        &mut shutdown_coordinator,
+                                        &mut shutdown_completion,
+                                        &mut shutdown_started,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                if !shutdown_started {
+                                    shard_failure = Some(error.context(format!("runtime shard {shard_id} failed")));
+                                    self.lifecycle.begin_drain(ShutdownReason::RuntimeFailure);
+                                    start_shutdown_coordinator(
+                                        self.lifecycle.clone(),
+                                        &mut shutdown_coordinator,
+                                        &mut shutdown_completion,
+                                        &mut shutdown_started,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                result = &mut shutdown, if !shutdown_started => {
+                    let reason = result.context("wait for shutdown signal")?;
+                    if self.lifecycle.begin_drain(reason) {
+                        tracing::info!("received shutdown signal; beginning drain");
+                    }
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
+                }
+                _ = &mut drain_start_wait, if !shutdown_started => {
+                    self.lifecycle.begin_drain(ShutdownReason::AdminRequest);
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
+                }
+                outcome = &mut shutdown_completion, if shutdown_started => {
+                    let _ = shutdown_completion_tx.send(Some(outcome));
+                    if let Some(coordinator) = shutdown_coordinator.take() {
+                        coordinator.complete();
+                    }
+                    join_runtime_shards(shard_threads)?;
+                    if let Some(error) = shard_failure {
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
         reload::validate_runtime_assets(&effective_config)?;
         let backend_credentials =
@@ -417,89 +770,72 @@ impl Proxy {
             route_config.freshness.max_replica_lag_ms,
         );
 
-        let listener = TcpListener::bind(effective_config.connection.listen_addr)
-            .await
-            .with_context(|| {
-                format!("bind listener {}", effective_config.connection.listen_addr)
-            })?;
-
-        let drain = self.lifecycle.drain_controller();
-        let _control_plane_handles = run_control_plane(
-            &effective_config,
-            self.config.clone(),
-            Arc::clone(&active_config),
-            &route_config,
-            Arc::clone(&drain),
-            self.lifecycle.clone(),
-            self.snapshot_store.clone(),
-            mirror_outcome_recorder.clone(),
-        )
-        .await?;
-
-        tracing::info!(listen_addr = %effective_config.connection.listen_addr, "listening");
-
-        let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
-        let shard_context = ShardContext {
-            shard_id: 0,
-            listener,
-            route_pools,
-            active_config: Arc::clone(&active_config),
-            snapshot_store: self.snapshot_store.clone(),
-            client_slots: Arc::clone(&self.client_slots),
-            lifecycle: self.lifecycle.clone(),
-            buffer_pool: self.buffer_pool.clone(),
+        Ok(ProxyRuntimeState {
+            effective_config,
             backend_credentials,
-            mirror_dispatcher,
-            routing_planner,
-            reject_phase_recorder,
-            debug_sampler,
             phase_metrics_enabled,
             phase_timing_sample_rate,
-            shutdown_completion: shutdown_completion_rx,
-        };
-        let mut shard = Box::pin(run_shard(shard_context));
-        let mut shutdown = Box::pin(wait_for_shutdown_signal());
-        let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
-        let mut shutdown_coordinator = None;
-        let mut shutdown_completion: Pin<Box<dyn Future<Output = ShutdownOutcome> + Send>> =
-            Box::pin(std::future::pending());
-        let mut shutdown_started = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut shard => return result,
-                result = &mut shutdown, if !shutdown_started => {
-                    let reason = result.context("wait for shutdown signal")?;
-                    if self.lifecycle.begin_drain(reason) {
-                        tracing::info!("received shutdown signal; beginning drain");
-                    }
-                    start_shutdown_coordinator(
-                        self.lifecycle.clone(),
-                        &mut shutdown_coordinator,
-                        &mut shutdown_completion,
-                        &mut shutdown_started,
-                    );
-                }
-                _ = &mut drain_start_wait, if !shutdown_started => {
-                    self.lifecycle.begin_drain(ShutdownReason::AdminRequest);
-                    start_shutdown_coordinator(
-                        self.lifecycle.clone(),
-                        &mut shutdown_coordinator,
-                        &mut shutdown_completion,
-                        &mut shutdown_started,
-                    );
-                }
-                outcome = &mut shutdown_completion, if shutdown_started => {
-                    let _ = shutdown_completion_tx.send(Some(outcome));
-                    if let Some(coordinator) = shutdown_coordinator.take() {
-                        coordinator.complete();
-                    }
-                    return shard.await;
-                }
-            }
-        }
+            reject_phase_recorder,
+            debug_sampler,
+            active_config,
+            route_config,
+            mirror_outcome_recorder,
+            mirror_dispatcher,
+            route_pools,
+            routing_planner,
+        })
     }
+}
+
+#[cfg(feature = "runtime-experiments")]
+fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
+    if addr.port() != 0 {
+        return Ok(addr);
+    }
+
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("reserve runtime listener port for {addr}"))?;
+    listener.local_addr().context("read reserved listener addr")
+}
+
+#[cfg(feature = "runtime-experiments")]
+fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
+    let shard_count = match config.runtime.engine.runtime_shards {
+        Some(shards) => shards,
+        None => core_affinity::get_core_ids()
+            .map(|cores| cores.len())
+            .filter(|cores| *cores > 0)
+            .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+            .unwrap_or(1),
+    };
+
+    if shard_count == 0 {
+        anyhow::bail!("runtime_shards must be greater than zero");
+    }
+
+    Ok(shard_count)
+}
+
+#[cfg(feature = "runtime-experiments")]
+fn runtime_shard_core_assignments(shard_count: usize) -> Vec<Option<core_affinity::CoreId>> {
+    let Some(cores) = core_affinity::get_core_ids().filter(|cores| !cores.is_empty()) else {
+        return vec![None; shard_count];
+    };
+
+    (0..shard_count)
+        .map(|shard_id| cores.get(shard_id % cores.len()).copied())
+        .collect()
+}
+
+#[cfg(feature = "runtime-experiments")]
+fn join_runtime_shards(shards: Vec<std::thread::JoinHandle<()>>) -> anyhow::Result<()> {
+    for shard in shards {
+        shard
+            .join()
+            .map_err(|panic| anyhow::anyhow!("runtime shard thread panicked: {panic:?}"))?;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,8 +935,15 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
     let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
     let mut client_tasks = JoinSet::new();
     let mut draining = false;
+    let mut accepted_connections = 0_u64;
 
     tracing::debug!(shard_id = ctx.shard_id, "runtime shard started");
+    record_runtime_shard_snapshot(
+        &ctx,
+        RuntimeLifecycleState::Ready,
+        accepted_connections,
+        client_tasks.len(),
+    );
 
     loop {
         if draining {
@@ -626,11 +969,23 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            record_runtime_shard_snapshot(
+                                &ctx,
+                                RuntimeLifecycleState::Stopped,
+                                accepted_connections,
+                                client_tasks.len(),
+                            );
                         } else {
                             tracing::info!(
                                 shard_id = ctx.shard_id,
                                 active_clients = drain.active_clients(),
                                 "drain completed"
+                            );
+                            record_runtime_shard_snapshot(
+                                &ctx,
+                                RuntimeLifecycleState::Stopped,
+                                accepted_connections,
+                                client_tasks.len(),
                             );
                         }
                         return Ok(());
@@ -639,9 +994,22 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                         if let Some(Err(error)) = joined {
                             tracing::warn!(shard_id = ctx.shard_id, error = %error, "client task failed");
                         }
+                        record_runtime_shard_snapshot(
+                            &ctx,
+                            RuntimeLifecycleState::Draining,
+                            accepted_connections,
+                            client_tasks.len(),
+                        );
                     }
                     accept = ctx.listener.accept() => {
                         let (client, client_addr) = accept.context("accept draining client")?;
+                        accepted_connections = accepted_connections.saturating_add(1);
+                        record_runtime_shard_snapshot(
+                            &ctx,
+                            RuntimeLifecycleState::Draining,
+                            accepted_connections,
+                            client_tasks.len(),
+                        );
                         let config_snapshot = ctx.active_config.read().await.clone();
                         let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
                         socket::apply_socket_options(&client, &socket_options, "client")
@@ -661,14 +1029,27 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
             _ = &mut drain_start_wait => {
                 ctx.lifecycle.begin_drain(ShutdownReason::AdminRequest);
                 draining = true;
+                record_runtime_shard_snapshot(
+                    &ctx,
+                    RuntimeLifecycleState::Draining,
+                    accepted_connections,
+                    client_tasks.len(),
+                );
             }
             joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
                 if let Some(Err(error)) = joined {
                     tracing::warn!(shard_id = ctx.shard_id, error = %error, "client task failed");
                 }
+                record_runtime_shard_snapshot(
+                    &ctx,
+                    RuntimeLifecycleState::Ready,
+                    accepted_connections,
+                    client_tasks.len(),
+                );
             }
             accept = ctx.listener.accept() => {
                 let (client, client_addr) = accept.context("accept client")?;
+                accepted_connections = accepted_connections.saturating_add(1);
                 let config_snapshot = ctx.active_config.read().await.clone();
                 let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
                 socket::apply_socket_options(&client, &socket_options, "client")
@@ -737,9 +1118,35 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                         tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
                     }
                 });
+                record_runtime_shard_snapshot(
+                    &ctx,
+                    RuntimeLifecycleState::Ready,
+                    accepted_connections,
+                    client_tasks.len(),
+                );
             }
         }
     }
+}
+
+fn record_runtime_shard_snapshot(
+    ctx: &ShardContext,
+    lifecycle_state: RuntimeLifecycleState,
+    accepted_connections: u64,
+    active_clients: usize,
+) {
+    if !ctx.runtime_shard_observability {
+        return;
+    }
+
+    ctx.snapshot_store
+        .set_runtime_shard_snapshot(RuntimeShardSnapshot::new(
+            ctx.shard_id,
+            ctx.runtime_shard_core_id,
+            lifecycle_state,
+            accepted_connections,
+            active_clients,
+        ));
 }
 
 #[allow(clippy::too_many_arguments)]

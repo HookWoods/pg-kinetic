@@ -38,3 +38,11 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     })?;
     proxy::Proxy::new(config).run().await
 }
+
+#[cfg(feature = "runtime-experiments")]
+pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
+    metrics::install(metrics::MetricsConfig {
+        listen_addr: config.observability.metrics_addr,
+    })?;
+    proxy::Proxy::new(config).run_thread_per_core()
+}

@@ -25,8 +25,8 @@ use crate::{
         NodeSummaryRole, NodeSummarySnapshot, PerformanceSnapshot, PinningSnapshot,
         PolicyReloadSnapshot, PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot,
         RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
-        RoutePolicySnapshot, RouteSnapshot, RuntimeSnapshot, ServerSnapshot, SettingsSnapshot,
-        ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+        RoutePolicySnapshot, RouteSnapshot, RuntimeShardSnapshot, RuntimeSnapshot, ServerSnapshot,
+        SettingsSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -401,6 +401,9 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.replica_health_snapshots(),
         ),
         AdminView::Runtime => runtime_table(state.snapshot_store.runtime_snapshot(), &state.config),
+        AdminView::RuntimeShards => {
+            runtime_shards_table(&state.snapshot_store.runtime_shard_snapshots())
+        }
         AdminView::Nodes => nodes_table(
             state.snapshot_store.node_snapshots(),
             state.snapshot_store.runtime_snapshot(),
@@ -619,6 +622,34 @@ fn runtime_table(runtime: Option<RuntimeSnapshot>, config: &Config) -> AdminTabl
             runtime.runtime_engine.as_str().to_string(),
             duration_millis(runtime.uptime),
         ])],
+    )
+}
+
+fn runtime_shards_table(shards: &[RuntimeShardSnapshot]) -> AdminTable {
+    admin_table(
+        AdminView::RuntimeShards,
+        &[
+            ("shard_id", AdminColumnType::Int8),
+            ("core_id", AdminColumnType::Text),
+            ("lifecycle_state", AdminColumnType::Text),
+            ("accepted_connections", AdminColumnType::Int8),
+            ("active_clients", AdminColumnType::Int8),
+        ],
+        shards
+            .iter()
+            .map(|snapshot| {
+                AdminRow::new(vec![
+                    snapshot.shard_id.to_string(),
+                    snapshot
+                        .core_id
+                        .map(|core_id| core_id.to_string())
+                        .unwrap_or_default(),
+                    snapshot.lifecycle_state.as_str().to_string(),
+                    snapshot.accepted_connections.to_string(),
+                    snapshot.active_clients.to_string(),
+                ])
+            })
+            .collect(),
     )
 }
 

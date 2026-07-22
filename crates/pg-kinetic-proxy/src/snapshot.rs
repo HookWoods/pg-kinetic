@@ -305,6 +305,34 @@ impl RuntimeSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeShardSnapshot {
+    pub shard_id: usize,
+    pub core_id: Option<usize>,
+    pub lifecycle_state: RuntimeLifecycleState,
+    pub accepted_connections: u64,
+    pub active_clients: usize,
+}
+
+impl RuntimeShardSnapshot {
+    #[must_use]
+    pub const fn new(
+        shard_id: usize,
+        core_id: Option<usize>,
+        lifecycle_state: RuntimeLifecycleState,
+        accepted_connections: u64,
+        active_clients: usize,
+    ) -> Self {
+        Self {
+            shard_id,
+            core_id,
+            lifecycle_state,
+            accepted_connections,
+            active_clients,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeSummarySnapshot {
     pub role: NodeSummaryRole,
     pub node_id: NodeId,
@@ -802,6 +830,7 @@ struct SnapshotStoreInner {
     recoveries: Vec<RecoverySnapshot>,
     backpressure: HashMap<RouteKey, BackpressureSnapshot>,
     runtime: Option<RuntimeSnapshot>,
+    runtime_shards: BTreeMap<usize, RuntimeShardSnapshot>,
     nodes: Vec<NodeSummarySnapshot>,
     mirror: Option<MirrorSummarySnapshot>,
     benchmark_runs: VecDeque<BenchmarkRunSnapshot>,
@@ -880,6 +909,22 @@ impl SnapshotStore {
             .expect("snapshot store poisoned")
             .runtime
             .clone()
+    }
+
+    pub fn set_runtime_shard_snapshot(&self, snapshot: RuntimeShardSnapshot) {
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        inner.runtime_shards.insert(snapshot.shard_id, snapshot);
+    }
+
+    #[must_use]
+    pub fn runtime_shard_snapshots(&self) -> Vec<RuntimeShardSnapshot> {
+        self.inner
+            .read()
+            .expect("snapshot store poisoned")
+            .runtime_shards
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn set_node_snapshot(&self, snapshot: NodeSummarySnapshot) {

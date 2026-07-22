@@ -8,6 +8,7 @@ readme.workspace = true
 [features]
 default = []
 policy-wasm = ["pg-kinetic-proxy/policy-wasm"]
+runtime-experiments = ["pg-kinetic-proxy/runtime-experiments"]
 
 [dependencies]
 anyhow = "1"

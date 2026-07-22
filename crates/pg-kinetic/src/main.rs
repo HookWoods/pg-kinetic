@@ -15,6 +15,7 @@ use pg_kinetic::core::{
     policy::PolicyAction,
     regression::{RegressionCategory, RegressionPlatform},
     routing::QueryClass as RoutingQueryClass,
+    runtime::RuntimeEngine,
     session::TransactionAccessMode,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
@@ -32,6 +33,7 @@ use pg_kinetic_proxy::regression::{
     load_regression_manifest, redact_sensitive_text, score_benchmark_reports, write_ignored_output,
     RegressionRunner, RegressionSelection,
 };
+use pg_kinetic_proxy::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -340,12 +342,43 @@ fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?
-        .block_on(pg_kinetic::run(config))
-        .context("pg-kinetic runtime failed")
+    let selector = RuntimeEngineSelector::new(config.runtime.engine.runtime_engine)
+        .with_experiment(RuntimeEngineExperiment::new(
+            config.runtime.engine.experimental_runtime_enabled,
+        ));
+    selector.validate().context("validate runtime engine")?;
+
+    match selector.engine() {
+        RuntimeEngine::TokioDefault => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime")?
+            .block_on(pg_kinetic::run(config))
+            .context("pg-kinetic runtime failed"),
+        RuntimeEngine::TokioCurrentThread => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio current-thread runtime")?
+            .block_on(pg_kinetic::run(config))
+            .context("pg-kinetic runtime failed"),
+        RuntimeEngine::ExperimentalThreadPerCore => {
+            #[cfg(feature = "runtime-experiments")]
+            {
+                pg_kinetic::run_thread_per_core(config)
+                    .context("pg-kinetic thread-per-core runtime failed")
+            }
+
+            #[cfg(not(feature = "runtime-experiments"))]
+            {
+                unreachable!("experimental runtime was validated without runtime-experiments")
+            }
+        }
+        RuntimeEngine::ExperimentalIoUring => {
+            anyhow::bail!(
+                "experimental_io_uring is Linux-only and is not implemented in this build"
+            );
+        }
+    }
 }
 
 fn run_policy_preview(_config: Config, args: PolicyPreviewArgs) -> anyhow::Result<()> {
