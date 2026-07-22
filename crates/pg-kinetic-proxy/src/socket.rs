@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
-use socket2::{SockRef, TcpKeepalive};
+use anyhow::Context;
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::net::TcpStream;
 
 use crate::config::SocketConfig;
@@ -110,6 +111,38 @@ pub fn apply_socket_options(
         Some(error) => Err(error),
         None => Ok(report),
     }
+}
+
+pub fn bind_reuseport_listener(
+    addr: SocketAddr,
+    backlog: i32,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .context("create listener socket")?;
+    socket.set_reuse_address(true).context("set SO_REUSEADDR")?;
+    set_reuse_port(&socket).context("set SO_REUSEPORT")?;
+    socket.set_nonblocking(true).context("set nonblocking")?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("bind listener to {addr}"))?;
+    socket.listen(backlog).context("listen")?;
+
+    std::net::TcpListener::from(socket)
+        .try_into()
+        .context("convert listener to tokio")
+}
+
+#[cfg(unix)]
+fn set_reuse_port(socket: &Socket) -> std::io::Result<()> {
+    socket.set_reuse_port(true)
+}
+
+#[cfg(not(unix))]
+fn set_reuse_port(_socket: &Socket) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_REUSEPORT is unsupported on this platform",
+    ))
 }
 
 fn apply_keepalive_option(
@@ -411,4 +444,19 @@ fn record_socket_option(
         "outcome" => outcome_label
     )
     .increment(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::bind_reuseport_listener;
+
+    #[tokio::test]
+    async fn two_reuseport_listeners_share_one_address() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let first = bind_reuseport_listener(addr, 1024).expect("first bind");
+        let bound = first.local_addr().expect("local addr");
+        let _second = bind_reuseport_listener(bound, 1024).expect("second bind");
+    }
 }
