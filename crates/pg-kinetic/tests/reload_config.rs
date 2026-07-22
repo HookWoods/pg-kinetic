@@ -308,8 +308,8 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
     let auth_users_v2 = write_temp_file("auth-users-v2", ".toml", "alice = trust\nbob = trust\n");
     let server_chain_v1 = copy_fixture("server-chain-v1", "server-chain.pem");
     let server_key_v1 = copy_fixture("server-key-v1", "server-key.pem");
-    let server_chain_v2 = copy_fixture("server-chain-v2", "server-chain.pem");
-    let server_key_v2 = copy_fixture("server-key-v2", "server-key.pem");
+    let server_chain_v2 = fixture_path("server-chain.pem");
+    let server_key_v2 = fixture_path("server-key.pem");
     let client_ca = fixture_path("ca.pem");
 
     let mut config = base_config();
@@ -351,8 +351,8 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
             "127.0.0.1:6543".parse().expect("listen"),
             "127.0.0.1:5432".parse().expect("backend"),
             &auth_users_v2,
-            &server_chain_v2,
-            &server_key_v2,
+            &server_chain_v1,
+            &server_key_v1,
             &client_ca,
             false,
             3_333,
@@ -365,6 +365,8 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
     )
     .expect("overwrite config file");
     fs::write(&auth_users_v2, "alice = trust\nbob = trust\n").expect("update auth users");
+    fs::copy(&server_chain_v2, &server_chain_v1).expect("update server certificate");
+    fs::copy(&server_key_v2, &server_key_v1).expect("update server key");
 
     let decision = reload_once(&config, &active_config).await.expect("reload");
 
@@ -378,7 +380,7 @@ async fn safe_reload_applies_qos_timeouts_socket_tls_and_users() {
         .expect("users")
         .get("bob")
         .is_some());
-    assert_ne!(
+    assert_eq!(
         effective.tls.client_cert_path,
         updated_config.tls.client_cert_path
     );

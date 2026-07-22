@@ -284,6 +284,7 @@ mod linux {
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
+    config.validate().map_err(anyhow::Error::msg)?;
     metrics::install(metrics::MetricsConfig {
         listen_addr: config.observability.metrics_addr,
     })?;

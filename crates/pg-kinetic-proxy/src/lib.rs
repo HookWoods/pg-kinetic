@@ -36,6 +36,7 @@ pub use health::{EndpointHealthProbe, EndpointHealthSnapshot};
 pub use reload::ReloadDecision;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
+    config.validate().map_err(anyhow::Error::msg)?;
     metrics::install(metrics::MetricsConfig {
         listen_addr: config.observability.metrics_addr,
     })?;
@@ -44,6 +45,7 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
 
 #[cfg(feature = "runtime-experiments")]
 pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
+    config.validate().map_err(anyhow::Error::msg)?;
     metrics::install(metrics::MetricsConfig {
         listen_addr: config.observability.metrics_addr,
     })?;

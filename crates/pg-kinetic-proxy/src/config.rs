@@ -1618,6 +1618,17 @@ pub struct CapacityConfig {
     pub max_checkout_waiters: usize,
 }
 
+impl CapacityConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_backends == 0 {
+            return Err(String::from(
+                "capacity.max_backends must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct PoolLifecycleConfig {
@@ -2161,6 +2172,9 @@ impl Config {
         T: Into<std::ffi::OsString> + Clone,
     {
         let config = Self::try_parse_from(args)?;
+        config.capacity.validate().map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+        })?;
         config.runtime.engine.validate().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
@@ -2185,6 +2199,11 @@ impl Config {
         validate_pool_configs(&self.pools)
     }
 
+    pub fn validate(&self) -> Result<(), String> {
+        self.capacity.validate()?;
+        self.validate_pool_configs()
+    }
+
     #[must_use]
     pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
         self.connection == next.connection
@@ -2203,6 +2222,9 @@ impl Config {
             && self.admin == next.admin
             && self.observability == next.observability
             && self.tls.client_tls_mode == next.tls.client_tls_mode
+            && self.tls.client_cert_path == next.tls.client_cert_path
+            && self.tls.client_key_path == next.tls.client_key_path
+            && self.tls.client_ca_path == next.tls.client_ca_path
             && self.tls.backend_tls_mode == next.tls.backend_tls_mode
             && self.tls.backend_ca_path == next.tls.backend_ca_path
             && self.tls.backend_server_name == next.tls.backend_server_name
@@ -2864,6 +2886,18 @@ mod tests {
         let mut next = current.clone();
         next.qos.max_route_in_flight += 1;
         assert!(!current.is_reload_compatible_with(&next));
+
+        let mut next = current.clone();
+        next.tls.client_cert_path = Some("changed-cert.pem".into());
+        assert!(!current.is_reload_compatible_with(&next));
+
+        let mut next = current.clone();
+        next.tls.client_key_path = Some("changed-key.pem".into());
+        assert!(!current.is_reload_compatible_with(&next));
+
+        let mut next = current.clone();
+        next.tls.client_ca_path = Some("changed-ca.pem".into());
+        assert!(!current.is_reload_compatible_with(&next));
     }
 
     #[test]
@@ -2873,6 +2907,18 @@ mod tests {
         next.qos.query_timeout_ms += 1;
 
         assert!(current.is_reload_compatible_with(&next));
+    }
+
+    #[test]
+    fn rejects_zero_global_backend_capacity() {
+        let mut config = Config::default();
+        config.capacity.max_backends = 0;
+
+        let error = config
+            .validate()
+            .expect_err("zero backend capacity must fail");
+
+        assert_eq!(error, "capacity.max_backends must be greater than zero");
     }
 
     #[test]

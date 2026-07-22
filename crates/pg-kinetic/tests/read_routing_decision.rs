@@ -961,12 +961,10 @@ async fn collect_events(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 async fn read_until_ready_for_query(stream: &mut TcpStream, context: &str) {
     let mut buffer = BytesMut::with_capacity(1024);
     loop {
-        if parse_backend_frame(&mut buffer)
-            .expect(context)
-            .and_then(|frame| frame.ready_status())
-            .is_some()
-        {
-            return;
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect(context) {
+            if frame.ready_status().is_some() {
+                return;
+            }
         }
 
         let read = stream.read_buf(&mut buffer).await.expect(context);

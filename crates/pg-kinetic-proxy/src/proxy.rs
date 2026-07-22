@@ -786,9 +786,7 @@ impl Proxy {
 
     async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
-        effective_config
-            .validate_pool_configs()
-            .map_err(anyhow::Error::msg)?;
+        effective_config.validate().map_err(anyhow::Error::msg)?;
         reload::validate_runtime_assets(&effective_config)?;
         self.lifecycle.configure(
             effective_config.drain.drain_timeout(),
@@ -1333,10 +1331,11 @@ async fn handle_client(
             secret_key,
         }) => {
             startup_timer.finish(MetricOutcome::Canceled);
-            if let Some(target) = cancel_registry.lookup((process_id, secret_key)) {
-                if let Err(error) = cancel::forward_cancel(target).await {
-                    tracing::debug!(%error, "cancel forwarding failed");
-                }
+            if let Err(error) = cancel_registry
+                .forward_cancel((process_id, secret_key))
+                .await
+            {
+                tracing::debug!(%error, "cancel forwarding failed");
             }
             return Ok(());
         }
@@ -1749,7 +1748,8 @@ async fn handle_client(
                         cancel_registry.as_ref(),
                         client_key,
                         backend,
-                    );
+                    )
+                    .await;
                     pause.wait_if_paused().await;
                     let Ok(replacement) = checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
@@ -1936,11 +1936,30 @@ async fn handle_client(
                                     cancel_registry.as_ref(),
                                     client_key,
                                     backend,
-                                );
+                                )
+                                .await;
                             }
                         }
 
                         if client_disconnected_after_ready {
+                            if let Some(backend) = held_backend.take() {
+                                cancel_registry.unbind(client_key).await;
+                                finalize_backend_on_disconnect(
+                                    backend,
+                                    &route_pools,
+                                    &performance,
+                                    &mut session,
+                                    &mut pinned_backend,
+                                    &snapshot_store,
+                                    session_id,
+                                    session_route.clone(),
+                                    &recovery_snapshot_handle,
+                                    &qos,
+                                    phase_recorder.as_ref(),
+                                    debug_sampler,
+                                )
+                                .await?;
+                            }
                             return Ok(());
                         }
                     }
@@ -1972,7 +1991,8 @@ async fn handle_client(
                                 cancel_registry.as_ref(),
                                 client_key,
                                 backend,
-                            );
+                            )
+                            .await;
                         }
                         return Ok(());
                     }
@@ -1982,7 +2002,8 @@ async fn handle_client(
                             cancel_registry.as_ref(),
                             client_key,
                             backend,
-                        );
+                        )
+                        .await;
                         return Ok(());
                     }
                     Ok(Err(error)) => {
@@ -1993,7 +2014,8 @@ async fn handle_client(
                                 cancel_registry.as_ref(),
                                 client_key,
                                 backend,
-                            );
+                            )
+                            .await;
                             return Ok(());
                         }
 
@@ -2014,18 +2036,22 @@ async fn handle_client(
                             cancel_registry.as_ref(),
                             client_key,
                             backend,
-                        );
+                        )
+                        .await;
                         if error.downcast_ref::<BackendFailure>().is_some() {
                             return Ok(());
                         }
                         return Err(error).with_context(|| format!("proxy client {client_addr}"));
                     }
                     Err(_) => {
-                        cancel_registry.unbind(client_key);
+                        cancel_registry.unbind(client_key).await;
                         let continue_client = handle_query_timeout(
                             &mut client,
                             &performance,
                             backend,
+                            &mut held_backend,
+                            cancel_registry.as_ref(),
+                            client_key,
                             &mut session,
                             &mut pinned_backend,
                             &snapshot_store,
@@ -2049,7 +2075,7 @@ async fn handle_client(
             }
             ClientCycle::Terminate => {
                 if let Some(backend) = held_backend.take() {
-                    cancel_registry.unbind(client_key);
+                    cancel_registry.unbind(client_key).await;
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -2070,7 +2096,7 @@ async fn handle_client(
             }
             ClientCycle::IdleTimeout(kind) => {
                 if let Some(backend) = held_backend.take() {
-                    cancel_registry.unbind(client_key);
+                    cancel_registry.unbind(client_key).await;
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -2100,7 +2126,7 @@ async fn handle_client(
             ClientCycle::BufferLimitExceeded => {
                 record_buffer_limit(BufferBudgetKind::Client);
                 if let Some(backend) = held_backend.take() {
-                    cancel_registry.unbind(client_key);
+                    cancel_registry.unbind(client_key).await;
                     finalize_backend_on_disconnect(
                         backend,
                         &route_pools,
@@ -3377,16 +3403,16 @@ async fn release_backend_with_cancel_unbind(
     client_key: (i32, i32),
     backend: PooledBackend,
 ) {
-    registry.unbind(client_key);
+    registry.unbind(client_key).await;
     backend.release().await;
 }
 
-fn discard_backend_with_cancel_unbind(
+async fn discard_backend_with_cancel_unbind(
     registry: &cancel::CancelRegistry,
     client_key: (i32, i32),
     backend: PooledBackend,
 ) {
-    registry.unbind(client_key);
+    registry.unbind(client_key).await;
     backend.discard();
 }
 
@@ -4618,6 +4644,9 @@ async fn handle_query_timeout(
     client: &mut ClientConnection,
     performance: &crate::config::PerformanceConfig,
     mut backend: PooledBackend,
+    held_backend: &mut Option<PooledBackend>,
+    cancel_registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
     session: &mut VirtualSession,
     pinned_backend: &mut PinnedBackend,
     snapshot_store: &SnapshotStore,
@@ -4669,7 +4698,12 @@ async fn handle_query_timeout(
     .unwrap_or(false);
     clear_pinned_backend(pinned_backend, snapshot_store, session_id);
     if reused {
-        backend.release().await;
+        if performance.pool_mode == crate::config::PoolMode::Session {
+            bind_cancel_target(cancel_registry, client_key, &backend);
+            *held_backend = Some(backend);
+        } else {
+            backend.release().await;
+        }
     } else {
         backend.discard();
     }
