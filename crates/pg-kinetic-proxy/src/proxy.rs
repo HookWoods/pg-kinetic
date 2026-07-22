@@ -3926,6 +3926,18 @@ async fn forward_message_cycle(
                 anyhow::Error::new(error).context("write frontend cycle to backend"),
             )
         })?;
+    backend
+        .backend_mut()
+        .stream_mut()
+        .flush()
+        .await
+        .map_err(|error| {
+            backend_failure(
+                BackendFailureKind::Write,
+                false,
+                anyhow::Error::new(error).context("flush frontend cycle to backend"),
+            )
+        })?;
     execute_timer.finish(MetricOutcome::Ok);
     buffers.clear_backend_write();
 
