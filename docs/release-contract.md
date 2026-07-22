@@ -124,14 +124,18 @@ feature-parity claim.
 
 Run the release gate on Linux. The reproducible compatibility environment is
 the repository's Docker Compose stack; it starts PostgreSQL and pg-kinetic with
-the pinned service configuration before running the smoke suites.
+the pinned service configuration before running the Rust smoke suites. The full
+Rust, Go, Java, JavaScript, Python, .NET, C, and C++ smoke matrix is owned by
+the compatibility workflow because those jobs install language-specific
+toolchains and client libraries.
 
 ```bash
 docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
 cargo fmt --check
 cargo test --workspace --locked
-cargo run -p xtask -- compat --target direct-postgres --smoke
-cargo run -p xtask -- compat --target pg-kinetic --smoke
+cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+cargo run -p xtask -- compat --language rust --target direct-postgres --smoke
+cargo run -p xtask -- compat --language rust --target pg-kinetic --smoke
 docker compose -f bench/compose.yml down --volumes
 ```
 
@@ -144,5 +148,5 @@ npm --prefix docs-site run build
 ```
 
 The contract assertion intentionally checks the stable-primary wording, the
-live-traffic exclusion, and the proxy compatibility command. Keep those checks
-machine-readable when revising this page.
+live-traffic exclusion, and the stable-gate proxy compatibility command. Keep
+those checks machine-readable when revising this page.

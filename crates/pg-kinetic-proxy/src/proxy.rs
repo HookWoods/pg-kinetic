@@ -1695,7 +1695,12 @@ async fn handle_client(
                             )
                         });
                         session.mark_ready_after_copy();
-                        let action = cleanup_action(&session, status);
+                        let action =
+                            if status == ReadyStatus::Idle && prepared.has_named_statements() {
+                                CleanupAction::KeepPinned
+                            } else {
+                                cleanup_action(&session, status)
+                            };
                         metrics::increment_cleanup(action);
 
                         match action {
@@ -3471,6 +3476,7 @@ async fn forward_message_cycle(
     let needs_sync = should_sync_for_frames(&frames);
     let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
     let mut simple_query_commands = simple_query_commands.iter();
+    let mut injected_parse_completes = 0_usize;
     buffers.clear_backend_write();
     for frame in frames {
         let simple_query_command = if frame.tag == u8::from(FrontendTag::Query) {
@@ -3497,6 +3503,9 @@ async fn forward_message_cycle(
         )?;
 
         for prelude in &plan.prelude {
+            if prelude.tag == u8::from(FrontendTag::Parse) {
+                injected_parse_completes += 1;
+            }
             buffers.append_frontend_frame(prelude.tag, &prelude.payload);
         }
         buffers.append_frontend_frame(plan.frame.tag, &plan.frame.payload);
@@ -3555,6 +3564,10 @@ async fn forward_message_cycle(
         let mut ready = None;
         let mut forwarded_frames: Vec<([u8; 5], Bytes)> = Vec::new();
         while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
+            if injected_parse_completes > 0 && frame.tag == b'1' {
+                injected_parse_completes -= 1;
+                continue;
+            }
             state.progress.response_started = true;
             if let Some(sqlstate) = frame.sqlstate() {
                 metrics::increment_sqlstate(sqlstate);

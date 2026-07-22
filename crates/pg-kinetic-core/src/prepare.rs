@@ -151,6 +151,11 @@ impl PreparedCatalog {
     }
 
     #[must_use]
+    pub fn has_named_statements(&self) -> bool {
+        self.statements.keys().any(|name| !name.is_empty())
+    }
+
+    #[must_use]
     pub fn is_materialized(&self, backend_id: u64, statement: &PreparedStatement) -> bool {
         if !self.is_current_route_map(statement) {
             return false;
@@ -292,5 +297,24 @@ impl PreparedStatement {
     #[must_use]
     pub const fn command(&self) -> &SqlCommand {
         &self.command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreparedCatalog;
+
+    #[test]
+    fn named_statement_presence_ignores_the_unnamed_slot() {
+        let mut catalog = PreparedCatalog::new(42);
+
+        catalog.upsert("", "select $1::int", Vec::new());
+        assert!(!catalog.has_named_statements());
+
+        catalog.upsert("s1", "select $1::int", Vec::new());
+        assert!(catalog.has_named_statements());
+
+        catalog.remove("s1");
+        assert!(!catalog.has_named_statements());
     }
 }

@@ -65,34 +65,34 @@ fn observed(case_id: &str, outcome: &str) -> serde_json::Value {
 async fn run_tokio_postgres(url: &str) -> Result<(), String> {
     let (mut client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("connect: {error}"))?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
     client
         .query_one("SELECT $1::int", &[&1])
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("parameterized query: {error}"))?;
     let statement = client
         .prepare("SELECT $1::int")
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("prepare statement: {error}"))?;
     client
         .query_one(&statement, &[&2])
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("prepared query: {error}"))?;
     let transaction = client
         .transaction()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("begin transaction: {error}"))?;
     transaction
         .execute("CREATE TEMP TABLE IF NOT EXISTS compat_probe (id int)", &[])
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("create temp table: {error}"))?;
     transaction
         .rollback()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("rollback transaction: {error}"))?;
     let error = client
         .query_one("SELECT * FROM compat_missing_relation", &[])
         .await;
