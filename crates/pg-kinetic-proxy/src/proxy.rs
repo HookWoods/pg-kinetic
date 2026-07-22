@@ -963,7 +963,14 @@ async fn run_control_plane(
         let reload_config = effective_config.reload.clone();
         let active_config = Arc::clone(&active_config);
         Some(tokio::spawn(async move {
-            reload::spawn_reload_loop(base_config, reload_config, active_config, route_pools).await;
+            reload::spawn_reload_loop(
+                base_config,
+                reload_config,
+                active_config,
+                route_pools,
+                route_pool_registry,
+            )
+            .await;
         }))
     } else {
         None

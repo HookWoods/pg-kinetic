@@ -479,6 +479,14 @@ impl RoutePoolRegistry {
     }
 
     #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes
+            .read()
+            .expect("route registry poisoned")
+            .is_empty()
+    }
+
+    #[must_use]
     pub fn route_pools(&self, route: &RouteKey) -> Option<RoutePools> {
         self.routes
             .read()
@@ -498,6 +506,20 @@ impl RoutePoolRegistry {
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| left.0.metric_label().cmp(&right.0.metric_label()));
         snapshots
+    }
+
+    pub async fn retire_idle_backends(&self) {
+        let pools = self
+            .routes
+            .read()
+            .expect("route registry poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for pools in pools {
+            pools.retire_idle_backends().await;
+        }
     }
 
     pub async fn checkout_primary(
@@ -1694,6 +1716,49 @@ mod tests {
         assert_eq!(replica_accepts.load(Ordering::Relaxed), 0);
         assert_eq!(pools.primary().role(), BackendRole::Primary);
         assert_eq!(pools.replicas().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_pool_registry_retires_idle_backends_from_all_routes() {
+        let (first_addr, first_accepts) = backend_listener().await;
+        let (second_addr, second_accepts) = backend_listener().await;
+        let first_route = RouteKey::new("first", "postgres", None, None, QueryClass::Default);
+        let second_route = RouteKey::new("second", "postgres", None, None, QueryClass::Default);
+        let first_pools = RoutePools::new(
+            backend_ref_primary(first_addr),
+            Vec::new(),
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let second_pools = RoutePools::new(
+            backend_ref_primary(second_addr),
+            Vec::new(),
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        );
+        let registry = RoutePoolRegistry::new();
+        registry.insert(first_route.clone(), first_pools.clone());
+        registry.insert(second_route.clone(), second_pools.clone());
+
+        registry
+            .checkout_primary(&first_route, CheckoutMode::AllowConnect)
+            .await
+            .expect("first checkout")
+            .release()
+            .await;
+        registry
+            .checkout_primary(&second_route, CheckoutMode::AllowConnect)
+            .await
+            .expect("second checkout")
+            .release()
+            .await;
+        wait_for_accepts(&first_accepts, 1).await;
+        wait_for_accepts(&second_accepts, 1).await;
+        assert_eq!(first_pools.primary().idle_backends(), 1);
+        assert_eq!(second_pools.primary().idle_backends(), 1);
+
+        registry.retire_idle_backends().await;
+
+        assert_eq!(first_pools.primary().idle_backends(), 0);
+        assert_eq!(second_pools.primary().idle_backends(), 0);
     }
 
     #[tokio::test]

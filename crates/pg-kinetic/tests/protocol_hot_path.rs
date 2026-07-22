@@ -272,12 +272,27 @@ async fn run_simple_query_forwarding_with_stats(sql: &str) -> (Vec<u8>, ProxyBuf
         .expect("connect proxy");
     stream.write_all(&startup_packet()).await.expect("startup");
 
-    let mut auth = vec![0_u8; auth_ok_ready().len()];
+    let mut authentication_ok = vec![0_u8; 9];
     stream
-        .read_exact(&mut auth)
+        .read_exact(&mut authentication_ok)
         .await
-        .expect("read auth response");
-    assert_eq!(auth, auth_ok_ready());
+        .expect("read authentication response");
+    assert_eq!(&authentication_ok[..], &auth_ok_ready()[..9]);
+
+    let mut backend_key_data = [0_u8; 13];
+    stream
+        .read_exact(&mut backend_key_data)
+        .await
+        .expect("read proxy backend key data");
+    assert_eq!(backend_key_data[0], b'K');
+    assert_eq!(&backend_key_data[1..5], &12_i32.to_be_bytes());
+
+    let mut ready_for_query = [0_u8; 6];
+    stream
+        .read_exact(&mut ready_for_query)
+        .await
+        .expect("read ready for query");
+    assert_eq!(&ready_for_query[..], &auth_ok_ready()[9..]);
 
     stream.write_all(&query_packet(sql)).await.expect("query");
 

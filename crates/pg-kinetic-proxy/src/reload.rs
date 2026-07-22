@@ -12,7 +12,7 @@ use crate::{
     auth,
     config::{ClientTlsMode, Config, PolicyConfig, ReloadConfig},
     policy::{PolicyReloadResult, PolicyStore},
-    pool::RoutePools,
+    pool::{RoutePoolRegistry, RoutePools},
     sharding::RouteMapReloadResult,
     snapshot::{PolicyReloadSnapshot, RouteMapReloadSnapshot, SnapshotStore},
     tls,
@@ -77,13 +77,14 @@ pub async fn reload_once(
     base: &Config,
     active_config: &Arc<RwLock<Config>>,
 ) -> anyhow::Result<ReloadDecision> {
-    reload_once_with_pools(base, active_config, None).await
+    reload_once_with_pools(base, active_config, None, None).await
 }
 
 pub async fn reload_once_with_pools(
     base: &Config,
     active_config: &Arc<RwLock<Config>>,
     route_pools: Option<&Arc<RoutePools>>,
+    route_pool_registry: Option<&Arc<RoutePoolRegistry>>,
 ) -> anyhow::Result<ReloadDecision> {
     let next_config = load_effective_config(base)?;
     let current_config = active_config.read().await.clone();
@@ -98,7 +99,9 @@ pub async fn reload_once_with_pools(
 
     validate_runtime_assets(&next_config)?;
     *active_config.write().await = next_config;
-    if let Some(route_pools) = route_pools {
+    if let Some(route_pool_registry) = route_pool_registry.filter(|registry| !registry.is_empty()) {
+        route_pool_registry.retire_idle_backends().await;
+    } else if let Some(route_pools) = route_pools {
         route_pools.retire_idle_backends().await;
     }
     Ok(ReloadDecision::Applied)
@@ -130,6 +133,7 @@ pub async fn spawn_reload_loop(
     reload_config: ReloadConfig,
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
+    route_pool_registry: Arc<RoutePoolRegistry>,
 ) {
     if base.reload.config_file.is_none() {
         return;
@@ -141,7 +145,14 @@ pub async fn spawn_reload_loop(
 
     loop {
         ticker.tick().await;
-        match reload_once_with_pools(&base, &active_config, Some(&route_pools)).await {
+        match reload_once_with_pools(
+            &base,
+            &active_config,
+            Some(&route_pools),
+            Some(&route_pool_registry),
+        )
+        .await
+        {
             Ok(ReloadDecision::Applied) => {
                 metrics_crate::counter!("pg_kinetic_config_reload_total", "outcome" => "applied")
                     .increment(1);

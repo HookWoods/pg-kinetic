@@ -126,6 +126,7 @@ impl AdminState {
             &self.base_config,
             &self.active_config,
             Some(&self.route_pools),
+            Some(&self.route_pool_registry),
         )
         .await?;
 
