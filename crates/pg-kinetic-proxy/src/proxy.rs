@@ -229,11 +229,18 @@ impl ClientConnection {
         let mut slice_offset = 0;
 
         while slice_index < slices.len() {
+            skip_empty_vectored_slices(slices, &mut slice_index, &mut slice_offset);
+            if slice_index >= slices.len() {
+                return Ok(());
+            }
+
             let mut remaining_slices = Vec::with_capacity(slices.len() - slice_index);
             let first_slice = &slices[slice_index][slice_offset..];
             remaining_slices.push(IoSlice::new(first_slice));
             for slice in &slices[slice_index + 1..] {
-                remaining_slices.push(IoSlice::new(slice));
+                if !slice.is_empty() {
+                    remaining_slices.push(IoSlice::new(slice));
+                }
             }
 
             let written = match self.inner.as_mut().expect("client stream present") {
@@ -250,6 +257,14 @@ impl ClientConnection {
             let mut remaining = written;
             while remaining > 0 {
                 let current_slice_len = slices[slice_index].len() - slice_offset;
+                if current_slice_len == 0 {
+                    slice_index += 1;
+                    slice_offset = 0;
+                    if slice_index >= slices.len() {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 if remaining < current_slice_len {
                     slice_offset += remaining;
                     remaining = 0;
@@ -289,6 +304,17 @@ impl ClientConnection {
         let tls = tls::accept_client_tls(plain, server_config).await?;
         self.inner = Some(ClientTransport::Tls(tls));
         Ok(())
+    }
+}
+
+fn skip_empty_vectored_slices(
+    slices: &[IoSlice<'_>],
+    slice_index: &mut usize,
+    slice_offset: &mut usize,
+) {
+    while *slice_index < slices.len() && *slice_offset >= slices[*slice_index].len() {
+        *slice_index += 1;
+        *slice_offset = 0;
     }
 }
 
@@ -4887,7 +4913,9 @@ fn record_buffer_limit(kind: BufferBudgetKind) {
 
 #[cfg(test)]
 mod tests {
-    use super::auth_request_expects_client_response;
+    use std::io::IoSlice;
+
+    use super::{auth_request_expects_client_response, skip_empty_vectored_slices};
 
     fn auth_payload(code: i32) -> [u8; 4] {
         code.to_be_bytes()
@@ -4903,5 +4931,24 @@ mod tests {
     fn sasl_final_and_ok_do_not_expect_client_responses() {
         assert!(!auth_request_expects_client_response(&auth_payload(12)).unwrap());
         assert!(!auth_request_expects_client_response(&auth_payload(0)).unwrap());
+    }
+
+    #[test]
+    fn vectored_write_progress_skips_empty_payload_slices() {
+        let header = [b'1', 0, 0, 0, 4];
+        let payload = [];
+        let next_header = [b'Z', 0, 0, 0, 5];
+        let slices = [
+            IoSlice::new(&header),
+            IoSlice::new(&payload),
+            IoSlice::new(&next_header),
+        ];
+        let mut slice_index = 1;
+        let mut slice_offset = 0;
+
+        skip_empty_vectored_slices(&slices, &mut slice_index, &mut slice_offset);
+
+        assert_eq!(slice_index, 2);
+        assert_eq!(slice_offset, 0);
     }
 }
