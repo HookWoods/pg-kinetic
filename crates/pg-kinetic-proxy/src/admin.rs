@@ -9,7 +9,7 @@ use anyhow::Context;
 use bytes::{BufMut, BytesMut};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     time::timeout,
 };
 use tokio_rustls::rustls::ServerConfig;
@@ -17,6 +17,8 @@ use tokio_rustls::rustls::ServerConfig;
 use crate::{
     config::{Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig},
     drain::DrainController,
+    pause::PauseController,
+    pool::RoutePools,
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
@@ -44,7 +46,7 @@ use pg_kinetic_core::{
     sharding::ShardLifecycleState,
 };
 use pg_kinetic_wire::{
-    admin::{build_admin_table_response, AdminWireColumn, AdminWireType},
+    admin::{build_admin_table_response, build_command_response, AdminWireColumn, AdminWireType},
     backend::build_error_response,
     frame::parse_frontend_frame,
     message::parse_simple_query,
@@ -59,8 +61,12 @@ const ADMIN_UNSUPPORTED_SQLSTATE: &str = "0A000";
 #[derive(Debug)]
 struct AdminState {
     config: Config,
+    base_config: Config,
+    active_config: Arc<RwLock<Config>>,
+    route_pools: Arc<RoutePools>,
     client_tls_server_config: Option<Arc<ServerConfig>>,
     drain: Arc<DrainController>,
+    pause: Arc<PauseController>,
     snapshot_store: SnapshotStore,
     client_slots: Arc<Semaphore>,
 }
@@ -77,7 +83,11 @@ enum AdminRequest {
 pub async fn spawn(
     listen_addr: SocketAddr,
     config: Config,
+    base_config: Config,
+    active_config: Arc<RwLock<Config>>,
+    route_pools: Arc<RoutePools>,
     drain: Arc<DrainController>,
+    pause: Arc<PauseController>,
     snapshot_store: SnapshotStore,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(listen_addr)
@@ -93,14 +103,49 @@ pub async fn spawn(
     let state = Arc::new(AdminState {
         client_slots: Arc::new(Semaphore::new(config.admin.admin_max_clients)),
         config,
+        base_config,
+        active_config,
+        route_pools,
         client_tls_server_config,
         drain,
+        pause,
         snapshot_store,
     });
 
     Ok(tokio::spawn(async move {
         run_server(listener, state).await;
     }))
+}
+
+impl AdminState {
+    async fn reload_now(&self) -> anyhow::Result<reload::ReloadDecision> {
+        let decision = reload::reload_once_with_pools(
+            &self.base_config,
+            &self.active_config,
+            Some(&self.route_pools),
+        )
+        .await?;
+
+        metrics_crate::counter!(
+            "pg_kinetic_config_reload_total",
+            "outcome" => match decision {
+                reload::ReloadDecision::Applied => "applied",
+                reload::ReloadDecision::Rejected => "rejected",
+                reload::ReloadDecision::Unchanged => "unchanged",
+            }
+        )
+        .increment(1);
+
+        if decision == reload::ReloadDecision::Applied {
+            let config = self.active_config.read().await.clone();
+            self.snapshot_store
+                .set_settings_snapshot(SettingsSnapshot::from_config(&config));
+            self.snapshot_store
+                .set_limits_snapshot(LimitsSnapshot::from_config(&config));
+        }
+
+        Ok(decision)
+    }
 }
 
 async fn run_server(listener: TcpListener, state: Arc<AdminState>) {
@@ -229,7 +274,8 @@ async fn handle_session(
 
                 match parse_admin_command(sql) {
                     AdminCommand::Show(view) => {
-                        if let Some(response) = render_admin_view(state, view) {
+                        let config = state.active_config.read().await.clone();
+                        if let Some(response) = render_admin_view(state, &config, view) {
                             client
                                 .write_all(&response)
                                 .await
@@ -244,6 +290,46 @@ async fn handle_session(
                             .await?;
                         }
                     }
+                    AdminCommand::Pause => {
+                        state.pause.pause();
+                        client
+                            .write_all(&build_command_response("PAUSE"))
+                            .await
+                            .context("write admin pause response")?;
+                    }
+                    AdminCommand::Resume => {
+                        state.pause.resume();
+                        client
+                            .write_all(&build_command_response("RESUME"))
+                            .await
+                            .context("write admin resume response")?;
+                    }
+                    AdminCommand::Reload => match state.reload_now().await {
+                        Ok(reload::ReloadDecision::Applied | reload::ReloadDecision::Unchanged) => {
+                            client
+                                .write_all(&build_command_response("RELOAD"))
+                                .await
+                                .context("write admin reload response")?;
+                        }
+                        Ok(reload::ReloadDecision::Rejected) => {
+                            error_response_and_ready(
+                                client,
+                                "55000",
+                                "reload rejected: incompatible config change",
+                                ReadyStatusByte::Idle,
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            error_response_and_ready(
+                                client,
+                                "55000",
+                                &format!("reload rejected: {error:#}"),
+                                ReadyStatusByte::Idle,
+                            )
+                            .await?;
+                        }
+                    },
                     AdminCommand::Unknown(sql) => {
                         error_response_and_ready(
                             client,
@@ -386,7 +472,7 @@ fn ready_for_query(status: ReadyStatusByte) -> BytesMut {
     bytes
 }
 
-fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
+fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Option<BytesMut> {
     let sharding_snapshot = state.snapshot_store.sharding_snapshot();
     let table = match view {
         AdminView::Clients => clients_table(
@@ -401,7 +487,7 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             &state.snapshot_store.server_snapshots(),
             &state.snapshot_store.replica_health_snapshots(),
         ),
-        AdminView::Runtime => runtime_table(state.snapshot_store.runtime_snapshot(), &state.config),
+        AdminView::Runtime => runtime_table(state.snapshot_store.runtime_snapshot(), config),
         AdminView::RuntimeShards => {
             runtime_shards_table(&state.snapshot_store.runtime_shard_snapshots())
         }
@@ -409,19 +495,11 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             state.snapshot_store.node_snapshots(),
             state.snapshot_store.runtime_snapshot(),
         ),
-        AdminView::Mirroring => {
-            mirroring_table(state.snapshot_store.mirror_snapshot(), &state.config)
-        }
+        AdminView::Mirroring => mirroring_table(state.snapshot_store.mirror_snapshot(), config),
         AdminView::Adaptive => adaptive_table(
-            state
-                .config
-                .runtime
-                .production
-                .adaptive
-                .adaptive_mode
-                .as_str(),
-            &state.config.runtime.production.adaptive.apply,
-            &state.config.runtime.production.adaptive.guardrail,
+            config.runtime.production.adaptive.adaptive_mode.as_str(),
+            &config.runtime.production.adaptive.apply,
+            &config.runtime.production.adaptive.guardrail,
             &state.snapshot_store.adaptive_recommendation_snapshots(),
             &state.snapshot_store.adaptive_outcome_snapshots(),
         ),
@@ -467,7 +545,7 @@ fn render_admin_view(state: &AdminState, view: AdminView) -> Option<BytesMut> {
             migrations_table(&state.snapshot_store.shard_migration_safety_snapshots())
         }
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
-        AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), &state.config),
+        AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), config),
     };
 
     Some(admin_table_response(table))

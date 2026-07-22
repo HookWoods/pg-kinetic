@@ -47,3 +47,15 @@ fn rejects_non_admin_sql() {
         AdminCommand::Unknown(_)
     ));
 }
+
+#[test]
+fn parses_operational_verbs() {
+    assert_eq!(parse_admin_command("PAUSE"), AdminCommand::Pause);
+    assert_eq!(parse_admin_command("pause;"), AdminCommand::Pause);
+    assert_eq!(parse_admin_command("RESUME"), AdminCommand::Resume);
+    assert_eq!(parse_admin_command("RELOAD"), AdminCommand::Reload);
+    assert!(matches!(
+        parse_admin_command("PAUSE db1"),
+        AdminCommand::Unknown(_)
+    ));
+}

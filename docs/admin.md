@@ -58,6 +58,9 @@ Unset optional fields render as `<none>`.
 | `SHOW PERFORMANCE` | Regression-budget thresholds and outcomes, profile and process-metric status, process CPU and resident-memory samples, and proxy performance counters. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
+| `PAUSE` | Queues new backend checkouts without killing connected clients or in-flight queries. |
+| `RESUME` | Releases clients waiting behind `PAUSE`. |
+| `RELOAD` | Applies the configured config file immediately when the change is reload-compatible; incompatible changes are rejected with the reason surfaced as an error. |
 
 ## Availability Rules
 
@@ -116,3 +119,5 @@ All values are point-in-time in-process snapshots. They are not transactional re
 - Use `SHOW RUNTIME`, `SHOW ADAPTIVE`, and `SHOW BENCHMARKS` with the runtime, adaptive, and benchmarking guides to track available runtime and tooling state.
 - Use `SHOW PERFORMANCE` after a report comparison to review the warning and failure thresholds, observed and baseline values, profile status, and process-metric availability.
 - Use `SHOW SETTINGS` and `SHOW LIMITS` to verify the live configuration after a reload or before a support investigation.
+- Use `PAUSE` before backend maintenance when new query checkouts should wait, then `RESUME` after the backend is ready. Existing in-flight queries are not canceled.
+- Use `RELOAD` for compatible runtime config changes such as timeout and reloadable asset updates; listener, capacity, routing topology, TLS mode, and auth mode changes still require restart.

@@ -38,6 +38,7 @@ use crate::{
     },
     metrics,
     mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
+    pause::PauseController,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
         ReplicaSelectionStrategy, ReplicaSelector, RoutePools,
@@ -299,6 +300,7 @@ pub struct Proxy {
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
     cancel_registry: Arc<cancel::CancelRegistry>,
+    pause: Arc<PauseController>,
 }
 
 struct ControlPlaneHandles {
@@ -320,6 +322,7 @@ pub(crate) struct ShardContext {
     pub mirror_dispatcher: Arc<MirrorDispatcher>,
     pub routing_planner: ReadRoutingPlanner,
     pub cancel_registry: Arc<cancel::CancelRegistry>,
+    pub pause: Arc<PauseController>,
     pub reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     pub debug_sampler: DebugSampler,
     pub phase_metrics_enabled: bool,
@@ -371,6 +374,7 @@ impl Proxy {
             lifecycle,
             snapshot_store,
             cancel_registry: Arc::new(cancel::CancelRegistry::default()),
+            pause: Arc::new(PauseController::default()),
         }
     }
 
@@ -416,6 +420,7 @@ impl Proxy {
             Arc::clone(&state.route_pools),
             &state.route_config,
             Arc::clone(&drain),
+            Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
             state.mirror_outcome_recorder.clone(),
@@ -437,6 +442,7 @@ impl Proxy {
             mirror_dispatcher: Arc::clone(&state.mirror_dispatcher),
             routing_planner: state.routing_planner,
             cancel_registry: Arc::clone(&self.cancel_registry),
+            pause: Arc::clone(&self.pause),
             reject_phase_recorder: Arc::clone(&state.reject_phase_recorder),
             debug_sampler: state.debug_sampler,
             phase_metrics_enabled: state.phase_metrics_enabled,
@@ -523,6 +529,7 @@ impl Proxy {
             let mirror_dispatcher = Arc::clone(&state.mirror_dispatcher);
             let routing_planner = state.routing_planner;
             let cancel_registry = Arc::clone(&self.cancel_registry);
+            let pause = Arc::clone(&self.pause);
             let reject_phase_recorder = Arc::clone(&state.reject_phase_recorder);
             let debug_sampler = state.debug_sampler;
             let phase_metrics_enabled = state.phase_metrics_enabled;
@@ -592,6 +599,7 @@ impl Proxy {
                             mirror_dispatcher,
                             routing_planner,
                             cancel_registry,
+                            pause,
                             reject_phase_recorder,
                             debug_sampler,
                             phase_metrics_enabled,
@@ -645,6 +653,7 @@ impl Proxy {
             Arc::clone(&state.route_pools),
             &state.route_config,
             Arc::clone(&drain),
+            Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
             state.mirror_outcome_recorder.clone(),
@@ -860,6 +869,7 @@ async fn run_control_plane(
     route_pools: Arc<RoutePools>,
     route_config: &RouteConfig,
     drain: Arc<DrainController>,
+    pause: Arc<PauseController>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
     mirror_outcome_recorder: MirrorOutcomeRecorder,
@@ -885,7 +895,11 @@ async fn run_control_plane(
             admin::spawn(
                 admin_addr,
                 effective_config.clone(),
+                base_config.clone(),
+                Arc::clone(&active_config),
+                Arc::clone(&route_pools),
                 Arc::clone(&drain),
+                Arc::clone(&pause),
                 snapshot_store.clone(),
             )
             .await?,
@@ -1108,6 +1122,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                 let routing_planner = ctx.routing_planner;
                 let debug_sampler = ctx.debug_sampler;
                 let cancel_registry = Arc::clone(&ctx.cancel_registry);
+                let pause = Arc::clone(&ctx.pause);
 
                 client_tasks.spawn(async move {
                     let _client_guard = client_guard;
@@ -1126,6 +1141,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                         buffer_pool,
                         backend_credentials,
                         cancel_registry,
+                        pause,
                     )
                     .await;
                     drop(permit);
@@ -1182,6 +1198,7 @@ async fn handle_client(
     buffer_pool: ProxyBufferPool,
     backend_credentials: Option<Arc<auth::BackendCredentials>>,
     cancel_registry: Arc<cancel::CancelRegistry>,
+    pause: Arc<PauseController>,
 ) -> anyhow::Result<()> {
     let mut session_buffer_lease = buffer_pool.acquire();
     let session_buffers = session_buffer_lease.buffers_mut();
@@ -1340,6 +1357,7 @@ async fn handle_client(
             .map(auth::BackendCredentials::username),
     )?;
 
+    pause.wait_if_paused().await;
     let mut backend = match checkout_backend(CheckoutBackendRequest {
         route_pools: &route_pools,
         route: session_route.clone(),
@@ -1529,6 +1547,7 @@ async fn handle_client(
                 let mut backend = if let Some(backend) = held_backend.take() {
                     backend
                 } else {
+                    pause.wait_if_paused().await;
                     match checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
                         route: route.clone(),
@@ -1662,6 +1681,7 @@ async fn handle_client(
                         client_key,
                         backend,
                     );
+                    pause.wait_if_paused().await;
                     let Ok(replacement) = checkout_backend(CheckoutBackendRequest {
                         route_pools: &route_pools,
                         route: route.clone(),

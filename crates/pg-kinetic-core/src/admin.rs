@@ -1,6 +1,9 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminCommand {
     Show(AdminView),
+    Pause,
+    Resume,
+    Reload,
     Unknown(String),
 }
 
@@ -33,6 +36,9 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
         ["show", "migrations"] => AdminCommand::Show(AdminView::Migrations),
         ["show", "settings"] => AdminCommand::Show(AdminView::Settings),
         ["show", "limits"] => AdminCommand::Show(AdminView::Limits),
+        ["pause"] => AdminCommand::Pause,
+        ["resume"] => AdminCommand::Resume,
+        ["reload"] => AdminCommand::Reload,
         _ => AdminCommand::Unknown(normalized_sql),
     }
 }
@@ -42,7 +48,7 @@ impl AdminCommand {
     pub fn view(&self) -> Option<AdminView> {
         match self {
             Self::Show(view) => Some(*view),
-            Self::Unknown(_) => None,
+            Self::Pause | Self::Resume | Self::Reload | Self::Unknown(_) => None,
         }
     }
 }

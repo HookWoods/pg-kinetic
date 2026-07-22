@@ -143,6 +143,14 @@ pub fn build_admin_table_response(columns: &[AdminWireColumn], rows: &[Vec<Strin
     response
 }
 
+#[must_use]
+pub fn build_command_response(command_tag: &str) -> BytesMut {
+    let mut response = BytesMut::new();
+    response.extend_from_slice(&build_command_complete(command_tag));
+    response.extend_from_slice(&build_ready_for_query());
+    response
+}
+
 fn build_ready_for_query() -> BytesMut {
     let mut payload = BytesMut::new();
     payload.put_u8(u8::from(ReadyStatusByte::Idle));

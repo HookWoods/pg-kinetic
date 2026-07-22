@@ -14,6 +14,7 @@ pub mod io_uring;
 pub mod lifecycle;
 pub mod metrics;
 pub mod mirror;
+pub mod pause;
 pub mod policy;
 #[cfg(feature = "policy-wasm")]
 pub mod policy_wasm;

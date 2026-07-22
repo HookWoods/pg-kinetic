@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use pg_kinetic_wire::admin::{
-    build_admin_table_response, build_command_complete, build_data_row, build_row_description,
-    AdminWireColumn, AdminWireType,
+    build_admin_table_response, build_command_complete, build_command_response, build_data_row,
+    build_row_description, AdminWireColumn, AdminWireType,
 };
 
 #[test]
@@ -54,4 +54,16 @@ fn builds_individual_messages() {
     assert!(row_description.starts_with(b"T"));
     assert!(data_rows.starts_with(b"D"));
     assert!(command_complete.starts_with(b"C"));
+}
+
+#[test]
+fn builds_command_response() {
+    let response = build_command_response("PAUSE");
+
+    assert_eq!(
+        response,
+        BytesMut::from(
+            &[b'C', 0, 0, 0, 10, b'P', b'A', b'U', b'S', b'E', 0, b'Z', 0, 0, 0, 5, b'I'][..]
+        ),
+    );
 }

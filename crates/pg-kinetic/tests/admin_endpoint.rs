@@ -1,4 +1,5 @@
 use std::{
+    fs,
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -561,6 +562,58 @@ async fn show_settings_and_limits_keep_secrets_out() {
     let _ = run_handle.await;
 }
 
+#[tokio::test]
+async fn pause_blocks_new_queries_and_resume_releases_them() {
+    let backend_addr = spawn_query_backend().await;
+    let admin_addr = free_port().await;
+    let (run_handle, listen_addr, _) =
+        spawn_proxy(test_config(Some(admin_addr), Some("admin"), backend_addr)).await;
+
+    let pause_frames = admin_query(admin_addr, "PAUSE").await;
+    assert_command_complete(&pause_frames, "PAUSE");
+
+    let blocked = tokio::spawn(async move {
+        run_query_via_proxy(listen_addr).await;
+    });
+    time::sleep(Duration::from_millis(200)).await;
+    assert!(!blocked.is_finished());
+
+    let resume_frames = admin_query(admin_addr, "RESUME").await;
+    assert_command_complete(&resume_frames, "RESUME");
+    time::timeout(Duration::from_secs(2), blocked)
+        .await
+        .expect("query released")
+        .expect("query task");
+
+    run_handle.abort();
+    let _ = run_handle.await;
+}
+
+#[tokio::test]
+async fn reload_applies_a_compatible_config_change() {
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_addr = spawn_backend_monitor(Arc::clone(&backend_hits)).await;
+    let admin_addr = free_port().await;
+    let config_file = write_temp_config("[qos]\nquery_timeout_ms = 30000\n");
+    let mut config = test_config(Some(admin_addr), Some("admin"), backend_addr);
+    config.reload.config_file = Some(config_file.clone());
+
+    let (run_handle, _, _) = spawn_proxy(config).await;
+    fs::write(&config_file, "[qos]\nquery_timeout_ms = 10000\n").expect("update config");
+
+    let reload_frames = admin_query(admin_addr, "RELOAD").await;
+    assert_command_complete(&reload_frames, "RELOAD");
+
+    let limits_frames = admin_query(admin_addr, "SHOW LIMITS").await;
+    assert_eq!(
+        table_value(&limits_frames, "query_timeout_ms").as_deref(),
+        Some("10000")
+    );
+
+    run_handle.abort();
+    let _ = run_handle.await;
+}
+
 async fn spawn_proxy(config: Config) -> (tokio::task::JoinHandle<()>, SocketAddr, SnapshotStore) {
     let listen = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let listen_addr = listen.local_addr().expect("listen addr");
@@ -681,6 +734,98 @@ async fn spawn_backend_monitor(hits: Arc<AtomicUsize>) -> SocketAddr {
     backend_addr
 }
 
+async fn spawn_query_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = listener.local_addr().expect("backend addr");
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept backend");
+            tokio::spawn(async move {
+                let mut startup = [0_u8; 1024];
+                let _ = stream.read(&mut startup).await.expect("read startup");
+                stream
+                    .write_all(&auth_ok_ready())
+                    .await
+                    .expect("startup response");
+
+                loop {
+                    let mut query = [0_u8; 1024];
+                    let read = stream.read(&mut query).await.expect("read query");
+                    if read == 0 {
+                        break;
+                    }
+                    stream
+                        .write_all(&select_one_ready())
+                        .await
+                        .expect("query response");
+                }
+            });
+        }
+    });
+
+    backend_addr
+}
+
+async fn run_query_via_proxy(proxy_addr: SocketAddr) {
+    let mut stream = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    stream
+        .write_all(&startup_packet("postgres"))
+        .await
+        .expect("startup");
+    let _ = read_until_ready(&mut stream).await;
+    stream
+        .write_all(&query_packet("select 1"))
+        .await
+        .expect("query");
+    let frames = read_until_ready(&mut stream).await;
+    assert!(
+        frames.iter().any(|frame| frame.tag == b'C'),
+        "expected command complete"
+    );
+}
+
+fn write_temp_config(contents: &str) -> PathBuf {
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(1);
+    let path = std::env::temp_dir().join(format!(
+        "pg-kinetic-admin-reload-{}-{}.toml",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::write(&path, contents).expect("write config");
+    path
+}
+
+fn assert_command_complete(frames: &[BackendFrame], tag: &str) {
+    let command = frames
+        .iter()
+        .find(|frame| frame.tag == b'C')
+        .expect("command complete");
+    assert_eq!(
+        std::str::from_utf8(&command.payload[..command.payload.len() - 1]).expect("command tag"),
+        tag
+    );
+    assert!(
+        frames.iter().any(|frame| frame.tag == b'Z'),
+        "expected ready"
+    );
+}
+
+fn table_value(frames: &[BackendFrame], column: &str) -> Option<String> {
+    let columns = frames
+        .iter()
+        .find(|frame| frame.tag == b'T')
+        .map(row_description_columns)?;
+    let row = frames
+        .iter()
+        .find(|frame| frame.tag == b'D')
+        .map(data_row_values)?;
+    let index = columns.iter().position(|name| name == column)?;
+    row.get(index).cloned()
+}
+
 async fn free_port() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -737,6 +882,43 @@ fn query_packet(sql: &str) -> Vec<u8> {
     packet.put_i32((payload.len() + 4) as i32);
     packet.extend_from_slice(&payload);
     packet.to_vec()
+}
+
+fn auth_ok_ready() -> Vec<u8> {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'R');
+    bytes.put_i32(8);
+    bytes.put_i32(0);
+    bytes.put_u8(b'Z');
+    bytes.put_i32(5);
+    bytes.put_u8(b'I');
+    bytes.to_vec()
+}
+
+fn select_one_ready() -> Vec<u8> {
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'T');
+    bytes.put_i32(33);
+    bytes.put_i16(1);
+    bytes.extend_from_slice(b"?column?\0");
+    bytes.put_i32(0);
+    bytes.put_i16(0);
+    bytes.put_i32(23);
+    bytes.put_i16(4);
+    bytes.put_i32(-1);
+    bytes.put_i16(0);
+    bytes.put_u8(b'D');
+    bytes.put_i32(11);
+    bytes.put_i16(1);
+    bytes.put_i32(1);
+    bytes.extend_from_slice(b"1");
+    bytes.put_u8(b'C');
+    bytes.put_i32(13);
+    bytes.extend_from_slice(b"SELECT 1\0");
+    bytes.put_u8(b'Z');
+    bytes.put_i32(5);
+    bytes.put_u8(b'I');
+    bytes.to_vec()
 }
 
 fn error_message(frame: &BackendFrame) -> Option<&str> {
