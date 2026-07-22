@@ -18,16 +18,17 @@ use pg_kinetic_core::{
     },
 };
 use pg_kinetic_proxy::{
-    config::TlsConfig,
+    config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
     pool::{
-        BackendPool, BackendPoolRef, CheckoutMode, ReplicaSelectionStrategy, ReplicaSelector,
-        RoutePoolRegistry, RoutePools, ShardPoolCheckoutTarget, ShardPoolKey, ShardPools,
-        ShardedPoolRegistry,
+        BackendPool, BackendPoolRef, CheckoutMode, PoolError, ReplicaSelectionStrategy,
+        ReplicaSelector, RoutePoolRegistry, RoutePools, ShardPoolCheckoutTarget, ShardPoolKey,
+        ShardPools, ShardedPoolRegistry,
     },
     routing::{RoutingReason, RoutingTarget},
     sharding::ShardRouteMapStore,
     snapshot::SnapshotStore,
 };
+use tokio::sync::Semaphore;
 
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
 
@@ -76,6 +77,23 @@ fn test_pool_with_waiters(addr: SocketAddr, max_route_waiters: usize) -> Arc<Bac
         max_route_waiters,
         Duration::from_millis(200),
         "DISCARD ALL",
+    )
+}
+
+fn globally_limited_pool(addr: SocketAddr, global_slots: Arc<Semaphore>) -> Arc<BackendPool> {
+    let mut lifecycle = PoolLifecycleConfig::default();
+    lifecycle.max_size = 1;
+    BackendPool::new_with_socket_lifecycle_and_global_limit(
+        addr,
+        TlsConfig::default(),
+        SocketConfig::default(),
+        4,
+        4,
+        4,
+        Duration::from_millis(25),
+        "DISCARD ALL",
+        lifecycle,
+        Some(global_slots),
     )
 }
 
@@ -306,6 +324,39 @@ async fn concurrent_checkouts_do_not_serialize_on_snapshot_store() {
     pool.with_snapshot_store(|snapshot_store| {
         let _ = snapshot_store;
     });
+}
+
+#[tokio::test]
+async fn shared_global_backend_cap_prevents_cross_pool_overallocation() {
+    let (backend_addr, accepted) = backend_listener().await;
+    let global_slots = Arc::new(Semaphore::new(1));
+    let first_pool = globally_limited_pool(backend_addr, Arc::clone(&global_slots));
+    let second_pool = globally_limited_pool(backend_addr, Arc::clone(&global_slots));
+    let route = route_key();
+
+    let first = first_pool
+        .checkout_primary(route.clone())
+        .await
+        .expect("first pool opens the global backend slot");
+    wait_for_accepts(&accepted, 1).await;
+
+    let blocked = second_pool
+        .checkout_primary(route.clone())
+        .await
+        .expect_err("second pool waits behind the global backend cap");
+    assert!(matches!(
+        blocked,
+        PoolError::Backpressure(pg_kinetic_core::backpressure::BackpressureError::Timeout)
+    ));
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+
+    first.discard();
+    let second = second_pool
+        .checkout_primary(route)
+        .await
+        .expect("discarding the first backend frees the global slot");
+    wait_for_accepts(&accepted, 2).await;
+    second.discard();
 }
 
 #[test]

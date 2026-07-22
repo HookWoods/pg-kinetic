@@ -291,6 +291,7 @@ pub struct Proxy {
     config: Config,
     buffer_pool: ProxyBufferPool,
     client_slots: Arc<Semaphore>,
+    backend_slots: Arc<Semaphore>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
 }
@@ -342,6 +343,7 @@ impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
         let client_slots = Arc::new(Semaphore::new(config.capacity.max_clients));
+        let backend_slots = Arc::new(Semaphore::new(config.capacity.max_backends));
         let drain = Arc::new(DrainController::new());
         let lifecycle = LifecycleController::new(
             drain,
@@ -355,6 +357,7 @@ impl Proxy {
             config,
             buffer_pool: ProxyBufferPool::default(),
             client_slots,
+            backend_slots,
             lifecycle,
             snapshot_store,
         }
@@ -499,7 +502,12 @@ impl Proxy {
             let startup_tx = startup_tx.clone();
             let shard_result_tx = shard_result_tx.clone();
             let shutdown_completion = shutdown_completion_rx.clone();
-            let route_pools = Arc::clone(&state.route_pools);
+            let route_pools = Arc::new(build_route_pools(
+                &state.effective_config,
+                &state.route_config,
+                self.snapshot_store.clone(),
+                Some(Arc::clone(&self.backend_slots)),
+            ));
             let active_config = Arc::clone(&state.active_config);
             let snapshot_store = self.snapshot_store.clone();
             let client_slots = Arc::clone(&self.client_slots);
@@ -761,6 +769,7 @@ impl Proxy {
             &effective_config,
             &route_config,
             self.snapshot_store.clone(),
+            Some(Arc::clone(&self.backend_slots)),
         ));
         self.lifecycle.mark_backend_pools_initialized();
         let routing_planner = ReadRoutingPlanner::new(
@@ -2793,6 +2802,7 @@ fn build_route_pools(
     config: &Config,
     route_config: &RouteConfig,
     snapshot_store: SnapshotStore,
+    global_backend_slots: Option<Arc<Semaphore>>,
 ) -> RoutePools {
     let mut lifecycle = config.pool_lifecycle.clone();
     lifecycle.max_size = lifecycle.max_size.min(config.capacity.max_backends);
@@ -2807,7 +2817,7 @@ fn build_route_pools(
         lifecycle,
     );
 
-    let primary_pool = BackendPool::new_with_socket_and_lifecycle(
+    let primary_pool = BackendPool::new_with_socket_lifecycle_and_global_limit(
         route_config.primary.address,
         pool_args.0.clone(),
         pool_args.1.clone(),
@@ -2817,6 +2827,7 @@ fn build_route_pools(
         pool_args.5,
         pool_args.6.clone(),
         pool_args.7.clone(),
+        global_backend_slots.clone(),
     );
     let primary = BackendPoolRef::primary(primary_pool);
     primary.attach_snapshot_store(snapshot_store.clone());
@@ -2826,7 +2837,7 @@ fn build_route_pools(
         .iter()
         .enumerate()
         .map(|(index, replica)| {
-            let pool = BackendPool::new_with_socket_and_lifecycle(
+            let pool = BackendPool::new_with_socket_lifecycle_and_global_limit(
                 replica.address,
                 pool_args.0.clone(),
                 pool_args.1.clone(),
@@ -2836,6 +2847,7 @@ fn build_route_pools(
                 pool_args.5,
                 pool_args.6.clone(),
                 pool_args.7.clone(),
+                global_backend_slots.clone(),
             );
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
         })

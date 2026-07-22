@@ -9,7 +9,7 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::routing::{RoutingReason, RoutingTarget};
@@ -36,11 +36,13 @@ pub struct BackendPool {
     route_gates: StdRwLock<HashMap<PoolKey, RouteGateEntry>>,
     idle: Mutex<VecDeque<Backend>>,
     backend_lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
+    backend_global_permits: StdMutex<HashMap<u64, OwnedSemaphorePermit>>,
     backend_available: Notify,
     snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
     active_backends: AtomicUsize,
     idle_backends: AtomicUsize,
+    global_backend_slots: Option<Arc<Semaphore>>,
     max_backends: usize,
     max_waiters: usize,
     route_max_in_flight: usize,
@@ -799,6 +801,34 @@ impl BackendPool {
         reset_query: impl Into<Arc<str>>,
         lifecycle: PoolLifecycleConfig,
     ) -> Arc<Self> {
+        Self::new_with_socket_lifecycle_and_global_limit(
+            backend_addr,
+            tls,
+            socket,
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            checkout_timeout,
+            reset_query,
+            lifecycle,
+            None,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_socket_lifecycle_and_global_limit(
+        backend_addr: SocketAddr,
+        tls: TlsConfig,
+        socket: SocketConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        reset_query: impl Into<Arc<str>>,
+        lifecycle: PoolLifecycleConfig,
+        global_backend_slots: Option<Arc<Semaphore>>,
+    ) -> Arc<Self> {
         assert!(
             lifecycle.validate().is_ok(),
             "invalid pool lifecycle config"
@@ -812,11 +842,13 @@ impl BackendPool {
             route_gates: StdRwLock::new(HashMap::new()),
             idle: Mutex::new(VecDeque::new()),
             backend_lifecycle: StdMutex::new(HashMap::new()),
+            backend_global_permits: StdMutex::new(HashMap::new()),
             backend_available: Notify::new(),
             snapshot_store: ArcSwapOption::empty(),
             health: Arc::new(AtomicBool::new(true)),
             active_backends: AtomicUsize::new(0),
             idle_backends: AtomicUsize::new(0),
+            global_backend_slots,
             max_backends: lifecycle.max_size,
             max_waiters,
             route_max_in_flight,
@@ -935,24 +967,26 @@ impl BackendPool {
                 .set(route_gate_gate.waiting() as f64);
             self.record_backpressure_counts(&checkout_route, &route_gate_gate);
 
-            if mode == CheckoutMode::PreferConnect && self.reserve_backend_slot() {
-                match self.connect_reserved_backend().await {
-                    Ok(mut backend) => {
-                        self.attach_backend_snapshot_store(&mut backend);
-                        backend.mark_checked_out(Some(checkout_route.clone()));
-                        self.sync_pool_snapshot();
-                        return Ok(PooledBackend {
-                            backend: Some(backend),
-                            pool: self.clone(),
-                            health: Arc::clone(&self.health),
-                            _permit: BackpressurePermit::join(route_permit, permit),
-                            route_key: checkout_route.clone(),
-                            route_gate: route_gate_gate.clone(),
-                            requires_startup: true,
-                        });
+            if mode == CheckoutMode::PreferConnect {
+                if let Some(global_permit) = self.reserve_backend_slot() {
+                    match self.connect_reserved_backend(global_permit).await {
+                        Ok(mut backend) => {
+                            self.attach_backend_snapshot_store(&mut backend);
+                            backend.mark_checked_out(Some(checkout_route.clone()));
+                            self.sync_pool_snapshot();
+                            return Ok(PooledBackend {
+                                backend: Some(backend),
+                                pool: self.clone(),
+                                health: Arc::clone(&self.health),
+                                _permit: BackpressurePermit::join(route_permit, permit),
+                                route_key: checkout_route.clone(),
+                                route_gate: route_gate_gate.clone(),
+                                requires_startup: true,
+                            });
+                        }
+                        Err(PoolError::Connect(_)) => {}
+                        Err(error) => return Err(error),
                     }
-                    Err(PoolError::Connect(_)) => {}
-                    Err(error) => return Err(error),
                 }
             }
 
@@ -978,21 +1012,23 @@ impl BackendPool {
                 });
             }
 
-            if mode == CheckoutMode::AllowConnect && self.reserve_backend_slot() {
-                let mut backend = self.connect_reserved_backend().await?;
-                self.attach_backend_snapshot_store(&mut backend);
-                backend.mark_checked_out(Some(checkout_route.clone()));
-                self.sync_pool_snapshot();
+            if mode == CheckoutMode::AllowConnect {
+                if let Some(global_permit) = self.reserve_backend_slot() {
+                    let mut backend = self.connect_reserved_backend(global_permit).await?;
+                    self.attach_backend_snapshot_store(&mut backend);
+                    backend.mark_checked_out(Some(checkout_route.clone()));
+                    self.sync_pool_snapshot();
 
-                return Ok(PooledBackend {
-                    backend: Some(backend),
-                    pool: self.clone(),
-                    health: Arc::clone(&self.health),
-                    _permit: BackpressurePermit::join(route_permit, permit),
-                    route_key: checkout_route.clone(),
-                    route_gate: route_gate_gate.clone(),
-                    requires_startup: true,
-                });
+                    return Ok(PooledBackend {
+                        backend: Some(backend),
+                        pool: self.clone(),
+                        health: Arc::clone(&self.health),
+                        _permit: BackpressurePermit::join(route_permit, permit),
+                        route_key: checkout_route.clone(),
+                        route_gate: route_gate_gate.clone(),
+                        requires_startup: true,
+                    });
+                }
             }
 
             let mut backend = self
@@ -1055,11 +1091,11 @@ impl BackendPool {
         Some(backend)
     }
 
-    fn reserve_backend_slot(&self) -> bool {
+    fn reserve_backend_slot(&self) -> Option<Option<OwnedSemaphorePermit>> {
         let mut active_backends = self.active_backends.load(Ordering::Acquire);
         loop {
             if active_backends >= self.max_backends {
-                return false;
+                return None;
             }
             match self.active_backends.compare_exchange_weak(
                 active_backends,
@@ -1067,20 +1103,36 @@ impl BackendPool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => break,
                 Err(observed) => active_backends = observed,
             }
         }
+
+        let global_permit = match &self.global_backend_slots {
+            Some(slots) => match Arc::clone(slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.release_reserved_backend_slot(None);
+                    return None;
+                }
+            },
+            None => None,
+        };
+
+        Some(global_permit)
     }
 
-    async fn connect_reserved_backend(&self) -> Result<Backend, PoolError> {
+    async fn connect_reserved_backend(
+        &self,
+        global_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Backend, PoolError> {
         match Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await {
             Ok(backend) => {
-                self.register_backend(&backend);
+                self.register_backend(&backend, global_permit);
                 Ok(backend)
             }
             Err(error) => {
-                self.discard_backend();
+                self.release_reserved_backend_slot(global_permit);
                 Err(PoolError::Connect(error))
             }
         }
@@ -1148,6 +1200,10 @@ impl BackendPool {
             self.backend_lifecycle
                 .lock()
                 .expect("backend lifecycle poisoned")
+                .remove(&backend.id());
+            self.backend_global_permits
+                .lock()
+                .expect("backend global permits poisoned")
                 .remove(&backend.id());
             self.active_backends.fetch_sub(1, Ordering::AcqRel);
             metrics::record_pool_eviction(reason);
@@ -1254,7 +1310,7 @@ impl BackendPool {
         });
     }
 
-    fn register_backend(&self, backend: &Backend) {
+    fn register_backend(&self, backend: &Backend, global_permit: Option<OwnedSemaphorePermit>) {
         let now = tokio::time::Instant::now();
         self.backend_lifecycle
             .lock()
@@ -1266,6 +1322,12 @@ impl BackendPool {
                     last_released_at: now,
                 },
             );
+        if let Some(permit) = global_permit {
+            self.backend_global_permits
+                .lock()
+                .expect("backend global permits poisoned")
+                .insert(backend.id(), permit);
+        }
     }
 
     fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
@@ -1294,7 +1356,20 @@ impl BackendPool {
         self.sync_pool_snapshot();
     }
 
-    fn discard_backend(&self) {
+    fn discard_backend(&self, backend_id: u64) {
+        self.backend_global_permits
+            .lock()
+            .expect("backend global permits poisoned")
+            .remove(&backend_id);
+        self.backend_lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .remove(&backend_id);
+        self.release_reserved_backend_slot(None);
+    }
+
+    fn release_reserved_backend_slot(&self, global_permit: Option<OwnedSemaphorePermit>) {
+        drop(global_permit);
         self.active_backends.fetch_sub(1, Ordering::AcqRel);
         self.backend_available.notify_waiters();
         self.sync_pool_snapshot();
@@ -1374,7 +1449,7 @@ impl PooledBackend {
 
         if let Some(backend) = backend {
             backend.mark_discarded();
-            pool.discard_backend();
+            pool.discard_backend(backend.id());
         }
 
         drop(_permit);
