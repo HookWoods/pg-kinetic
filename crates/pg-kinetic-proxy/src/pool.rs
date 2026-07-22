@@ -43,6 +43,7 @@ pub struct BackendPool {
     active_backends: AtomicUsize,
     idle_backends: AtomicUsize,
     global_backend_slots: Option<Arc<Semaphore>>,
+    global_backend_available: Option<Arc<Notify>>,
     max_backends: usize,
     max_waiters: usize,
     route_max_in_flight: usize,
@@ -228,6 +229,16 @@ impl BackendPoolRef {
         self.inner.pool.max_backends()
     }
 
+    #[must_use]
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            configured_backends: self.inner.pool.max_backends(),
+            active_backends: self.inner.pool.active_count(),
+            idle_backends: self.inner.pool.idle_count(),
+            waiting_clients: self.inner.pool.gate.waiting(),
+        }
+    }
+
     fn new(id: u64, role: BackendRole, weight: usize, pool: Arc<BackendPool>) -> Self {
         Self {
             inner: Arc::new(BackendPoolRefInner {
@@ -356,6 +367,19 @@ impl RoutePools {
         }
     }
 
+    #[must_use]
+    pub fn snapshot(&self) -> PoolSnapshot {
+        let mut snapshot = self.primary.snapshot();
+        for replica in &self.replicas {
+            let replica = replica.snapshot();
+            snapshot.configured_backends += replica.configured_backends;
+            snapshot.active_backends += replica.active_backends;
+            snapshot.idle_backends += replica.idle_backends;
+            snapshot.waiting_clients += replica.waiting_clients;
+        }
+        snapshot
+    }
+
     pub async fn checkout_primary(
         &self,
         route: RouteKey,
@@ -451,7 +475,7 @@ impl RoutePoolRegistry {
         self.routes
             .write()
             .expect("route registry poisoned")
-            .insert(route.pool_key(), pools);
+            .insert(route.selection_key(), pools);
     }
 
     #[must_use]
@@ -459,8 +483,21 @@ impl RoutePoolRegistry {
         self.routes
             .read()
             .expect("route registry poisoned")
-            .get(&route.pool_key())
+            .get(&route.selection_key())
             .cloned()
+    }
+
+    #[must_use]
+    pub fn snapshots(&self) -> Vec<(PoolKey, PoolSnapshot)> {
+        let mut snapshots = self
+            .routes
+            .read()
+            .expect("route registry poisoned")
+            .iter()
+            .map(|(key, pools)| (key.clone(), pools.snapshot()))
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.0.metric_label().cmp(&right.0.metric_label()));
+        snapshots
     }
 
     pub async fn checkout_primary(
@@ -836,6 +873,36 @@ impl BackendPool {
         lifecycle: PoolLifecycleConfig,
         global_backend_slots: Option<Arc<Semaphore>>,
     ) -> Arc<Self> {
+        Self::new_with_socket_lifecycle_and_global_limit_and_notify(
+            backend_addr,
+            tls,
+            socket,
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            checkout_timeout,
+            reset_query,
+            lifecycle,
+            global_backend_slots,
+            None,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_socket_lifecycle_and_global_limit_and_notify(
+        backend_addr: SocketAddr,
+        tls: TlsConfig,
+        socket: SocketConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        reset_query: impl Into<Arc<str>>,
+        lifecycle: PoolLifecycleConfig,
+        global_backend_slots: Option<Arc<Semaphore>>,
+        global_backend_available: Option<Arc<Notify>>,
+    ) -> Arc<Self> {
         assert!(
             lifecycle.validate().is_ok(),
             "invalid pool lifecycle config"
@@ -856,6 +923,7 @@ impl BackendPool {
             active_backends: AtomicUsize::new(0),
             idle_backends: AtomicUsize::new(0),
             global_backend_slots,
+            global_backend_available,
             max_backends: lifecycle.max_size,
             max_waiters,
             route_max_in_flight,
@@ -1038,10 +1106,21 @@ impl BackendPool {
                 }
             }
 
-            let mut backend = self
-                .checkout_idle_backend(true)
-                .await
-                .expect("waiting for an available backend returns one");
+            let mut backend = loop {
+                if let Some(backend) = self.checkout_idle_backend(false).await {
+                    break backend;
+                }
+
+                if mode == CheckoutMode::AllowConnect {
+                    if let Some(global_permit) = self.reserve_backend_slot() {
+                        break self.connect_reserved_backend(global_permit).await?;
+                    }
+                }
+
+                if let Some(backend) = self.checkout_idle_backend(true).await {
+                    break backend;
+                }
+            };
             self.attach_backend_snapshot_store(&mut backend);
             backend.mark_checked_out(Some(checkout_route.clone()));
             self.sync_pool_snapshot();
@@ -1087,7 +1166,14 @@ impl BackendPool {
             if !wait_for_backend {
                 return None;
             }
-            notified.await;
+            if let Some(global_backend_available) = &self.global_backend_available {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = global_backend_available.notified() => return None,
+                }
+            } else {
+                notified.await;
+            }
         }
     }
 
@@ -1212,6 +1298,7 @@ impl BackendPool {
                 .lock()
                 .expect("backend global permits poisoned")
                 .remove(&backend.id());
+            self.notify_global_backend_available();
             self.active_backends.fetch_sub(1, Ordering::AcqRel);
             metrics::record_pool_eviction(reason);
         }
@@ -1236,6 +1323,7 @@ impl BackendPool {
                 .lock()
                 .expect("backend global permits poisoned")
                 .remove(&backend.id());
+            self.notify_global_backend_available();
             self.active_backends.fetch_sub(1, Ordering::AcqRel);
             metrics::record_pool_eviction("reload");
         }
@@ -1392,6 +1480,7 @@ impl BackendPool {
             .lock()
             .expect("backend global permits poisoned")
             .remove(&backend_id);
+        self.notify_global_backend_available();
         self.backend_lifecycle
             .lock()
             .expect("backend lifecycle poisoned")
@@ -1403,7 +1492,14 @@ impl BackendPool {
         drop(global_permit);
         self.active_backends.fetch_sub(1, Ordering::AcqRel);
         self.backend_available.notify_waiters();
+        self.notify_global_backend_available();
         self.sync_pool_snapshot();
+    }
+
+    fn notify_global_backend_available(&self) {
+        if let Some(notify) = &self.global_backend_available {
+            notify.notify_waiters();
+        }
     }
 }
 

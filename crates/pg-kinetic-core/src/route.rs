@@ -120,6 +120,15 @@ impl RouteKey {
     }
 
     #[must_use]
+    pub fn selection_key(&self) -> PoolKey {
+        PoolKey {
+            database: Arc::clone(&self.database),
+            user: Arc::clone(&self.user),
+            application_name: None,
+        }
+    }
+
+    #[must_use]
     pub const fn query_class(&self) -> QueryClass {
         self.query_class
     }
@@ -175,6 +184,34 @@ impl RouteKey {
     #[must_use]
     pub fn metric_label_shared(&self) -> Arc<str> {
         Arc::clone(&self.metric_label)
+    }
+}
+
+impl PoolKey {
+    #[must_use]
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    #[must_use]
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    #[must_use]
+    pub fn application_name(&self) -> Option<&str> {
+        self.application_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn metric_label(&self) -> String {
+        build_metric_label(
+            &self.database,
+            &self.user,
+            self.application_name.as_deref(),
+            QueryClass::Default,
+        )
+        .to_string()
     }
 }
 

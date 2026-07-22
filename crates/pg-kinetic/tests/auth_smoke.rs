@@ -382,6 +382,7 @@ async fn spawn_proxy_with_backend_service_auth(
             backend_addr,
         },
         routes: Vec::new(),
+        pools: Vec::new(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
@@ -517,6 +518,7 @@ async fn spawn_proxy_with_auth(
             backend_addr,
         },
         routes: Vec::new(),
+        pools: Vec::new(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,

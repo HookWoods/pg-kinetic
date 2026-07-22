@@ -68,6 +68,31 @@ replica_health_timeout_ms = 500
 
 If `routes` is empty, the proxy builds one route from `connection.backend_addr`.
 
+## Database/User Pools
+
+`[[pools]]` maps a startup `database` and `user` pair to a backend service address.
+
+```toml
+[[pools]]
+database = "app_a"
+user = "app_a"
+backend_addr = "127.0.0.1:5432"
+max_backends = 20
+
+[[pools]]
+database = "app_b"
+user = "app_b"
+backend_addr = "127.0.0.1:5432"
+```
+
+If `[[pools]]` is empty, pg-kinetic keeps the existing single default route from `connection.backend_addr`.
+
+When `[[pools]]` is non-empty, the startup database and user must match one configured pool before backend checkout. Application name is intentionally ignored for selection. Unmatched clients are rejected with SQLSTATE `3D000`, and duplicate `(database,user)` entries are rejected during configuration parsing.
+
+Each pool is bounded by the lower of the global `capacity.max_backends` and its optional `max_backends`. The global `capacity.max_backends` semaphore remains the aggregate cap across all configured pools; it is not multiplied by the number of `[[pools]]` entries.
+
+v1 uses a single shared backend service identity: pg-kinetic does not infer per-pool credentials. In pass-through authentication, client credentials continue to be forwarded according to the existing auth configuration; pool entries only select the configured `backend_addr`.
+
 ## Runtime Field Reference
 
 | Field | Type | Default | CLI | Environment | Reload | Failure mode |

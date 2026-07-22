@@ -172,6 +172,10 @@ pub struct Config {
     #[arg(skip)]
     pub routes: Vec<RouteConfig>,
 
+    #[serde(deserialize_with = "deserialize_pools")]
+    #[arg(skip)]
+    pub pools: Vec<PoolConfig>,
+
     #[command(flatten)]
     pub runtime: RuntimeConfig,
 
@@ -918,6 +922,31 @@ pub struct ConnectionConfig {
         default_value = "127.0.0.1:5432"
     )]
     pub backend_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PoolConfig {
+    pub database: String,
+    pub user: String,
+    pub backend_addr: SocketAddr,
+    pub max_backends: Option<usize>,
+}
+
+fn deserialize_pools<'de, D>(deserializer: D) -> Result<Vec<PoolConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let pools = Vec::<PoolConfig>::deserialize(deserializer)?;
+    let mut identities = HashSet::with_capacity(pools.len());
+    for pool in &pools {
+        if !identities.insert((&pool.database, &pool.user)) {
+            return Err(serde::de::Error::custom(format!(
+                "duplicate pool for database/user {}/{}",
+                pool.database, pool.user
+            )));
+        }
+    }
+    Ok(pools)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2145,6 +2174,7 @@ impl Config {
     pub fn is_reload_compatible_with(&self, next: &Self) -> bool {
         self.connection == next.connection
             && self.routes == next.routes
+            && self.pools == next.pools
             && self.capacity == next.capacity
             && self.admin == next.admin
             && self.observability == next.observability
@@ -2697,6 +2727,7 @@ mod tests {
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
         assert_eq!(config.pool_lifecycle, PoolLifecycleConfig::default());
         assert_eq!(config.routes.len(), 0);
+        assert_eq!(config.pools.len(), 0);
         assert!(!config.runtime.node.node_id.as_str().is_empty());
         assert_eq!(
             config.runtime.engine.runtime_engine,
@@ -3319,6 +3350,33 @@ mod tests {
                 replica_health_timeout_ms: 750,
             }
         );
+    }
+
+    #[test]
+    fn parses_pools_section() {
+        let config: Config = toml::from_str(
+            r#"
+            [connection]
+            listen_addr = "127.0.0.1:6543"
+            backend_addr = "127.0.0.1:5432"
+
+            [[pools]]
+            database = "db_a"
+            user = "user_a"
+            backend_addr = "127.0.0.1:5433"
+            max_backends = 7
+            "#,
+        )
+        .expect("parse");
+
+        assert_eq!(config.pools.len(), 1);
+        assert_eq!(config.pools[0].database, "db_a");
+        assert_eq!(config.pools[0].user, "user_a");
+        assert_eq!(
+            config.pools[0].backend_addr,
+            "127.0.0.1:5433".parse().expect("valid socket")
+        );
+        assert_eq!(config.pools[0].max_backends, Some(7));
     }
 
     #[test]

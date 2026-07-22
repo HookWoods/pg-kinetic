@@ -18,7 +18,7 @@ use crate::{
     config::{Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig},
     drain::DrainController,
     pause::PauseController,
-    pool::RoutePools,
+    pool::{RoutePoolRegistry, RoutePools},
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
@@ -64,6 +64,7 @@ struct AdminState {
     base_config: Config,
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
+    route_pool_registry: Arc<RoutePoolRegistry>,
     client_tls_server_config: Option<Arc<ServerConfig>>,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
@@ -86,6 +87,7 @@ pub async fn spawn(
     base_config: Config,
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
+    route_pool_registry: Arc<RoutePoolRegistry>,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
     snapshot_store: SnapshotStore,
@@ -106,6 +108,7 @@ pub async fn spawn(
         base_config,
         active_config,
         route_pools,
+        route_pool_registry,
         client_tls_server_config,
         drain,
         pause,
@@ -481,6 +484,7 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
         ),
         AdminView::Pools => pools_table(
             &state.snapshot_store.pool_snapshot(),
+            &state.route_pool_registry.snapshots(),
             &state.snapshot_store.performance_snapshot(),
         ),
         AdminView::Servers => servers_table(
@@ -603,7 +607,36 @@ fn clients_table(
     )
 }
 
-fn pools_table(pool: &PoolSnapshot, performance: &PerformanceSnapshot) -> AdminTable {
+fn pools_table(
+    pool: &PoolSnapshot,
+    configured_pools: &[(pg_kinetic_core::route::PoolKey, PoolSnapshot)],
+    performance: &PerformanceSnapshot,
+) -> AdminTable {
+    let rows = if configured_pools.is_empty() {
+        vec![AdminRow::new(vec![
+            String::from("global"),
+            pool.configured_backends.to_string(),
+            pool.active_backends.to_string(),
+            pool.idle_backends.to_string(),
+            pool.waiting_clients.to_string(),
+            optional_metric_value(performance.pool_checkout_lock_wait_ms),
+        ])]
+    } else {
+        configured_pools
+            .iter()
+            .map(|(key, pool)| {
+                AdminRow::new(vec![
+                    key.metric_label(),
+                    pool.configured_backends.to_string(),
+                    pool.active_backends.to_string(),
+                    pool.idle_backends.to_string(),
+                    pool.waiting_clients.to_string(),
+                    optional_metric_value(performance.pool_checkout_lock_wait_ms),
+                ])
+            })
+            .collect()
+    };
+
     admin_table(
         AdminView::Pools,
         &[
@@ -614,14 +647,7 @@ fn pools_table(pool: &PoolSnapshot, performance: &PerformanceSnapshot) -> AdminT
             ("waiting_clients", AdminColumnType::Int8),
             ("checkout_lock_wait_ms", AdminColumnType::Float8),
         ],
-        vec![AdminRow::new(vec![
-            String::from("global"),
-            pool.configured_backends.to_string(),
-            pool.active_backends.to_string(),
-            pool.idle_backends.to_string(),
-            pool.waiting_clients.to_string(),
-            optional_metric_value(performance.pool_checkout_lock_wait_ms),
-        ])],
+        rows,
     )
 }
 

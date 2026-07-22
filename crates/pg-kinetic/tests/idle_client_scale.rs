@@ -308,6 +308,7 @@ async fn start_proxy(
             backend_addr,
         },
         routes: Vec::new(),
+        pools: Vec::new(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 16,

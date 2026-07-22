@@ -47,6 +47,24 @@ postgres://app_user@postgres.example.internal:5432/app_db
 postgres://app_user@pg-kinetic.example.internal:6432/app_db
 ```
 
+Consolidating two database/user pairs through one proxy:
+
+```toml
+[[pools]]
+database = "app_a"
+user = "app_a"
+backend_addr = "postgres.example.internal:5432"
+
+[[pools]]
+database = "app_b"
+user = "app_b"
+backend_addr = "postgres.example.internal:5432"
+```
+
+Both application pairs connect to the same pg-kinetic listener, and pg-kinetic routes each startup database/user pair to the shared PostgreSQL backend service explicitly. Duplicate `(database,user)` entries are rejected, and the global `capacity.max_backends` limit remains aggregate across the configured pools.
+
+v1 has one shared backend service identity. Pool entries do not select or infer separate backend credentials; pass-through authentication retains its existing credential-forwarding behavior.
+
 ## PgBouncer To pg-kinetic
 
 1. Match the application-visible host, user, database, TLS mode, and password behavior.

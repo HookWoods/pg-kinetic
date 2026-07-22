@@ -31,6 +31,7 @@ async fn reconnects_with_different_source_ports_reuse_a_bounded_backend_pool() {
             backend_addr,
         },
         routes: Vec::new(),
+        pools: Vec::new(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,

@@ -30,7 +30,7 @@ use crate::{
     admin, auth,
     buffers::{ProxyBufferPool, SessionBufferSet},
     cancel,
-    config::{Config, RouteConfig},
+    config::{Config, PoolConfig, RouteConfig},
     drain::DrainController,
     health,
     lifecycle::{
@@ -41,7 +41,7 @@ use crate::{
     pause::PauseController,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
-        ReplicaSelectionStrategy, ReplicaSelector, RoutePools,
+        ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePools,
     },
     reload,
     snapshot::{
@@ -106,6 +106,7 @@ use crate::policy::{PolicyEvalInput, PolicyRuntime};
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
+const INVALID_CATALOG_NAME_SQLSTATE: &str = "3D000";
 const REPLICA_UNAVAILABLE_MESSAGE: &str = "no healthy replica available";
 const POOL_WARMUP_MIN_IDLE_BACKENDS: usize = 2;
 
@@ -313,7 +314,7 @@ struct ControlPlaneHandles {
 pub(crate) struct ShardContext {
     pub shard_id: usize,
     pub listener: TcpListener,
-    pub route_pools: Arc<RoutePools>,
+    pub route_pool_selector: RoutePoolSelector,
     pub active_config: Arc<RwLock<Config>>,
     pub snapshot_store: SnapshotStore,
     pub client_slots: Arc<Semaphore>,
@@ -339,11 +340,49 @@ struct ProxyRuntimeState {
     reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     debug_sampler: DebugSampler,
     active_config: Arc<RwLock<Config>>,
-    route_config: RouteConfig,
+    control_route_config: RouteConfig,
     mirror_outcome_recorder: MirrorOutcomeRecorder,
     mirror_dispatcher: Arc<MirrorDispatcher>,
-    route_pools: Arc<RoutePools>,
+    route_pool_selector: RoutePoolSelector,
+    control_route_pools: Arc<RoutePools>,
     routing_planner: ReadRoutingPlanner,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RoutePoolSelector {
+    default_pools: Option<Arc<RoutePools>>,
+    registry: Arc<RoutePoolRegistry>,
+}
+
+impl RoutePoolSelector {
+    #[must_use]
+    fn default(default_pools: Arc<RoutePools>) -> Self {
+        Self {
+            default_pools: Some(default_pools),
+            registry: Arc::new(RoutePoolRegistry::new()),
+        }
+    }
+
+    #[must_use]
+    fn configured(registry: Arc<RoutePoolRegistry>) -> Self {
+        Self {
+            default_pools: None,
+            registry,
+        }
+    }
+
+    #[must_use]
+    fn resolve(&self, route: &RouteKey) -> Option<Arc<RoutePools>> {
+        self.registry
+            .route_pools(route)
+            .map(Arc::new)
+            .or_else(|| self.default_pools.as_ref().map(Arc::clone))
+    }
+
+    #[must_use]
+    pub(crate) fn registry(&self) -> &Arc<RoutePoolRegistry> {
+        &self.registry
+    }
 }
 
 fn session_backend_credentials(
@@ -417,8 +456,9 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
-            Arc::clone(&state.route_pools),
-            &state.route_config,
+            Arc::clone(&state.control_route_pools),
+            Arc::clone(state.route_pool_selector.registry()),
+            &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
@@ -433,7 +473,7 @@ impl Proxy {
         let shard_context = ShardContext {
             shard_id: 0,
             listener,
-            route_pools: Arc::clone(&state.route_pools),
+            route_pool_selector: state.route_pool_selector.clone(),
             active_config: Arc::clone(&state.active_config),
             snapshot_store: self.snapshot_store.clone(),
             client_slots: Arc::clone(&self.client_slots),
@@ -520,7 +560,7 @@ impl Proxy {
             let startup_tx = startup_tx.clone();
             let shard_result_tx = shard_result_tx.clone();
             let shutdown_completion = shutdown_completion_rx.clone();
-            let route_pools = Arc::clone(&state.route_pools);
+            let route_pool_selector = state.route_pool_selector.clone();
             let active_config = Arc::clone(&state.active_config);
             let snapshot_store = self.snapshot_store.clone();
             let client_slots = Arc::clone(&self.client_slots);
@@ -590,7 +630,7 @@ impl Proxy {
                         let shard_context = ShardContext {
                             shard_id,
                             listener,
-                            route_pools,
+                            route_pool_selector,
                             active_config,
                             snapshot_store,
                             client_slots,
@@ -650,8 +690,9 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
-            Arc::clone(&state.route_pools),
-            &state.route_config,
+            Arc::clone(&state.control_route_pools),
+            Arc::clone(state.route_pool_selector.registry()),
+            &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
@@ -773,19 +814,20 @@ impl Proxy {
             .into_iter()
             .next()
             .context("missing effective route config")?;
+        let control_route_config = control_route_config(&effective_config, &route_config);
         let mirror_outcome_recorder = MirrorOutcomeRecorder::default();
         let mirror_dispatcher = Arc::new(MirrorDispatcher::disabled(
-            route_config.primary.address,
+            control_route_config.primary.address,
             effective_config.tls.clone(),
             effective_config.socket.clone(),
             mirror_outcome_recorder.clone(),
         ));
-        let route_pools = Arc::new(build_route_pools(
+        let (route_pool_selector, control_route_pools) = build_route_pool_selector(
             &effective_config,
             &route_config,
             self.snapshot_store.clone(),
-            Some(Arc::clone(&self.backend_slots)),
-        ));
+            Arc::clone(&self.backend_slots),
+        );
         self.lifecycle.mark_backend_pools_initialized();
         let routing_planner = ReadRoutingPlanner::new(
             route_config.read_routing.read_routing_mode,
@@ -801,10 +843,11 @@ impl Proxy {
             reject_phase_recorder,
             debug_sampler,
             active_config,
-            route_config,
+            control_route_config,
             mirror_outcome_recorder,
             mirror_dispatcher,
-            route_pools,
+            route_pool_selector,
+            control_route_pools,
             routing_planner,
         })
     }
@@ -867,6 +910,7 @@ async fn run_control_plane(
     base_config: Config,
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
+    route_pool_registry: Arc<RoutePoolRegistry>,
     route_config: &RouteConfig,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
@@ -898,6 +942,7 @@ async fn run_control_plane(
                 base_config.clone(),
                 Arc::clone(&active_config),
                 Arc::clone(&route_pools),
+                Arc::clone(&route_pool_registry),
                 Arc::clone(&drain),
                 Arc::clone(&pause),
                 snapshot_store.clone(),
@@ -1095,7 +1140,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                 };
 
                 let permit = ctx.client_slots.clone().acquire_owned().await?;
-                let route_pools = Arc::clone(&ctx.route_pools);
+                let route_pool_selector = ctx.route_pool_selector.clone();
                 let snapshot_store = ctx.snapshot_store.clone();
                 let client_snapshot_handle = snapshot_store.client_handle();
                 let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1129,7 +1174,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                     let result = handle_client(
                         client,
                         client_addr,
-                        route_pools,
+                        route_pool_selector,
                         config_snapshot,
                         routing_planner,
                         session_id,
@@ -1186,7 +1231,7 @@ fn record_runtime_shard_snapshot(
 async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,
-    route_pools: Arc<RoutePools>,
+    route_pool_selector: RoutePoolSelector,
     config: Config,
     routing_planner: ReadRoutingPlanner,
     session_id: u64,
@@ -1302,6 +1347,20 @@ async fn handle_client(
         route_application_name.as_deref(),
         client_addr,
     );
+    let Some(route_pools) = route_pool_selector.resolve(&session_route) else {
+        startup_timer.finish(MetricOutcome::Rejected);
+        let message = format!(
+            "database \"{route_database}\" for user \"{route_user}\" is not configured on this proxy"
+        );
+        error_response_and_ready_with_state(
+            &mut client,
+            INVALID_CATALOG_NAME_SQLSTATE,
+            &message,
+            ReadyStatus::Idle,
+        )
+        .await?;
+        return Ok(());
+    };
     update_client_snapshot(
         &client_snapshot_handle,
         session_id,
@@ -2902,6 +2961,7 @@ fn build_route_pools(
     route_config: &RouteConfig,
     snapshot_store: SnapshotStore,
     global_backend_slots: Option<Arc<Semaphore>>,
+    global_backend_available: Option<Arc<tokio::sync::Notify>>,
 ) -> RoutePools {
     let mut lifecycle = config.pool_lifecycle.clone();
     lifecycle.max_size = lifecycle.max_size.min(config.capacity.max_backends);
@@ -2916,7 +2976,7 @@ fn build_route_pools(
         lifecycle,
     );
 
-    let primary_pool = BackendPool::new_with_socket_lifecycle_and_global_limit(
+    let primary_pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
         route_config.primary.address,
         pool_args.0.clone(),
         pool_args.1.clone(),
@@ -2927,6 +2987,7 @@ fn build_route_pools(
         pool_args.6.clone(),
         pool_args.7.clone(),
         global_backend_slots.clone(),
+        global_backend_available.clone(),
     );
     let primary = BackendPoolRef::primary(primary_pool);
     primary.attach_snapshot_store(snapshot_store.clone());
@@ -2936,7 +2997,7 @@ fn build_route_pools(
         .iter()
         .enumerate()
         .map(|(index, replica)| {
-            let pool = BackendPool::new_with_socket_lifecycle_and_global_limit(
+            let pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
                 replica.address,
                 pool_args.0.clone(),
                 pool_args.1.clone(),
@@ -2947,6 +3008,7 @@ fn build_route_pools(
                 pool_args.6.clone(),
                 pool_args.7.clone(),
                 global_backend_slots.clone(),
+                global_backend_available.clone(),
             );
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
         })
@@ -2956,6 +3018,86 @@ fn build_route_pools(
         primary,
         replicas,
         ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+    )
+}
+
+fn control_route_config(config: &Config, default_route_config: &RouteConfig) -> RouteConfig {
+    config.pools.first().map_or_else(
+        || default_route_config.clone(),
+        |pool| RouteConfig::from_backend_addr(pool.backend_addr),
+    )
+}
+
+fn build_route_pool_selector(
+    config: &Config,
+    default_route_config: &RouteConfig,
+    snapshot_store: SnapshotStore,
+    global_backend_slots: Arc<Semaphore>,
+) -> (RoutePoolSelector, Arc<RoutePools>) {
+    if config.pools.is_empty() {
+        let global_backend_available = Arc::new(tokio::sync::Notify::new());
+        let default_pools = Arc::new(build_route_pools(
+            config,
+            default_route_config,
+            snapshot_store,
+            Some(global_backend_slots),
+            Some(global_backend_available),
+        ));
+        return (
+            RoutePoolSelector::default(Arc::clone(&default_pools)),
+            default_pools,
+        );
+    }
+
+    let registry = Arc::new(RoutePoolRegistry::new());
+    let global_backend_available = Arc::new(tokio::sync::Notify::new());
+    let mut control_route_pools = None;
+    for pool_config in &config.pools {
+        let route = RouteKey::new(
+            pool_config.database.as_str(),
+            pool_config.user.as_str(),
+            None,
+            None,
+            QueryClass::Default,
+        );
+        let pools = build_route_pools_for_pool(
+            config,
+            pool_config,
+            snapshot_store.clone(),
+            Arc::clone(&global_backend_slots),
+            Some(Arc::clone(&global_backend_available)),
+        );
+        if control_route_pools.is_none() {
+            control_route_pools = Some(Arc::new(pools.clone()));
+        }
+        registry.insert(route, pools);
+    }
+
+    (
+        RoutePoolSelector::configured(registry),
+        control_route_pools.expect("non-empty pools has a control pool"),
+    )
+}
+
+fn build_route_pools_for_pool(
+    config: &Config,
+    pool_config: &PoolConfig,
+    snapshot_store: SnapshotStore,
+    global_backend_slots: Arc<Semaphore>,
+    global_backend_available: Option<Arc<tokio::sync::Notify>>,
+) -> RoutePools {
+    let mut scoped_config = config.clone();
+    if let Some(max_backends) = pool_config.max_backends {
+        scoped_config.pool_lifecycle.max_size =
+            scoped_config.pool_lifecycle.max_size.min(max_backends);
+    }
+    let route_config = RouteConfig::from_backend_addr(pool_config.backend_addr);
+    build_route_pools(
+        &scoped_config,
+        &route_config,
+        snapshot_store,
+        Some(global_backend_slots),
+        global_backend_available,
     )
 }
 

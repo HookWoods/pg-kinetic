@@ -297,6 +297,7 @@ fn proxy_config(listen_addr: SocketAddr, backend_addr: SocketAddr) -> Config {
             backend_addr,
         },
         routes: Vec::new(),
+        pools: Vec::new(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
