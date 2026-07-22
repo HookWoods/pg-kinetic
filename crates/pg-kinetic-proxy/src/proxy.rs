@@ -1,6 +1,8 @@
 use std::{
+    future::Future,
     io::IoSlice,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -13,8 +15,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{RwLock, Semaphore},
-    task::JoinSet,
+    sync::{watch, RwLock, Semaphore},
+    task::{JoinHandle, JoinSet},
     time::timeout,
 };
 use tokio_rustls::{rustls::ServerConfig, server::TlsStream};
@@ -30,7 +32,9 @@ use crate::{
     config::{Config, RouteConfig},
     drain::DrainController,
     health,
-    lifecycle::{wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator},
+    lifecycle::{
+        wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator, ShutdownOutcome,
+    },
     metrics,
     mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
     pool::{
@@ -291,6 +295,32 @@ pub struct Proxy {
     snapshot_store: SnapshotStore,
 }
 
+struct ControlPlaneHandles {
+    _health_handle: Option<JoinHandle<()>>,
+    _admin_handle: Option<JoinHandle<()>>,
+    _reload_handle: Option<JoinHandle<()>>,
+    _adaptive_handle: Option<JoinHandle<()>>,
+}
+
+pub(crate) struct ShardContext {
+    pub shard_id: usize,
+    pub listener: TcpListener,
+    pub route_pools: Arc<RoutePools>,
+    pub active_config: Arc<RwLock<Config>>,
+    pub snapshot_store: SnapshotStore,
+    pub client_slots: Arc<Semaphore>,
+    pub lifecycle: LifecycleController,
+    pub buffer_pool: ProxyBufferPool,
+    pub backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    pub mirror_dispatcher: Arc<MirrorDispatcher>,
+    pub routing_planner: ReadRoutingPlanner,
+    pub reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    pub debug_sampler: DebugSampler,
+    pub phase_metrics_enabled: bool,
+    pub phase_timing_sample_rate: f64,
+    pub shutdown_completion: watch::Receiver<Option<ShutdownOutcome>>,
+}
+
 impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
@@ -394,201 +424,319 @@ impl Proxy {
             })?;
 
         let drain = self.lifecycle.drain_controller();
-        let _health_handle = if let Some(health_addr) = effective_config.health.health_addr {
-            Some(
-                health::spawn(
-                    health_addr,
-                    Arc::clone(&drain),
-                    route_config.primary.address,
-                    effective_config.tls.clone(),
-                    effective_config.socket.clone(),
-                    effective_config.health.readiness_timeout(),
-                    effective_config.health.readiness_backend_check_interval(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let _admin_handle = if let Some(admin_addr) = effective_config.admin.admin_addr {
-            Some(
-                admin::spawn(
-                    admin_addr,
-                    effective_config.clone(),
-                    Arc::clone(&drain),
-                    self.snapshot_store.clone(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        self.lifecycle.mark_listeners_initialized();
-
-        if effective_config.reload.reload_enabled && effective_config.reload.config_file.is_some() {
-            let base_config = self.config.clone();
-            let reload_config = effective_config.reload.clone();
-            let active_config = Arc::clone(&active_config);
-            tokio::spawn(async move {
-                reload::spawn_reload_loop(base_config, reload_config, active_config).await;
-            });
-        }
-
-        if effective_config.runtime.production.adaptive_enabled {
-            let controller = AdaptiveController::new(
-                self.snapshot_store.clone(),
-                mirror_outcome_recorder.clone(),
-                Arc::clone(&active_config),
-            );
-            tokio::spawn(async move {
-                controller.run().await;
-            });
-        }
+        let _control_plane_handles = run_control_plane(
+            &effective_config,
+            self.config.clone(),
+            Arc::clone(&active_config),
+            &route_config,
+            Arc::clone(&drain),
+            self.lifecycle.clone(),
+            self.snapshot_store.clone(),
+            mirror_outcome_recorder.clone(),
+        )
+        .await?;
 
         tracing::info!(listen_addr = %effective_config.connection.listen_addr, "listening");
 
+        let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
+        let shard_context = ShardContext {
+            shard_id: 0,
+            listener,
+            route_pools,
+            active_config: Arc::clone(&active_config),
+            snapshot_store: self.snapshot_store.clone(),
+            client_slots: Arc::clone(&self.client_slots),
+            lifecycle: self.lifecycle.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+            backend_credentials,
+            mirror_dispatcher,
+            routing_planner,
+            reject_phase_recorder,
+            debug_sampler,
+            phase_metrics_enabled,
+            phase_timing_sample_rate,
+            shutdown_completion: shutdown_completion_rx,
+        };
+        let mut shard = Box::pin(run_shard(shard_context));
         let mut shutdown = Box::pin(wait_for_shutdown_signal());
         let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
-        let mut client_tasks = JoinSet::new();
-        let mut draining = false;
+        let mut shutdown_coordinator = None;
+        let mut shutdown_completion: Pin<Box<dyn Future<Output = ShutdownOutcome> + Send>> =
+            Box::pin(std::future::pending());
+        let mut shutdown_started = false;
 
         loop {
-            if draining {
-                let shutdown_coordinator = ShutdownCoordinator::new(self.lifecycle.clone());
-                let coordinator = shutdown_coordinator.clone();
-                let mut shutdown_completion =
-                    Box::pin(async move { coordinator.coordinate().await });
-                loop {
-                    tokio::select! {
-                        biased;
-                        outcome = &mut shutdown_completion => {
-                            if outcome.forced_sessions() > 0 {
-                                tracing::warn!(
-                                    active_clients = outcome.forced_sessions(),
-                                    "shutdown grace expired; force-closing client sessions"
-                                );
-                                client_tasks.abort_all();
-                                while let Some(result) = client_tasks.join_next().await {
-                                    if let Err(error) = result {
-                                        if !error.is_cancelled() {
-                                            tracing::warn!(error = %error, "client task failed during shutdown");
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::info!(active_clients = drain.active_clients(), "drain completed");
-                            }
-                            shutdown_coordinator.complete();
-                            return Ok(());
-                        }
-                        joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                            if let Some(Err(error)) = joined {
-                                tracing::warn!(error = %error, "client task failed");
-                            }
-                        }
-                        accept = listener.accept() => {
-                            let (client, client_addr) = accept.context("accept draining client")?;
-                            let config_snapshot = active_config.read().await.clone();
-                            let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
-                            socket::apply_socket_options(&client, &socket_options, "client")
-                                .context("apply draining client socket options")?;
-                            let mut client = ClientConnection::new(client);
-                            metrics::increment_client_connections();
-                            reject_client_during_drain(&mut client, reject_phase_recorder.as_ref())
-                                .await?;
-                            tracing::info!(%client_addr, "rejected client during drain");
-                        }
-                    }
-                }
-            }
-
             tokio::select! {
                 biased;
-                result = &mut shutdown => {
+                result = &mut shard => return result,
+                result = &mut shutdown, if !shutdown_started => {
                     let reason = result.context("wait for shutdown signal")?;
                     if self.lifecycle.begin_drain(reason) {
                         tracing::info!("received shutdown signal; beginning drain");
                     }
-                    draining = true;
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
                 }
-                _ = &mut drain_start_wait => {
+                _ = &mut drain_start_wait, if !shutdown_started => {
                     self.lifecycle.begin_drain(ShutdownReason::AdminRequest);
-                    draining = true;
+                    start_shutdown_coordinator(
+                        self.lifecycle.clone(),
+                        &mut shutdown_coordinator,
+                        &mut shutdown_completion,
+                        &mut shutdown_started,
+                    );
                 }
-                joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                    if let Some(Err(error)) = joined {
-                        tracing::warn!(error = %error, "client task failed");
+                outcome = &mut shutdown_completion, if shutdown_started => {
+                    let _ = shutdown_completion_tx.send(Some(outcome));
+                    if let Some(coordinator) = shutdown_coordinator.take() {
+                        coordinator.complete();
+                    }
+                    return shard.await;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_control_plane(
+    effective_config: &Config,
+    base_config: Config,
+    active_config: Arc<RwLock<Config>>,
+    route_config: &RouteConfig,
+    drain: Arc<DrainController>,
+    lifecycle: LifecycleController,
+    snapshot_store: SnapshotStore,
+    mirror_outcome_recorder: MirrorOutcomeRecorder,
+) -> anyhow::Result<ControlPlaneHandles> {
+    let health_handle = if let Some(health_addr) = effective_config.health.health_addr {
+        Some(
+            health::spawn(
+                health_addr,
+                Arc::clone(&drain),
+                route_config.primary.address,
+                effective_config.tls.clone(),
+                effective_config.socket.clone(),
+                effective_config.health.readiness_timeout(),
+                effective_config.health.readiness_backend_check_interval(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let admin_handle = if let Some(admin_addr) = effective_config.admin.admin_addr {
+        Some(
+            admin::spawn(
+                admin_addr,
+                effective_config.clone(),
+                Arc::clone(&drain),
+                snapshot_store.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    lifecycle.mark_listeners_initialized();
+
+    let reload_handle = if effective_config.reload.reload_enabled
+        && effective_config.reload.config_file.is_some()
+    {
+        let reload_config = effective_config.reload.clone();
+        let active_config = Arc::clone(&active_config);
+        Some(tokio::spawn(async move {
+            reload::spawn_reload_loop(base_config, reload_config, active_config).await;
+        }))
+    } else {
+        None
+    };
+
+    let adaptive_handle = if effective_config.runtime.production.adaptive_enabled {
+        let controller = AdaptiveController::new(
+            snapshot_store,
+            mirror_outcome_recorder,
+            Arc::clone(&active_config),
+        );
+        Some(tokio::spawn(async move {
+            controller.run().await;
+        }))
+    } else {
+        None
+    };
+
+    Ok(ControlPlaneHandles {
+        _health_handle: health_handle,
+        _admin_handle: admin_handle,
+        _reload_handle: reload_handle,
+        _adaptive_handle: adaptive_handle,
+    })
+}
+
+fn start_shutdown_coordinator(
+    lifecycle: LifecycleController,
+    shutdown_coordinator: &mut Option<ShutdownCoordinator>,
+    shutdown_completion: &mut Pin<Box<dyn Future<Output = ShutdownOutcome> + Send>>,
+    shutdown_started: &mut bool,
+) {
+    if *shutdown_started {
+        return;
+    }
+
+    let coordinator = ShutdownCoordinator::new(lifecycle);
+    let task_coordinator = coordinator.clone();
+    *shutdown_completion = Box::pin(async move { task_coordinator.coordinate().await });
+    *shutdown_coordinator = Some(coordinator);
+    *shutdown_started = true;
+}
+
+async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
+    let drain = ctx.lifecycle.drain_controller();
+    let mut drain_start_wait = Box::pin(drain.wait_for_drain_start());
+    let mut client_tasks = JoinSet::new();
+    let mut draining = false;
+
+    tracing::debug!(shard_id = ctx.shard_id, "runtime shard started");
+
+    loop {
+        if draining {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = ctx.shutdown_completion.changed() => {
+                        changed.context("watch shutdown completion")?;
+                        let Some(outcome) = *ctx.shutdown_completion.borrow() else {
+                            continue;
+                        };
+                        if outcome.forced_sessions() > 0 {
+                            tracing::warn!(
+                                shard_id = ctx.shard_id,
+                                active_clients = outcome.forced_sessions(),
+                                "shutdown grace expired; force-closing client sessions"
+                            );
+                            client_tasks.abort_all();
+                            while let Some(result) = client_tasks.join_next().await {
+                                if let Err(error) = result {
+                                    if !error.is_cancelled() {
+                                        tracing::warn!(shard_id = ctx.shard_id, error = %error, "client task failed during shutdown");
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                shard_id = ctx.shard_id,
+                                active_clients = drain.active_clients(),
+                                "drain completed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            tracing::warn!(shard_id = ctx.shard_id, error = %error, "client task failed");
+                        }
+                    }
+                    accept = ctx.listener.accept() => {
+                        let (client, client_addr) = accept.context("accept draining client")?;
+                        let config_snapshot = ctx.active_config.read().await.clone();
+                        let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
+                        socket::apply_socket_options(&client, &socket_options, "client")
+                            .context("apply draining client socket options")?;
+                        let mut client = ClientConnection::new(client);
+                        metrics::increment_client_connections();
+                        reject_client_during_drain(&mut client, ctx.reject_phase_recorder.as_ref())
+                            .await?;
+                        tracing::info!(shard_id = ctx.shard_id, %client_addr, "rejected client during drain");
                     }
                 }
-                accept = listener.accept() => {
-                    let (client, client_addr) = accept.context("accept client")?;
-                    let config_snapshot = active_config.read().await.clone();
-                    let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
-                    socket::apply_socket_options(&client, &socket_options, "client")
-                        .context("apply client socket options")?;
-                    let client = ClientConnection::new(client);
-                    metrics::increment_client_connections();
+            }
+        }
 
-                    let Some(client_guard) = self.lifecycle.drain_token().try_enter() else {
-                        let mut client = client;
-                        reject_client_during_drain(&mut client, reject_phase_recorder.as_ref())
-                            .await?;
-                        tracing::info!(%client_addr, "rejected client during drain");
-                        continue;
-                    };
-
-                    let permit = self.client_slots.clone().acquire_owned().await?;
-                    let route_pools = Arc::clone(&route_pools);
-                    let snapshot_store = self.snapshot_store.clone();
-                    let client_snapshot_handle = snapshot_store.client_handle();
-                    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-                    client_snapshot_handle.register(session_id);
-                    telemetry::emit_debug_sample_with(
-                        &debug_sampler,
-                        session_id,
-                        || DebugSample::client_accepted(
-                            session_id,
-                            client_addr,
-                            config_snapshot.tls.client_tls_mode.as_str(),
-                            client.has_peer_certificates(),
-                        ),
-                    );
-                    let phase_recorder = telemetry::sampled_phase_timing_recorder(
-                        phase_metrics_enabled,
-                        phase_timing_sample_rate,
-                        session_id,
-                    );
-
-                    let mirror_dispatcher = Arc::clone(&mirror_dispatcher);
-                    let buffer_pool = self.buffer_pool.clone();
-                    let backend_credentials = backend_credentials.clone();
-
-                    client_tasks.spawn(async move {
-                        let _client_guard = client_guard;
-                        let result = handle_client(
-                            client,
-                            client_addr,
-                            route_pools,
-                            config_snapshot,
-                            routing_planner,
-                            session_id,
-                            snapshot_store,
-                            client_snapshot_handle,
-                            phase_recorder,
-                            debug_sampler,
-                            mirror_dispatcher,
-                            buffer_pool,
-                            backend_credentials,
-                        )
-                        .await;
-                        drop(permit);
-
-                        if let Err(error) = result {
-                            let error_chain = format!("{error:#}");
-                            tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
-                        }
-                    });
+        tokio::select! {
+            biased;
+            _ = &mut drain_start_wait => {
+                ctx.lifecycle.begin_drain(ShutdownReason::AdminRequest);
+                draining = true;
+            }
+            joined = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    tracing::warn!(shard_id = ctx.shard_id, error = %error, "client task failed");
                 }
+            }
+            accept = ctx.listener.accept() => {
+                let (client, client_addr) = accept.context("accept client")?;
+                let config_snapshot = ctx.active_config.read().await.clone();
+                let socket_options = socket::SocketOptions::from(&config_snapshot.socket);
+                socket::apply_socket_options(&client, &socket_options, "client")
+                    .context("apply client socket options")?;
+                let client = ClientConnection::new(client);
+                metrics::increment_client_connections();
+
+                let Some(client_guard) = ctx.lifecycle.drain_token().try_enter() else {
+                    let mut client = client;
+                    reject_client_during_drain(&mut client, ctx.reject_phase_recorder.as_ref())
+                        .await?;
+                    tracing::info!(shard_id = ctx.shard_id, %client_addr, "rejected client during drain");
+                    continue;
+                };
+
+                let permit = ctx.client_slots.clone().acquire_owned().await?;
+                let route_pools = Arc::clone(&ctx.route_pools);
+                let snapshot_store = ctx.snapshot_store.clone();
+                let client_snapshot_handle = snapshot_store.client_handle();
+                let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+                client_snapshot_handle.register(session_id);
+                telemetry::emit_debug_sample_with(
+                    &ctx.debug_sampler,
+                    session_id,
+                    || DebugSample::client_accepted(
+                        session_id,
+                        client_addr,
+                        config_snapshot.tls.client_tls_mode.as_str(),
+                        client.has_peer_certificates(),
+                    ),
+                );
+                let phase_recorder = telemetry::sampled_phase_timing_recorder(
+                    ctx.phase_metrics_enabled,
+                    ctx.phase_timing_sample_rate,
+                    session_id,
+                );
+
+                let mirror_dispatcher = Arc::clone(&ctx.mirror_dispatcher);
+                let buffer_pool = ctx.buffer_pool.clone();
+                let backend_credentials = ctx.backend_credentials.clone();
+                let routing_planner = ctx.routing_planner;
+                let debug_sampler = ctx.debug_sampler;
+
+                client_tasks.spawn(async move {
+                    let _client_guard = client_guard;
+                    let result = handle_client(
+                        client,
+                        client_addr,
+                        route_pools,
+                        config_snapshot,
+                        routing_planner,
+                        session_id,
+                        snapshot_store,
+                        client_snapshot_handle,
+                        phase_recorder,
+                        debug_sampler,
+                        mirror_dispatcher,
+                        buffer_pool,
+                        backend_credentials,
+                    )
+                    .await;
+                    drop(permit);
+
+                    if let Err(error) = result {
+                        let error_chain = format!("{error:#}");
+                        tracing::warn!(%client_addr, error = %error_chain, "client connection closed with error");
+                    }
+                });
             }
         }
     }
