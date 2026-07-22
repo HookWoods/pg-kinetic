@@ -132,12 +132,30 @@ pub fn bind_reuseport_listener(
         .context("convert listener to tokio")
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        target_os = "wasi"
+    ))
+))]
 fn set_reuse_port(socket: &Socket) -> std::io::Result<()> {
     socket.set_reuse_port(true)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        target_os = "wasi"
+    ))
+)))]
 fn set_reuse_port(_socket: &Socket) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
