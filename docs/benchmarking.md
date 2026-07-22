@@ -100,6 +100,20 @@ Use this workflow for checked-in performance baselines:
 
 Keep the same target labels and target set when updating a baseline. Adding or removing `direct_postgresql`, `pgbouncer`, `pgdog`, or `pg_kinetic` is a scenario change and needs review before the performance score gate can be trusted. PgBouncer and PgDog results are directional context only and do not expand the stable product contract.
 
+## Phase Metric Sampling
+
+Use the read-only wrapper to compare detailed phase timing overhead without
+changing the benchmark scenario or committing generated reports:
+
+```bash
+PG_KINETIC_PHASE_TIMING_SAMPLE_RATE=1.0 bash scripts/bench/run-read-only.sh
+PG_KINETIC_PHASE_TIMING_SAMPLE_RATE=0.0 bash scripts/bench/run-read-only.sh
+```
+
+Both commands write under the ignored `bench/results/` directory by default.
+The `0.0` run disables detailed phase histograms while core health, pool,
+error, and backpressure metrics remain mandatory.
+
 ## Profiles And Process Hooks
 
 Check whether optional profile tools are available:

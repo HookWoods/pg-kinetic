@@ -48,6 +48,7 @@ Validate the benchmark command plumbing without collecting live measurements:
 
 ~~~bash
 bash scripts/bench/run-performance.sh --dry-run
+PG_KINETIC_PHASE_TIMING_SAMPLE_RATE=0.0 bash scripts/bench/run-read-only.sh --dry-run
 bash scripts/bench/profile-performance.sh --dry-run
 ~~~
 

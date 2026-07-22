@@ -35,6 +35,7 @@ fn bash_scripts_use_the_shared_contract() {
         "scripts/smoke/mirroring.sh",
         "scripts/smoke/performance.sh",
         "scripts/bench/run-performance.sh",
+        "scripts/bench/run-read-only.sh",
         "scripts/bench/compare-performance.sh",
         "scripts/bench/profile-performance.sh",
     ] {
@@ -110,6 +111,11 @@ fn benchmark_scripts_preserve_the_product_command_contract() {
     assert!(run.contains("benchmark run"));
     assert!(run.contains("--format json"));
     assert!(run.contains("--dry-run"));
+
+    let read_only = read_repository_file("scripts/bench/run-read-only.sh");
+    assert!(read_only.contains("PG_KINETIC_PHASE_TIMING_SAMPLE_RATE"));
+    assert!(read_only.contains("benchmark run"));
+    assert!(read_only.contains("read-only-phase-sampling"));
 
     let compare = read_repository_file("scripts/bench/compare-performance.sh");
     assert!(compare.contains("benchmark compare"));
