@@ -94,6 +94,25 @@ Rotate the secret by updating the orchestration secret/environment and restartin
 
 For the required pairing, supported PostgreSQL backend authentication methods, TLS rule for cleartext passwords, and role design, see [Backend Service Authentication](backend-service-auth.md).
 
+## Dynamic User Lookup
+
+`auth_query_enabled = true` lets pg-kinetic look up users that are absent from the local user store. The lookup uses a dedicated backend connection with `backend_user` and `backend_password_env_var_name`; it is never borrowed from or returned to the normal client pool.
+
+```toml
+[auth]
+auth_mode = "scram_sha_256"
+auth_users_file = "/etc/pg-kinetic/users.txt"
+backend_user = "pg_kinetic_auth"
+backend_password_env_var_name = "PG_KINETIC_AUTH_PASSWORD"
+auth_query_enabled = true
+auth_query = "SELECT usename, passwd FROM pg_shadow WHERE usename = $1"
+auth_query_cache_ttl_ms = 60000
+```
+
+The query must contain exactly one `$1` placeholder. pg-kinetic substitutes it as a single quoted SQL literal, accepts either SCRAM-SHA-256 verifiers or PgBouncer-compatible MD5 secrets, rejects duplicate or malformed rows, and caches only successful lookups until `auth_query_cache_ttl_ms` expires.
+
+For hardened deployments, prefer a narrowly scoped `SECURITY DEFINER` function owned by a privileged role instead of granting broad `pg_shadow` access to the proxy service role. The service role should be able to execute only that lookup function.
+
 ## SSL Fallback For Clients
 
 PostgreSQL clients often use `sslmode` or `PGSSLMODE` to decide whether they send an `SSLRequest`.

@@ -1961,6 +1961,23 @@ pub struct AuthConfig {
     #[arg(long, env = "PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME")]
     pub backend_password_env_var_name: Option<String>,
 
+    #[arg(long, env = "PG_KINETIC_AUTH_QUERY_ENABLED")]
+    pub auth_query_enabled: bool,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_AUTH_QUERY",
+        default_value = "SELECT usename, passwd FROM pg_shadow WHERE usename = $1"
+    )]
+    pub auth_query: String,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_AUTH_QUERY_CACHE_TTL_MS",
+        default_value_t = 60_000
+    )]
+    pub auth_query_cache_ttl_ms: u64,
+
     #[arg(
         long,
         env = "PG_KINETIC_AUTH_FAILURE_MESSAGE_MODE",
@@ -1975,6 +1992,53 @@ impl AuthConfig {
     pub fn auth_mode_core(&self) -> CoreAuthMode {
         self.auth_mode.into()
     }
+
+    #[must_use]
+    pub const fn auth_query_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.auth_query_cache_ttl_ms)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match (
+            self.backend_user.as_deref(),
+            self.backend_password_env_var_name.as_deref(),
+        ) {
+            (Some(_), Some(_)) if self.auth_mode == AuthMode::PassThrough => {
+                return Err(String::from(
+                    "backend service credentials are incompatible with auth_mode=pass_through",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(String::from(
+                    "auth.backend_user requires auth.backend_password_env_var_name",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(String::from(
+                    "auth.backend_password_env_var_name requires auth.backend_user",
+                ));
+            }
+            _ => {}
+        }
+
+        if self.auth_query_enabled {
+            if self.backend_user.is_none() || self.backend_password_env_var_name.is_none() {
+                return Err(String::from(
+                    "auth_query_enabled requires backend service credentials",
+                ));
+            }
+            if self.auth_query.trim().is_empty() {
+                return Err(String::from("auth_query must not be empty"));
+            }
+            if self.auth_query.match_indices("$1").count() != 1 {
+                return Err(String::from(
+                    "auth_query must contain exactly one $1 placeholder",
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for AuthConfig {
@@ -1984,6 +2048,9 @@ impl Default for AuthConfig {
             auth_users_file: None,
             backend_user: None,
             backend_password_env_var_name: None,
+            auth_query_enabled: false,
+            auth_query: String::from("SELECT usename, passwd FROM pg_shadow WHERE usename = $1"),
+            auth_query_cache_ttl_ms: 60_000,
             auth_failure_message_mode: AuthFailureMessageMode::Generic,
         }
     }
@@ -2204,6 +2271,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         self.capacity.validate()?;
+        self.auth.validate()?;
         self.validate_pool_configs()
     }
 
@@ -2232,6 +2300,9 @@ impl Config {
             && self.tls.backend_ca_path == next.tls.backend_ca_path
             && self.tls.backend_server_name == next.tls.backend_server_name
             && self.auth.auth_mode == next.auth.auth_mode
+            && self.auth.auth_query_enabled == next.auth.auth_query_enabled
+            && self.auth.auth_query == next.auth.auth_query
+            && self.auth.auth_query_cache_ttl_ms == next.auth.auth_query_cache_ttl_ms
             && self.auth.auth_failure_message_mode == next.auth.auth_failure_message_mode
             && self.reload == next.reload
             && self.drain == next.drain

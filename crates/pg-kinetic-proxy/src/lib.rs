@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod admin;
 pub mod auth;
 pub mod backend;
+pub mod backend_query;
 pub mod benchmark;
 pub mod buffers;
 pub mod cancel;

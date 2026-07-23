@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::{
+    backend_query::AuthQueryService,
     config::{AuthConfig, AuthFailureMessageMode, AuthMode},
     proxy::ClientConnection,
 };
@@ -440,16 +441,36 @@ pub(crate) async fn authenticate_client(
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
+    auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ClientAuthOutcome> {
     match auth.auth_mode {
         AuthMode::PassThrough => Ok(ClientAuthOutcome::PassThrough),
         AuthMode::Trust => authenticate_trust(client, username, auth, users).await,
         AuthMode::ScramSha256 => {
-            authenticate_scram(client, username, auth, users, max_client_buffer_bytes).await
+            authenticate_scram(
+                client,
+                username,
+                auth,
+                users,
+                auth_query,
+                max_client_buffer_bytes,
+                max_backend_buffer_bytes,
+            )
+            .await
         }
         AuthMode::Md5 => {
-            authenticate_md5(client, username, auth, users, max_client_buffer_bytes).await
+            authenticate_md5(
+                client,
+                username,
+                auth,
+                users,
+                auth_query,
+                max_client_buffer_bytes,
+                max_backend_buffer_bytes,
+            )
+            .await
         }
     }
 }
@@ -497,9 +518,32 @@ async fn authenticate_scram(
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
+    auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ClientAuthOutcome> {
-    let Some(UserSecret::ScramSha256(verifier)) = users.get(username) else {
+    let secret = match resolve_user_secret(
+        username,
+        auth,
+        users,
+        auth_query,
+        max_backend_buffer_bytes,
+    )
+    .await
+    {
+        Ok(secret) => secret,
+        Err(_) => {
+            reject_authentication(
+                client,
+                auth.auth_failure_message_mode,
+                username,
+                "auth query failed",
+            )
+            .await?;
+            return Ok(ClientAuthOutcome::Rejected);
+        }
+    };
+    let Some(UserSecret::ScramSha256(verifier)) = secret else {
         reject_authentication(
             client,
             auth.auth_failure_message_mode,
@@ -563,7 +607,7 @@ async fn authenticate_scram(
 
     let auth_message =
         format!("{client_first_bare},{server_first},c={channel_binding},r={combined_nonce}");
-    if verify_scram_proof(verifier, auth_message.as_bytes(), &proof).is_err() {
+    if verify_scram_proof(&verifier, auth_message.as_bytes(), &proof).is_err() {
         reject_authentication(
             client,
             auth.auth_failure_message_mode,
@@ -574,7 +618,7 @@ async fn authenticate_scram(
         return Ok(ClientAuthOutcome::Rejected);
     }
 
-    let server_signature = scram_server_signature(verifier, auth_message.as_bytes());
+    let server_signature = scram_server_signature(&verifier, auth_message.as_bytes());
     let server_final = format!("v={}", STANDARD.encode(server_signature));
     let server_final_message = authentication_sasl_final(server_final.as_bytes());
     client
@@ -595,9 +639,32 @@ async fn authenticate_md5(
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
+    auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
+    max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<ClientAuthOutcome> {
-    let Some(UserSecret::Md5(secret)) = users.get(username) else {
+    let secret = match resolve_user_secret(
+        username,
+        auth,
+        users,
+        auth_query,
+        max_backend_buffer_bytes,
+    )
+    .await
+    {
+        Ok(secret) => secret,
+        Err(_) => {
+            reject_authentication(
+                client,
+                auth.auth_failure_message_mode,
+                username,
+                "auth query failed",
+            )
+            .await?;
+            return Ok(ClientAuthOutcome::Rejected);
+        }
+    };
+    let Some(UserSecret::Md5(secret)) = secret else {
         reject_authentication(
             client,
             auth.auth_failure_message_mode,
@@ -630,7 +697,7 @@ async fn authenticate_md5(
         return Ok(ClientAuthOutcome::Rejected);
     };
 
-    let expected = expected_md5_client_hash(secret, salt);
+    let expected = expected_md5_client_hash(&secret, salt);
     if bool::from(expected.as_bytes().ct_eq(response)) {
         client
             .write_all(&authentication_ok())
@@ -647,6 +714,30 @@ async fn authenticate_md5(
         .await?;
         Ok(ClientAuthOutcome::Rejected)
     }
+}
+
+async fn resolve_user_secret(
+    username: &str,
+    auth: &AuthConfig,
+    users: &UserStore,
+    auth_query: Option<&AuthQueryService>,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<Option<UserSecret>> {
+    if let Some(secret) = users.get(username) {
+        return Ok(Some(secret.clone()));
+    }
+
+    if !auth.auth_query_enabled {
+        return Ok(None);
+    }
+
+    let Some(auth_query) = auth_query else {
+        bail!("auth query service unavailable");
+    };
+
+    auth_query
+        .lookup(auth, username, max_backend_buffer_bytes)
+        .await
 }
 
 async fn reject_authentication(

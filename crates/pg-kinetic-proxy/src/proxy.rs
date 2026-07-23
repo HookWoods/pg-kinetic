@@ -28,6 +28,7 @@ use crate::routing::{
 use crate::{
     adaptive::AdaptiveController,
     admin, auth,
+    backend_query::AuthQueryService,
     buffers::{ProxyBufferPool, SessionBufferSet},
     cancel,
     config::{Config, PoolConfig, RouteConfig},
@@ -352,6 +353,7 @@ pub(crate) struct ShardContext {
     pub routing_planner: ReadRoutingPlanner,
     pub cancel_registry: Arc<cancel::CancelRegistry>,
     pub pause: Arc<PauseController>,
+    pub auth_query_service: Arc<AuthQueryService>,
     pub reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     pub debug_sampler: DebugSampler,
     pub phase_metrics_enabled: bool,
@@ -377,6 +379,7 @@ struct ProxyRuntimeState {
     route_pool_selector: RoutePoolSelector,
     control_route_pools: Arc<RoutePools>,
     routing_planner: ReadRoutingPlanner,
+    auth_query_service: Arc<AuthQueryService>,
 }
 
 #[derive(Clone, Debug)]
@@ -519,6 +522,7 @@ impl Proxy {
             routing_planner: state.routing_planner,
             cancel_registry: Arc::clone(&self.cancel_registry),
             pause: Arc::clone(&self.pause),
+            auth_query_service: Arc::clone(&state.auth_query_service),
             reject_phase_recorder: Arc::clone(&state.reject_phase_recorder),
             debug_sampler: state.debug_sampler,
             phase_metrics_enabled: state.phase_metrics_enabled,
@@ -611,6 +615,7 @@ impl Proxy {
             let routing_planner = state.routing_planner;
             let cancel_registry = Arc::clone(&self.cancel_registry);
             let pause = Arc::clone(&self.pause);
+            let auth_query_service = Arc::clone(&state.auth_query_service);
             let reject_phase_recorder = Arc::clone(&state.reject_phase_recorder);
             let debug_sampler = state.debug_sampler;
             let phase_metrics_enabled = state.phase_metrics_enabled;
@@ -682,6 +687,7 @@ impl Proxy {
                             routing_planner,
                             cancel_registry,
                             pause,
+                            auth_query_service,
                             reject_phase_recorder,
                             debug_sampler,
                             phase_metrics_enabled,
@@ -855,6 +861,12 @@ impl Proxy {
             .set_limits_snapshot(LimitsSnapshot::from_config(&effective_config));
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
         let backend_credentials = reload::BackendCredentialCache::from_config(&effective_config)?;
+        let auth_query_service = Arc::new(AuthQueryService::new(
+            effective_config.connection.backend_addr,
+            effective_config.tls.clone(),
+            effective_config.socket.clone(),
+            backend_credentials.clone(),
+        ));
         let route_config = effective_config
             .effective_routes()
             .into_iter()
@@ -900,6 +912,7 @@ impl Proxy {
             route_pool_selector,
             control_route_pools,
             routing_planner,
+            auth_query_service,
         })
     }
 }
@@ -1228,6 +1241,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                 let debug_sampler = ctx.debug_sampler;
                 let cancel_registry = Arc::clone(&ctx.cancel_registry);
                 let pause = Arc::clone(&ctx.pause);
+                let auth_query_service = Arc::clone(&ctx.auth_query_service);
 
                 client_tasks.spawn(async move {
                     let _client_guard = client_guard;
@@ -1247,6 +1261,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
                         backend_credentials,
                         cancel_registry,
                         pause,
+                        auth_query_service,
                     )
                     .await;
                     drop(permit);
@@ -1304,6 +1319,7 @@ async fn handle_client(
     backend_credentials: Option<Arc<auth::BackendCredentials>>,
     cancel_registry: Arc<cancel::CancelRegistry>,
     pause: Arc<PauseController>,
+    auth_query_service: Arc<AuthQueryService>,
 ) -> anyhow::Result<()> {
     let mut session_buffer_lease = buffer_pool.acquire();
     let session_buffers = session_buffer_lease.buffers_mut();
@@ -1448,7 +1464,9 @@ async fn handle_client(
             &route_user,
             &auth,
             auth_users,
+            Some(auth_query_service.as_ref()),
             qos.max_client_buffer_bytes,
+            qos.max_backend_buffer_bytes,
         )
         .await
         .with_context(|| format!("authenticate client {client_addr}"))
