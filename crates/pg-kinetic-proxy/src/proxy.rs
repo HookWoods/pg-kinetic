@@ -30,7 +30,7 @@ use crate::{
     adaptive::AdaptiveController,
     admin, auth,
     backend_query::AuthQueryService,
-    buffers::{ProxyBufferPool, SessionBufferSet},
+    buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, SessionBufferSet},
     cancel,
     config::{Config, PoolConfig, RouteConfig},
     drain::DrainController,
@@ -275,7 +275,7 @@ impl Proxy {
 
         Self {
             config,
-            buffer_pool: ProxyBufferPool::default(),
+            buffer_pool: default_buffer_pool(),
             client_slots,
             backend_slots,
             lifecycle,
@@ -771,6 +771,26 @@ impl Proxy {
             auth_query_service,
         })
     }
+}
+
+fn default_buffer_pool() -> ProxyBufferPool {
+    let resource_limits = limits::detect_cgroup_limits();
+    let mut reuse_policy = BufferReusePolicy::default();
+    reuse_policy.max_cached_bytes = buffer_cache_budget(reuse_policy, resource_limits);
+    ProxyBufferPool::new(reuse_policy, OversizedBufferPolicy::default())
+}
+
+fn buffer_cache_budget(
+    reuse_policy: BufferReusePolicy,
+    resource_limits: limits::ResourceLimits,
+) -> usize {
+    resource_limits
+        .mem_limit_bytes
+        .map_or(reuse_policy.max_cached_bytes, |mem_limit_bytes| {
+            (mem_limit_bytes as usize / 100)
+                .max(reuse_policy.initial_capacity)
+                .min(reuse_policy.max_cached_bytes)
+        })
 }
 
 fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
@@ -1445,7 +1465,8 @@ mod tests {
 
     use super::{
         auth_request_expects_client_response, cgroup_shard_cap,
-        connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count, Config,
+        connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count,
+        BufferReusePolicy, Config,
     };
 
     fn auth_payload(code: i32) -> [u8; 4] {
@@ -1493,6 +1514,36 @@ mod tests {
         assert_eq!(cgroup_shard_cap(Some(f64::NAN), 16), 16);
         assert_eq!(cgroup_shard_cap(Some(0.25), 16), 1);
         assert_eq!(cgroup_shard_cap(Some(2.0), 0), 1);
+    }
+
+    #[test]
+    fn cgroup_memory_caps_cached_buffer_budget() {
+        let policy = BufferReusePolicy {
+            initial_capacity: 16 * 1024,
+            max_cached_sessions: 64,
+            max_cached_bytes: 4 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            super::buffer_cache_budget(
+                policy,
+                limits::ResourceLimits {
+                    cpu_quota: None,
+                    mem_limit_bytes: Some(128 * 1024 * 1024),
+                },
+            ),
+            128 * 1024 * 1024 / 100
+        );
+        assert_eq!(
+            super::buffer_cache_budget(
+                policy,
+                limits::ResourceLimits {
+                    cpu_quota: None,
+                    mem_limit_bytes: Some(512 * 1024),
+                },
+            ),
+            policy.initial_capacity
+        );
     }
 
     #[test]

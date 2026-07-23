@@ -9,6 +9,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub struct BufferReusePolicy {
     pub initial_capacity: usize,
     pub max_cached_sessions: usize,
+    pub max_cached_bytes: usize,
 }
 
 impl Default for BufferReusePolicy {
@@ -16,6 +17,7 @@ impl Default for BufferReusePolicy {
         Self {
             initial_capacity: 16 * 1024,
             max_cached_sessions: 64,
+            max_cached_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -46,6 +48,7 @@ struct BufferCounters {
     backend_to_client_copies: AtomicU64,
     backend_to_client_copied_bytes: AtomicU64,
     oversized_buffers_released: AtomicU64,
+    cached_sessions_released: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,6 +64,8 @@ pub struct ProxyBufferStats {
     pub backend_to_client_copies: u64,
     pub backend_to_client_copied_bytes: u64,
     pub oversized_buffers_released: u64,
+    pub cached_sessions_released: u64,
+    pub cached_session_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +74,7 @@ pub struct ProxyBufferPool {
     oversized_policy: OversizedBufferPolicy,
     counters: Arc<BufferCounters>,
     available: Arc<Mutex<Vec<SessionBufferSet>>>,
+    cached_session_bytes: Arc<Mutex<usize>>,
 }
 
 impl Default for ProxyBufferPool {
@@ -87,6 +93,7 @@ impl ProxyBufferPool {
             reuse_policy: BufferReusePolicy {
                 initial_capacity: reuse_policy.initial_capacity.max(1),
                 max_cached_sessions: reuse_policy.max_cached_sessions,
+                max_cached_bytes: reuse_policy.max_cached_bytes,
             },
             oversized_policy: OversizedBufferPolicy {
                 max_retained_capacity: oversized_policy
@@ -95,6 +102,7 @@ impl ProxyBufferPool {
             },
             counters: Arc::new(BufferCounters::default()),
             available: Arc::new(Mutex::new(Vec::new())),
+            cached_session_bytes: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -103,6 +111,8 @@ impl ProxyBufferPool {
         let buffers = self.available.lock().expect("buffer pool poisoned").pop();
         let buffers = match buffers {
             Some(buffers) => {
+                let retained_bytes = buffers.retained_capacity();
+                self.adjust_cached_session_bytes(|bytes| bytes.saturating_sub(retained_bytes));
                 self.counters
                     .sessions_reused
                     .fetch_add(1, Ordering::Relaxed);
@@ -155,26 +165,59 @@ impl ProxyBufferPool {
                 .counters
                 .oversized_buffers_released
                 .load(Ordering::Relaxed),
+            cached_sessions_released: self
+                .counters
+                .cached_sessions_released
+                .load(Ordering::Relaxed),
+            cached_session_bytes: *self
+                .cached_session_bytes
+                .lock()
+                .expect("buffer pool poisoned"),
         }
     }
 
     pub fn trim_cached(&self) {
-        for buffers in self
-            .available
-            .lock()
-            .expect("buffer pool poisoned")
-            .iter_mut()
-        {
+        let mut available = self.available.lock().expect("buffer pool poisoned");
+        for buffers in available.iter_mut() {
             buffers.trim_empty_buffers();
         }
+        let cached_bytes = available
+            .iter()
+            .map(SessionBufferSet::retained_capacity)
+            .sum();
+        *self
+            .cached_session_bytes
+            .lock()
+            .expect("buffer pool poisoned") = cached_bytes;
     }
 
     fn recycle(&self, mut buffers: SessionBufferSet) {
         buffers.prepare_for_reuse();
         let mut available = self.available.lock().expect("buffer pool poisoned");
-        if available.len() < self.reuse_policy.max_cached_sessions {
+        let retained_bytes = buffers.retained_capacity();
+        let mut cached_bytes = self
+            .cached_session_bytes
+            .lock()
+            .expect("buffer pool poisoned");
+        let fits_count = available.len() < self.reuse_policy.max_cached_sessions;
+        let fits_bytes =
+            cached_bytes.saturating_add(retained_bytes) <= self.reuse_policy.max_cached_bytes;
+        if fits_count && fits_bytes {
+            *cached_bytes += retained_bytes;
             available.push(buffers);
+        } else {
+            self.counters
+                .cached_sessions_released
+                .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn adjust_cached_session_bytes(&self, update: impl FnOnce(usize) -> usize) {
+        let mut cached_bytes = self
+            .cached_session_bytes
+            .lock()
+            .expect("buffer pool poisoned");
+        *cached_bytes = update(*cached_bytes);
     }
 }
 
@@ -366,6 +409,12 @@ impl SessionBufferSet {
             self.backend_write.capacity(),
             self.client_write.capacity(),
         ]
+    }
+
+    #[must_use]
+    pub fn retained_capacity(&self) -> usize {
+        self.capacities().into_iter().sum::<usize>()
+            + self.backend_frames.capacity() * std::mem::size_of::<([u8; 5], Bytes)>()
     }
 
     fn prepare_for_reuse(&mut self) {

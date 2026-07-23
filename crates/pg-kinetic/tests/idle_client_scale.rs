@@ -71,6 +71,7 @@ fn test_buffer_pool() -> ProxyBufferPool {
         BufferReusePolicy {
             initial_capacity: 64,
             max_cached_sessions: 64,
+            max_cached_bytes: 8 * 1024,
         },
         OversizedBufferPolicy {
             max_retained_capacity: 128,
