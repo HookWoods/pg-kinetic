@@ -52,7 +52,10 @@ if [[ -n "$BASELINE" || -n "$CURRENT" ]]; then
     echo "BASELINE and CURRENT must be supplied together" >&2
     exit 2
   fi
-  run_from_repo_root bash scripts/bench/compare-performance.sh --baseline "$BASELINE" --current "$CURRENT"
+  run_from_repo_root cargo run -p pg-kinetic -- benchmark score \
+    --baseline "$BASELINE" \
+    --current "$CURRENT" \
+    --release
 fi
 
 success "performance smoke passed"

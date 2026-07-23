@@ -44,9 +44,10 @@ try {
             throw "current report does not exist: $Current"
         }
 
-        & powershell.exe -ExecutionPolicy Bypass -File scripts\bench\compare-performance.ps1 `
-            -Baseline $Baseline `
-            -Current $Current
+        & cargo run -p pg-kinetic -- benchmark score `
+            --baseline $Baseline `
+            --current $Current `
+            --release
         if ($LASTEXITCODE -ne 0) {
             throw "benchmark regression gate failed with exit code $LASTEXITCODE"
         }

@@ -14,13 +14,22 @@ pg-kinetic uses versioned scenarios and JSON reports to compare the proxy with d
 
 ## Local Targets
 
-Start only the targets needed for one measurement run:
+Start the isolated target stack:
 
 ```powershell
-docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+docker compose -f bench/compose.yml --profile comparison up --detach --wait --build
 ```
 
-The stable compose stack exposes direct PostgreSQL on `55432` and pg-kinetic on `58432`. PgBouncer and PgDog are opt-in comparison services; start one with `--profile comparison`, never alongside a target that is being measured. Verify the selected target with `psql` before collecting a baseline or candidate. Stop it after every target with `docker compose -f bench/compose.yml down --volumes --remove-orphans` so PostgreSQL state and competing poolers cannot affect the next run.
+The compose stack gives each target its own PostgreSQL instance and private pair network:
+
+| Target | Host port | Backend service |
+| --- | --- | --- |
+| direct PostgreSQL | `55432` | `pg-direct` |
+| PgBouncer | `56432` | `pg-bouncer-db` |
+| PgDog | `57432` | `pg-dog-db` |
+| pg-kinetic | `58432` | `pg-kinetic-db` |
+
+The `driver` service joins every pair network for in-container checks and workload execution. pg-kinetic defaults to `PG_KINETIC_RUNTIME_ENGINE=thread_per_core` in this stack; override it only for explicit runtime A/B experiments. Verify every backend with `pg_isready` before collecting a baseline or candidate, then run targets sequentially or interleaved so one workload is active at a time. Stop the stack with `docker compose -f bench/compose.yml down --volumes --remove-orphans` after each measurement session.
 
 The benchmark scenarios use their own target DSNs. For a host-side workload driver, set them to the selected compose port (`55432`, `56432`, `57432`, or `58432`) before collecting measurements; the checked-in scenario ports model an internal target matrix. Do not commit credentials or generated benchmark output in the repository. The runner redacts DSN credentials in JSON output.
 
@@ -93,7 +102,7 @@ Collect at least three live runs for a baseline update and review the median wit
 Use this workflow for checked-in performance baselines:
 
 1. Validate the scenario and target matrix with `benchmark validate`.
-2. Start one target at a time and verify it with `psql`; tear down the stack with volumes between targets.
+2. Start the isolated compose stack, verify every target backend, and run one target workload at a time.
 3. Collect repeated live reports under ignored `bench/results/` with the PowerShell or Bash wrapper for the current platform.
 4. Compare the reviewed candidate against the existing baseline with `compare-performance`.
 5. Commit only the reviewed baseline file under `bench/baselines/` or `regression/baselines/`; leave raw run output in ignored result directories.

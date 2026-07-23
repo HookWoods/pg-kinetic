@@ -1,7 +1,7 @@
 services:
-  postgres:
+  pg-direct:
     image: postgres:18
-    environment:
+    environment: &postgres_env
       POSTGRES_DB: pgkinetic
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -11,29 +11,68 @@ services:
       - "55432:5432"
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
+    healthcheck: &postgres_healthcheck
       test: ["CMD-SHELL", "pg_isready -U postgres -d pgkinetic"]
       interval: 2s
       timeout: 2s
       retries: 30
+    networks:
+      direct:
+        aliases:
+          - postgres
+
+  pg-bouncer-db:
+    image: postgres:18
+    environment: *postgres_env
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck: *postgres_healthcheck
+    networks:
+      pgbouncer:
+        aliases:
+          - postgres
+
+  pg-dog-db:
+    image: postgres:18
+    environment: *postgres_env
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck: *postgres_healthcheck
+    networks:
+      pgdog:
+        aliases:
+          - postgres
+
+  pg-kinetic-db:
+    image: postgres:18
+    environment: *postgres_env
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck: *postgres_healthcheck
+    networks:
+      pgkinetic:
+        aliases:
+          - postgres
 
   pgbouncer:
     profiles: [comparison]
     image: edoburu/pgbouncer:v1.25.2-p0
     depends_on:
-      postgres:
+      pg-bouncer-db:
         condition: service_healthy
     ports:
       - "56432:5432"
     volumes:
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks:
+      - pgbouncer
 
   pgdog:
     profiles: [comparison]
     image: ghcr.io/pgdogdev/pgdog:v0.1.46
     depends_on:
-      postgres:
+      pg-dog-db:
         condition: service_healthy
     ports:
       - "57432:6432"
@@ -42,6 +81,8 @@ services:
       - ./pgdog/users.toml:/pgdog/users.toml:ro
     environment:
       RUST_LOG: info
+    networks:
+      - pgdog
 
   pg-kinetic:
     build:
@@ -68,14 +109,14 @@ services:
           --listen-addr "$${PG_KINETIC_LISTEN_ADDR:-0.0.0.0:6543}" \
           --backend-addr "$${backend_ip}:5432"
     depends_on:
-      postgres:
+      pg-kinetic-db:
         condition: service_healthy
     ports:
       - "58432:6543"
       - "59091:9091"
       - "19090:9090"
     environment:
-      PG_KINETIC_RUNTIME_ENGINE: tokio_default
+      PG_KINETIC_RUNTIME_ENGINE: "${PG_KINETIC_RUNTIME_ENGINE:-thread_per_core}"
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
       PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"
@@ -86,7 +127,24 @@ services:
       PG_KINETIC_BACKEND_USER: postgres
       PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME: PG_KINETIC_BACKEND_PASSWORD
       PG_KINETIC_BACKEND_PASSWORD: postgres
-      PG_KINETIC_MAX_BACKENDS: "8"
+      PG_KINETIC_MAX_BACKENDS: "64"
       RUST_LOG: info
     volumes:
       - ./pg-kinetic/auth-users.txt:/etc/pg-kinetic/auth-users.txt:ro
+    networks:
+      - pgkinetic
+
+  driver:
+    image: postgres:18
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      - direct
+      - pgbouncer
+      - pgdog
+      - pgkinetic
+
+networks:
+  direct: {}
+  pgbouncer: {}
+  pgdog: {}
+  pgkinetic: {}
