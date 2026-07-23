@@ -4029,39 +4029,12 @@ async fn forward_message_cycle(
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
-        let mut ready = None;
-        let mut forwarded_frames: Vec<([u8; 5], Bytes)> = Vec::new();
-        while let Some(frame) = parse_backend_frame(buffers.backend_read_mut())? {
-            if injected_parse_completes > 0 && frame.tag == b'1' {
-                injected_parse_completes -= 1;
-                continue;
-            }
-            state.progress.response_started = true;
-            if let Some(sqlstate) = frame.sqlstate() {
-                metrics::increment_sqlstate(sqlstate);
-                let scope = state
-                    .prepared
-                    .invalidate_for_sqlstate(sqlstate, backend.backend_id());
-                if scope != InvalidationScope::None {
-                    metrics::increment_prepared_event(PreparedEvent::Invalidate);
-                    publish_prepared_snapshot(state.prepared, &state.prepared_snapshot_handle);
-                }
-            }
-
-            if frame.tag == u8::from(BackendTag::ErrorResponse)
-                && matches!(state.session.pin_reason(), Some(PinReason::OpenTransaction))
-            {
-                state.session.mark_failed_transaction();
-            }
-
-            if let Some(status) = frame.ready_status() {
-                ready = Some(status);
-            }
-            let mut header = [0_u8; 5];
-            header[0] = frame.tag;
-            header[1..].copy_from_slice(&((frame.payload.len() + 4) as i32).to_be_bytes());
-            forwarded_frames.push((header, frame.payload));
-        }
+        let (ready, forwarded_frames) = classify_backend_frames(
+            backend.backend_id(),
+            state,
+            buffers.backend_read_mut(),
+            &mut injected_parse_completes,
+        )?;
 
         if !forwarded_frames.is_empty() {
             let mut client_write = Vec::with_capacity(forwarded_frames.len() * 2);
@@ -4088,6 +4061,46 @@ async fn forward_message_cycle(
             return Ok(ForwardOutcome::Ready(status));
         }
     }
+}
+
+fn classify_backend_frames(
+    backend_id: u64,
+    state: &mut ForwardCycleState<'_>,
+    backend_buffer: &mut BytesMut,
+    injected_parse_completes: &mut usize,
+) -> anyhow::Result<(Option<ReadyStatus>, Vec<([u8; 5], Bytes)>)> {
+    let mut ready = None;
+    let mut forwarded_frames = Vec::new();
+    while let Some(frame) = parse_backend_frame(backend_buffer)? {
+        if *injected_parse_completes > 0 && frame.tag == b'1' {
+            *injected_parse_completes -= 1;
+            continue;
+        }
+        state.progress.response_started = true;
+        if let Some(sqlstate) = frame.sqlstate() {
+            metrics::increment_sqlstate(sqlstate);
+            let scope = state.prepared.invalidate_for_sqlstate(sqlstate, backend_id);
+            if scope != InvalidationScope::None {
+                metrics::increment_prepared_event(PreparedEvent::Invalidate);
+                publish_prepared_snapshot(state.prepared, &state.prepared_snapshot_handle);
+            }
+        }
+
+        if frame.tag == u8::from(BackendTag::ErrorResponse)
+            && matches!(state.session.pin_reason(), Some(PinReason::OpenTransaction))
+        {
+            state.session.mark_failed_transaction();
+        }
+
+        if let Some(status) = frame.ready_status() {
+            ready = Some(status);
+        }
+        let mut header = [0_u8; 5];
+        header[0] = frame.tag;
+        header[1..].copy_from_slice(&((frame.payload.len() + 4) as i32).to_be_bytes());
+        forwarded_frames.push((header, frame.payload));
+    }
+    Ok((ready, forwarded_frames))
 }
 
 fn prepare_frame_for_backend(
