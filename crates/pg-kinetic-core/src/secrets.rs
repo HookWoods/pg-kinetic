@@ -17,6 +17,7 @@ const DEFAULT_NONCE_LEN: usize = 18;
 pub enum UserSecret {
     Trust,
     ScramSha256(ScramVerifier),
+    Md5(Md5Secret),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +26,11 @@ pub struct ScramVerifier {
     pub salt: Vec<u8>,
     pub stored_key: Vec<u8>,
     pub server_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Md5Secret {
+    hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +57,32 @@ pub enum SecretError {
     },
     #[error("SCRAM nonce generation failed")]
     NonceGeneration,
+    #[error("MD5 secret must use md5 followed by 32 lowercase hex characters")]
+    InvalidMd5Secret,
+}
+
+impl Md5Secret {
+    pub fn parse(secret: &str) -> Result<Self, SecretError> {
+        let hex = secret
+            .strip_prefix("md5")
+            .ok_or(SecretError::InvalidMd5Secret)?;
+        if hex.len() != 32
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(SecretError::InvalidMd5Secret);
+        }
+
+        Ok(Self {
+            hex: hex.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn stored_hex(&self) -> &str {
+        &self.hex
+    }
 }
 
 impl ScramVerifier {

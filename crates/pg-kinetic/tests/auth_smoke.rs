@@ -7,6 +7,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::{BufMut, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
+use md5::Md5;
 use pg_kinetic::{
     config::{
         AuthConfig, AuthFailureMessageMode, AuthMode, BackendTlsMode, CapacityConfig, Config,
@@ -160,6 +161,46 @@ async fn scram_mode_rejects_invalid_password() {
             .any(|frame| error_sqlstate(frame) == Some("28P01"))
             || frames.iter().any(|frame| frame.tag == b'E'),
         "SCRAM rejection should return a PostgreSQL error"
+    );
+    assert!(collect_events(&mut events).await.is_empty());
+}
+
+#[tokio::test]
+async fn md5_mode_accepts_valid_credentials() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
+    let auth_users_file = write_auth_users_file(&format!(
+        "alice = md5{}\n",
+        md5_password_hash("secretpass", "alice")
+    ));
+    let (proxy_addr, mut events) = spawn_proxy(AuthMode::Md5, Some(auth_users_file)).await;
+    let frames = run_md5_startup(proxy_addr, "alice", "secretpass").await;
+
+    assert!(frames.iter().any(|frame| auth_code(frame) == 5));
+    assert!(frames.iter().any(|frame| auth_code(frame) == 0));
+    assert!(frames
+        .iter()
+        .any(|frame| { frame.tag == b'Z' && frame.ready_status() == Some(ReadyStatus::Idle) }));
+    assert_eq!(
+        collect_events(&mut events).await,
+        vec![String::from("backend_accept")]
+    );
+}
+
+#[tokio::test]
+async fn md5_mode_rejects_invalid_password() {
+    let _guard = AUTH_SMOKE_LOCK.lock().await;
+    let auth_users_file = write_auth_users_file(&format!(
+        "alice = md5{}\n",
+        md5_password_hash("secretpass", "alice")
+    ));
+    let (proxy_addr, mut events) = spawn_proxy(AuthMode::Md5, Some(auth_users_file)).await;
+    let frames = run_md5_startup(proxy_addr, "alice", "wrongpass").await;
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| error_sqlstate(frame) == Some("28P01")),
+        "MD5 rejection should return PostgreSQL invalid_password"
     );
     assert!(collect_events(&mut events).await.is_empty());
 }
@@ -706,6 +747,44 @@ async fn run_scram_startup_expect_error(
     frames
 }
 
+async fn run_md5_startup(addr: SocketAddr, user: &str, password: &str) -> Vec<BackendFrame> {
+    let mut stream = TcpStream::connect(addr).await.expect("connect proxy");
+    stream
+        .write_all(&startup_packet(user))
+        .await
+        .expect("startup");
+
+    let mut buffer = BytesMut::new();
+    let mut frames = Vec::new();
+
+    loop {
+        while let Some(frame) = parse_backend_frame(&mut buffer).expect("parse backend frame") {
+            let ready = frame.ready_status();
+            if frame.tag == b'R' && auth_code(&frame) == 5 {
+                let salt: [u8; 4] = frame.payload[4..8].try_into().expect("md5 salt");
+                stream
+                    .write_all(&md5_password_message(password, user, salt))
+                    .await
+                    .expect("write MD5 password");
+            }
+            let is_error = frame.tag == b'E';
+            frames.push(frame);
+            if ready == Some(ReadyStatus::Idle) || is_error {
+                return frames;
+            }
+        }
+
+        let mut chunk = [0_u8; 4096];
+        match time::timeout(Duration::from_millis(200), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => buffer.extend_from_slice(&chunk[..read]),
+            Ok(Err(error)) => panic!("read proxy response: {error}"),
+        }
+    }
+
+    frames
+}
+
 async fn collect_backend_frames(stream: &mut TcpStream) -> Vec<BackendFrame> {
     let mut buffer = BytesMut::new();
     let mut frames = Vec::new();
@@ -772,6 +851,25 @@ fn scram_final_message(payload: &str) -> Vec<u8> {
     bytes.put_i32((payload.len() + 4) as i32);
     bytes.extend_from_slice(payload.as_bytes());
     bytes.to_vec()
+}
+
+fn md5_password_message(password: &str, user: &str, salt: [u8; 4]) -> Vec<u8> {
+    let first = md5_password_hash(password, user);
+    let mut second_input = BytesMut::new();
+    second_input.extend_from_slice(first.as_bytes());
+    second_input.extend_from_slice(&salt);
+    let response = format!("md5{}", hex_lower(Md5::digest(second_input).as_ref()));
+
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(b'p');
+    bytes.put_i32((response.len() + 5) as i32);
+    bytes.extend_from_slice(response.as_bytes());
+    bytes.put_u8(0);
+    bytes.to_vec()
+}
+
+fn md5_password_hash(password: &str, user: &str) -> String {
+    hex_lower(Md5::digest(format!("{password}{user}")).as_ref())
 }
 
 fn auth_ok_ready() -> Vec<u8> {
@@ -858,6 +956,16 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("valid hmac key");
     mac.update(data);
     mac.finalize().into_bytes().into()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn xor_bytes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {

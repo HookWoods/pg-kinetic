@@ -48,6 +48,7 @@ Backend verification modes require `backend_ca_path`. `verify_full` also require
 | `pass_through` | Preserve the backend's normal authentication flow. |
 | `trust` | Authenticate locally with the configured user store. |
 | `scram_sha_256` | Run local SCRAM-SHA-256 authentication before backend checkout. |
+| `md5` | Run PostgreSQL MD5 password authentication against PgBouncer-compatible stored secrets. |
 
 Use `auth_failure_message_mode = "generic"` for public-facing deployments. `detailed` can expose user/reason context to clients.
 
@@ -58,6 +59,7 @@ The local user store accepts one `username=secret` entry per line. Blank lines a
 ```text
 alice=trust
 bob=SCRAM-SHA-256$4096:c2FsdA==$base64storedkey32bytes:base64serverkey32bytes
+carol=md5cb970ccc08b4d76c34e1ba04ef2b4cb2
 ```
 
 SCRAM verifier format:
@@ -72,6 +74,8 @@ Rules:
 - `salt`, `stored_key`, and `server_key` must be valid standard Base64.
 - `stored_key` must decode to 32 bytes.
 - `server_key` must decode to 32 bytes.
+- MD5 secrets must use the PgBouncer userlist form `md5<32 lowercase hex characters>`, where the stored hash is `md5(password + username)`.
+- MD5 is legacy migration compatibility. Prefer SCRAM-SHA-256 for new users and rotate MD5 users to SCRAM when possible.
 - usernames are matched case-sensitively. `alice=trust` does not authenticate a startup user named `Alice`.
 
 ## Backend Credentials

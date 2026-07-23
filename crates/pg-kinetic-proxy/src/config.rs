@@ -102,6 +102,7 @@ pub enum AuthMode {
     #[serde(rename = "scram_sha_256", alias = "scram_sha256")]
     #[value(name = "scram_sha_256", alias = "scram_sha256")]
     ScramSha256,
+    Md5,
 }
 
 impl AuthMode {
@@ -111,6 +112,7 @@ impl AuthMode {
             Self::PassThrough => "pass_through",
             Self::Trust => "trust",
             Self::ScramSha256 => "scram_sha_256",
+            Self::Md5 => "md5",
         }
     }
 }
@@ -121,6 +123,7 @@ impl From<AuthMode> for CoreAuthMode {
             AuthMode::PassThrough => Self::PassThrough,
             AuthMode::Trust => Self::Trust,
             AuthMode::ScramSha256 => Self::ScramSha256,
+            AuthMode::Md5 => Self::Md5,
         }
     }
 }

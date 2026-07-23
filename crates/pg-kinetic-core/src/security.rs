@@ -45,6 +45,7 @@ pub enum AuthMode {
     PassThrough,
     Trust,
     ScramSha256,
+    Md5,
 }
 
 impl AuthMode {
@@ -54,6 +55,7 @@ impl AuthMode {
             Self::PassThrough => "pass_through",
             Self::Trust => "trust",
             Self::ScramSha256 => "scram_sha_256",
+            Self::Md5 => "md5",
         }
     }
 }

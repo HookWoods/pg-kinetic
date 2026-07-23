@@ -14,11 +14,11 @@ use crate::{
     config::{AuthConfig, AuthFailureMessageMode, AuthMode},
     proxy::ClientConnection,
 };
-use pg_kinetic_core::secrets::{generate_nonce, ScramVerifier, UserSecret, UserStore};
+use pg_kinetic_core::secrets::{generate_nonce, Md5Secret, ScramVerifier, UserSecret, UserStore};
 use pg_kinetic_wire::{
     auth::{
-        authentication_ok, authentication_sasl_continue, authentication_sasl_final,
-        authentication_sasl_scram_sha_256,
+        authentication_md5_password, authentication_ok, authentication_sasl_continue,
+        authentication_sasl_final, authentication_sasl_scram_sha_256,
     },
     backend::build_error_response,
     frame::{parse_frontend_frame, FrontendFrame},
@@ -409,6 +409,15 @@ pub fn load_user_store(path: Option<&Path>) -> anyhow::Result<UserStore> {
 
         let user_secret = if secret.eq_ignore_ascii_case("trust") {
             UserSecret::Trust
+        } else if secret.starts_with("md5") {
+            UserSecret::Md5(Md5Secret::parse(secret).with_context(|| {
+                format!(
+                    "parse MD5 verifier for user {} in {} line {}",
+                    username,
+                    path.display(),
+                    line_number + 1
+                )
+            })?)
         } else {
             UserSecret::ScramSha256(ScramVerifier::parse(secret).with_context(|| {
                 format!(
@@ -439,6 +448,9 @@ pub(crate) async fn authenticate_client(
         AuthMode::ScramSha256 => {
             authenticate_scram(client, username, auth, users, max_client_buffer_bytes).await
         }
+        AuthMode::Md5 => {
+            authenticate_md5(client, username, auth, users, max_client_buffer_bytes).await
+        }
     }
 }
 
@@ -457,7 +469,7 @@ async fn authenticate_trust(
                 .context("write trust authentication ok")?;
             Ok(ClientAuthOutcome::Authenticated)
         }
-        Some(UserSecret::ScramSha256(_)) => {
+        Some(UserSecret::ScramSha256(_) | UserSecret::Md5(_)) => {
             reject_authentication(
                 client,
                 auth.auth_failure_message_mode,
@@ -578,6 +590,65 @@ async fn authenticate_scram(
     Ok(ClientAuthOutcome::Authenticated)
 }
 
+async fn authenticate_md5(
+    client: &mut ClientConnection,
+    username: &str,
+    auth: &AuthConfig,
+    users: &UserStore,
+    max_client_buffer_bytes: usize,
+) -> anyhow::Result<ClientAuthOutcome> {
+    let Some(UserSecret::Md5(secret)) = users.get(username) else {
+        reject_authentication(
+            client,
+            auth.auth_failure_message_mode,
+            username,
+            "unknown user",
+        )
+        .await?;
+        return Ok(ClientAuthOutcome::Rejected);
+    };
+
+    let mut salt = [0_u8; 4];
+    getrandom::fill(&mut salt).context("generate MD5 authentication salt")?;
+    client
+        .write_all(&authentication_md5_password(salt))
+        .await
+        .context("write MD5 authentication request")?;
+
+    let response = read_authentication_frame(client, max_client_buffer_bytes)
+        .await
+        .context("read MD5 password response")?;
+    let response = parse_md5_password_response(parse_password_frame(&response)?);
+    let Some(response) = response else {
+        reject_authentication(
+            client,
+            auth.auth_failure_message_mode,
+            username,
+            "malformed md5 response",
+        )
+        .await?;
+        return Ok(ClientAuthOutcome::Rejected);
+    };
+
+    let expected = expected_md5_client_hash(secret, salt);
+    if bool::from(expected.as_bytes().ct_eq(response)) {
+        client
+            .write_all(&authentication_ok())
+            .await
+            .context("write MD5 authentication ok")?;
+        Ok(ClientAuthOutcome::Authenticated)
+    } else {
+        reject_authentication(
+            client,
+            auth.auth_failure_message_mode,
+            username,
+            "invalid password",
+        )
+        .await?;
+        Ok(ClientAuthOutcome::Rejected)
+    }
+}
+
 async fn reject_authentication(
     client: &mut ClientConnection,
     mode: AuthFailureMessageMode,
@@ -630,6 +701,27 @@ fn parse_password_frame(frame: &FrontendFrame) -> anyhow::Result<&[u8]> {
         frame.tag
     );
     Ok(frame.payload.as_ref())
+}
+
+fn parse_md5_password_response(payload: &[u8]) -> Option<&[u8]> {
+    let payload = payload.strip_suffix(&[0]).unwrap_or(payload);
+    let response = payload.strip_prefix(b"md5")?;
+    if response.len() == 32
+        && response
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Some(response)
+    } else {
+        None
+    }
+}
+
+fn expected_md5_client_hash(secret: &Md5Secret, salt: [u8; 4]) -> String {
+    let mut second_input = BytesMut::with_capacity(secret.stored_hex().len() + salt.len());
+    second_input.extend_from_slice(secret.stored_hex().as_bytes());
+    second_input.extend_from_slice(&salt);
+    hex_lower(Md5::digest(second_input).as_ref())
 }
 
 fn parse_scram_initial_response(payload: &[u8]) -> anyhow::Result<(&str, &str)> {

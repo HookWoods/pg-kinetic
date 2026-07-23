@@ -1,4 +1,4 @@
-use pg_kinetic_core::secrets::{ScramVerifier, SecretError, UserSecret, UserStore};
+use pg_kinetic_core::secrets::{Md5Secret, ScramVerifier, SecretError, UserSecret, UserStore};
 
 #[test]
 fn parses_postgres_style_scram_verifier_strings() {
@@ -29,6 +29,17 @@ fn rejects_malformed_verifier_strings() {
     ] {
         assert!(ScramVerifier::parse(verifier).is_err(), "{verifier}");
     }
+}
+
+#[test]
+fn parses_md5_user_secret() {
+    let parsed = Md5Secret::parse("md5cb970ccc08b4d76c34e1ba04ef2b4cb2")
+        .expect("valid pgbouncer-compatible md5 secret");
+
+    assert_eq!(parsed.stored_hex(), "cb970ccc08b4d76c34e1ba04ef2b4cb2");
+    assert!(Md5Secret::parse("md5notahex").is_err());
+    assert!(Md5Secret::parse("plainpassword").is_err());
+    assert!(Md5Secret::parse("md5CB970CCC08B4D76C34E1BA04EF2B4CB2").is_err());
 }
 
 #[test]
