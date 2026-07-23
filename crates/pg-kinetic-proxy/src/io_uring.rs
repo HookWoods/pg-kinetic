@@ -291,7 +291,10 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     linux::run(config)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+pub fn validate_supported_config_for_test(config: &Config) -> anyhow::Result<()> {
+    validate_supported_config(config)
+}
+
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
     use crate::config::{AuthMode, BackendTlsMode, ClientTlsMode};
 
