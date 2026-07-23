@@ -15,8 +15,8 @@ mod linux {
     };
 
     use anyhow::{bail, Context};
+    use bytes::BytesMut;
     use monoio::{
-        io::{AsyncWriteRent, Splitable},
         net::{ListenerOpts, TcpListener, TcpStream},
         RuntimeBuilder,
     };
@@ -230,20 +230,87 @@ mod linux {
         let backend = TcpStream::connect_addr(backend_addr)
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut backend_read, mut backend_write) = backend.into_split();
+        let mut client = crate::io_uring_transport::MonoioTransport::new(client);
+        let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
+        let mut client_buffer = BytesMut::with_capacity(16 * 1024);
+        let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
 
-        monoio::select! {
-            client_to_backend = monoio::io::copy(&mut client_read, &mut backend_write) => {
-                let _ = backend_write.shutdown().await;
-                client_to_backend.context("copy client to backend")?;
+        let read = client
+            .read_into(&mut client_buffer)
+            .await
+            .context("read startup")?;
+        if read == 0 {
+            return Ok(());
+        }
+        backend
+            .write_all(&client_buffer)
+            .await
+            .context("forward startup")?;
+        client_buffer.clear();
+
+        loop {
+            let read = backend
+                .read_into(&mut backend_buffer)
+                .await
+                .context("read startup response")?;
+            if read == 0 {
+                anyhow::bail!("backend closed during startup");
             }
-            backend_to_client = monoio::io::copy(&mut backend_read, &mut client_write) => {
-                let _ = client_write.shutdown().await;
-                backend_to_client.context("copy backend to client")?;
+            client
+                .write_all(&backend_buffer)
+                .await
+                .context("write startup response")?;
+            if startup_ready_seen(&backend_buffer)? {
+                backend_buffer.clear();
+                break;
+            }
+            backend_buffer.clear();
+        }
+
+        loop {
+            let read = client
+                .read_into(&mut client_buffer)
+                .await
+                .context("read client query")?;
+            if read == 0 {
+                let _ = backend.shutdown().await;
+                return Ok(());
+            }
+            backend
+                .write_all(&client_buffer)
+                .await
+                .context("write query")?;
+            client_buffer.clear();
+
+            loop {
+                let read = backend
+                    .read_into(&mut backend_buffer)
+                    .await
+                    .context("read backend response")?;
+                if read == 0 {
+                    anyhow::bail!("backend closed during response");
+                }
+                client
+                    .write_all(&backend_buffer)
+                    .await
+                    .context("write backend response")?;
+                if startup_ready_seen(&backend_buffer)? {
+                    backend_buffer.clear();
+                    break;
+                }
+                backend_buffer.clear();
             }
         }
-        Ok(())
+    }
+
+    fn startup_ready_seen(buffer: &BytesMut) -> anyhow::Result<bool> {
+        let mut scan = buffer.clone();
+        while let Some(frame) = pg_kinetic_wire::backend::parse_backend_frame(&mut scan)? {
+            if frame.ready_status().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn bind_reuseport_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
