@@ -38,7 +38,7 @@ use crate::{
     lifecycle::{
         wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator, ShutdownOutcome,
     },
-    metrics,
+    limits, metrics,
     mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
     pause::PauseController,
     pool::{
@@ -416,7 +416,22 @@ impl Proxy {
         let state = self.initialize_runtime_state().await?;
         let listen_addr =
             resolve_runtime_listen_addr(state.effective_config.connection.listen_addr)?;
-        let shard_count = resolve_runtime_shard_count(&state.effective_config)?;
+        let resource_limits = limits::detect_cgroup_limits();
+        let shard_count = resolve_runtime_shard_count(&state.effective_config, resource_limits)?;
+        if state
+            .effective_config
+            .runtime
+            .engine
+            .runtime_shards
+            .is_none()
+        {
+            tracing::info!(
+                cpu_quota = ?resource_limits.cpu_quota,
+                mem_limit_bytes = ?resource_limits.mem_limit_bytes,
+                shards = shard_count,
+                "resolved implicit thread-per-core runtime sizing"
+            );
+        }
         let core_assignments = runtime_shard_core_assignments(shard_count);
         let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
         let (startup_tx, startup_rx) = std::sync::mpsc::channel();
@@ -756,14 +771,16 @@ fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
     listener.local_addr().context("read reserved listener addr")
 }
 
-fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
+fn resolve_runtime_shard_count(
+    config: &Config,
+    resource_limits: limits::ResourceLimits,
+) -> anyhow::Result<usize> {
     let shard_count = match config.runtime.engine.runtime_shards {
         Some(shards) => shards,
-        None => core_affinity::get_core_ids()
-            .map(|cores| cores.len())
-            .filter(|cores| *cores > 0)
-            .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
-            .unwrap_or(1),
+        None => {
+            let host_parallelism = host_parallelism();
+            cgroup_shard_cap(resource_limits.cpu_quota, host_parallelism)
+        }
     };
 
     if shard_count == 0 {
@@ -771,6 +788,23 @@ fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
     }
 
     Ok(shard_count)
+}
+
+fn host_parallelism() -> usize {
+    core_affinity::get_core_ids()
+        .map(|cores| cores.len())
+        .filter(|cores| *cores > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+}
+
+fn cgroup_shard_cap(cpu_quota: Option<f64>, host_parallelism: usize) -> usize {
+    let host_parallelism = host_parallelism.max(1);
+    let Some(cpu_quota) = cpu_quota.filter(|quota| quota.is_finite() && *quota > 0.0) else {
+        return host_parallelism;
+    };
+
+    host_parallelism.min(cpu_quota.ceil().max(1.0) as usize)
 }
 
 fn runtime_shard_core_assignments(shard_count: usize) -> Vec<Option<core_affinity::CoreId>> {
@@ -1372,7 +1406,10 @@ fn build_route_pools_for_pool(
 mod tests {
     use std::io::IoSlice;
 
-    use super::{auth_request_expects_client_response, connection::skip_empty_vectored_slices};
+    use super::{
+        auth_request_expects_client_response, cgroup_shard_cap,
+        connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count, Config,
+    };
 
     fn auth_payload(code: i32) -> [u8; 4] {
         code.to_be_bytes()
@@ -1407,5 +1444,40 @@ mod tests {
 
         assert_eq!(slice_index, 2);
         assert_eq!(slice_offset, 0);
+    }
+
+    #[test]
+    fn cgroup_quota_caps_implicit_runtime_shards() {
+        assert_eq!(cgroup_shard_cap(Some(2.0), 16), 2);
+        assert_eq!(cgroup_shard_cap(Some(1.5), 16), 2);
+        assert_eq!(cgroup_shard_cap(Some(32.0), 16), 16);
+        assert_eq!(cgroup_shard_cap(None, 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(0.0), 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(f64::NAN), 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(0.25), 16), 1);
+        assert_eq!(cgroup_shard_cap(Some(2.0), 0), 1);
+    }
+
+    #[test]
+    fn explicit_runtime_shards_are_not_cgroup_capped() {
+        let mut config = Config::default();
+        config.runtime.engine.runtime_shards = Some(4);
+
+        assert_eq!(
+            resolve_runtime_shard_count(&config, limits::ResourceLimits::default())
+                .expect("shards"),
+            4
+        );
+    }
+
+    #[test]
+    fn explicit_zero_runtime_shards_are_rejected() {
+        let mut config = Config::default();
+        config.runtime.engine.runtime_shards = Some(0);
+
+        let error = resolve_runtime_shard_count(&config, limits::ResourceLimits::default())
+            .expect_err("zero shards");
+
+        assert!(error.to_string().contains("runtime_shards"));
     }
 }
