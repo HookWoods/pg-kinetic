@@ -43,8 +43,17 @@ fn node_id_rejects_empty_ids() {
 }
 
 #[test]
-fn tokio_default_is_the_default_runtime_engine() {
-    assert_eq!(RuntimeEngine::default(), RuntimeEngine::TokioDefault);
+fn thread_per_core_is_the_default_runtime_engine() {
+    assert_eq!(RuntimeEngine::default(), RuntimeEngine::ThreadPerCore);
+    assert_eq!(RuntimeEngine::ThreadPerCore.as_str(), "thread_per_core");
+    assert_eq!(
+        RuntimeEngine::ThreadPerCore.status(),
+        RuntimeEngineStatus::Stable
+    );
+}
+
+#[test]
+fn tokio_default_is_a_stable_runtime_engine() {
     assert_eq!(RuntimeEngine::TokioDefault.as_str(), "tokio_default");
     assert_eq!(
         RuntimeEngine::TokioDefault.status(),
@@ -53,15 +62,21 @@ fn tokio_default_is_the_default_runtime_engine() {
 }
 
 #[test]
-fn experimental_runtime_engines_are_explicitly_labeled() {
-    for engine in [
-        RuntimeEngine::ExperimentalThreadPerCore,
-        RuntimeEngine::ExperimentalIoUring,
-    ] {
-        assert!(engine.is_experimental());
-        assert_eq!(engine.status(), RuntimeEngineStatus::Experimental);
-        assert!(engine.as_str().starts_with("experimental_"));
-    }
+fn thread_per_core_is_a_stable_runtime_engine() {
+    assert_eq!(RuntimeEngine::ThreadPerCore.as_str(), "thread_per_core");
+    assert_eq!(
+        RuntimeEngine::ThreadPerCore.status(),
+        RuntimeEngineStatus::Stable
+    );
+    assert!(!RuntimeEngine::ThreadPerCore.is_experimental());
+}
+
+#[test]
+fn experimental_runtime_engine_is_explicitly_labeled() {
+    let engine = RuntimeEngine::ExperimentalIoUring;
+    assert!(engine.is_experimental());
+    assert_eq!(engine.status(), RuntimeEngineStatus::Experimental);
+    assert!(engine.as_str().starts_with("experimental_"));
 
     assert!(!RuntimeEngine::TokioCurrentThread.is_experimental());
 }

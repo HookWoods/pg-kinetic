@@ -46,7 +46,6 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
     proxy::Proxy::new(config).run().await
 }
 
-#[cfg(feature = "runtime-experiments")]
 pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
     metrics::install(metrics::MetricsConfig {

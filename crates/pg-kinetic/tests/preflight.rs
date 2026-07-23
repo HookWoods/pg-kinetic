@@ -147,11 +147,7 @@ experimental_runtime_enabled = true
         .filter(|finding| finding.check == PreflightCheck::RuntimeEngine)
         .count();
 
-    if cfg!(all(
-        target_os = "linux",
-        feature = "runtime-experiments",
-        feature = "io-uring"
-    )) {
+    if cfg!(all(target_os = "linux", feature = "io-uring")) {
         assert_eq!(runtime_errors, 0, "{report:?}");
     } else {
         assert!(runtime_errors > 0, "{report:?}");

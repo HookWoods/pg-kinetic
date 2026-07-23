@@ -19,7 +19,7 @@ impl RuntimeEngineExperiment {
 
     #[must_use]
     pub const fn feature_enabled(self) -> bool {
-        cfg!(feature = "runtime-experiments")
+        true
     }
 
     #[must_use]
@@ -122,6 +122,15 @@ impl RuntimeEngineCapabilities {
     }
 
     #[must_use]
+    pub const fn feature_supported(self) -> bool {
+        match self.engine {
+            RuntimeEngine::ThreadPerCore => true,
+            RuntimeEngine::ExperimentalIoUring => cfg!(feature = "io-uring"),
+            RuntimeEngine::TokioDefault | RuntimeEngine::TokioCurrentThread => true,
+        }
+    }
+
+    #[must_use]
     pub const fn is_stable(self) -> bool {
         matches!(self.engine.status(), RuntimeEngineStatus::Stable)
     }
@@ -142,7 +151,7 @@ impl RuntimeEngineCapabilities {
 
     #[must_use]
     pub const fn is_available(self) -> bool {
-        self.platform_supported() && self.is_enabled()
+        self.platform_supported() && self.feature_supported() && self.is_enabled()
     }
 
     #[must_use]
@@ -190,6 +199,12 @@ impl RuntimeEngineCapabilities {
             });
         }
 
+        if !self.feature_supported() {
+            return Err(RuntimeEngineSelectionError::MissingFeature {
+                engine: self.engine,
+            });
+        }
+
         if self.is_experimental() && !self.experiment.is_enabled() {
             return Err(RuntimeEngineSelectionError::ExperimentalDisabled {
                 engine: self.engine,
@@ -227,9 +242,9 @@ pub enum RuntimeEngineSelectionError {
         engine: RuntimeEngine,
         platform: &'static str,
     },
-    #[error(
-        "runtime engine '{engine}' requires the runtime-experiments feature and an explicit config gate"
-    )]
+    #[error("runtime engine '{engine}' requires a cargo feature that is not enabled")]
+    MissingFeature { engine: RuntimeEngine },
+    #[error("runtime engine '{engine}' requires experimental_runtime_enabled = true")]
     ExperimentalDisabled { engine: RuntimeEngine },
 }
 

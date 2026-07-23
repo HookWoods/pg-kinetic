@@ -9,7 +9,6 @@ readme.workspace = true
 default = []
 io-uring = ["dep:monoio"]
 policy-wasm = ["dep:wasmi"]
-runtime-experiments = []
 
 [dependencies]
 anyhow = "1"
@@ -47,7 +46,7 @@ wasmi = { version = "1.1.0", default-features = false, features = ["std", "wat"]
 monoio = { version = "0.2.4", default-features = false, features = ["iouring", "macros"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["param"] }
+rustix = { version = "1", features = ["net", "param"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

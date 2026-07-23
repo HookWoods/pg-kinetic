@@ -9,44 +9,58 @@ fn default_runtime_engine_is_stable_and_supported_on_all_platforms() {
     let selector = RuntimeEngineSelector::default();
     let capabilities = selector.capabilities();
 
-    assert_eq!(selector.engine(), RuntimeEngine::TokioDefault);
-    assert_eq!(capabilities.engine(), RuntimeEngine::TokioDefault);
+    assert_eq!(selector.engine(), RuntimeEngine::ThreadPerCore);
+    assert_eq!(capabilities.engine(), RuntimeEngine::ThreadPerCore);
     assert!(capabilities.is_stable());
     assert_eq!(capabilities.status(), RuntimeEngineStatus::Stable);
     assert!(capabilities.platform_supported());
     assert!(capabilities.is_available());
-    assert_eq!(capabilities.benchmark_label(), "tokio_default");
+    assert_eq!(capabilities.benchmark_label(), "thread_per_core");
     assert!(selector.validate().is_ok());
 }
 
 #[test]
-fn experimental_runtime_engines_are_disabled_by_default() {
-    for engine in [
-        RuntimeEngine::ExperimentalThreadPerCore,
-        RuntimeEngine::ExperimentalIoUring,
-    ] {
-        let selector = RuntimeEngineSelector::new(engine);
-        let capabilities = selector.capabilities();
+fn experimental_io_uring_is_disabled_by_default() {
+    let engine = RuntimeEngine::ExperimentalIoUring;
+    let selector = RuntimeEngineSelector::new(engine);
+    let capabilities = selector.capabilities();
 
-        assert!(capabilities.is_experimental());
-        assert!(!RuntimeEngineExperiment::default().is_enabled());
-        assert!(!capabilities.is_available());
-        if capabilities.platform_supported() {
-            assert_eq!(capabilities.status(), engine.status());
-            assert!(matches!(
-                selector.validate(),
-                Err(RuntimeEngineSelectionError::ExperimentalDisabled { engine: selected })
-                    if selected == engine
-            ));
-        } else {
-            assert_eq!(capabilities.status(), RuntimeEngineStatus::Unsupported);
-            assert!(matches!(
-                selector.validate(),
-                Err(RuntimeEngineSelectionError::UnsupportedPlatform { engine: selected, .. })
-                    if selected == engine
-            ));
-        }
+    assert!(capabilities.is_experimental());
+    assert!(!RuntimeEngineExperiment::default().is_enabled());
+    assert!(!capabilities.is_available());
+    if capabilities.platform_supported() && capabilities.feature_supported() {
+        assert_eq!(capabilities.status(), engine.status());
+        assert!(matches!(
+            selector.validate(),
+            Err(RuntimeEngineSelectionError::ExperimentalDisabled { engine: selected })
+                if selected == engine
+        ));
+    } else if !capabilities.platform_supported() {
+        assert_eq!(capabilities.status(), RuntimeEngineStatus::Unsupported);
+        assert!(matches!(
+            selector.validate(),
+            Err(RuntimeEngineSelectionError::UnsupportedPlatform { engine: selected, .. })
+                if selected == engine
+        ));
+    } else {
+        assert!(matches!(
+            selector.validate(),
+            Err(RuntimeEngineSelectionError::MissingFeature { engine: selected })
+                if selected == engine
+        ));
     }
+}
+
+#[test]
+fn stable_thread_per_core_does_not_need_experimental_config_gate() {
+    let selector = RuntimeEngineSelector::new(RuntimeEngine::ThreadPerCore);
+    let capabilities = selector.capabilities();
+
+    assert!(capabilities.is_stable());
+    assert!(!capabilities.is_experimental());
+    assert_eq!(capabilities.benchmark_label(), "thread_per_core");
+    assert!(selector.validate().is_ok());
+    assert!(capabilities.is_available());
 }
 
 #[test]
@@ -93,31 +107,51 @@ fn experimental_runtime_engine_cannot_be_enabled_without_feature_or_config_gate(
     let disabled = RuntimeEngineExperiment::new(false);
     assert!(!disabled.is_enabled());
 
-    let ungated_selector = RuntimeEngineSelector::new(RuntimeEngine::ExperimentalThreadPerCore)
-        .with_experiment(disabled);
-    assert!(matches!(
-        ungated_selector.validate(),
-        Err(RuntimeEngineSelectionError::ExperimentalDisabled { engine })
-            if engine == RuntimeEngine::ExperimentalThreadPerCore
-    ));
+    let ungated_selector =
+        RuntimeEngineSelector::new(RuntimeEngine::ExperimentalIoUring).with_experiment(disabled);
+    if !ungated_selector.capabilities().platform_supported() {
+        assert!(matches!(
+            ungated_selector.validate(),
+            Err(RuntimeEngineSelectionError::UnsupportedPlatform { engine, .. })
+                if engine == RuntimeEngine::ExperimentalIoUring
+        ));
+    } else if ungated_selector.capabilities().feature_supported() {
+        assert!(matches!(
+            ungated_selector.validate(),
+            Err(RuntimeEngineSelectionError::ExperimentalDisabled { engine })
+                if engine == RuntimeEngine::ExperimentalIoUring
+        ));
+    } else {
+        assert!(matches!(
+            ungated_selector.validate(),
+            Err(RuntimeEngineSelectionError::MissingFeature { engine })
+                if engine == RuntimeEngine::ExperimentalIoUring
+        ));
+    }
     assert!(!ungated_selector.selection_snapshot().available);
 
     let gated = RuntimeEngineExperiment::new(true);
     let gated_selector =
-        RuntimeEngineSelector::new(RuntimeEngine::ExperimentalThreadPerCore).with_experiment(gated);
+        RuntimeEngineSelector::new(RuntimeEngine::ExperimentalIoUring).with_experiment(gated);
 
-    if gated.feature_enabled() {
+    if !gated_selector.capabilities().platform_supported() {
+        assert!(matches!(
+            gated_selector.validate(),
+            Err(RuntimeEngineSelectionError::UnsupportedPlatform { engine, .. })
+                if engine == RuntimeEngine::ExperimentalIoUring
+        ));
+    } else if gated_selector.capabilities().feature_supported() {
         assert!(gated.feature_enabled());
         assert!(gated.is_enabled());
         assert!(gated_selector.validate().is_ok());
         assert!(gated_selector.selection_snapshot().available);
     } else {
-        assert!(!gated.feature_enabled());
-        assert!(!gated.is_enabled());
+        assert!(gated.is_enabled());
+        assert!(!gated_selector.selection_snapshot().available);
         assert!(matches!(
             gated_selector.validate(),
-            Err(RuntimeEngineSelectionError::ExperimentalDisabled { engine })
-                if engine == RuntimeEngine::ExperimentalThreadPerCore
+            Err(RuntimeEngineSelectionError::MissingFeature { engine })
+                if engine == RuntimeEngine::ExperimentalIoUring
         ));
     }
 }

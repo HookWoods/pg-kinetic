@@ -10,7 +10,8 @@ use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
     proxy_runtime::reload::{
         load_auth_users, load_backend_credential_provider, load_client_tls_server_config,
-        load_effective_config, reload_once, validate_runtime_assets, ReloadDecision,
+        load_effective_config, reload_once, reload_once_with_pools_and_credentials,
+        validate_runtime_assets, BackendCredentialCache, ReloadDecision,
     },
 };
 use tokio::sync::RwLock;
@@ -439,6 +440,59 @@ async fn safe_reload_applies_backend_service_credential_source_changes() {
         .expect("rotated service auth")
         .credentials()
         .expect("rotated credentials");
+    assert_eq!(rotated_credentials.username(), "proxy_user_rotated");
+    assert_eq!(rotated_credentials.password(), "rotated-secret");
+
+    std::env::remove_var(initial_env);
+    std::env::remove_var(rotated_env);
+}
+
+#[tokio::test]
+async fn safe_reload_updates_cached_backend_service_credential_source() {
+    let initial_env = "PG_KINETIC_CACHE_PASSWORD_INITIAL";
+    let rotated_env = "PG_KINETIC_CACHE_PASSWORD_ROTATED";
+    std::env::set_var(initial_env, "initial-secret");
+    std::env::set_var(rotated_env, "rotated-secret");
+
+    let mut config = base_config();
+    let config_file = write_temp_file(
+        "service-auth-cache-config",
+        ".toml",
+        &service_auth_file_config(
+            "127.0.0.1:6543".parse().expect("listen"),
+            "127.0.0.1:5432".parse().expect("backend"),
+            "proxy_user",
+            initial_env,
+        ),
+    );
+    config.reload.config_file = Some(config_file.clone());
+
+    let effective = load_effective_config(&config).expect("initial load");
+    let active_config = Arc::new(RwLock::new(effective.clone()));
+    let cache = BackendCredentialCache::from_config(&effective).expect("cache");
+
+    let initial_credentials = cache.load().expect("initial cached credentials");
+    assert_eq!(initial_credentials.username(), "proxy_user");
+    assert_eq!(initial_credentials.password(), "initial-secret");
+
+    fs::write(
+        &config_file,
+        service_auth_file_config(
+            "127.0.0.1:6543".parse().expect("listen"),
+            "127.0.0.1:5432".parse().expect("backend"),
+            "proxy_user_rotated",
+            rotated_env,
+        ),
+    )
+    .expect("overwrite config file");
+
+    let decision =
+        reload_once_with_pools_and_credentials(&config, &active_config, None, None, Some(&cache))
+            .await
+            .expect("reload");
+
+    assert_eq!(decision, ReloadDecision::Applied);
+    let rotated_credentials = cache.load().expect("rotated cached credentials");
     assert_eq!(rotated_credentials.username(), "proxy_user_rotated");
     assert_eq!(rotated_credentials.password(), "rotated-secret");
 

@@ -1,6 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{fmt, path::Path, sync::Arc};
 
 use anyhow::Context;
+use arc_swap::ArcSwapOption;
 use tokio::{
     sync::RwLock,
     time::{interval, MissedTickBehavior},
@@ -12,7 +13,7 @@ use crate::{
     auth,
     config::{ClientTlsMode, Config, PolicyConfig, ReloadConfig},
     policy::{PolicyReloadResult, PolicyStore},
-    pool::{RoutePoolRegistry, RoutePools},
+    pool::{RoutePoolRegistry, RoutePoolRetirementTargets, RoutePools},
     sharding::RouteMapReloadResult,
     snapshot::{PolicyReloadSnapshot, RouteMapReloadSnapshot, SnapshotStore},
     tls,
@@ -24,6 +25,43 @@ pub enum ReloadDecision {
     Applied,
     Rejected,
     Unchanged,
+}
+
+#[derive(Clone)]
+pub struct BackendCredentialCache {
+    credentials: Arc<ArcSwapOption<auth::BackendCredentials>>,
+}
+
+impl fmt::Debug for BackendCredentialCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendCredentialCache")
+            .field("configured", &self.credentials.load().is_some())
+            .finish()
+    }
+}
+
+impl BackendCredentialCache {
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let cache = Self {
+            credentials: Arc::new(ArcSwapOption::empty()),
+        };
+        cache.reload_from_config(config)?;
+        Ok(cache)
+    }
+
+    pub fn load(&self) -> Option<Arc<auth::BackendCredentials>> {
+        self.credentials.load_full()
+    }
+
+    fn reload_from_config(&self, config: &Config) -> anyhow::Result<()> {
+        self.store(auth::load_backend_credentials(&config.auth)?.map(Arc::new));
+        Ok(())
+    }
+
+    fn store(&self, credentials: Option<Arc<auth::BackendCredentials>>) {
+        self.credentials.store(credentials);
+    }
 }
 
 pub fn record_route_map_reload(snapshot_store: &SnapshotStore, result: &RouteMapReloadResult) {
@@ -77,7 +115,7 @@ pub async fn reload_once(
     base: &Config,
     active_config: &Arc<RwLock<Config>>,
 ) -> anyhow::Result<ReloadDecision> {
-    reload_once_with_pools(base, active_config, None, None).await
+    reload_once_with_pools_and_credentials(base, active_config, None, None, None).await
 }
 
 pub async fn reload_once_with_pools(
@@ -86,7 +124,30 @@ pub async fn reload_once_with_pools(
     route_pools: Option<&Arc<RoutePools>>,
     route_pool_registry: Option<&Arc<RoutePoolRegistry>>,
 ) -> anyhow::Result<ReloadDecision> {
+    reload_once_with_pools_and_credentials(
+        base,
+        active_config,
+        route_pools,
+        route_pool_registry,
+        None,
+    )
+    .await
+}
+
+pub async fn reload_once_with_pools_and_credentials(
+    base: &Config,
+    active_config: &Arc<RwLock<Config>>,
+    route_pools: Option<&Arc<RoutePools>>,
+    route_pool_registry: Option<&Arc<RoutePoolRegistry>>,
+    backend_credentials: Option<&BackendCredentialCache>,
+) -> anyhow::Result<ReloadDecision> {
     let next_config = load_effective_config(base)?;
+    let next_backend_credentials = backend_credentials
+        .map(|_| {
+            auth::load_backend_credentials(&next_config.auth)
+                .map(|credentials| credentials.map(Arc::new))
+        })
+        .transpose()?;
     let mut current_config = active_config.write().await;
 
     if next_config == *current_config {
@@ -99,6 +160,11 @@ pub async fn reload_once_with_pools(
 
     validate_runtime_assets(&next_config)?;
     *current_config = next_config;
+    if let (Some(backend_credentials), Some(next_backend_credentials)) =
+        (backend_credentials, next_backend_credentials)
+    {
+        backend_credentials.store(next_backend_credentials);
+    }
     drop(current_config);
     if let Some(route_pool_registry) = route_pool_registry.filter(|registry| !registry.is_empty()) {
         route_pool_registry.retire_idle_backends().await;
@@ -135,6 +201,8 @@ pub async fn spawn_reload_loop(
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
+    backend_credentials: BackendCredentialCache,
+    route_pool_retirement_targets: RoutePoolRetirementTargets,
 ) {
     if base.reload.config_file.is_none() {
         return;
@@ -146,15 +214,17 @@ pub async fn spawn_reload_loop(
 
     loop {
         ticker.tick().await;
-        match reload_once_with_pools(
+        match reload_once_with_pools_and_credentials(
             &base,
             &active_config,
             Some(&route_pools),
             Some(&route_pool_registry),
+            Some(&backend_credentials),
         )
         .await
         {
             Ok(ReloadDecision::Applied) => {
+                route_pool_retirement_targets.retire_idle_backends().await;
                 metrics_crate::counter!("pg_kinetic_config_reload_total", "outcome" => "applied")
                     .increment(1);
                 tracing::info!("applied config reload");

@@ -1,5 +1,3 @@
-#![cfg(feature = "runtime-experiments")]
-
 use std::{net::SocketAddr, time::Duration};
 
 use pg_kinetic::{
@@ -11,13 +9,12 @@ use pg_kinetic::{
 use tokio::{net::TcpListener, time};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn experimental_thread_per_core_publishes_shards_and_drains() {
+async fn stable_thread_per_core_publishes_shards_and_drains() {
     let mut config = Config::default();
     config.connection.listen_addr = free_port().await;
     config.drain.drain_timeout_ms = 100;
     config.runtime.lifecycle.shutdown_grace_ms = 100;
-    config.runtime.engine.runtime_engine = RuntimeEngine::ExperimentalThreadPerCore;
-    config.runtime.engine.experimental_runtime_enabled = true;
+    config.runtime.engine.runtime_engine = RuntimeEngine::ThreadPerCore;
     config.runtime.engine.runtime_shards = Some(2);
 
     let proxy = Proxy::new(config);

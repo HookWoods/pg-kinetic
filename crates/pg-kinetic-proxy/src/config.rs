@@ -555,7 +555,7 @@ pub struct RuntimeEngineConfig {
         long,
         env = "PG_KINETIC_RUNTIME_ENGINE",
         value_parser = parse_runtime_engine,
-        default_value = "tokio_default"
+        default_value = "thread_per_core"
     )]
     #[serde(
         default = "default_runtime_engine",
@@ -2640,16 +2640,18 @@ where
 }
 
 const fn default_runtime_engine() -> RuntimeEngine {
-    RuntimeEngine::TokioDefault
+    RuntimeEngine::ThreadPerCore
 }
 
 fn parse_runtime_engine(value: &str) -> Result<RuntimeEngine, String> {
     match value {
         "tokio_default" => Ok(RuntimeEngine::TokioDefault),
         "tokio_current_thread" => Ok(RuntimeEngine::TokioCurrentThread),
-        "experimental_thread_per_core" => Ok(RuntimeEngine::ExperimentalThreadPerCore),
+        "thread_per_core" => Ok(RuntimeEngine::ThreadPerCore),
         "experimental_io_uring" => Ok(RuntimeEngine::ExperimentalIoUring),
-        _ => Err(format!("unsupported runtime engine '{value}'")),
+        _ => Err(format!(
+            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, experimental_io_uring"
+        )),
     }
 }
 
@@ -2777,7 +2779,7 @@ mod tests {
         assert!(!config.runtime.node.node_id.as_str().is_empty());
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::TokioDefault
+            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
         assert_eq!(config.runtime.engine.runtime_shards, None);
@@ -2992,28 +2994,34 @@ mod tests {
         .expect_err("ungated experimental runtime is rejected");
         assert!(error.to_string().contains("experimental_runtime_enabled"));
 
-        let config = toml::from_str::<Config>(
-            r#"
-            [runtime.engine]
-            runtime_engine = "experimental_thread_per_core"
-            experimental_runtime_enabled = true
-            runtime_shards = 2
-            "#,
-        )
-        .expect("explicitly gated experimental runtime parses");
-        assert!(config.runtime.engine.runtime_engine.is_experimental());
-        assert_eq!(config.runtime.engine.runtime_shards, Some(2));
-
         let error = toml::from_str::<Config>(
             r#"
             [runtime.engine]
-            runtime_engine = "experimental_thread_per_core"
-            experimental_runtime_enabled = true
+            runtime_engine = "thread_per_core"
             runtime_shards = 0
             "#,
         )
         .expect_err("zero runtime shards are rejected");
         assert!(error.to_string().contains("runtime_shards"));
+    }
+
+    #[test]
+    fn stable_thread_per_core_parses_without_experimental_config_gate() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "thread_per_core"
+            runtime_shards = 2
+            "#,
+        )
+        .expect("stable thread-per-core runtime parses");
+
+        assert_eq!(
+            config.runtime.engine.runtime_engine,
+            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
+        );
+        assert!(!config.runtime.engine.experimental_runtime_enabled);
+        assert_eq!(config.runtime.engine.runtime_shards, Some(2));
     }
 
     #[test]

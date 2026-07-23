@@ -207,10 +207,10 @@ impl NodeMetadata {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum RuntimeEngine {
-    #[default]
     TokioDefault,
     TokioCurrentThread,
-    ExperimentalThreadPerCore,
+    #[default]
+    ThreadPerCore,
     ExperimentalIoUring,
 }
 
@@ -220,7 +220,7 @@ impl RuntimeEngine {
         match self {
             Self::TokioDefault => "tokio_default",
             Self::TokioCurrentThread => "tokio_current_thread",
-            Self::ExperimentalThreadPerCore => "experimental_thread_per_core",
+            Self::ThreadPerCore => "thread_per_core",
             Self::ExperimentalIoUring => "experimental_io_uring",
         }
     }
@@ -228,10 +228,10 @@ impl RuntimeEngine {
     #[must_use]
     pub const fn status(self) -> RuntimeEngineStatus {
         match self {
-            Self::TokioDefault | Self::TokioCurrentThread => RuntimeEngineStatus::Stable,
-            Self::ExperimentalThreadPerCore | Self::ExperimentalIoUring => {
-                RuntimeEngineStatus::Experimental
+            Self::TokioDefault | Self::TokioCurrentThread | Self::ThreadPerCore => {
+                RuntimeEngineStatus::Stable
             }
+            Self::ExperimentalIoUring => RuntimeEngineStatus::Experimental,
         }
     }
 

@@ -18,7 +18,7 @@ use crate::{
     config::{Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig},
     drain::DrainController,
     pause::PauseController,
-    pool::{RoutePoolRegistry, RoutePools},
+    pool::{RoutePoolRegistry, RoutePoolRetirementTargets, RoutePools},
     proxy::{read_startup_packet, ClientConnection, StartupRead},
     reload,
     snapshot::{
@@ -65,6 +65,8 @@ struct AdminState {
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
+    backend_credentials: reload::BackendCredentialCache,
+    route_pool_retirement_targets: RoutePoolRetirementTargets,
     client_tls_server_config: Option<Arc<ServerConfig>>,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
@@ -88,6 +90,8 @@ pub async fn spawn(
     active_config: Arc<RwLock<Config>>,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
+    backend_credentials: reload::BackendCredentialCache,
+    route_pool_retirement_targets: RoutePoolRetirementTargets,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
     snapshot_store: SnapshotStore,
@@ -109,6 +113,8 @@ pub async fn spawn(
         active_config,
         route_pools,
         route_pool_registry,
+        backend_credentials,
+        route_pool_retirement_targets,
         client_tls_server_config,
         drain,
         pause,
@@ -122,11 +128,12 @@ pub async fn spawn(
 
 impl AdminState {
     async fn reload_now(&self) -> anyhow::Result<reload::ReloadDecision> {
-        let decision = reload::reload_once_with_pools(
+        let decision = reload::reload_once_with_pools_and_credentials(
             &self.base_config,
             &self.active_config,
             Some(&self.route_pools),
             Some(&self.route_pool_registry),
+            Some(&self.backend_credentials),
         )
         .await?;
 
@@ -141,6 +148,9 @@ impl AdminState {
         .increment(1);
 
         if decision == reload::ReloadDecision::Applied {
+            self.route_pool_retirement_targets
+                .retire_idle_backends()
+                .await;
             let config = self.active_config.read().await.clone();
             self.snapshot_store
                 .set_settings_snapshot(SettingsSnapshot::from_config(&config));

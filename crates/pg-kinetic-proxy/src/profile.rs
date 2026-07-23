@@ -12,17 +12,15 @@ use serde::Serialize;
 pub enum ProfileTool {
     Flamegraph,
     Perf,
-    Ebpf,
 }
 
 impl ProfileTool {
-    pub const ALL: [Self; 3] = [Self::Flamegraph, Self::Perf, Self::Ebpf];
+    pub const ALL: [Self; 2] = [Self::Flamegraph, Self::Perf];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Flamegraph => "flamegraph",
             Self::Perf => "perf",
-            Self::Ebpf => "ebpf",
         }
     }
 
@@ -30,7 +28,6 @@ impl ProfileTool {
         match self {
             Self::Flamegraph => "cargo-flamegraph",
             Self::Perf => "perf",
-            Self::Ebpf => "bpftrace",
         }
     }
 }
@@ -161,15 +158,6 @@ impl ProfileRunner {
                 ),
             };
         }
-        if matches!(tool, ProfileTool::Ebpf) && !cfg!(target_os = "linux") {
-            return ProfileToolStatus::Skipped {
-                reason: format!(
-                    "eBPF profiling requires Linux; current platform is {}",
-                    std::env::consts::OS
-                ),
-            };
-        }
-
         let command = tool.command();
         if (self.tool_lookup)(command) {
             ProfileToolStatus::Ready {
@@ -229,18 +217,6 @@ impl ProfileRunner {
                 ])
                 .status()
                 .context("run perf record")?,
-            ProfileTool::Ebpf => Command::new("bpftrace")
-                .args([
-                    "-q",
-                    "-o",
-                    path_arg(&config.output_path),
-                    "-e",
-                    EBPF_PROFILE_SCRIPT,
-                    "-c",
-                    &cargo_benchmark_command(config),
-                ])
-                .status()
-                .context("run bpftrace profile")?,
         };
 
         if !status.success() {
@@ -254,50 +230,8 @@ impl ProfileRunner {
     }
 }
 
-const EBPF_PROFILE_SCRIPT: &str = r#"
-BEGIN
-{
-  printf("pg_kinetic_ebpf_profile_start\n");
-}
-
-tracepoint:raw_syscalls:sys_enter /comm == "pg-kinetic"/
-{
-  @syscalls = count();
-}
-
-tracepoint:sched:sched_switch /args->prev_comm == "pg-kinetic" || args->next_comm == "pg-kinetic"/
-{
-  @sched_switches = count();
-}
-
-END
-{
-  printf("pg_kinetic_ebpf_profile_end\n");
-}
-"#;
-
 fn command_exists(command: &str) -> bool {
     Command::new(command).arg("--version").output().is_ok()
-}
-
-fn cargo_benchmark_command(config: &ProfileRunConfig) -> String {
-    format!(
-        "cargo run -p {} -- benchmark run --scenario {} --dry-run",
-        shell_quote(&config.target),
-        shell_quote(path_arg(&config.scenario))
-    )
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
-    {
-        return value.to_owned();
-    }
-
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn path_arg(path: &Path) -> &str {
@@ -372,34 +306,5 @@ mod tests {
         assert!(metadata.contains("<absolute>/profile-secret-scenario.toml"));
         assert!(metadata.contains("<absolute>/profile-output.svg"));
         assert!(!metadata.contains(std::env::temp_dir().to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn ebpf_profile_is_skipped_on_non_linux_before_lookup() {
-        let runner = ProfileRunner::with_tool_lookup(|_| true);
-        let status = runner.validate(ProfileTool::Ebpf);
-
-        assert!(matches!(
-            status,
-            ProfileToolStatus::Skipped { ref reason }
-                if reason.contains("eBPF profiling requires Linux")
-        ));
-    }
-
-    #[test]
-    fn ebpf_child_command_shell_quotes_user_paths() {
-        let config = ProfileRunConfig::new(
-            ProfileTool::Ebpf,
-            "bench/scenarios/simple query's.toml",
-            "pg-kinetic",
-            30_000,
-            "bench/profiles/simple.txt",
-        );
-
-        assert_eq!(
-            cargo_benchmark_command(&config),
-            "cargo run -p pg-kinetic -- benchmark run --scenario 'bench/scenarios/simple query'\"'\"'s.toml' --dry-run"
-        );
     }
 }

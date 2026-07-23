@@ -4,8 +4,6 @@ members = [
     "crates/pg-kinetic",
     "crates/pg-kinetic-wire",
     "crates/pg-kinetic-core",
-    "crates/pg-kinetic-splice-protocol",
-    "crates/pg-kinetic-splice",
     "crates/pg-kinetic-proxy",
     "crates/xtask",
 ]

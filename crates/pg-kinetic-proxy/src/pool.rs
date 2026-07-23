@@ -130,6 +130,17 @@ pub struct RoutePoolRegistry {
     routes: StdRwLock<HashMap<PoolKey, RoutePools>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RoutePoolRetirementTargets {
+    inner: Arc<StdMutex<RoutePoolRetirementTargetsInner>>,
+}
+
+#[derive(Debug, Default)]
+struct RoutePoolRetirementTargetsInner {
+    pools: Vec<Arc<RoutePools>>,
+    registries: Vec<Arc<RoutePoolRegistry>>,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ShardPoolKey {
     route: RouteKey,
@@ -579,6 +590,46 @@ impl RoutePoolRegistry {
             .route_pools(route)
             .ok_or(PoolError::Backpressure(BackpressureError::Closed))?;
         pools.checkout_target(route.clone(), target, mode).await
+    }
+}
+
+impl RoutePoolRetirementTargets {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_pools(&self, pools: Arc<RoutePools>) {
+        self.inner
+            .lock()
+            .expect("route pool retirement targets poisoned")
+            .pools
+            .push(pools);
+    }
+
+    pub fn register_registry(&self, registry: Arc<RoutePoolRegistry>) {
+        self.inner
+            .lock()
+            .expect("route pool retirement targets poisoned")
+            .registries
+            .push(registry);
+    }
+
+    pub async fn retire_idle_backends(&self) {
+        let (pools, registries) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("route pool retirement targets poisoned");
+            (inner.pools.clone(), inner.registries.clone())
+        };
+
+        for pools in pools {
+            pools.retire_idle_backends().await;
+        }
+        for registry in registries {
+            registry.retire_idle_backends().await;
+        }
     }
 }
 

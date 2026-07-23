@@ -41,7 +41,8 @@ use crate::{
     pause::PauseController,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
-        ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePools,
+        ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePoolRetirementTargets,
+        RoutePools,
     },
     reload,
     snapshot::{
@@ -342,6 +343,7 @@ pub(crate) struct ShardContext {
     pub listener: TcpListener,
     pub route_pool_selector: RoutePoolSelector,
     pub active_config: Arc<RwLock<Config>>,
+    pub backend_credentials: reload::BackendCredentialCache,
     pub snapshot_store: SnapshotStore,
     pub client_slots: Arc<Semaphore>,
     pub lifecycle: LifecycleController,
@@ -366,6 +368,9 @@ struct ProxyRuntimeState {
     reject_phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     debug_sampler: DebugSampler,
     active_config: Arc<RwLock<Config>>,
+    backend_credentials: reload::BackendCredentialCache,
+    default_route_config: RouteConfig,
+    route_pool_retirement_targets: RoutePoolRetirementTargets,
     control_route_config: RouteConfig,
     mirror_outcome_recorder: MirrorOutcomeRecorder,
     mirror_dispatcher: Arc<MirrorDispatcher>,
@@ -409,12 +414,14 @@ impl RoutePoolSelector {
     pub(crate) fn registry(&self) -> &Arc<RoutePoolRegistry> {
         &self.registry
     }
-}
 
-fn session_backend_credentials(
-    config: &Config,
-) -> anyhow::Result<Option<Arc<auth::BackendCredentials>>> {
-    auth::load_backend_credentials(&config.auth).map(|credentials| credentials.map(Arc::new))
+    fn register_retirement_target(&self, targets: &RoutePoolRetirementTargets) {
+        if let Some(default_pools) = &self.default_pools {
+            targets.register_pools(Arc::clone(default_pools));
+        } else {
+            targets.register_registry(Arc::clone(&self.registry));
+        }
+    }
 }
 
 impl Proxy {
@@ -482,6 +489,8 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
+            state.backend_credentials.clone(),
+            state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
             &state.control_route_config,
@@ -501,6 +510,7 @@ impl Proxy {
             listener,
             route_pool_selector: state.route_pool_selector.clone(),
             active_config: Arc::clone(&state.active_config),
+            backend_credentials: state.backend_credentials.clone(),
             snapshot_store: self.snapshot_store.clone(),
             client_slots: Arc::clone(&self.client_slots),
             lifecycle: self.lifecycle.clone(),
@@ -561,7 +571,6 @@ impl Proxy {
         }
     }
 
-    #[cfg(feature = "runtime-experiments")]
     pub fn run_thread_per_core(self) -> anyhow::Result<()> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -570,7 +579,6 @@ impl Proxy {
             .block_on(self.run_thread_per_core_inner())
     }
 
-    #[cfg(feature = "runtime-experiments")]
     async fn run_thread_per_core_inner(self) -> anyhow::Result<()> {
         let state = self.initialize_runtime_state().await?;
         let listen_addr =
@@ -586,8 +594,15 @@ impl Proxy {
             let startup_tx = startup_tx.clone();
             let shard_result_tx = shard_result_tx.clone();
             let shutdown_completion = shutdown_completion_rx.clone();
-            let route_pool_selector = state.route_pool_selector.clone();
+            let (route_pool_selector, _shard_control_route_pools) = build_route_pool_selector(
+                &state.effective_config,
+                &state.default_route_config,
+                self.snapshot_store.clone(),
+                Arc::clone(&self.backend_slots),
+            );
+            route_pool_selector.register_retirement_target(&state.route_pool_retirement_targets);
             let active_config = Arc::clone(&state.active_config);
+            let backend_credentials = state.backend_credentials.clone();
             let snapshot_store = self.snapshot_store.clone();
             let client_slots = Arc::clone(&self.client_slots);
             let lifecycle = self.lifecycle.clone();
@@ -658,6 +673,7 @@ impl Proxy {
                             listener,
                             route_pool_selector,
                             active_config,
+                            backend_credentials,
                             snapshot_store,
                             client_slots,
                             lifecycle,
@@ -716,6 +732,8 @@ impl Proxy {
             &state.effective_config,
             self.config.clone(),
             Arc::clone(&state.active_config),
+            state.backend_credentials.clone(),
+            state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
             &state.control_route_config,
@@ -836,6 +854,7 @@ impl Proxy {
         self.snapshot_store
             .set_limits_snapshot(LimitsSnapshot::from_config(&effective_config));
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
+        let backend_credentials = reload::BackendCredentialCache::from_config(&effective_config)?;
         let route_config = effective_config
             .effective_routes()
             .into_iter()
@@ -855,6 +874,8 @@ impl Proxy {
             self.snapshot_store.clone(),
             Arc::clone(&self.backend_slots),
         );
+        let route_pool_retirement_targets = RoutePoolRetirementTargets::new();
+        route_pool_selector.register_retirement_target(&route_pool_retirement_targets);
         self.lifecycle.mark_backend_pools_initialized();
         let routing_planner = ReadRoutingPlanner::new(
             route_config.read_routing.read_routing_mode,
@@ -870,6 +891,9 @@ impl Proxy {
             reject_phase_recorder,
             debug_sampler,
             active_config,
+            backend_credentials,
+            default_route_config: route_config,
+            route_pool_retirement_targets,
             control_route_config,
             mirror_outcome_recorder,
             mirror_dispatcher,
@@ -880,7 +904,6 @@ impl Proxy {
     }
 }
 
-#[cfg(feature = "runtime-experiments")]
 fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
     if addr.port() != 0 {
         return Ok(addr);
@@ -891,7 +914,6 @@ fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
     listener.local_addr().context("read reserved listener addr")
 }
 
-#[cfg(feature = "runtime-experiments")]
 fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
     let shard_count = match config.runtime.engine.runtime_shards {
         Some(shards) => shards,
@@ -909,7 +931,6 @@ fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
     Ok(shard_count)
 }
 
-#[cfg(feature = "runtime-experiments")]
 fn runtime_shard_core_assignments(shard_count: usize) -> Vec<Option<core_affinity::CoreId>> {
     let Some(cores) = core_affinity::get_core_ids().filter(|cores| !cores.is_empty()) else {
         return vec![None; shard_count];
@@ -920,7 +941,6 @@ fn runtime_shard_core_assignments(shard_count: usize) -> Vec<Option<core_affinit
         .collect()
 }
 
-#[cfg(feature = "runtime-experiments")]
 fn join_runtime_shards(shards: Vec<std::thread::JoinHandle<()>>) -> anyhow::Result<()> {
     for shard in shards {
         shard
@@ -936,6 +956,8 @@ async fn run_control_plane(
     effective_config: &Config,
     base_config: Config,
     active_config: Arc<RwLock<Config>>,
+    backend_credentials: reload::BackendCredentialCache,
+    route_pool_retirement_targets: RoutePoolRetirementTargets,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
     route_config: &RouteConfig,
@@ -970,6 +992,8 @@ async fn run_control_plane(
                 Arc::clone(&active_config),
                 Arc::clone(&route_pools),
                 Arc::clone(&route_pool_registry),
+                backend_credentials.clone(),
+                route_pool_retirement_targets.clone(),
                 Arc::clone(&drain),
                 Arc::clone(&pause),
                 snapshot_store.clone(),
@@ -993,6 +1017,8 @@ async fn run_control_plane(
                 active_config,
                 route_pools,
                 route_pool_registry,
+                backend_credentials,
+                route_pool_retirement_targets,
             )
             .await;
         }))
@@ -1197,7 +1223,7 @@ async fn run_shard(mut ctx: ShardContext) -> anyhow::Result<()> {
 
                 let mirror_dispatcher = Arc::clone(&ctx.mirror_dispatcher);
                 let buffer_pool = ctx.buffer_pool.clone();
-                let backend_credentials = session_backend_credentials(&config_snapshot)?;
+                let backend_credentials = ctx.backend_credentials.load();
                 let routing_planner = ctx.routing_planner;
                 let debug_sampler = ctx.debug_sampler;
                 let cancel_registry = Arc::clone(&ctx.cancel_registry);
@@ -4029,12 +4055,16 @@ async fn forward_message_cycle(
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
-        let (ready, forwarded_frames) = classify_backend_frames(
+        let mut backend_read = std::mem::take(buffers.backend_read_mut());
+        let mut forwarded_frames = buffers.take_backend_frames();
+        let ready = classify_backend_frames(
             backend.backend_id(),
             state,
-            buffers.backend_read_mut(),
+            &mut backend_read,
             &mut injected_parse_completes,
+            &mut forwarded_frames,
         )?;
+        *buffers.backend_read_mut() = backend_read;
 
         if !forwarded_frames.is_empty() {
             let mut client_write = Vec::with_capacity(forwarded_frames.len() * 2);
@@ -4044,6 +4074,7 @@ async fn forward_message_cycle(
             }
 
             if client.write_all_vectored(&client_write).await.is_err() {
+                buffers.restore_backend_frames(forwarded_frames);
                 buffers.trim_empty_buffers();
                 if let Some(status) = ready {
                     rows_timer.finish(MetricOutcome::Canceled);
@@ -4054,6 +4085,7 @@ async fn forward_message_cycle(
                 return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
             }
         }
+        buffers.restore_backend_frames(forwarded_frames);
 
         if let Some(status) = ready {
             buffers.trim_empty_buffers();
@@ -4068,9 +4100,9 @@ fn classify_backend_frames(
     state: &mut ForwardCycleState<'_>,
     backend_buffer: &mut BytesMut,
     injected_parse_completes: &mut usize,
-) -> anyhow::Result<(Option<ReadyStatus>, Vec<([u8; 5], Bytes)>)> {
+    forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
+) -> anyhow::Result<Option<ReadyStatus>> {
     let mut ready = None;
-    let mut forwarded_frames = Vec::new();
     while let Some(frame) = parse_backend_frame(backend_buffer)? {
         if *injected_parse_completes > 0 && frame.tag == b'1' {
             *injected_parse_completes -= 1;
@@ -4100,7 +4132,7 @@ fn classify_backend_frames(
         header[1..].copy_from_slice(&((frame.payload.len() + 4) as i32).to_be_bytes());
         forwarded_frames.push((header, frame.payload));
     }
-    Ok((ready, forwarded_frames))
+    Ok(ready)
 }
 
 fn prepare_frame_for_backend(

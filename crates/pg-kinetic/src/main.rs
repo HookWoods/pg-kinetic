@@ -361,18 +361,8 @@ fn main() -> anyhow::Result<()> {
             .context("build tokio current-thread runtime")?
             .block_on(pg_kinetic::run(config))
             .context("pg-kinetic runtime failed"),
-        RuntimeEngine::ExperimentalThreadPerCore => {
-            #[cfg(feature = "runtime-experiments")]
-            {
-                pg_kinetic::run_thread_per_core(config)
-                    .context("pg-kinetic thread-per-core runtime failed")
-            }
-
-            #[cfg(not(feature = "runtime-experiments"))]
-            {
-                unreachable!("experimental runtime was validated without runtime-experiments")
-            }
-        }
+        RuntimeEngine::ThreadPerCore => pg_kinetic::run_thread_per_core(config)
+            .context("pg-kinetic thread-per-core runtime failed"),
         RuntimeEngine::ExperimentalIoUring => {
             pg_kinetic::run_io_uring(config).context("pg-kinetic io_uring runtime failed")
         }
@@ -695,7 +685,6 @@ fn default_profile_output(scenario: &Path, kind: ProfileTool) -> PathBuf {
     let extension = match kind {
         ProfileTool::Flamegraph => "svg",
         ProfileTool::Perf => "data",
-        ProfileTool::Ebpf => "txt",
     };
     PathBuf::from("bench").join("profiles").join(format!(
         "{scenario_name}-{}.{}",
@@ -1086,9 +1075,8 @@ fn parse_profile_tool(value: &str) -> Result<ProfileTool, String> {
     match value {
         "flamegraph" => Ok(ProfileTool::Flamegraph),
         "perf" => Ok(ProfileTool::Perf),
-        "ebpf" => Ok(ProfileTool::Ebpf),
         _ => Err(format!(
-            "invalid profile kind '{value}', expected one of: flamegraph, perf, ebpf"
+            "invalid profile kind '{value}', expected one of: flamegraph, perf"
         )),
     }
 }

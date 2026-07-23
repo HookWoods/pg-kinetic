@@ -3,7 +3,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferReusePolicy {
@@ -196,6 +196,7 @@ pub struct SessionBufferSet {
     backend_read: BytesMut,
     backend_write: BytesMut,
     client_write: BytesMut,
+    backend_frames: Vec<([u8; 5], Bytes)>,
     client_read_capacity: usize,
     backend_read_capacity: usize,
     backend_write_capacity: usize,
@@ -218,6 +219,7 @@ impl SessionBufferSet {
             backend_read: BytesMut::new(),
             backend_write: BytesMut::new(),
             client_write: BytesMut::new(),
+            backend_frames: Vec::new(),
             client_read_capacity: 0,
             backend_read_capacity: 0,
             backend_write_capacity: 0,
@@ -276,6 +278,26 @@ impl SessionBufferSet {
     pub fn clear_client_write(&mut self) {
         self.client_write.clear();
         self.trim_client_write();
+    }
+
+    pub fn take_backend_frames(&mut self) -> Vec<([u8; 5], Bytes)> {
+        let mut backend_frames = std::mem::take(&mut self.backend_frames);
+        backend_frames.clear();
+        if backend_frames.capacity() > 1024 {
+            backend_frames.shrink_to(64);
+        }
+        backend_frames
+    }
+
+    pub fn restore_backend_frames(&mut self, backend_frames: Vec<([u8; 5], Bytes)>) {
+        self.backend_frames = backend_frames;
+    }
+
+    pub fn clear_backend_frames(&mut self) {
+        self.backend_frames.clear();
+        if self.backend_frames.capacity() > 1024 {
+            self.backend_frames.shrink_to(64);
+        }
     }
 
     pub fn observe_client_read(&mut self) {
@@ -340,6 +362,10 @@ impl SessionBufferSet {
         self.backend_read.clear();
         self.backend_write.clear();
         self.client_write.clear();
+        self.backend_frames.clear();
+        if self.backend_frames.capacity() > 1024 {
+            self.backend_frames.shrink_to(64);
+        }
         self.trim_empty_buffers();
     }
 
