@@ -21,7 +21,7 @@ const structuredData = {
       name: 'pg-kinetic Documentation',
       url: siteUrl,
       description:
-        'Operator documentation for pg-kinetic, a PostgreSQL wire proxy for pooling, routing, health checks, metrics, and deployment validation.',
+        'Evaluate, benchmark, install, and operate pg-kinetic, a PostgreSQL wire proxy for connection pooling, backpressure, conservative read routing, health checks, metrics, and deployment validation.',
       inLanguage: 'en',
       publisher: {
         '@id': `${siteUrl}/#organization`,
@@ -37,7 +37,7 @@ const structuredData = {
       url: siteUrl,
       codeRepository: repositoryUrl,
       description:
-        'pg-kinetic is a PostgreSQL wire proxy for connection pooling, conservative session handling, read routing, admin inspection, health checks, metrics, and regression tooling.',
+        'pg-kinetic is a PostgreSQL wire proxy for connection pooling, route-aware backpressure, conservative session handling, read routing, admin inspection, health checks, metrics, benchmark baselines, and regression tooling.',
       softwareRequirements: 'PostgreSQL-compatible client and backend',
       softwareVersion: 'unreleased source build',
       downloadUrl: repositoryUrl,
@@ -53,7 +53,7 @@ const structuredData = {
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'pg-kinetic',
-  tagline: 'PostgreSQL wire proxy documentation for operators',
+  tagline: 'PostgreSQL wire proxy documentation for evaluators and operators',
   url: siteUrl,
   baseUrl: '/',
   organizationName: 'hookwoods',
@@ -138,12 +138,12 @@ const config = {
         {
           name: 'description',
           content:
-            'Production-focused pg-kinetic documentation for PostgreSQL proxy deployment, configuration, pooling, routing, health checks, metrics, and regression testing.',
+            'Evaluate, benchmark, install, and operate pg-kinetic, a Rust PostgreSQL wire proxy for connection pooling, backpressure, read routing, health checks, metrics, and admin visibility.',
         },
         {
           name: 'keywords',
           content:
-            'pg-kinetic, PostgreSQL proxy, Postgres connection pooler, PostgreSQL wire protocol, Rust Postgres proxy, PostgreSQL read routing, PostgreSQL metrics, database proxy',
+            'pg-kinetic, PostgreSQL proxy, Postgres connection pooler, PostgreSQL wire protocol, Rust Postgres proxy, PostgreSQL connection storm, PgBouncer alternative, PgBouncer comparison, PgDog comparison, PgCat comparison, Odyssey comparison, PostgreSQL proxy benchmark, PostgreSQL read routing, PostgreSQL backpressure, PostgreSQL metrics, database proxy',
         },
         { name: 'robots', content: 'index,follow' },
         { name: 'googlebot', content: 'index,follow,max-snippet:-1,max-image-preview:large,max-video-preview:-1' },
@@ -153,7 +153,7 @@ const config = {
         {
           name: 'twitter:description',
           content:
-            'Install, configure, and operate pg-kinetic for PostgreSQL connection pooling, routing, health checks, metrics, and regression validation.',
+            'Evaluate and operate pg-kinetic for PostgreSQL connection pooling, backpressure, read routing, health checks, metrics, benchmarks, and regression validation.',
         },
         { name: 'twitter:image', content: socialImage },
       ],
@@ -214,6 +214,15 @@ const config = {
   headTags: [
     { tagName: 'meta', attributes: { property: 'og:type', content: 'website' } },
     { tagName: 'meta', attributes: { property: 'og:site_name', content: 'pg-kinetic Documentation' } },
+    { tagName: 'meta', attributes: { property: 'og:title', content: 'pg-kinetic PostgreSQL Wire Proxy Documentation' } },
+    {
+      tagName: 'meta',
+      attributes: {
+        property: 'og:description',
+        content:
+          'Evaluate, benchmark, install, and operate pg-kinetic for PostgreSQL connection pooling, backpressure, read routing, health checks, metrics, and admin visibility.',
+      },
+    },
     { tagName: 'meta', attributes: { property: 'og:image', content: socialImage } },
     { tagName: 'meta', attributes: { property: 'og:image:width', content: '1200' } },
     { tagName: 'meta', attributes: { property: 'og:image:height', content: '630' } },

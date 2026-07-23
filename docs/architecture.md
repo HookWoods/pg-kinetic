@@ -10,22 +10,45 @@ keywords:
 
 # Architecture
 
+For platform engineers who need to understand the hot path before trusting a PostgreSQL proxy.
+
 pg-kinetic is built around PostgreSQL wire correctness, conservative backend reuse, and operator-visible decisions. It does not require application driver changes because clients continue speaking the PostgreSQL protocol.
 
-## Request Path
+## Data Path
 
 ```mermaid
 flowchart LR
-  Client["PostgreSQL client"] --> Listener["pg-kinetic listener"]
-  Listener --> Parser["Wire parser"]
-  Parser --> Session["Virtual session tracker"]
-  Session --> Router["Route and policy decision"]
-  Router --> Pool["Backend pool checkout"]
+  Client["PostgreSQL client"] --> Accept["accept socket"]
+  Accept --> Startup["startup, TLS, auth"]
+  Startup --> Classify["parse and classify"]
+  Classify --> Session["virtual session state"]
+  Session --> Route["route and freshness decision"]
+  Route --> Gate["route backpressure gate"]
+  Gate --> Checkout["backend checkout"]
+  Checkout --> Forward["wire forward loop"]
+  Forward --> Cleanup["reset, replay, release, or discard"]
+  Cleanup --> Pool["pool snapshot"]
   Pool --> Backend["PostgreSQL primary or replica"]
-  Router --> Admin["Admin snapshots and metrics"]
 ```
 
-The proxy parses enough frontend and backend messages to understand transaction state, prepared-statement state, backend readiness, and unsafe session features. When the state is uncertain, pg-kinetic prefers pinning, recovery, or backend discard over unsafe reuse.
+The proxy parses enough frontend and backend messages to understand startup parameters, transaction state, prepared-statement state, backend readiness, cancellation keys, and unsafe session features. When the state is uncertain, pg-kinetic prefers pinning, recovery, or backend discard over unsafe reuse.
+
+## Hot Path Steps
+
+| Step | What happens | Why it matters |
+| --- | --- | --- |
+| Accept | The selected runtime engine accepts a PostgreSQL client socket. | Runtime choice changes scheduling, not the protocol contract. |
+| Startup | TLS, startup parameters, client authentication, route lookup, and cancel-key issuance run before query traffic. | Clients keep using the PostgreSQL protocol while the proxy owns the front-door policy. |
+| Classify | Frontend messages are parsed into query class, transaction state, prepared-statement intent, and unsafe session markers. | Ambiguous traffic stays conservative instead of being routed or pooled optimistically. |
+| Checkout | Route backpressure and pool limits decide whether work gets a backend, waits, times out, or fails. | Capacity failure is explicit and observable per route. |
+| Forward | Client and backend frames are copied while backend status, ParameterStatus, errors, and ReadyForQuery are observed. | The proxy can preserve client-visible PostgreSQL behavior and record backend state. |
+| Cleanup | Idle reusable backends are reset or replayed, pinned sessions stay attached, and uncertain backends are discarded. | Backend reuse never depends on assuming hidden session state is safe. |
+
+## Runtime Engines
+
+Runtime engines plug in at accept and task scheduling boundaries. `thread_per_core` is the default stable engine, while `tokio_default` and `tokio_current_thread` remain stable selectable engines. `experimental_io_uring` is opt-in and outside the default release path.
+
+The engine does not change the documented safety model. TLS/authentication support, pooling behavior, read routing, admin snapshots, and recovery rules remain governed by the stable runtime contract for the selected engine.
 
 ## Crate Layout
 

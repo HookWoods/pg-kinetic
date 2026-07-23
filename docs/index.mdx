@@ -1,10 +1,13 @@
 ---
-title: "pg-kinetic Documentation"
-description: "Operator documentation for pg-kinetic, covering implemented PostgreSQL proxy behavior, preview tooling, deployment assets, and validation workflows."
+title: "pg-kinetic PostgreSQL Proxy Documentation"
+description: "Evaluate, benchmark, install, and operate pg-kinetic, a Rust PostgreSQL wire proxy for connection pooling, backpressure, conservative read routing, health checks, metrics, and admin visibility."
 keywords:
   - pg-kinetic
   - PostgreSQL wire proxy
   - Postgres connection pooler
+  - PostgreSQL proxy benchmark
+  - PgBouncer alternative
+  - PgDog comparison
   - database proxy documentation
 ---
 
@@ -12,7 +15,7 @@ import DocCardList from '@theme/DocCardList';
 
 # pg-kinetic documentation
 
-pg-kinetic is a PostgreSQL wire proxy. These docs separate implemented runtime behavior from preview tooling so operators can decide what is ready for traffic.
+pg-kinetic is a PostgreSQL wire proxy for teams that need a controlled boundary between application connection demand and PostgreSQL capacity. These docs explain what it is, how it compares with other PostgreSQL poolers, what is ready for traffic, and how to operate it without confusing preview tooling with stable runtime behavior.
 
 ## Current State
 
@@ -34,12 +37,12 @@ pg-kinetic is a PostgreSQL wire proxy. These docs separate implemented runtime b
 
 ## What To Read First
 
-1. [Installation](installation.md) explains local Docker, Compose, and Helm assets.
-2. [Quickstart](quickstart.md) runs one local end-to-end check.
-3. [Configuration](configuration.md) documents implemented runtime config fields and precedence.
-4. [Health, Readiness, And Drain](health-and-drain.md) documents the exact HTTP health surface.
-5. [Compatibility](compatibility.md) documents client-driver smoke coverage.
-6. [Backend Service Authentication](backend-service-auth.md) explains pooled service-role sessions and upstream password methods.
+1. [What Is pg-kinetic?](what-is-pg-kinetic.md) explains the connection-storm problem, adoption cost, and what pg-kinetic is not.
+2. [How pg-kinetic Compares](how-it-compares.md) compares pg-kinetic with PgBouncer, PgDog, PgCat, and Odyssey.
+3. [Is pg-kinetic Ready?](is-it-ready.md) puts maturity, release scope, and preview exclusions in one place.
+4. [Benchmark Results](benchmark-results.md) shows source-backed baseline charts before the full benchmarking workflow.
+5. [Quickstart](quickstart.md) runs one local end-to-end check.
+6. [Configuration](configuration.md) documents implemented runtime config fields and precedence.
 
 ## Documentation Map
 

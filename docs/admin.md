@@ -10,6 +10,8 @@ keywords:
 
 # Admin Endpoint
 
+For operators inspecting live pg-kinetic state without querying PostgreSQL system tables.
+
 pg-kinetic exposes a separate PostgreSQL-compatible admin listener for operational reads.
 Enable it by setting `admin_addr`. When that address is unset, the admin plane stays off.
 
@@ -28,7 +30,7 @@ For runtime behavior, see [docs/production-runtime.md](production-runtime.md). P
 
 - The admin endpoint only accepts the simple query protocol.
 - Extended-protocol messages such as `Parse`, `Bind`, `Describe`, and `Execute` are rejected.
-- Supported SQL is limited to `SHOW <view>`.
+- Supported admin commands are limited to `SHOW <view>`, `PAUSE`, `RESUME`, and `RELOAD`.
 - One trailing semicolon is ignored.
 - Matching is case-insensitive.
 - Unsupported SQL returns SQLSTATE `0A000`.

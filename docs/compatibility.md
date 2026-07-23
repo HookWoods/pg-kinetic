@@ -11,6 +11,8 @@ keywords:
 
 # Compatibility Matrix
 
+For engineers checking whether PostgreSQL clients and protocol behaviors are covered before a rollout.
+
 pg-kinetic keeps a cross-language compatibility matrix for PostgreSQL clients. The matrix can run the same behavior contract against direct PostgreSQL and pg-kinetic so reports can compare proxy behavior with the baseline server path.
 
 The stable 1.0 support boundary is defined in the [Stable 1.0 Release Contract](./release-contract.md). It covers PostgreSQL 16 and 18 as tested release targets; other server versions require a matching compatibility run before a support claim is made.
@@ -22,8 +24,24 @@ The stable 1.0 support boundary is defined in the [Stable 1.0 Release Contract](
 | PostgreSQL server versions | Tested only where the local compatibility or CI stack starts PostgreSQL. Do not infer broad version coverage from docs alone. |
 | Simple query protocol | Covered by smoke checks. |
 | Extended query protocol | Covered by prepared-query smoke checks where each driver suite supports it. |
+| Cancellation requests | Supported for bound backends; unknown cancel keys are dropped silently. |
+| Backend parameter status | Captured from backend startup and replayed to clients on pooled connection reuse. |
 | COPY, LISTEN/NOTIFY, temp tables, advisory locks | Treated as stateful or pinning-sensitive behavior; not broad compatibility guarantees. |
 | Sharding and policy-denial cases | Preview/opt-in only; not default live proxy compatibility. |
+
+## Protocol Details
+
+### Cancellation
+
+PostgreSQL cancellation uses a separate startup packet containing a process id and secret key. pg-kinetic issues client-facing cancel keys during startup, binds them to the currently checked-out backend key while a backend is assigned, and forwards cancellation by opening a backend cancel connection with the backend's own process id and secret key.
+
+If the cancel key is unknown or no backend target is currently bound, pg-kinetic drops the cancel request without surfacing an error to the canceling connection. This matches the PostgreSQL cancellation shape where the cancel connection is not the query connection.
+
+### `server_version` And Parameter Status
+
+pg-kinetic forwards backend `ParameterStatus` fields such as `server_version`, `client_encoding`, and `standard_conforming_strings` to the client. When a pooled backend is reused, the proxy replays the captured parameter status in the synthetic startup-ready response so clients still see the backend parameters they expect.
+
+Do not use `server_version` as a broad compatibility guarantee by itself. The release contract names the PostgreSQL versions covered by the current validation matrix; clients can observe a backend-reported version even when that exact version has not been promoted to a documented support target.
 
 ## Libraries
 

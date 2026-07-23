@@ -10,6 +10,8 @@ keywords:
 
 # Read Routing
 
+For platform engineers deciding when replica reads are safe enough for application traffic.
+
 pg-kinetic can route eligible reads to replicas, but it does so conservatively. The goal is to avoid stale or unsafe reads rather than chase replica utilization at any cost.
 
 ## When Routing Is Safe
@@ -68,6 +70,28 @@ The relevant freshness controls are:
 - `read_after_write_timeout_ms`
 
 When the timeout expires, the configured fallback policy decides whether the proxy uses the primary, waits longer, or rejects the request.
+
+## Freshness Math
+
+Replica freshness is evaluated against two different signals when they are enabled:
+
+| Signal | Meaning | Pass condition |
+| --- | --- | --- |
+| Max lag | Wall-clock lag from the latest health probe | `observed_lag_ms <= max_replica_lag_ms` |
+| Session write LSN | The last write position required by this client session | `replica_replay_lsn >= required_session_write_lsn` |
+
+With this config:
+
+```toml
+[routes.freshness]
+freshness_policy = "session_write_lsn_and_max_lag"
+max_replica_lag_ms = 2500
+read_after_write_timeout_ms = 750
+```
+
+A read after a client write is eligible for a replica only when the selected replica has replayed at least the session's required write LSN and the latest measured lag is no more than 2500 ms. If the replica is 900 ms behind but has not replayed the session write LSN, pg-kinetic waits up to 750 ms. If the replica reaches both conditions during that window, the read can use the replica. If it does not, the fallback policy decides whether the read uses the primary, keeps waiting, or fails.
+
+The tradeoff is latency versus freshness. A larger `read_after_write_timeout_ms` gives replicas more time to catch up but can add client-visible wait time. A smaller timeout keeps reads snappy but falls back or rejects sooner.
 
 ## Replica Health And Lag
 

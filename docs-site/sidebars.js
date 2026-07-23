@@ -4,11 +4,23 @@ const sidebars = {
     'index',
     {
       type: 'category',
-      label: 'Getting Started',
+      label: 'Evaluate',
       link: {
         type: 'generated-index',
-        title: 'Getting Started',
-        description: 'Install pg-kinetic, choose a deployment target, and understand the first production decisions.',
+        title: 'Evaluate pg-kinetic',
+        description: 'Decide whether pg-kinetic fits your PostgreSQL workload before configuring a deployment.',
+        slug: '/evaluate',
+      },
+      collapsed: false,
+      items: ['what-is-pg-kinetic', 'how-it-compares', 'is-it-ready', 'benchmark-results'],
+    },
+    {
+      type: 'category',
+      label: 'Start',
+      link: {
+        type: 'generated-index',
+        title: 'Start With pg-kinetic',
+        description: 'Install pg-kinetic, run the first proxy query, choose config, and understand the first production decisions.',
         slug: '/getting-started',
       },
       collapsed: false,

@@ -10,6 +10,8 @@ keywords:
 
 # Backpressure And Overload
 
+For platform engineers sizing PostgreSQL capacity and deciding what clients see during overload.
+
 pg-kinetic uses route-aware backpressure so one noisy path does not consume all backend capacity. Overload should fail predictably instead of letting clients wait forever.
 
 ## Route Keys
@@ -44,6 +46,24 @@ This makes queueing more useful than a single global counter. A bulk worker can 
 | `overload_error_code` | SQLSTATE returned when overload is rejected. |
 
 The default overload SQLSTATE is `53300`, PostgreSQL's `too many connections` class.
+
+## Worked Example
+
+Assume an API route has:
+
+```toml
+[capacity]
+max_route_in_flight = 8
+max_route_waiters = 4
+checkout_timeout_ms = 250
+overload_error_code = "53300"
+```
+
+When twelve matching client requests arrive while all eight allowed backend checkouts are already in flight, pg-kinetic admits four waiters. A thirteenth matching request is rejected immediately with SQLSTATE `53300` because the route queue is full. The client receives a PostgreSQL error response followed by `ReadyForQuery`, so normal PostgreSQL drivers surface it as a query error rather than a broken socket.
+
+If one of the eight in-flight requests finishes within `checkout_timeout_ms`, the oldest waiter gets the backend and proceeds. If no backend becomes available before the timeout, that waiter is failed with the configured overload behavior and the `timed_out` counter increases for the route.
+
+The important tradeoff is explicit: increasing `max_route_waiters` absorbs bursts but adds tail latency; decreasing it fails faster and protects interactive traffic from standing behind known-slow work. Increasing `max_route_in_flight` can improve throughput only when PostgreSQL has remaining CPU, memory, lock, and I/O headroom.
 
 ## Failure Behavior
 
