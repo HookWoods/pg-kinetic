@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -46,6 +46,7 @@ use crate::{
         ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePoolRetirementTargets,
         RoutePools,
     },
+    pressure::PressureController,
     reload,
     snapshot::{
         ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
@@ -166,6 +167,7 @@ struct ControlPlaneHandles {
     _admin_handle: Option<JoinHandle<()>>,
     _reload_handle: Option<JoinHandle<()>>,
     _adaptive_handle: Option<JoinHandle<()>>,
+    _pressure_handle: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct ShardContext {
@@ -207,6 +209,7 @@ struct ProxyRuntimeState {
     mirror_dispatcher: Arc<MirrorDispatcher>,
     route_pool_selector: RoutePoolSelector,
     control_route_pools: Arc<RoutePools>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
     routing_planner: ReadRoutingPlanner,
     auth_query_service: Arc<AuthQueryService>,
 }
@@ -325,11 +328,13 @@ impl Proxy {
             state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
+            Arc::clone(&state.pressure_route_in_flight_limit),
             &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
+            self.buffer_pool.clone(),
             state.mirror_outcome_recorder.clone(),
         )
         .await?;
@@ -447,6 +452,7 @@ impl Proxy {
                 &state.default_route_config,
                 self.snapshot_store.clone(),
                 Arc::clone(&self.backend_slots),
+                Arc::clone(&state.pressure_route_in_flight_limit),
             );
             route_pool_selector.register_retirement_target(&state.route_pool_retirement_targets);
             let active_config = Arc::clone(&state.active_config);
@@ -586,11 +592,13 @@ impl Proxy {
             state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
+            Arc::clone(&state.pressure_route_in_flight_limit),
             &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
+            self.buffer_pool.clone(),
             state.mirror_outcome_recorder.clone(),
         )
         .await?;
@@ -724,11 +732,14 @@ impl Proxy {
             effective_config.socket.clone(),
             mirror_outcome_recorder.clone(),
         ));
+        let pressure_route_in_flight_limit =
+            Arc::new(AtomicUsize::new(effective_config.qos.max_route_in_flight));
         let (route_pool_selector, control_route_pools) = build_route_pool_selector(
             &effective_config,
             &route_config,
             self.snapshot_store.clone(),
             Arc::clone(&self.backend_slots),
+            Arc::clone(&pressure_route_in_flight_limit),
         );
         let route_pool_retirement_targets = RoutePoolRetirementTargets::new();
         route_pool_selector.register_retirement_target(&route_pool_retirement_targets);
@@ -755,6 +766,7 @@ impl Proxy {
             mirror_dispatcher,
             route_pool_selector,
             control_route_pools,
+            pressure_route_in_flight_limit,
             routing_planner,
             auth_query_service,
         })
@@ -836,11 +848,13 @@ async fn run_control_plane(
     route_pool_retirement_targets: RoutePoolRetirementTargets,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
     route_config: &RouteConfig,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
+    buffer_pool: ProxyBufferPool,
     mirror_outcome_recorder: MirrorOutcomeRecorder,
 ) -> anyhow::Result<ControlPlaneHandles> {
     let health_handle = if let Some(health_addr) = effective_config.health.health_addr {
@@ -904,9 +918,23 @@ async fn run_control_plane(
 
     let adaptive_handle = if effective_config.runtime.production.adaptive_enabled {
         let controller = AdaptiveController::new(
-            snapshot_store,
+            snapshot_store.clone(),
             mirror_outcome_recorder,
             Arc::clone(&active_config),
+        );
+        Some(tokio::spawn(async move {
+            controller.run().await;
+        }))
+    } else {
+        None
+    };
+
+    let pressure_handle = if effective_config.runtime.production.pressure.enabled {
+        let controller = PressureController::new(
+            Arc::clone(&active_config),
+            snapshot_store,
+            pressure_route_in_flight_limit,
+            buffer_pool,
         );
         Some(tokio::spawn(async move {
             controller.run().await;
@@ -920,6 +948,7 @@ async fn run_control_plane(
         _admin_handle: admin_handle,
         _reload_handle: reload_handle,
         _adaptive_handle: adaptive_handle,
+        _pressure_handle: pressure_handle,
     })
 }
 
@@ -1264,6 +1293,7 @@ fn build_route_pools(
     snapshot_store: SnapshotStore,
     global_backend_slots: Option<Arc<Semaphore>>,
     global_backend_available: Option<Arc<tokio::sync::Notify>>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> RoutePools {
     let mut lifecycle = config.pool_lifecycle.clone();
     lifecycle.max_size = lifecycle.max_size.min(config.capacity.max_backends);
@@ -1278,7 +1308,7 @@ fn build_route_pools(
         lifecycle,
     );
 
-    let primary_pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
+    let primary_pool = BackendPool::new_with_socket_lifecycle_global_limit_notify_and_route_limit(
         route_config.primary.address,
         pool_args.0.clone(),
         pool_args.1.clone(),
@@ -1290,6 +1320,7 @@ fn build_route_pools(
         pool_args.7.clone(),
         global_backend_slots.clone(),
         global_backend_available.clone(),
+        Some(Arc::clone(&pressure_route_in_flight_limit)),
     );
     let primary = BackendPoolRef::primary(primary_pool);
     primary.attach_snapshot_store(snapshot_store.clone());
@@ -1299,7 +1330,7 @@ fn build_route_pools(
         .iter()
         .enumerate()
         .map(|(index, replica)| {
-            let pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
+            let pool = BackendPool::new_with_socket_lifecycle_global_limit_notify_and_route_limit(
                 replica.address,
                 pool_args.0.clone(),
                 pool_args.1.clone(),
@@ -1311,6 +1342,7 @@ fn build_route_pools(
                 pool_args.7.clone(),
                 global_backend_slots.clone(),
                 global_backend_available.clone(),
+                Some(Arc::clone(&pressure_route_in_flight_limit)),
             );
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
         })
@@ -1335,6 +1367,7 @@ fn build_route_pool_selector(
     default_route_config: &RouteConfig,
     snapshot_store: SnapshotStore,
     global_backend_slots: Arc<Semaphore>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> (RoutePoolSelector, Arc<RoutePools>) {
     if config.pools.is_empty() {
         let default_pools = Arc::new(build_route_pools(
@@ -1343,6 +1376,7 @@ fn build_route_pool_selector(
             snapshot_store,
             Some(global_backend_slots),
             None,
+            pressure_route_in_flight_limit,
         ));
         return (
             RoutePoolSelector::default(Arc::clone(&default_pools)),
@@ -1367,6 +1401,7 @@ fn build_route_pool_selector(
             snapshot_store.clone(),
             Arc::clone(&global_backend_slots),
             Some(Arc::clone(&global_backend_available)),
+            Arc::clone(&pressure_route_in_flight_limit),
         );
         if control_route_pools.is_none() {
             control_route_pools = Some(Arc::new(pools.clone()));
@@ -1386,6 +1421,7 @@ fn build_route_pools_for_pool(
     snapshot_store: SnapshotStore,
     global_backend_slots: Arc<Semaphore>,
     global_backend_available: Option<Arc<tokio::sync::Notify>>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> RoutePools {
     let mut scoped_config = config.clone();
     if let Some(max_backends) = pool_config.max_backends {
@@ -1399,6 +1435,7 @@ fn build_route_pools_for_pool(
         snapshot_store,
         Some(global_backend_slots),
         global_backend_available,
+        pressure_route_in_flight_limit,
     )
 }
 

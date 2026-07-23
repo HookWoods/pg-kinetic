@@ -8,7 +8,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     time,
 };
 
@@ -23,15 +23,24 @@ pub struct RouteBackpressureSnapshot {
 #[derive(Clone, Debug)]
 pub struct BackpressureGate {
     capacity: Arc<Semaphore>,
+    max_in_flight: usize,
+    dynamic_limit: Arc<AtomicUsize>,
     max_waiters: usize,
     waiters: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
+    capacity_changed: Arc<Notify>,
 }
 
 #[derive(Debug)]
 pub struct BackpressurePermit {
     permits: Vec<OwnedSemaphorePermit>,
-    in_flight_counters: Vec<Arc<AtomicUsize>>,
+    in_flight_counters: Vec<PermitCounter>,
+}
+
+#[derive(Debug)]
+struct PermitCounter {
+    in_flight: Arc<AtomicUsize>,
+    capacity_changed: Arc<Notify>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,11 +66,15 @@ pub enum BackpressureError {
 impl BackpressureGate {
     #[must_use]
     pub fn new(max_in_flight: usize, max_waiters: usize) -> Self {
+        let max_in_flight = max_in_flight.max(1);
         Self {
             capacity: Arc::new(Semaphore::new(max_in_flight)),
+            max_in_flight,
+            dynamic_limit: Arc::new(AtomicUsize::new(max_in_flight)),
             max_waiters,
             waiters: Arc::new(AtomicUsize::new(0)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            capacity_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -70,42 +83,118 @@ impl BackpressureGate {
         Self::new(usize::MAX >> 3, max_waiters)
     }
 
+    #[must_use]
+    pub fn with_dynamic_limit(
+        max_in_flight: usize,
+        max_waiters: usize,
+        dynamic_limit: Arc<AtomicUsize>,
+    ) -> Self {
+        let max_in_flight = max_in_flight.max(1);
+        let normalized_limit = dynamic_limit
+            .load(Ordering::Acquire)
+            .max(1)
+            .min(max_in_flight);
+        dynamic_limit.store(normalized_limit, Ordering::Release);
+        Self {
+            capacity: Arc::new(Semaphore::new(max_in_flight)),
+            max_in_flight,
+            dynamic_limit,
+            max_waiters,
+            waiters: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            capacity_changed: Arc::new(Notify::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.dynamic_limit
+            .load(Ordering::Acquire)
+            .max(1)
+            .min(self.max_in_flight)
+    }
+
+    pub fn set_limit(&self, limit: usize) {
+        self.dynamic_limit
+            .store(limit.max(1).min(self.max_in_flight), Ordering::Release);
+        self.capacity_changed.notify_waiters();
+    }
+
     async fn checkout_until(
         &self,
         deadline: time::Instant,
     ) -> Result<BackpressurePermit, BackpressureError> {
-        let permit = match self.capacity.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::Closed) => return Err(BackpressureError::Closed),
-            Err(TryAcquireError::NoPermits) => {
-                let previous = self.waiters.fetch_add(1, Ordering::AcqRel);
-                if previous >= self.max_waiters {
-                    self.waiters.fetch_sub(1, Ordering::AcqRel);
-                    return Err(BackpressureError::QueueFull);
-                }
-
-                let permit = time::timeout_at(deadline, self.capacity.clone().acquire_owned())
-                    .await
-                    .map_err(|_| {
-                        self.waiters.fetch_sub(1, Ordering::AcqRel);
-                        BackpressureError::Timeout
-                    })?
-                    .map_err(|_| {
-                        self.waiters.fetch_sub(1, Ordering::AcqRel);
-                        BackpressureError::Closed
-                    })?;
-
-                self.waiters.fetch_sub(1, Ordering::AcqRel);
-                permit
+        loop {
+            if self.in_flight() >= self.limit() {
+                self.wait_for_capacity_change(deadline).await?;
+                continue;
             }
-        };
 
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+            let permit = match self.capacity.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(TryAcquireError::Closed) => return Err(BackpressureError::Closed),
+                Err(TryAcquireError::NoPermits) => {
+                    let previous = self.waiters.fetch_add(1, Ordering::AcqRel);
+                    if previous >= self.max_waiters {
+                        self.waiters.fetch_sub(1, Ordering::AcqRel);
+                        return Err(BackpressureError::QueueFull);
+                    }
 
-        Ok(BackpressurePermit::new(
-            vec![permit],
-            vec![self.in_flight.clone()],
-        ))
+                    let permit = time::timeout_at(deadline, self.capacity.clone().acquire_owned())
+                        .await
+                        .map_err(|_| {
+                            self.waiters.fetch_sub(1, Ordering::AcqRel);
+                            BackpressureError::Timeout
+                        })?
+                        .map_err(|_| {
+                            self.waiters.fetch_sub(1, Ordering::AcqRel);
+                            BackpressureError::Closed
+                        })?;
+
+                    self.waiters.fetch_sub(1, Ordering::AcqRel);
+                    permit
+                }
+            };
+
+            let previous = self.in_flight.fetch_add(1, Ordering::AcqRel);
+            if previous < self.limit() {
+                return Ok(BackpressurePermit::new(
+                    vec![permit],
+                    vec![PermitCounter {
+                        in_flight: self.in_flight.clone(),
+                        capacity_changed: self.capacity_changed.clone(),
+                    }],
+                ));
+            }
+
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            drop(permit);
+            self.wait_for_capacity_change(deadline).await?;
+        }
+    }
+
+    async fn wait_for_capacity_change(
+        &self,
+        deadline: time::Instant,
+    ) -> Result<(), BackpressureError> {
+        let previous = self.waiters.fetch_add(1, Ordering::AcqRel);
+        if previous >= self.max_waiters {
+            self.waiters.fetch_sub(1, Ordering::AcqRel);
+            return Err(BackpressureError::QueueFull);
+        }
+
+        let poll_deadline = (time::Instant::now() + Duration::from_millis(50)).min(deadline);
+        let result = time::timeout_at(poll_deadline, self.capacity_changed.notified())
+            .await
+            .or_else(|_| {
+                if poll_deadline >= deadline {
+                    Err(BackpressureError::Timeout)
+                } else {
+                    Ok(())
+                }
+            });
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        result
     }
 
     pub async fn checkout(
@@ -186,7 +275,7 @@ impl BackpressureCoordinator {
 }
 
 impl BackpressurePermit {
-    fn new(permits: Vec<OwnedSemaphorePermit>, in_flight_counters: Vec<Arc<AtomicUsize>>) -> Self {
+    fn new(permits: Vec<OwnedSemaphorePermit>, in_flight_counters: Vec<PermitCounter>) -> Self {
         Self {
             permits,
             in_flight_counters,
@@ -205,7 +294,8 @@ impl BackpressurePermit {
 impl Drop for BackpressurePermit {
     fn drop(&mut self) {
         for counter in &self.in_flight_counters {
-            counter.fetch_sub(1, Ordering::AcqRel);
+            counter.in_flight.fetch_sub(1, Ordering::AcqRel);
+            counter.capacity_changed.notify_waiters();
         }
     }
 }

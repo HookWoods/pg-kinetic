@@ -25,6 +25,7 @@ pub mod policy;
 pub mod policy_wasm;
 pub mod pool;
 pub mod preflight;
+pub mod pressure;
 pub mod profile;
 pub mod proxy;
 pub mod regression;

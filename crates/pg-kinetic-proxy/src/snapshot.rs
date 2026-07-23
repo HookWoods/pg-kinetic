@@ -244,6 +244,18 @@ pub struct BackpressureSnapshot {
     pub canceled: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureSnapshot {
+    pub enabled: bool,
+    pub cpu_some_avg10: Option<f64>,
+    pub mem_some_avg10: Option<f64>,
+    pub cpu_high_pct: f64,
+    pub mem_high_pct: f64,
+    pub pressured: bool,
+    pub route_in_flight_limit: usize,
+    pub configured_route_in_flight: usize,
+}
+
 impl BackpressureSnapshot {
     #[must_use]
     pub fn new(route_key: RouteKey) -> Self {
@@ -829,6 +841,7 @@ struct SnapshotStoreInner {
     pinning: BTreeMap<u64, PinningSnapshot>,
     recoveries: Vec<RecoverySnapshot>,
     backpressure: HashMap<RouteKey, BackpressureSnapshot>,
+    pressure: Option<PressureSnapshot>,
     runtime: Option<RuntimeSnapshot>,
     runtime_shards: BTreeMap<usize, RuntimeShardSnapshot>,
     nodes: Vec<NodeSummarySnapshot>,
@@ -1335,6 +1348,17 @@ impl SnapshotStore {
             .cloned()
             .collect::<Vec<_>>();
         sort_by_route_key(backpressure)
+    }
+
+    pub fn set_pressure_snapshot(&self, snapshot: PressureSnapshot) {
+        metrics::record_pressure_snapshot(&snapshot);
+        let mut inner = self.inner.write().expect("snapshot store poisoned");
+        inner.pressure = Some(snapshot);
+    }
+
+    #[must_use]
+    pub fn pressure_snapshot(&self) -> Option<PressureSnapshot> {
+        self.inner.read().expect("snapshot store poisoned").pressure
     }
 
     pub fn set_route_snapshot(&self, snapshot: RouteSnapshot) {

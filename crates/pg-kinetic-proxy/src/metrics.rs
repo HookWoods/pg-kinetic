@@ -4,9 +4,9 @@ use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
 use crate::sharding::RouteMapReloadErrorCode;
 use crate::snapshot::{
     AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BenchmarkRunSnapshot,
-    MirrorSummarySnapshot, PerformanceSnapshot, PoolSnapshot, ReplicaHealthSnapshot,
-    RouteCheckoutSnapshot, RouteMapReloadSnapshot, RuntimeSnapshot, ServerSnapshot,
-    ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+    MirrorSummarySnapshot, PerformanceSnapshot, PoolSnapshot, PressureSnapshot,
+    ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RuntimeSnapshot,
+    ServerSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
 };
 use crate::socket::SocketOptionOutcome;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -265,6 +265,15 @@ pub fn record_adaptive_outcome(snapshot: &AdaptiveOutcomeSnapshot) {
         "outcome" => snapshot.outcome.as_str()
     )
     .increment(1);
+}
+
+pub fn record_pressure_snapshot(snapshot: &PressureSnapshot) {
+    if let Some(value) = snapshot.cpu_some_avg10 {
+        metrics_crate::gauge!(ObservabilityMetricName::PressureCpu.as_str()).set(value);
+    }
+    if let Some(value) = snapshot.mem_some_avg10 {
+        metrics_crate::gauge!(ObservabilityMetricName::PressureMem.as_str()).set(value);
+    }
 }
 
 pub fn record_benchmark_run(snapshot: &BenchmarkRunSnapshot) {

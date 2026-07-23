@@ -26,9 +26,10 @@ use crate::{
         BenchmarkRunSnapshot, ClientSnapshot, LimitsSnapshot, MirrorSummarySnapshot,
         NodeSummaryRole, NodeSummarySnapshot, PerformanceSnapshot, PinningSnapshot,
         PolicyReloadSnapshot, PolicyStatusSnapshot, PoolSnapshot, PreparedSnapshot,
-        RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot,
-        RoutePolicySnapshot, RouteSnapshot, RuntimeShardSnapshot, RuntimeSnapshot, ServerSnapshot,
-        SettingsSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
+        PressureSnapshot, RecoverySnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
+        RouteMapReloadSnapshot, RoutePolicySnapshot, RouteSnapshot, RuntimeShardSnapshot,
+        RuntimeSnapshot, ServerSnapshot, SettingsSnapshot, ShardLifecycleSnapshot,
+        ShardMigrationSafetySnapshot, SnapshotStore,
     },
     socket, telemetry,
 };
@@ -518,6 +519,7 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
             &state.snapshot_store.adaptive_recommendation_snapshots(),
             &state.snapshot_store.adaptive_outcome_snapshots(),
         ),
+        AdminView::Pressure => pressure_table(state.snapshot_store.pressure_snapshot(), config),
         AdminView::Benchmarks => benchmarks_table(
             &state.snapshot_store.benchmark_run_snapshots(),
             &state.snapshot_store.performance_snapshot(),
@@ -1168,6 +1170,42 @@ fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
                 ])
             })
             .collect(),
+    )
+}
+
+fn pressure_table(snapshot: Option<PressureSnapshot>, config: &Config) -> AdminTable {
+    let snapshot = snapshot.unwrap_or(PressureSnapshot {
+        enabled: config.runtime.production.pressure.enabled,
+        cpu_some_avg10: None,
+        mem_some_avg10: None,
+        cpu_high_pct: config.runtime.production.pressure.cpu_high_pct,
+        mem_high_pct: config.runtime.production.pressure.mem_high_pct,
+        pressured: false,
+        route_in_flight_limit: config.qos.max_route_in_flight,
+        configured_route_in_flight: config.qos.max_route_in_flight,
+    });
+    admin_table(
+        AdminView::Pressure,
+        &[
+            ("enabled", AdminColumnType::Bool),
+            ("cpu_some_avg10", AdminColumnType::Float8),
+            ("mem_some_avg10", AdminColumnType::Float8),
+            ("cpu_high_pct", AdminColumnType::Float8),
+            ("mem_high_pct", AdminColumnType::Float8),
+            ("pressured", AdminColumnType::Bool),
+            ("route_in_flight_limit", AdminColumnType::Int8),
+            ("configured_route_in_flight", AdminColumnType::Int8),
+        ],
+        vec![AdminRow::new(vec![
+            snapshot.enabled.to_string(),
+            optional_float(snapshot.cpu_some_avg10),
+            optional_float(snapshot.mem_some_avg10),
+            format!("{:.3}", snapshot.cpu_high_pct),
+            format!("{:.3}", snapshot.mem_high_pct),
+            snapshot.pressured.to_string(),
+            snapshot.route_in_flight_limit.to_string(),
+            snapshot.configured_route_in_flight.to_string(),
+        ])],
     )
 }
 
@@ -1835,4 +1873,8 @@ fn adaptive_guardrails_label(
 
 fn benchmark_metric_value(value: f64) -> String {
     format!("{value:.3}")
+}
+
+fn optional_float(value: Option<f64>) -> String {
+    value.map_or_else(String::new, benchmark_metric_value)
 }

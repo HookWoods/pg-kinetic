@@ -662,6 +662,88 @@ pub struct ProductionConfig {
     #[command(flatten)]
     #[serde(flatten)]
     pub adaptive: AdaptiveConfig,
+
+    #[command(flatten)]
+    pub pressure: PressureConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct PressureConfig {
+    #[arg(
+        long = "pressure-enabled",
+        env = "PG_KINETIC_PRESSURE_ENABLED",
+        default_value_t = false
+    )]
+    pub enabled: bool,
+
+    #[arg(
+        long = "pressure-cpu-high-pct",
+        env = "PG_KINETIC_PRESSURE_CPU_HIGH_PCT",
+        default_value_t = 20.0
+    )]
+    pub cpu_high_pct: f64,
+
+    #[arg(
+        long = "pressure-mem-high-pct",
+        env = "PG_KINETIC_PRESSURE_MEM_HIGH_PCT",
+        default_value_t = 10.0
+    )]
+    pub mem_high_pct: f64,
+
+    #[arg(
+        long = "pressure-min-in-flight-floor",
+        env = "PG_KINETIC_PRESSURE_MIN_IN_FLIGHT_FLOOR",
+        default_value_t = 1
+    )]
+    pub min_in_flight_floor: usize,
+
+    #[arg(
+        long = "pressure-window-ms",
+        env = "PG_KINETIC_PRESSURE_WINDOW_MS",
+        default_value_t = 5_000
+    )]
+    pub window_ms: u64,
+}
+
+impl PressureConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_pressure_threshold("pressure_cpu_high_pct", self.cpu_high_pct)?;
+        validate_pressure_threshold("pressure_mem_high_pct", self.mem_high_pct)?;
+        if self.min_in_flight_floor == 0 {
+            return Err(String::from(
+                "pressure_min_in_flight_floor must be greater than zero",
+            ));
+        }
+        if self.window_ms == 0 {
+            return Err(String::from("pressure_window_ms must be greater than zero"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn window(&self) -> Duration {
+        Duration::from_millis(self.window_ms)
+    }
+}
+
+impl Default for PressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cpu_high_pct: 20.0,
+            mem_high_pct: 10.0,
+            min_in_flight_floor: 1,
+            window_ms: 5_000,
+        }
+    }
+}
+
+fn validate_pressure_threshold(name: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(format!("{name} must be between 0.0 and 100.0"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
@@ -2248,6 +2330,14 @@ impl Config {
         config.runtime.engine.validate().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
+        config
+            .runtime
+            .production
+            .pressure
+            .validate()
+            .map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+            })?;
         Ok(config)
     }
 
@@ -2272,6 +2362,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.capacity.validate()?;
         self.auth.validate()?;
+        self.runtime.production.pressure.validate()?;
         self.validate_pool_configs()
     }
 
@@ -2822,7 +2913,8 @@ mod tests {
     use super::{
         AuthFailureMessageMode, AuthMode, BackendEndpointConfig, BackendTlsMode, ClientTlsMode,
         Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, PoolLifecycleConfig,
-        PoolMode, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
+        PoolMode, PressureConfig, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig,
+        SocketConfig,
     };
     use crate::snapshot::SettingsSnapshot;
     use clap::Parser;
@@ -3055,6 +3147,70 @@ mod tests {
         assert!(config.runtime.production.control_plane_enabled);
         assert!(config.runtime.production.mirroring_enabled);
         assert!(config.runtime.production.adaptive_enabled);
+    }
+
+    #[test]
+    fn pressure_config_defaults_disabled_and_validates_thresholds() {
+        let pressure = PressureConfig::default();
+        assert!(!pressure.enabled);
+        assert_eq!(pressure.cpu_high_pct, 20.0);
+        assert_eq!(pressure.mem_high_pct, 10.0);
+        assert_eq!(pressure.min_in_flight_floor, 1);
+        pressure
+            .validate()
+            .expect("default pressure config is valid");
+
+        let mut invalid = pressure.clone();
+        invalid.cpu_high_pct = 101.0;
+        assert!(invalid.validate().expect_err("invalid cpu").contains("cpu"));
+
+        let mut invalid = pressure;
+        invalid.min_in_flight_floor = 0;
+        assert!(invalid
+            .validate()
+            .expect_err("invalid floor")
+            .contains("greater than zero"));
+    }
+
+    #[test]
+    fn pressure_config_parses_from_toml_and_cli() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.production.pressure]
+            enabled = true
+            cpu_high_pct = 12.5
+            mem_high_pct = 8.0
+            min_in_flight_floor = 3
+            window_ms = 2500
+            "#,
+        )
+        .expect("pressure config parses");
+
+        assert!(config.runtime.production.pressure.enabled);
+        assert_eq!(config.runtime.production.pressure.cpu_high_pct, 12.5);
+        assert_eq!(config.runtime.production.pressure.mem_high_pct, 8.0);
+        assert_eq!(config.runtime.production.pressure.min_in_flight_floor, 3);
+        assert_eq!(config.runtime.production.pressure.window_ms, 2_500);
+
+        let config = Config::try_parse_from_args([
+            "pg-kinetic",
+            "--pressure-enabled",
+            "--pressure-cpu-high-pct",
+            "11.5",
+            "--pressure-mem-high-pct",
+            "9.5",
+            "--pressure-min-in-flight-floor",
+            "2",
+            "--pressure-window-ms",
+            "1000",
+        ])
+        .expect("pressure flags parse");
+
+        assert!(config.runtime.production.pressure.enabled);
+        assert_eq!(config.runtime.production.pressure.cpu_high_pct, 11.5);
+        assert_eq!(config.runtime.production.pressure.mem_high_pct, 9.5);
+        assert_eq!(config.runtime.production.pressure.min_in_flight_floor, 2);
+        assert_eq!(config.runtime.production.pressure.window_ms, 1_000);
     }
 
     #[test]

@@ -158,6 +158,17 @@ impl ProxyBufferPool {
         }
     }
 
+    pub fn trim_cached(&self) {
+        for buffers in self
+            .available
+            .lock()
+            .expect("buffer pool poisoned")
+            .iter_mut()
+        {
+            buffers.trim_empty_buffers();
+        }
+    }
+
     fn recycle(&self, mut buffers: SessionBufferSet) {
         buffers.prepare_for_reuse();
         let mut available = self.available.lock().expect("buffer pool poisoned");

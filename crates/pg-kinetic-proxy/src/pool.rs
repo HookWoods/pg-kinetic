@@ -48,6 +48,7 @@ pub struct BackendPool {
     max_waiters: usize,
     route_max_in_flight: usize,
     route_max_waiters: usize,
+    route_dynamic_limit: Option<Arc<AtomicUsize>>,
     checkout_timeout: Duration,
     lifecycle: PoolLifecycleConfig,
 }
@@ -976,6 +977,38 @@ impl BackendPool {
         global_backend_slots: Option<Arc<Semaphore>>,
         global_backend_available: Option<Arc<Notify>>,
     ) -> Arc<Self> {
+        Self::new_with_socket_lifecycle_global_limit_notify_and_route_limit(
+            backend_addr,
+            tls,
+            socket,
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            checkout_timeout,
+            reset_query,
+            lifecycle,
+            global_backend_slots,
+            global_backend_available,
+            None,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_socket_lifecycle_global_limit_notify_and_route_limit(
+        backend_addr: SocketAddr,
+        tls: TlsConfig,
+        socket: SocketConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        reset_query: impl Into<Arc<str>>,
+        lifecycle: PoolLifecycleConfig,
+        global_backend_slots: Option<Arc<Semaphore>>,
+        global_backend_available: Option<Arc<Notify>>,
+        route_dynamic_limit: Option<Arc<AtomicUsize>>,
+    ) -> Arc<Self> {
         assert!(
             lifecycle.validate().is_ok(),
             "invalid pool lifecycle config"
@@ -1001,6 +1034,7 @@ impl BackendPool {
             max_waiters,
             route_max_in_flight,
             route_max_waiters,
+            route_dynamic_limit,
             checkout_timeout,
             lifecycle,
         })
@@ -1459,10 +1493,23 @@ impl BackendPool {
         route_gates
             .entry(pool_key)
             .or_insert_with(|| RouteGateEntry {
-                gate: BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
+                gate: self.route_backpressure_gate(),
                 metrics: RouteMetricHandles::resolve(route),
             })
             .clone()
+    }
+
+    fn route_backpressure_gate(&self) -> BackpressureGate {
+        self.route_dynamic_limit.as_ref().map_or_else(
+            || BackpressureGate::new(self.route_max_in_flight, self.route_max_waiters),
+            |limit| {
+                BackpressureGate::with_dynamic_limit(
+                    self.route_max_in_flight,
+                    self.route_max_waiters,
+                    Arc::clone(limit),
+                )
+            },
+        )
     }
 
     pub fn with_snapshot_store(&self, f: impl FnOnce(&SnapshotStore)) {
