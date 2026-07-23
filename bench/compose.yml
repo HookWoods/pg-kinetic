@@ -1,6 +1,7 @@
 services:
   pg-direct:
     image: postgres:18
+    command: &postgres_command ["postgres", "-c", "max_connections=512"]
     environment: &postgres_env
       POSTGRES_DB: pgkinetic
       POSTGRES_USER: postgres
@@ -23,6 +24,7 @@ services:
 
   pg-bouncer-db:
     image: postgres:18
+    command: *postgres_command
     environment: *postgres_env
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -34,6 +36,7 @@ services:
 
   pg-dog-db:
     image: postgres:18
+    command: *postgres_command
     environment: *postgres_env
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -45,6 +48,7 @@ services:
 
   pg-kinetic-db:
     image: postgres:18
+    command: *postgres_command
     environment: *postgres_env
     volumes:
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -120,14 +124,15 @@ services:
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
       PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"
-      PG_KINETIC_PHASE_TIMING_SAMPLE_RATE: "${PG_KINETIC_PHASE_TIMING_SAMPLE_RATE:-1.0}"
+      PG_KINETIC_PHASE_TIMING_SAMPLE_RATE: "${PG_KINETIC_PHASE_TIMING_SAMPLE_RATE:-0.0}"
       PG_KINETIC_HEALTH_ADDR: "0.0.0.0:9091"
       PG_KINETIC_AUTH_MODE: trust
       PG_KINETIC_AUTH_USERS_FILE: /etc/pg-kinetic/auth-users.txt
       PG_KINETIC_BACKEND_USER: postgres
       PG_KINETIC_BACKEND_PASSWORD_ENV_VAR_NAME: PG_KINETIC_BACKEND_PASSWORD
       PG_KINETIC_BACKEND_PASSWORD: postgres
-      PG_KINETIC_MAX_BACKENDS: "64"
+      PG_KINETIC_MAX_BACKENDS: "${PG_KINETIC_MAX_BACKENDS:-512}"
+      PG_KINETIC_POOL_MAX_SIZE: "${PG_KINETIC_POOL_MAX_SIZE:-512}"
       RUST_LOG: info
     volumes:
       - ./pg-kinetic/auth-users.txt:/etc/pg-kinetic/auth-users.txt:ro

@@ -1829,7 +1829,7 @@ pub struct ObservabilityConfig {
     #[arg(
         long,
         env = "PG_KINETIC_PHASE_TIMING_SAMPLE_RATE",
-        default_value_t = 1.0
+        default_value_t = 0.0
     )]
     pub phase_timing_sample_rate: f64,
 
@@ -1852,7 +1852,7 @@ impl Default for ObservabilityConfig {
         Self {
             metrics_addr: None,
             debug_trace_sampling_rate: 0.0,
-            phase_timing_sample_rate: 1.0,
+            phase_timing_sample_rate: 0.0,
             otel_enabled: false,
             otel_endpoint: None,
             otel_service_name: String::from("pg-kinetic"),
@@ -2903,7 +2903,7 @@ mod tests {
         assert_eq!(config.admin.admin_max_clients, 8);
         assert_eq!(config.observability.metrics_addr, None);
         assert_eq!(config.observability.debug_trace_sampling_rate, 0.0);
-        assert_eq!(config.observability.phase_timing_sample_rate, 1.0);
+        assert_eq!(config.observability.phase_timing_sample_rate, 0.0);
         assert!(!config.observability.otel_enabled);
         assert_eq!(config.observability.otel_endpoint, None);
         assert_eq!(config.observability.otel_service_name, "pg-kinetic");

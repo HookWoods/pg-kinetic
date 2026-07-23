@@ -190,6 +190,9 @@ pub fn sampled_phase_timing_recorder(
     if !enabled || sample_rate <= 0.0 {
         return phase_timing_recorder(false);
     }
+    if sample_rate >= 1.0 {
+        return shared_phase_timing_recorder();
+    }
 
     let recorder = shared_phase_timing_recorder();
     Arc::new(SampledPhaseTimingRecorder::new(
@@ -612,9 +615,14 @@ pub fn emit_debug_sample_with(
     session_id: u64,
     build_sample: impl FnOnce() -> DebugSample,
 ) {
-    let Some(sample) = sampler.sample_with(session_id, build_sample) else {
+    if !sampler.should_sample(session_id) {
         return;
-    };
+    }
+    if !tracing::enabled!(target: "pg_kinetic", tracing::Level::DEBUG) {
+        return;
+    }
+
+    let sample = build_sample();
 
     tracing::debug!(
         target: "pg_kinetic",

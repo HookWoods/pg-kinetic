@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     future::Future,
     io::IoSlice,
     net::SocketAddr,
@@ -111,6 +112,7 @@ const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 const INVALID_CATALOG_NAME_SQLSTATE: &str = "3D000";
 const REPLICA_UNAVAILABLE_MESSAGE: &str = "no healthy replica available";
 const POOL_WARMUP_MIN_IDLE_BACKENDS: usize = 2;
+const SQL_PLAN_CACHE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendFailureKind {
@@ -1357,6 +1359,7 @@ async fn handle_client(
     let mut session = VirtualSession::default();
     let mut pinned_backend = PinnedBackend::default();
     let mut prepared = PreparedCatalog::new(session_id);
+    let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
     let mut held_backend: Option<PooledBackend> = None;
     let mut wait_for_client_activity_after_timeout = false;
     let mut mirror_query_id = 0_u64;
@@ -1641,9 +1644,13 @@ async fn handle_client(
                 let current_query_id = mirror_query_id;
                 mirror_query_id = mirror_query_id.wrapping_add(1);
                 let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
-                let request_plans =
-                    request_plans_for_frames(&prepared, &frames, full_routing_analysis)
-                        .context("build request plan before backend checkout")?;
+                let request_plans = request_plans_for_frames(
+                    &prepared,
+                    &frames,
+                    full_routing_analysis,
+                    &mut sql_plan_cache,
+                )
+                .context("build request plan before backend checkout")?;
                 let committed_write_transaction = update_transaction_state_from_request_plans(
                     &mut session,
                     &request_plans,
@@ -1768,9 +1775,6 @@ async fn handle_client(
                     .filter(|plan| plan.updates_session_state)
                     .map(|plan| plan.command.clone())
                     .collect();
-                let request_is_safe_to_replay =
-                    safe_request_to_replay(&frames, &request_plans, &session);
-                drop(request_plans);
                 let mut retry_attempted = false;
                 let (result, progress) = loop {
                     let mut progress = QueryProgress::default();
@@ -1803,7 +1807,7 @@ async fn handle_client(
                                     && retry_disposition(
                                         failure.kind,
                                         failure.response_started,
-                                        request_is_safe_to_replay,
+                                        safe_request_to_replay(&frames, &request_plans, &session),
                                     ) == RetryDisposition::RetryBeforeResponse
                             })
                             .unwrap_or(false),
@@ -2142,6 +2146,7 @@ async fn handle_client(
                         wait_for_client_activity_after_timeout = true;
                     }
                 }
+                drop(request_plans);
             }
             ClientCycle::Terminate => {
                 if let Some(backend) = held_backend.take() {
@@ -2873,27 +2878,93 @@ struct RequestPlan<'a> {
     updates_session_state: bool,
 }
 
+#[derive(Clone, Debug)]
+struct CachedSqlPlan {
+    command: SqlCommand,
+    analysis: Option<SqlAnalysis>,
+}
+
+#[derive(Debug)]
+struct SqlPlanCache {
+    capacity: usize,
+    plans: HashMap<Vec<u8>, CachedSqlPlan>,
+    insertion_order: VecDeque<Vec<u8>>,
+}
+
+impl SqlPlanCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            plans: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    fn get_or_insert(&mut self, sql: &str, needs_analysis: bool) -> CachedSqlPlan {
+        if let Some(plan) = self.plans.get(sql.as_bytes()) {
+            if !needs_analysis || plan.analysis.is_some() {
+                return plan.clone();
+            }
+        }
+
+        let command = self
+            .plans
+            .get(sql.as_bytes())
+            .map(|plan| plan.command.clone())
+            .unwrap_or_else(|| classify(sql));
+        let plan = CachedSqlPlan {
+            command,
+            analysis: needs_analysis.then(|| analyze_sql(sql)),
+        };
+        if self.capacity == 0 {
+            return plan;
+        }
+
+        let key = sql.as_bytes().to_vec();
+        if !self.plans.contains_key(key.as_slice()) {
+            self.insertion_order.push_back(key.clone());
+        }
+        self.plans.insert(key, plan.clone());
+        self.evict_to_capacity();
+        plan
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.plans.len() > self.capacity {
+            let Some(key) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.plans.remove(key.as_slice());
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.plans.len()
+    }
+}
+
 impl<'a> RequestPlan<'a> {
     fn new(
         sql: Cow<'a, str>,
         updates_transaction_state: bool,
         updates_session_state: bool,
         needs_analysis: bool,
+        cache: &mut SqlPlanCache,
     ) -> Self {
-        let command = classify(sql.as_ref());
-        let analysis = needs_analysis.then(|| analyze_sql(sql.as_ref()));
+        let cached = cache.get_or_insert(sql.as_ref(), needs_analysis);
         Self {
             sql,
-            command,
-            analysis,
+            command: cached.command,
+            analysis: cached.analysis,
             updates_transaction_state,
             updates_session_state,
         }
     }
 
-    fn from_prepared(statement: &'a pg_kinetic_core::prepare::PreparedStatement) -> Self {
+    fn from_prepared(statement: &pg_kinetic_core::prepare::PreparedStatement) -> Self {
         Self {
-            sql: Cow::Borrowed(statement.query.as_str()),
+            sql: Cow::Owned(statement.query.clone()),
             command: statement.command().clone(),
             analysis: Some(statement.analysis()),
             updates_transaction_state: false,
@@ -2907,11 +2978,12 @@ impl<'a> RequestPlan<'a> {
     }
 }
 
-fn request_plans_for_frames<'a>(
-    prepared: &'a PreparedCatalog,
-    frames: &'a [FrontendFrame],
+fn request_plans_for_frames<'frames>(
+    prepared: &PreparedCatalog,
+    frames: &'frames [FrontendFrame],
     analyze_sql: bool,
-) -> anyhow::Result<Vec<RequestPlan<'a>>> {
+    cache: &mut SqlPlanCache,
+) -> anyhow::Result<Vec<RequestPlan<'frames>>> {
     let mut plans = Vec::new();
     for frame in frames {
         if let Some(query) = parse_simple_query(frame)? {
@@ -2920,6 +2992,7 @@ fn request_plans_for_frames<'a>(
                 true,
                 true,
                 analyze_sql,
+                cache,
             ));
             continue;
         }
@@ -2930,6 +3003,7 @@ fn request_plans_for_frames<'a>(
                 true,
                 false,
                 analyze_sql,
+                cache,
             ));
             continue;
         }
@@ -2957,6 +3031,56 @@ fn request_plans_for_frames<'a>(
     }
 
     Ok(plans)
+}
+
+#[cfg(test)]
+mod sql_plan_cache_tests {
+    use super::*;
+    use pg_kinetic_core::routing::{QueryClass as RoutingQueryClass, RoutingHint};
+
+    #[test]
+    fn cached_sql_plan_upgrades_to_full_analysis_only_when_needed() {
+        let mut cache = SqlPlanCache::new(8);
+
+        let minimal = cache.get_or_insert("select 1", false);
+        assert_eq!(minimal.command, SqlCommand::Query);
+        assert!(minimal.analysis.is_none());
+        assert_eq!(cache.len(), 1);
+
+        let repeated_minimal = cache.get_or_insert("select 1", false);
+        assert_eq!(repeated_minimal.command, SqlCommand::Query);
+        assert!(repeated_minimal.analysis.is_none());
+        assert_eq!(cache.len(), 1);
+
+        let analyzed = cache.get_or_insert("select 1", true);
+        assert_eq!(analyzed.command, SqlCommand::Query);
+        assert_eq!(
+            analyzed.analysis.expect("analysis").query_class(),
+            RoutingQueryClass::ReadCandidate
+        );
+        assert_eq!(cache.len(), 1);
+
+        let repeated_analyzed = cache.get_or_insert("select 1", true);
+        assert_eq!(
+            repeated_analyzed.analysis.expect("analysis").routing_hint(),
+            RoutingHint::None
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cached_sql_plan_is_bounded() {
+        let mut cache = SqlPlanCache::new(2);
+
+        cache.get_or_insert("select 1", true);
+        cache.get_or_insert("select 2", true);
+        cache.get_or_insert("select 3", true);
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.plans.contains_key(&b"select 1"[..]));
+        assert!(cache.plans.contains_key(&b"select 2"[..]));
+        assert!(cache.plans.contains_key(&b"select 3"[..]));
+    }
 }
 
 fn safe_request_to_replay(

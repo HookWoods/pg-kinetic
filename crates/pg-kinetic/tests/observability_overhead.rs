@@ -7,8 +7,8 @@ use pg_kinetic::{
     config::ObservabilityConfig,
     core::observability::{metric_catalog, LabelPolicy},
     proxy_runtime::telemetry::{
-        build_otel_tracer_provider, sampled_phase_timing_recorder, DebugSample, DebugSampler,
-        PhaseTimer,
+        build_otel_tracer_provider, emit_debug_sample_with, sampled_phase_timing_recorder,
+        shared_phase_timing_recorder, DebugSample, DebugSampler, PhaseTimer,
     },
 };
 
@@ -100,6 +100,23 @@ fn debug_sampling_is_deterministic_and_skips_unsampled_construction() {
 }
 
 #[test]
+fn debug_sample_emission_skips_construction_when_debug_tracing_is_disabled() {
+    let sampler = DebugSampler::new(1.0);
+    let constructed = AtomicUsize::new(0);
+
+    emit_debug_sample_with(&sampler, 42, || {
+        constructed.fetch_add(1, Ordering::Relaxed);
+        DebugSample::client_close(
+            42,
+            "127.0.0.1:5432".parse().expect("client address"),
+            Default::default(),
+        )
+    });
+
+    assert_eq!(constructed.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn disabled_phase_recorder_skips_clock_reads() {
     use pg_kinetic::core::observability::{MetricOutcome, ProtocolPhase};
 
@@ -108,4 +125,13 @@ fn disabled_phase_recorder_skips_clock_reads() {
 
     let timer = PhaseTimer::start(ProtocolPhase::Execute, recorder.as_ref());
     assert_eq!(timer.finish(MetricOutcome::Ok), std::time::Duration::ZERO);
+}
+
+#[test]
+fn full_phase_sampling_uses_shared_recorder_directly() {
+    let shared = shared_phase_timing_recorder();
+    let sampled = sampled_phase_timing_recorder(true, 1.0, 42);
+
+    assert!(sampled.is_enabled());
+    assert!(std::sync::Arc::ptr_eq(&shared, &sampled));
 }

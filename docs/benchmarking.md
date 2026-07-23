@@ -31,6 +31,13 @@ The compose stack gives each target its own PostgreSQL instance and private pair
 
 The `driver` service joins every pair network for in-container checks and workload execution. pg-kinetic defaults to `PG_KINETIC_RUNTIME_ENGINE=thread_per_core` in this stack; override it only for explicit runtime A/B experiments. Verify every backend with `pg_isready` before collecting a baseline or candidate, then run targets sequentially or interleaved so one workload is active at a time. Stop the stack with `docker compose -f bench/compose.yml down --volumes --remove-orphans` after each measurement session.
 
+The comparison stack is capacity-matched for high-concurrency read-only runs:
+each isolated PostgreSQL backend starts with `max_connections=512`, pg-kinetic
+defaults to `PG_KINETIC_MAX_BACKENDS=512` and
+`PG_KINETIC_POOL_MAX_SIZE=512`, and PgBouncer and PgDog default to
+`default_pool_size=512`. If you change any one of these values, record the
+change beside the benchmark result because it changes the pooler comparison.
+
 The benchmark scenarios use their own target DSNs. For a host-side workload driver, set them to the selected compose port (`55432`, `56432`, `57432`, or `58432`) before collecting measurements; the checked-in scenario ports model an internal target matrix. Do not commit credentials or generated benchmark output in the repository. The runner redacts DSN credentials in JSON output.
 
 ## Scenario Format
