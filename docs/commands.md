@@ -248,7 +248,7 @@ Flags:
 ```bash
 pg-kinetic profile validate
 pg-kinetic profile run --scenario bench/scenarios/benchmark-simple-query.toml --kind flamegraph
-pg-kinetic profile run --scenario bench/scenarios/benchmark-simple-query.toml --kind ebpf
+pg-kinetic profile run --scenario bench/scenarios/benchmark-simple-query.toml --kind perf
 ```
 
 Supported profile tools are validated locally because platform support differs between Windows, Linux, and developer machines.
@@ -258,6 +258,6 @@ Flags:
 | Command | Flags |
 | --- | --- |
 | `profile validate` | No command-specific flags. |
-| `profile run` | Required `--scenario path` and `--kind flamegraph|perf|ebpf`; optional `--target name` default `pg-kinetic`; optional `--output path`. |
+| `profile run` | Required `--scenario path` and `--kind flamegraph|perf`; optional `--target name` default `pg-kinetic`; optional `--output path`. |
 
 Common failures: profiler executable missing, OS support missing, invalid benchmark scenario, or output path not writable.

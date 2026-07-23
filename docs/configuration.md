@@ -172,8 +172,8 @@ v1 uses a single shared backend service identity: pg-kinetic does not infer per-
 | `runtime.lifecycle.startup_backend_checks_enabled` | bool | `true` | `--startup-backend-checks-enabled` | `PG_KINETIC_STARTUP_BACKEND_CHECKS_ENABLED` | restart | Startup readiness depends on backend checks when true. |
 | `runtime.lifecycle.termination_grace_period_seconds` | seconds | `65` | `--termination-grace-period-seconds` | `PG_KINETIC_TERMINATION_GRACE_PERIOD_SECONDS` | restart | Documents expected supervisor grace period. |
 | `runtime.node.node_id` | string | generated host/process id | `--node-id` | `PG_KINETIC_NODE_ID` | restart | Empty or invalid ids fail parse. |
-| `runtime.engine.runtime_engine` | enum | `tokio_default` | `--runtime-engine` | `PG_KINETIC_RUNTIME_ENGINE` | restart | Experimental engines require `experimental_runtime_enabled = true`. |
-| `runtime.engine.experimental_runtime_enabled` | bool | `false` | `--experimental-runtime-enabled` | `PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED` | restart | Experimental runtime parse fails when false. |
+| `runtime.engine.runtime_engine` | enum | `thread_per_core` | `--runtime-engine` | `PG_KINETIC_RUNTIME_ENGINE` | restart | Values are `thread_per_core`, `tokio_default`, `tokio_current_thread`, and `experimental_io_uring`. |
+| `runtime.engine.experimental_runtime_enabled` | bool | `false` | `--experimental-runtime-enabled` | `PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED` | restart | `experimental_io_uring` parse fails when false. |
 | `runtime.production.control_plane_enabled` | bool | `false` | `--control-plane-enabled` | `PG_KINETIC_CONTROL_PLANE_ENABLED` | restart | No control-plane runtime is documented as production-ready. |
 | `runtime.production.mirroring_enabled` | bool | `false` | `--mirroring-enabled` | `PG_KINETIC_MIRRORING_ENABLED` | restart | Live proxy still constructs a disabled mirror dispatcher. |
 | `runtime.production.adaptive_enabled` | bool | `false` | `--adaptive-enabled` | `PG_KINETIC_ADAPTIVE_ENABLED` | restart | Starts recommendation/simulation controller when true. |

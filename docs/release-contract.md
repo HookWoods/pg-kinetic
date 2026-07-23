@@ -52,9 +52,11 @@ The following behavior is stable for production use:
 - Readiness, graceful drain, metrics, and PostgreSQL-protocol admin views for
   operating the proxy and inspecting pool, route, health, and recovery state.
 
-The default runtime engine is `tokio_default`. `experimental_thread_per_core`
-and `experimental_io_uring` remain opt-in and are not part of the default
-release path.
+The default runtime engine is `thread_per_core`. Operators can switch back to
+the Tokio runtime with `runtime_engine = "tokio_default"` or
+`PG_KINETIC_RUNTIME_ENGINE=tokio_default` without rebuilding the binary.
+`experimental_io_uring` remains opt-in and is not part of the default release
+path.
 
 ## Authentication Contract
 

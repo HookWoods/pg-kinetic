@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("flamegraph", "perf", "ebpf")]
+    [ValidateSet("flamegraph", "perf")]
     [string]$Kind = "flamegraph",
     [string]$Scenario = "bench/scenarios/benchmark-simple-query.toml",
     [string]$Target = "pg-kinetic",
