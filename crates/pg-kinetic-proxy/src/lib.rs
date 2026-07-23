@@ -10,6 +10,7 @@ pub mod config;
 pub mod control;
 pub mod drain;
 pub mod health;
+pub mod io_runtime;
 pub mod io_uring;
 pub mod lifecycle;
 pub mod metrics;

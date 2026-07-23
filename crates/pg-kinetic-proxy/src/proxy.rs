@@ -3892,21 +3892,19 @@ struct ForwardCycleState<'a> {
     progress: &'a mut QueryProgress,
 }
 
-async fn forward_message_cycle(
-    client: &mut ClientConnection,
-    backend: &mut PooledBackend,
+fn plan_frontend_cycle(
+    backend_id: u64,
     state: &mut ForwardCycleState<'_>,
     frames: &[FrontendFrame],
     simple_query_commands: &[SqlCommand],
-    max_backend_buffer_bytes: usize,
     buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
-) -> anyhow::Result<ForwardOutcome> {
-    let needs_sync = should_sync_for_frames(&frames);
-    let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
+) -> anyhow::Result<crate::io_runtime::PlannedFrontendCycle> {
+    let needs_sync = should_sync_for_frames(frames);
     let mut simple_query_commands = simple_query_commands.iter();
     let mut injected_parse_completes = 0_usize;
     buffers.clear_backend_write();
+
     for frame in frames {
         let simple_query_command = if frame.tag == u8::from(FrontendTag::Query) {
             Some(
@@ -3918,7 +3916,7 @@ async fn forward_message_cycle(
             None
         };
         let plan = prepare_frame_for_backend(
-            backend.backend_id(),
+            backend_id,
             state.prepared,
             &state.prepared_snapshot_handle,
             frame.clone(),
@@ -3940,10 +3938,39 @@ async fn forward_message_cycle(
         buffers.append_frontend_frame(plan.frame.tag, &plan.frame.payload);
     }
 
+    Ok(crate::io_runtime::PlannedFrontendCycle {
+        backend_bytes: BytesMut::from(buffers.backend_write()),
+        injected_parse_completes,
+        needs_sync,
+    })
+}
+
+async fn forward_message_cycle(
+    client: &mut ClientConnection,
+    backend: &mut PooledBackend,
+    state: &mut ForwardCycleState<'_>,
+    frames: &[FrontendFrame],
+    simple_query_commands: &[SqlCommand],
+    max_backend_buffer_bytes: usize,
+    buffers: &mut SessionBufferSet,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
+) -> anyhow::Result<ForwardOutcome> {
+    let execute_timer = PhaseTimer::start(ProtocolPhase::Execute, phase_recorder);
+    let planned = plan_frontend_cycle(
+        backend.backend_id(),
+        state,
+        frames,
+        simple_query_commands,
+        buffers,
+        phase_recorder,
+    )?;
+    let needs_sync = planned.needs_sync;
+    let mut injected_parse_completes = planned.injected_parse_completes;
+
     backend
         .backend_mut()
         .stream_mut()
-        .write_all(buffers.backend_write())
+        .write_all(&planned.backend_bytes)
         .await
         .map_err(|error| {
             backend_failure(
