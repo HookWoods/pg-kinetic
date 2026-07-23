@@ -81,7 +81,9 @@ pub(super) async fn forward_message_cycle(
         phase_recorder,
     )?;
     let needs_sync = planned.needs_sync;
+    let expected_ready_count = expected_ready_count_for_frames(frames);
     let mut injected_parse_completes = planned.injected_parse_completes;
+    let mut ready_count = 0_usize;
 
     backend
         .backend_mut()
@@ -152,6 +154,7 @@ pub(super) async fn forward_message_cycle(
             state,
             &mut backend_read,
             &mut injected_parse_completes,
+            &mut ready_count,
             &mut forwarded_frames,
         )?;
         *buffers.backend_read_mut() = backend_read;
@@ -166,7 +169,7 @@ pub(super) async fn forward_message_cycle(
             if client.write_all_vectored(&client_write).await.is_err() {
                 buffers.restore_backend_frames(forwarded_frames);
                 buffers.trim_empty_buffers();
-                if let Some(status) = ready {
+                if let Some(status) = ready.filter(|_| ready_count >= expected_ready_count) {
                     rows_timer.finish(MetricOutcome::Canceled);
                     return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
                 }
@@ -177,7 +180,7 @@ pub(super) async fn forward_message_cycle(
         }
         buffers.restore_backend_frames(forwarded_frames);
 
-        if let Some(status) = ready {
+        if let Some(status) = ready.filter(|_| ready_count >= expected_ready_count) {
             buffers.trim_empty_buffers();
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));
@@ -190,6 +193,7 @@ pub(super) fn classify_backend_frames(
     state: &mut ForwardCycleState<'_>,
     backend_buffer: &mut BytesMut,
     injected_parse_completes: &mut usize,
+    ready_count: &mut usize,
     forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
 ) -> anyhow::Result<Option<ReadyStatus>> {
     let mut ready = None;
@@ -215,6 +219,7 @@ pub(super) fn classify_backend_frames(
         }
 
         if let Some(status) = frame.ready_status() {
+            *ready_count += 1;
             ready = Some(status);
         }
         let mut header = [0_u8; 5];
@@ -223,6 +228,14 @@ pub(super) fn classify_backend_frames(
         forwarded_frames.push((header, frame.payload));
     }
     Ok(ready)
+}
+
+fn expected_ready_count_for_frames(frames: &[FrontendFrame]) -> usize {
+    let query_count = frames
+        .iter()
+        .filter(|frame| frame.tag == u8::from(FrontendTag::Query))
+        .count();
+    query_count.max(1)
 }
 
 pub(super) fn prepare_frame_for_backend(
@@ -502,4 +515,25 @@ pub(super) fn update_virtual_session_from_frame(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_ready_count_tracks_batched_simple_queries() {
+        let simple_frames = vec![
+            simple_query_frame("select 1"),
+            simple_query_frame("select 2"),
+            simple_query_frame("select 3"),
+        ];
+        let sync_frame = FrontendFrame {
+            tag: u8::from(FrontendTag::Sync),
+            payload: Bytes::new(),
+        };
+
+        assert_eq!(expected_ready_count_for_frames(&simple_frames), 3);
+        assert_eq!(expected_ready_count_for_frames(&[sync_frame]), 1);
+    }
 }

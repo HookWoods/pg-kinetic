@@ -50,7 +50,9 @@ pub(super) async fn next_client_cycle(
     }
 
     if first.tag == u8::from(FrontendTag::Query) {
-        return Ok(Some(ClientCycle::Frames(vec![first])));
+        let mut frames = vec![first];
+        drain_buffered_simple_queries(client_buffer, &mut frames)?;
+        return Ok(Some(ClientCycle::Frames(frames)));
     }
 
     let mut frames = vec![first];
@@ -99,12 +101,89 @@ pub(super) async fn next_client_cycle(
     Ok(Some(ClientCycle::Frames(frames)))
 }
 
+fn drain_buffered_simple_queries(
+    client_buffer: &mut BytesMut,
+    frames: &mut Vec<FrontendFrame>,
+) -> anyhow::Result<()> {
+    while next_complete_frontend_tag(client_buffer) == Some(u8::from(FrontendTag::Query)) {
+        let Some(frame) = parse_frontend_frame(client_buffer)? else {
+            break;
+        };
+        frames.push(frame);
+    }
+
+    Ok(())
+}
+
+fn next_complete_frontend_tag(buffer: &[u8]) -> Option<u8> {
+    if buffer.len() < 5 {
+        return None;
+    }
+
+    let len = i32::from_be_bytes(
+        buffer[1..5]
+            .try_into()
+            .expect("frontend frame length header is present"),
+    );
+    if len < 4 {
+        return Some(buffer[0]);
+    }
+
+    (buffer.len() >= len as usize + 1).then_some(buffer[0])
+}
+
 #[derive(Debug)]
 pub(super) enum ClientCycle {
     Frames(Vec<FrontendFrame>),
     Terminate,
     IdleTimeout(IdleTimeoutKind),
     BufferLimitExceeded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frontend_frame(tag: FrontendTag, payload: &[u8]) -> BytesMut {
+        let mut frame = BytesMut::with_capacity(payload.len() + 5);
+        frame.put_u8(u8::from(tag));
+        frame.put_i32((payload.len() + 4) as i32);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn drains_pipelined_simple_queries_already_in_one_read_buffer() {
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 1\0"));
+        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 2\0"));
+        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 3\0"));
+        let first = parse_frontend_frame(&mut buffer)
+            .expect("first query parses")
+            .expect("first query is complete");
+        let mut frames = vec![first];
+
+        drain_buffered_simple_queries(&mut buffer, &mut frames).expect("drain queries");
+
+        assert_eq!(frames.len(), 3);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn simple_query_drain_preserves_partial_followup_frame() {
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 1\0"));
+        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 2\0")[..3]);
+        let first = parse_frontend_frame(&mut buffer)
+            .expect("first query parses")
+            .expect("first query is complete");
+        let mut frames = vec![first];
+
+        drain_buffered_simple_queries(&mut buffer, &mut frames).expect("drain queries");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(buffer.len(), 3);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
