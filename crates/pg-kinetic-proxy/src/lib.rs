@@ -12,6 +12,8 @@ pub mod drain;
 pub mod health;
 pub mod io_runtime;
 pub mod io_uring;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod io_uring_transport;
 pub mod lifecycle;
 pub mod metrics;
 pub mod mirror;
