@@ -234,6 +234,7 @@ mod linux {
         let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
         let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+        let mut backend_scan_buffer = BytesMut::with_capacity(16 * 1024);
 
         let read = client
             .read_into(&mut client_buffer)
@@ -260,11 +261,11 @@ mod linux {
                 .write_all(&backend_buffer)
                 .await
                 .context("write startup response")?;
-            if startup_ready_seen(&backend_buffer)? {
-                backend_buffer.clear();
+            backend_scan_buffer.extend_from_slice(&backend_buffer);
+            backend_buffer.clear();
+            if ready_seen(&mut backend_scan_buffer)? {
                 break;
             }
-            backend_buffer.clear();
         }
 
         loop {
@@ -294,19 +295,19 @@ mod linux {
                     .write_all(&backend_buffer)
                     .await
                     .context("write backend response")?;
-                if startup_ready_seen(&backend_buffer)? {
-                    backend_buffer.clear();
+                backend_scan_buffer.extend_from_slice(&backend_buffer);
+                backend_buffer.clear();
+                if ready_seen(&mut backend_scan_buffer)? {
                     break;
                 }
-                backend_buffer.clear();
             }
         }
     }
 
-    fn startup_ready_seen(buffer: &BytesMut) -> anyhow::Result<bool> {
-        let mut scan = buffer.clone();
-        while let Some(frame) = pg_kinetic_wire::backend::parse_backend_frame(&mut scan)? {
+    fn ready_seen(buffer: &mut BytesMut) -> anyhow::Result<bool> {
+        while let Some(frame) = pg_kinetic_wire::backend::parse_backend_frame(buffer)? {
             if frame.ready_status().is_some() {
+                buffer.clear();
                 return Ok(true);
             }
         }
