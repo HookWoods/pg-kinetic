@@ -1093,6 +1093,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-kinetic-splice-protocol"
+version = "0.1.0"
+dependencies = [
+ "pretty_assertions",
+]
+
+[[package]]
 name = "pg-kinetic-proxy"
 version = "0.1.0"
 dependencies = [
