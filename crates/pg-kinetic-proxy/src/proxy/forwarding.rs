@@ -16,7 +16,8 @@ pub(super) fn plan_frontend_cycle(
     buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<crate::io_runtime::PlannedFrontendCycle> {
-    let needs_sync = should_sync_for_frames(frames);
+    let cycle_shape = crate::io_runtime::FrontendCycleShape::from_frames(frames);
+    let needs_sync = cycle_shape.needs_sync();
     let mut simple_query_commands = simple_query_commands.iter();
     let mut injected_parse_completes = 0_usize;
     buffers.clear_backend_write();
@@ -81,7 +82,8 @@ pub(super) async fn forward_message_cycle(
         phase_recorder,
     )?;
     let needs_sync = planned.needs_sync;
-    let expected_ready_count = expected_ready_count_for_frames(frames);
+    let expected_ready_count =
+        crate::io_runtime::FrontendCycleShape::from_frames(frames).expected_ready_count();
     let mut injected_parse_completes = planned.injected_parse_completes;
     let mut ready_count = 0_usize;
 
@@ -230,14 +232,6 @@ pub(super) fn classify_backend_frames(
     })
 }
 
-fn expected_ready_count_for_frames(frames: &[FrontendFrame]) -> usize {
-    let query_count = frames
-        .iter()
-        .filter(|frame| frame.tag == u8::from(FrontendTag::Query))
-        .count();
-    query_count.max(1)
-}
-
 pub(super) fn prepare_frame_for_backend(
     backend_id: u64,
     prepared: &mut PreparedCatalog,
@@ -365,12 +359,6 @@ pub(super) enum ForwardOutcome {
     ClientDisconnectedAfterReady(ReadyStatus),
     AbandonedResponse { needs_sync: bool },
     BufferLimitExceeded,
-}
-
-pub(super) fn should_sync_for_frames(frames: &[FrontendFrame]) -> bool {
-    frames
-        .iter()
-        .any(|frame| frame.tag != u8::from(FrontendTag::Query))
 }
 
 pub(super) fn simple_query_frame(sql: &str) -> FrontendFrame {
@@ -522,7 +510,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expected_ready_count_tracks_batched_simple_queries() {
+    fn cycle_shape_tracks_batched_simple_queries() {
         let simple_frames = vec![
             simple_query_frame("select 1"),
             simple_query_frame("select 2"),
@@ -533,7 +521,12 @@ mod tests {
             payload: Bytes::new(),
         };
 
-        assert_eq!(expected_ready_count_for_frames(&simple_frames), 3);
-        assert_eq!(expected_ready_count_for_frames(&[sync_frame]), 1);
+        let simple_shape = crate::io_runtime::FrontendCycleShape::from_frames(&simple_frames);
+        let sync_shape = crate::io_runtime::FrontendCycleShape::from_frames(&[sync_frame]);
+
+        assert_eq!(simple_shape.expected_ready_count(), 3);
+        assert!(!simple_shape.needs_sync());
+        assert_eq!(sync_shape.expected_ready_count(), 1);
+        assert!(sync_shape.needs_sync());
     }
 }

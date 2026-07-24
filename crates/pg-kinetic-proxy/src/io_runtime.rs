@@ -1,5 +1,40 @@
 use bytes::{Bytes, BytesMut};
 use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
+use pg_kinetic_wire::{frame::FrontendFrame, protocol::FrontendTag};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontendCycleShape {
+    expected_ready_count: usize,
+    needs_sync: bool,
+}
+
+impl FrontendCycleShape {
+    #[must_use]
+    pub fn from_frames(frames: &[FrontendFrame]) -> Self {
+        let query_count = frames
+            .iter()
+            .filter(|frame| frame.tag == u8::from(FrontendTag::Query))
+            .count();
+        let needs_sync = frames
+            .iter()
+            .any(|frame| frame.tag != u8::from(FrontendTag::Query));
+
+        Self {
+            expected_ready_count: query_count.max(1),
+            needs_sync,
+        }
+    }
+
+    #[must_use]
+    pub const fn expected_ready_count(self) -> usize {
+        self.expected_ready_count
+    }
+
+    #[must_use]
+    pub const fn needs_sync(self) -> bool {
+        self.needs_sync
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PlannedFrontendCycle {
