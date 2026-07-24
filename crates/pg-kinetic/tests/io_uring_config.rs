@@ -1,8 +1,11 @@
 use pg_kinetic::{
-    config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, RouteConfig},
+    config::{
+        AuthMode, BackendTlsMode, ClientTlsMode, Config, PoolConfig, ReadRoutingConfig, RouteConfig,
+    },
     core::runtime::RuntimeEngine,
     proxy_runtime::io_uring,
 };
+use pg_kinetic_core::routing::ReadRoutingMode;
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();
@@ -17,6 +20,18 @@ fn io_uring_accepts_current_plain_pass_through_boundary() {
 
     io_uring::validate_supported_config_for_test(&config)
         .expect("plain pass-through io_uring boundary remains supported");
+}
+
+#[test]
+fn io_uring_accepts_single_primary_route_boundary() {
+    let mut config = io_uring_config();
+    config.routes = vec![RouteConfig::from_backend_addr(
+        "127.0.0.1:6544".parse().expect("route addr"),
+    )];
+
+    let resolved = io_uring::direct_backend_addr_for_test(&config).expect("route is supported");
+
+    assert_eq!(resolved.to_string(), "127.0.0.1:6544");
 }
 
 #[test]
@@ -53,12 +68,60 @@ fn io_uring_rejects_auth_modes_until_auth_path_exists() {
 }
 
 #[test]
-fn io_uring_rejects_routes_until_pooling_path_exists() {
+fn io_uring_rejects_multiple_routes_until_route_selection_exists() {
     let mut config = io_uring_config();
-    config.routes = vec![RouteConfig::default()];
+    config.routes = vec![
+        RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr")),
+        RouteConfig::from_backend_addr("127.0.0.1:6545".parse().expect("route addr")),
+    ];
 
     let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("routes are not supported yet");
+        .expect_err("route selection is not supported yet");
 
-    assert!(error.to_string().contains("routes to be omitted"));
+    assert!(error.to_string().contains("single primary route"));
+}
+
+#[test]
+fn io_uring_rejects_replicas_until_pooling_path_exists() {
+    let mut config = io_uring_config();
+    let mut route = RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
+    route.replicas.push(Default::default());
+    config.routes = vec![route];
+
+    let error = io_uring::validate_supported_config_for_test(&config)
+        .expect_err("replica routing is not supported yet");
+
+    assert!(error.to_string().contains("replicas"));
+}
+
+#[test]
+fn io_uring_rejects_read_routing_until_route_selection_exists() {
+    let mut config = io_uring_config();
+    let mut route = RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
+    route.read_routing = ReadRoutingConfig {
+        read_routing_mode: ReadRoutingMode::PreferReplica,
+        ..ReadRoutingConfig::default()
+    };
+    config.routes = vec![route];
+
+    let error = io_uring::validate_supported_config_for_test(&config)
+        .expect_err("read routing is not supported yet");
+
+    assert!(error.to_string().contains("read routing"));
+}
+
+#[test]
+fn io_uring_rejects_pool_configs_until_pool_checkout_exists() {
+    let mut config = io_uring_config();
+    config.pools = vec![PoolConfig {
+        database: "app".to_string(),
+        user: "app".to_string(),
+        backend_addr: "127.0.0.1:6544".parse().expect("pool addr"),
+        max_backends: None,
+    }];
+
+    let error = io_uring::validate_supported_config_for_test(&config)
+        .expect_err("pool checkout is not supported yet");
+
+    assert!(error.to_string().contains("pool configs"));
 }

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use crate::{config::Config, metrics};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -30,6 +32,7 @@ mod linux {
     pub fn run(config: Config) -> anyhow::Result<()> {
         validate_supported_config(&config)?;
 
+        let backend_addr = direct_backend_addr(&config)?;
         let shard_count = config
             .runtime
             .engine
@@ -52,7 +55,6 @@ mod linux {
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
-            let backend_addr = config.connection.backend_addr;
             let drain_timeout = config.drain.drain_timeout();
             let max_client_buffer_bytes = config.qos.max_client_buffer_bytes;
             let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
@@ -112,7 +114,7 @@ mod linux {
 
         tracing::info!(
             listen_addr = %config.connection.listen_addr,
-            backend_addr = %config.connection.backend_addr,
+            backend_addr = %backend_addr,
             shards = shard_count,
             "experimental io_uring plaintext pass-through runtime listening"
         );
@@ -426,6 +428,10 @@ pub fn validate_supported_config_for_test(config: &Config) -> anyhow::Result<()>
     validate_supported_config(config)
 }
 
+pub fn direct_backend_addr_for_test(config: &Config) -> anyhow::Result<SocketAddr> {
+    direct_backend_addr(config)
+}
+
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
     use crate::config::{AuthMode, BackendTlsMode, ClientTlsMode};
 
@@ -438,19 +444,55 @@ fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
     if config.auth.auth_mode != AuthMode::PassThrough {
         anyhow::bail!("experimental_io_uring currently requires auth_mode=pass_through");
     }
-    if !config.routes.is_empty() {
+    direct_backend_addr(config)?;
+    Ok(())
+}
+
+fn direct_backend_addr(config: &Config) -> anyhow::Result<SocketAddr> {
+    use crate::config::{BackendTlsMode, FreshnessConfig, HaConfig, ReadRoutingConfig};
+
+    if !config.pools.is_empty() {
         anyhow::bail!(
-            "experimental_io_uring currently requires routes to be omitted; it uses connection.backend_addr directly"
+            "experimental_io_uring currently rejects pool configs until shared pool checkout exists"
         );
     }
-    Ok(())
+
+    let routes = config.effective_routes();
+    let [route] = routes.as_slice() else {
+        anyhow::bail!("experimental_io_uring currently requires a single primary route");
+    };
+    if !route.replicas.is_empty() {
+        anyhow::bail!(
+            "experimental_io_uring currently rejects replicas until route selection exists"
+        );
+    }
+    if route.read_routing != ReadRoutingConfig::default() {
+        anyhow::bail!(
+            "experimental_io_uring currently rejects read routing until route selection exists"
+        );
+    }
+    if route.freshness != FreshnessConfig::default() {
+        anyhow::bail!(
+            "experimental_io_uring currently rejects freshness policy until route selection exists"
+        );
+    }
+    if route.ha != HaConfig::default() {
+        anyhow::bail!(
+            "experimental_io_uring currently rejects route HA until route selection exists"
+        );
+    }
+    if route.primary.tls_mode != BackendTlsMode::Disable {
+        anyhow::bail!("experimental_io_uring currently requires route primary tls_mode=disable");
+    }
+    Ok(route.primary.address)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::config::{AuthMode, ClientTlsMode};
+    use crate::config::{AuthMode, ClientTlsMode, PoolConfig, ReadRoutingConfig, RouteConfig};
+    use pg_kinetic_core::routing::ReadRoutingMode;
 
     #[test]
     fn supported_config_accepts_plain_pass_through_defaults() {
@@ -480,14 +522,58 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_route_configuration() {
+    fn supported_config_accepts_single_primary_route_configuration() {
         let mut config = Config::default();
         config.routes = vec![crate::config::RouteConfig::from_backend_addr(
-            config.connection.backend_addr,
+            "127.0.0.1:6544".parse().expect("route addr"),
         )];
 
-        let error = validate_supported_config(&config).expect_err("routes are rejected");
+        let addr = direct_backend_addr(&config).expect("single primary route is supported");
 
-        assert!(error.to_string().contains("routes to be omitted"));
+        assert_eq!(addr.to_string(), "127.0.0.1:6544");
+    }
+
+    #[test]
+    fn supported_config_rejects_multiple_route_configurations() {
+        let mut config = Config::default();
+        config.routes = vec![
+            RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr")),
+            RouteConfig::from_backend_addr("127.0.0.1:6545".parse().expect("route addr")),
+        ];
+
+        let error = validate_supported_config(&config).expect_err("multiple routes are rejected");
+
+        assert!(error.to_string().contains("single primary route"));
+    }
+
+    #[test]
+    fn supported_config_rejects_pool_configuration() {
+        let mut config = Config::default();
+        config.pools = vec![PoolConfig {
+            database: "app".to_string(),
+            user: "app".to_string(),
+            backend_addr: "127.0.0.1:6544".parse().expect("pool addr"),
+            max_backends: None,
+        }];
+
+        let error = validate_supported_config(&config).expect_err("pools are rejected");
+
+        assert!(error.to_string().contains("pool configs"));
+    }
+
+    #[test]
+    fn supported_config_rejects_read_routing() {
+        let mut config = Config::default();
+        let mut route =
+            RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
+        route.read_routing = ReadRoutingConfig {
+            read_routing_mode: ReadRoutingMode::PreferReplica,
+            ..ReadRoutingConfig::default()
+        };
+        config.routes = vec![route];
+
+        let error = validate_supported_config(&config).expect_err("read routing is rejected");
+
+        assert!(error.to_string().contains("read routing"));
     }
 }
