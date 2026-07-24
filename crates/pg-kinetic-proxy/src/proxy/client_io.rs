@@ -30,7 +30,7 @@ where
                 }
 
                 match idle_timeout {
-                    Some(duration) => match crate::io_runtime::timeout(
+                    Some(duration) => match crate::io_runtime::tokio_timeout(
                         duration,
                         crate::io_runtime::read_from(client, client_buffer),
                     )
@@ -319,7 +319,7 @@ pub(super) async fn read_startup_packet_with_buffer(
                     return Ok(StartupRead::BufferLimitExceeded);
                 }
 
-                match crate::io_runtime::timeout(
+                match crate::io_runtime::tokio_timeout(
                     idle_timeout,
                     crate::io_runtime::read_from(client, buffer),
                 )

@@ -72,17 +72,45 @@ pub(crate) async fn shutdown<S: RuntimeByteStream + ?Sized>(stream: &mut S) -> i
     stream.shutdown_stream().await
 }
 
-pub(crate) async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    {
+pub(crate) trait TimeoutRuntime {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TokioTimeout;
+
+impl TimeoutRuntime for TokioTimeout {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+        tokio::time::timeout(duration, future).await.map_err(|_| ())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MonoioTimeout;
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl TimeoutRuntime for MonoioTimeout {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
         monoio::time::timeout(duration, future)
             .await
             .map_err(|_| ())
     }
-    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    {
-        tokio::time::timeout(duration, future).await.map_err(|_| ())
-    }
+}
+
+pub(crate) async fn tokio_timeout<F: Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, ()> {
+    TokioTimeout::timeout(duration, future).await
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) async fn monoio_timeout<F: Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, ()> {
+    MonoioTimeout::timeout(duration, future).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

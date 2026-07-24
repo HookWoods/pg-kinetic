@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -40,7 +41,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct BackendPoolCore<T, C>
+pub(crate) struct BackendPoolCore<T, C, R = crate::io_runtime::TokioTimeout>
 where
     T: PoolBackendTransport,
     C: PoolBackendConnector<T>,
@@ -57,6 +58,7 @@ where
     route_dynamic_limit: Option<Arc<AtomicUsize>>,
     checkout_timeout: Duration,
     lifecycle: PoolLifecycleConfig,
+    timeout_runtime: PhantomData<R>,
 }
 
 pub(crate) trait PoolBackendTransport: std::fmt::Debug {
@@ -1424,10 +1426,11 @@ impl BackendPool {
     }
 }
 
-impl<T, C> BackendPoolCore<T, C>
+impl<T, C, R> BackendPoolCore<T, C, R>
 where
     T: PoolBackendTransport,
     C: PoolBackendConnector<T>,
+    R: crate::io_runtime::TimeoutRuntime + Send + Sync + 'static,
 {
     pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
         self.snapshot_store
@@ -1600,7 +1603,7 @@ where
             Ok(PooledBackendLease::new(backend, lease))
         };
 
-        let result = match crate::io_runtime::timeout(self.checkout_timeout, checkout).await {
+        let result = match R::timeout(self.checkout_timeout, checkout).await {
             Ok(result) => result,
             Err(_) => {
                 metrics::increment_backpressure_event(&route, "timeout");
@@ -1828,10 +1831,17 @@ where
             route_dynamic_limit,
             checkout_timeout,
             lifecycle,
+            timeout_runtime: PhantomData,
         })
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl<T, C> BackendPoolCore<T, C, crate::io_runtime::TokioTimeout>
+where
+    T: PoolBackendTransport,
+    C: PoolBackendConnector<T>,
+{
     fn new_for_test(connector: C, lifecycle: PoolLifecycleConfig) -> Arc<Self> {
         Arc::new(Self {
             connector,
@@ -1846,6 +1856,7 @@ where
             route_dynamic_limit: None,
             checkout_timeout: Duration::from_millis(200),
             lifecycle,
+            timeout_runtime: PhantomData,
         })
     }
 }

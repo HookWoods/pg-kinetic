@@ -204,7 +204,13 @@ pub(crate) type MonoioPooledBackend =
 pub(crate) struct MonoioBackendPool {
     #[cfg(test)]
     backend_addr: SocketAddr,
-    core: std::sync::Arc<crate::pool::BackendPoolCore<MonoioBackend, MonoioBackendConnector>>,
+    core: std::sync::Arc<
+        crate::pool::BackendPoolCore<
+            MonoioBackend,
+            MonoioBackendConnector,
+            crate::io_runtime::MonoioTimeout,
+        >,
+    >,
 }
 
 #[derive(Debug)]
