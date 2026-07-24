@@ -278,15 +278,15 @@ mod linux {
                 let _ = backend.shutdown().await;
                 return Ok(());
             }
-            backend
-                .write_all(&client_buffer)
-                .await
-                .context("write query")?;
             let expected_ready_count =
                 crate::io_runtime::FrontendCycleShape::from_wire_bytes(&client_buffer)?.map_or(
                     1,
                     crate::io_runtime::FrontendCycleShape::expected_ready_count,
                 );
+            backend
+                .write_all(&client_buffer)
+                .await
+                .context("write query")?;
             client_buffer.clear();
             let mut response_drain =
                 crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
