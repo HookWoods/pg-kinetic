@@ -27,7 +27,11 @@ pub(super) async fn next_client_cycle(
                 }
 
                 match idle_timeout {
-                    Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await
+                    Some(duration) => match timeout(
+                        duration,
+                        crate::io_runtime::read_from(client, client_buffer),
+                    )
+                    .await
                     {
                         Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
                         Ok(Ok(_)) => {
@@ -40,8 +44,7 @@ pub(super) async fn next_client_cycle(
                         Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
                     },
                     None => {
-                        if client
-                            .read_buf(client_buffer)
+                        if crate::io_runtime::read_from(client, client_buffer)
                             .await
                             .context("read client")?
                             == 0
@@ -239,7 +242,7 @@ pub(super) async fn read_startup_packet_with_buffer(
                     return Ok(StartupRead::BufferLimitExceeded);
                 }
 
-                match timeout(idle_timeout, client.read_buf(buffer)).await {
+                match timeout(idle_timeout, crate::io_runtime::read_from(client, buffer)).await {
                     Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
                     Ok(Ok(_)) => {
                         if buffer.len() > max_client_buffer_bytes {
@@ -258,8 +261,7 @@ pub(super) async fn read_startup_packet_with_buffer(
 pub(super) async fn reject_startup_encryption_request(
     client: &mut ClientConnection,
 ) -> anyhow::Result<()> {
-    client
-        .write_all(b"N")
+    crate::io_runtime::write_all_to(client, b"N")
         .await
         .context("reject startup encryption request")
 }

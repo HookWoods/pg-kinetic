@@ -253,6 +253,20 @@ impl AsyncWrite for BackendStream {
     }
 }
 
+impl crate::io_runtime::RuntimeByteStream for BackendStream {
+    async fn read_into(&mut self, dst: &mut bytes::BytesMut) -> std::io::Result<usize> {
+        self.read_buf(dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        self.shutdown().await
+    }
+}
+
 async fn negotiate_backend_tls(
     mut stream: TcpStream,
     tls_mode: BackendTlsMode,

@@ -332,7 +332,9 @@ pub(super) async fn reject_client_during_drain(
     )
     .await?;
     drain_timer.finish(MetricOutcome::Rejected);
-    client.shutdown().await.context("shutdown draining client")
+    crate::io_runtime::shutdown(client)
+        .await
+        .context("shutdown draining client")
 }
 
 #[allow(clippy::too_many_arguments)]

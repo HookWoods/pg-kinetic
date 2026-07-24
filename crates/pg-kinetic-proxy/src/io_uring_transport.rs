@@ -52,3 +52,17 @@ impl MonoioTransport {
         self.stream.shutdown().await
     }
 }
+
+impl crate::io_runtime::RuntimeByteStream for MonoioTransport {
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        MonoioTransport::read_into(self, dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        MonoioTransport::write_all(self, bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        MonoioTransport::shutdown(self).await
+    }
+}

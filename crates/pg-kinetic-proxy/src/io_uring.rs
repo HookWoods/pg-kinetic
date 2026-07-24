@@ -297,17 +297,15 @@ mod linux {
                         .await
                         .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
                     let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-                    backend
-                        .write_all(&bytes)
+                    crate::io_runtime::write_all_to(&mut backend, &bytes)
                         .await
                         .context("forward cancel request")?;
-                    let _ = backend.shutdown().await;
+                    let _ = crate::io_runtime::shutdown(&mut backend).await;
                     drop(backend_capacity_guard);
                     return Ok(());
                 }
                 crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
-                    client
-                        .write_all(b"N")
+                    crate::io_runtime::write_all_to(&mut client, b"N")
                         .await
                         .context("reject startup encryption request")?;
                 }
@@ -315,8 +313,7 @@ mod linux {
                     anyhow::bail!("client startup packet exceeded configured buffer limit");
                 }
                 crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
-                    let read = client
-                        .read_into(&mut client_buffer)
+                    let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
                         .await
                         .context("read startup")?;
                     if read == 0 {
@@ -335,15 +332,13 @@ mod linux {
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
         let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-        backend
-            .write_all(&startup_packet)
+        crate::io_runtime::write_all_to(&mut backend, &startup_packet)
             .await
             .context("forward startup")?;
 
         let mut startup_drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
         loop {
-            let read = backend
-                .read_into(&mut backend_buffer)
+            let read = crate::io_runtime::read_from(&mut backend, &mut backend_buffer)
                 .await
                 .context("read startup response")?;
             if read == 0 {
@@ -352,8 +347,7 @@ mod linux {
             if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
                 anyhow::bail!("backend response exceeded configured buffer limit");
             }
-            client
-                .write_all(&backend_buffer)
+            crate::io_runtime::write_all_to(&mut client, &backend_buffer)
                 .await
                 .context("write startup response")?;
             backend_scan_buffer.extend_from_slice(&backend_buffer);
@@ -377,35 +371,32 @@ mod linux {
                         break (bytes, shape.expected_ready_count());
                     }
                     crate::io_runtime::FrontendCycleRead::Terminate { bytes } => {
-                        let _ = backend.write_all(&bytes).await;
-                        let _ = backend.shutdown().await;
+                        let _ = crate::io_runtime::write_all_to(&mut backend, &bytes).await;
+                        let _ = crate::io_runtime::shutdown(&mut backend).await;
                         return Ok(());
                     }
                     crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
                         anyhow::bail!("client request exceeded configured buffer limit");
                     }
                     crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
-                        let read = client
-                            .read_into(&mut client_buffer)
+                        let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
                             .await
                             .context("read client query")?;
                         if read == 0 {
-                            let _ = backend.shutdown().await;
+                            let _ = crate::io_runtime::shutdown(&mut backend).await;
                             return Ok(());
                         }
                     }
                 }
             };
-            backend
-                .write_all(&client_cycle)
+            crate::io_runtime::write_all_to(&mut backend, &client_cycle)
                 .await
                 .context("write query")?;
             let mut response_drain =
                 crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
 
             loop {
-                let read = backend
-                    .read_into(&mut backend_buffer)
+                let read = crate::io_runtime::read_from(&mut backend, &mut backend_buffer)
                     .await
                     .context("read backend response")?;
                 if read == 0 {
@@ -414,8 +405,7 @@ mod linux {
                 if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
                     anyhow::bail!("backend response exceeded configured buffer limit");
                 }
-                client
-                    .write_all(&backend_buffer)
+                crate::io_runtime::write_all_to(&mut client, &backend_buffer)
                     .await
                     .context("write backend response")?;
                 backend_scan_buffer.extend_from_slice(&backend_buffer);

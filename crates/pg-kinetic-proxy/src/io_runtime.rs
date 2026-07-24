@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -42,6 +43,32 @@ pub enum StartupPacketRead {
     EncryptionRequest(StartupEncryptionRequest),
     BufferLimitExceeded,
     NeedMoreBytes,
+}
+
+pub(crate) trait RuntimeByteStream {
+    async fn read_into(&mut self, dst: &mut BytesMut) -> io::Result<usize>;
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    async fn shutdown_stream(&mut self) -> io::Result<()>;
+}
+
+pub(crate) async fn read_from<S: RuntimeByteStream + ?Sized>(
+    stream: &mut S,
+    dst: &mut BytesMut,
+) -> io::Result<usize> {
+    stream.read_into(dst).await
+}
+
+pub(crate) async fn write_all_to<S: RuntimeByteStream + ?Sized>(
+    stream: &mut S,
+    bytes: &[u8],
+) -> io::Result<()> {
+    stream.write_all_bytes(bytes).await
+}
+
+pub(crate) async fn shutdown<S: RuntimeByteStream + ?Sized>(stream: &mut S) -> io::Result<()> {
+    stream.shutdown_stream().await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
