@@ -28,29 +28,295 @@ use pg_kinetic_core::{
 
 #[derive(Debug)]
 pub struct BackendPool {
-    backend_addr: SocketAddr,
-    tls: TlsConfig,
-    socket: SocketConfig,
+    connector: TokioBackendConnector,
     reset_query: Arc<str>,
     gate: BackpressureGate,
     route_gates: StdRwLock<HashMap<PoolKey, RouteGateEntry>>,
-    idle: Mutex<VecDeque<Backend>>,
-    backend_lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
-    backend_global_permits: StdMutex<HashMap<u64, OwnedSemaphorePermit>>,
-    backend_available: Notify,
+    backends: BackendStore,
     snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
-    active_backends: AtomicUsize,
-    idle_backends: AtomicUsize,
-    global_backend_slots: Option<Arc<Semaphore>>,
-    global_backend_available: Option<Arc<Notify>>,
-    max_backends: usize,
     max_waiters: usize,
     route_max_in_flight: usize,
     route_max_waiters: usize,
     route_dynamic_limit: Option<Arc<AtomicUsize>>,
     checkout_timeout: Duration,
     lifecycle: PoolLifecycleConfig,
+}
+
+#[derive(Clone, Debug)]
+struct TokioBackendConnector {
+    backend_addr: SocketAddr,
+    tls: TlsConfig,
+    socket: SocketConfig,
+}
+
+impl TokioBackendConnector {
+    const fn new(backend_addr: SocketAddr, tls: TlsConfig, socket: SocketConfig) -> Self {
+        Self {
+            backend_addr,
+            tls,
+            socket,
+        }
+    }
+
+    const fn backend_addr(&self) -> SocketAddr {
+        self.backend_addr
+    }
+
+    fn connection_settings(&self) -> (TlsConfig, SocketConfig) {
+        (self.tls.clone(), self.socket.clone())
+    }
+
+    async fn connect(&self) -> anyhow::Result<Backend> {
+        Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await
+    }
+}
+
+#[derive(Debug)]
+struct BackendStore {
+    idle: Mutex<VecDeque<Backend>>,
+    lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
+    global_permits: StdMutex<HashMap<u64, OwnedSemaphorePermit>>,
+    available: Notify,
+    active_backends: AtomicUsize,
+    idle_backends: AtomicUsize,
+    global_slots: Option<Arc<Semaphore>>,
+    global_available: Option<Arc<Notify>>,
+    max_backends: usize,
+}
+
+impl BackendStore {
+    fn new(
+        max_backends: usize,
+        global_slots: Option<Arc<Semaphore>>,
+        global_available: Option<Arc<Notify>>,
+    ) -> Self {
+        Self {
+            idle: Mutex::new(VecDeque::new()),
+            lifecycle: StdMutex::new(HashMap::new()),
+            global_permits: StdMutex::new(HashMap::new()),
+            available: Notify::new(),
+            active_backends: AtomicUsize::new(0),
+            idle_backends: AtomicUsize::new(0),
+            global_slots,
+            global_available,
+            max_backends,
+        }
+    }
+
+    async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<Backend> {
+        loop {
+            let notified = self.available.notified();
+            if let Some(backend) = self.try_checkout_idle_backend() {
+                return Some(backend);
+            }
+            if !wait_for_backend {
+                return None;
+            }
+            if let Some(global_available) = &self.global_available {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = global_available.notified() => return None,
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+
+    fn try_checkout_idle_backend(&self) -> Option<Backend> {
+        let mut idle_backends = self.idle.try_lock().ok()?;
+        let backend = idle_backends.pop_front()?;
+        self.idle_backends.fetch_sub(1, Ordering::AcqRel);
+        Some(backend)
+    }
+
+    fn reserve_backend_slot(&self) -> Option<Option<OwnedSemaphorePermit>> {
+        let mut active_backends = self.active_backends.load(Ordering::Acquire);
+        loop {
+            if active_backends >= self.max_backends {
+                return None;
+            }
+            match self.active_backends.compare_exchange_weak(
+                active_backends,
+                active_backends + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => active_backends = observed,
+            }
+        }
+
+        let global_permit = match &self.global_slots {
+            Some(slots) => match Arc::clone(slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.release_reserved_backend_slot(None);
+                    return None;
+                }
+            },
+            None => None,
+        };
+
+        Some(global_permit)
+    }
+
+    fn register_backend(&self, backend: &Backend, global_permit: Option<OwnedSemaphorePermit>) {
+        let now = tokio::time::Instant::now();
+        self.lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .insert(
+                backend.id(),
+                BackendLifecycle {
+                    created_at: now,
+                    last_released_at: now,
+                },
+            );
+        if let Some(permit) = global_permit {
+            self.global_permits
+                .lock()
+                .expect("backend global permits poisoned")
+                .insert(backend.id(), permit);
+        }
+    }
+
+    async fn return_backend(&self, backend: Backend) {
+        if let Some(lifecycle) = self
+            .lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .get_mut(&backend.id())
+        {
+            lifecycle.last_released_at = tokio::time::Instant::now();
+        }
+        self.idle.lock().await.push_back(backend);
+        self.idle_backends.fetch_add(1, Ordering::AcqRel);
+        self.available.notify_one();
+    }
+
+    fn discard_backend(&self, backend_id: u64) {
+        self.global_permits
+            .lock()
+            .expect("backend global permits poisoned")
+            .remove(&backend_id);
+        self.notify_global_backend_available();
+        self.lifecycle
+            .lock()
+            .expect("backend lifecycle poisoned")
+            .remove(&backend_id);
+        self.release_reserved_backend_slot(None);
+    }
+
+    fn release_reserved_backend_slot(&self, global_permit: Option<OwnedSemaphorePermit>) {
+        drop(global_permit);
+        self.active_backends.fetch_sub(1, Ordering::AcqRel);
+        self.available.notify_waiters();
+        self.notify_global_backend_available();
+    }
+
+    fn notify_global_backend_available(&self) {
+        if let Some(notify) = &self.global_available {
+            notify.notify_waiters();
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        self.active_backends.load(Ordering::Acquire)
+    }
+
+    fn idle_count(&self) -> usize {
+        self.idle_backends.load(Ordering::Acquire)
+    }
+
+    fn attach_snapshot_store_to_idle(&self, snapshot_store: SnapshotStore) {
+        if let Ok(mut idle_backends) = self.idle.try_lock() {
+            for backend in idle_backends.iter_mut() {
+                backend.attach_snapshot_store(snapshot_store.clone());
+            }
+        }
+    }
+
+    async fn reap_idle(&self, lifecycle: &PoolLifecycleConfig) {
+        let now = tokio::time::Instant::now();
+        let mut idle = self.idle.lock().await;
+        let mut retained = VecDeque::with_capacity(idle.len());
+        let mut evicted = Vec::new();
+        while let Some(backend) = idle.pop_front() {
+            let backend_lifecycle = self
+                .lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .get(&backend.id())
+                .copied();
+            let eviction_reason = backend_lifecycle.and_then(|backend_lifecycle| {
+                (lifecycle.idle_timeout != Duration::ZERO
+                    && now.duration_since(backend_lifecycle.last_released_at)
+                        >= lifecycle.idle_timeout)
+                    .then_some("idle_timeout")
+                    .or_else(|| {
+                        (lifecycle.max_lifetime != Duration::ZERO
+                            && now.duration_since(backend_lifecycle.created_at)
+                                >= lifecycle.max_lifetime)
+                            .then_some("max_lifetime")
+                    })
+            });
+            if let Some(reason) = eviction_reason {
+                if retained.len() + idle.len() >= lifecycle.min_idle {
+                    evicted.push((backend, reason));
+                } else {
+                    retained.push_back(backend);
+                }
+            } else {
+                retained.push_back(backend);
+            }
+        }
+        *idle = retained;
+        drop(idle);
+
+        for (backend, reason) in evicted {
+            backend.mark_discarded();
+            self.lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .remove(&backend.id());
+            self.global_permits
+                .lock()
+                .expect("backend global permits poisoned")
+                .remove(&backend.id());
+            self.notify_global_backend_available();
+            self.active_backends.fetch_sub(1, Ordering::AcqRel);
+            metrics::record_pool_eviction(reason);
+        }
+        self.idle_backends
+            .store(self.idle.lock().await.len(), Ordering::Release);
+        self.available.notify_waiters();
+    }
+
+    async fn retire_idle_backends(&self) {
+        let mut idle = self.idle.lock().await;
+        let retired: Vec<_> = idle.drain(..).collect();
+        drop(idle);
+
+        for backend in retired {
+            backend.mark_discarded();
+            self.lifecycle
+                .lock()
+                .expect("backend lifecycle poisoned")
+                .remove(&backend.id());
+            self.global_permits
+                .lock()
+                .expect("backend global permits poisoned")
+                .remove(&backend.id());
+            self.notify_global_backend_available();
+            self.active_backends.fetch_sub(1, Ordering::AcqRel);
+            metrics::record_pool_eviction("reload");
+        }
+
+        self.idle_backends.store(0, Ordering::Release);
+        self.available.notify_waiters();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,17 +533,17 @@ impl BackendPoolRef {
 
     #[must_use]
     pub fn backend_addr(&self) -> SocketAddr {
-        self.inner.pool.backend_addr
+        self.inner.pool.connector.backend_addr()
     }
 
     #[must_use]
     pub fn backend_connection_settings(&self) -> (TlsConfig, SocketConfig) {
-        (self.inner.pool.tls.clone(), self.inner.pool.socket.clone())
+        self.inner.pool.connector.connection_settings()
     }
 
     #[must_use]
     pub fn idle_backends(&self) -> usize {
-        self.inner.pool.idle_backends.load(Ordering::Acquire)
+        self.inner.pool.backends.idle_count()
     }
 
     #[must_use]
@@ -1058,23 +1324,17 @@ impl BackendPool {
             "invalid pool lifecycle config"
         );
         Arc::new(Self {
-            backend_addr,
-            tls,
-            socket,
+            connector: TokioBackendConnector::new(backend_addr, tls, socket),
             reset_query: reset_query.into(),
             gate: BackpressureGate::new(lifecycle.max_size, max_waiters),
             route_gates: StdRwLock::new(HashMap::new()),
-            idle: Mutex::new(VecDeque::new()),
-            backend_lifecycle: StdMutex::new(HashMap::new()),
-            backend_global_permits: StdMutex::new(HashMap::new()),
-            backend_available: Notify::new(),
+            backends: BackendStore::new(
+                lifecycle.max_size,
+                global_backend_slots,
+                global_backend_available,
+            ),
             snapshot_store: ArcSwapOption::empty(),
             health: Arc::new(AtomicBool::new(true)),
-            active_backends: AtomicUsize::new(0),
-            idle_backends: AtomicUsize::new(0),
-            global_backend_slots,
-            global_backend_available,
-            max_backends: lifecycle.max_size,
             max_waiters,
             route_max_in_flight,
             route_max_waiters,
@@ -1088,11 +1348,7 @@ impl BackendPool {
         self.snapshot_store
             .store(Some(Arc::new(snapshot_store.clone())));
 
-        if let Ok(mut idle_backends) = self.idle.try_lock() {
-            for backend in idle_backends.iter_mut() {
-                backend.attach_snapshot_store(snapshot_store.clone());
-            }
-        }
+        self.backends.attach_snapshot_store_to_idle(snapshot_store);
 
         self.sync_pool_snapshot();
     }
@@ -1194,7 +1450,7 @@ impl BackendPool {
             self.record_backpressure_counts(&checkout_route, &route_gate_gate);
 
             if mode == CheckoutMode::PreferConnect {
-                if let Some(global_permit) = self.reserve_backend_slot() {
+                if let Some(global_permit) = self.backends.reserve_backend_slot() {
                     match self.connect_reserved_backend(global_permit).await {
                         Ok(mut backend) => {
                             self.attach_backend_snapshot_store(&mut backend);
@@ -1216,10 +1472,10 @@ impl BackendPool {
                 }
             }
 
-            let idle_backend = match self.try_checkout_idle_backend() {
+            let idle_backend = match self.backends.try_checkout_idle_backend() {
                 Some(backend) => Some(backend),
-                None if self.idle_backends.load(Ordering::Acquire) > 0 => {
-                    self.checkout_idle_backend(false).await
+                None if self.backends.idle_count() > 0 => {
+                    self.backends.checkout_idle_backend(false).await
                 }
                 None => None,
             };
@@ -1239,7 +1495,7 @@ impl BackendPool {
             }
 
             if mode == CheckoutMode::AllowConnect {
-                if let Some(global_permit) = self.reserve_backend_slot() {
+                if let Some(global_permit) = self.backends.reserve_backend_slot() {
                     let mut backend = self.connect_reserved_backend(global_permit).await?;
                     self.attach_backend_snapshot_store(&mut backend);
                     backend.mark_checked_out(Some(checkout_route.clone()));
@@ -1258,17 +1514,17 @@ impl BackendPool {
             }
 
             let mut backend = loop {
-                if let Some(backend) = self.checkout_idle_backend(false).await {
+                if let Some(backend) = self.backends.checkout_idle_backend(false).await {
                     break backend;
                 }
 
                 if mode == CheckoutMode::AllowConnect {
-                    if let Some(global_permit) = self.reserve_backend_slot() {
+                    if let Some(global_permit) = self.backends.reserve_backend_slot() {
                         break self.connect_reserved_backend(global_permit).await?;
                     }
                 }
 
-                if let Some(backend) = self.checkout_idle_backend(true).await {
+                if let Some(backend) = self.backends.checkout_idle_backend(true).await {
                     break backend;
                 }
             };
@@ -1308,75 +1564,18 @@ impl BackendPool {
         result
     }
 
-    async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<Backend> {
-        loop {
-            let notified = self.backend_available.notified();
-            if let Some(backend) = self.try_checkout_idle_backend() {
-                return Some(backend);
-            }
-            if !wait_for_backend {
-                return None;
-            }
-            if let Some(global_backend_available) = &self.global_backend_available {
-                tokio::select! {
-                    _ = notified => {}
-                    _ = global_backend_available.notified() => return None,
-                }
-            } else {
-                notified.await;
-            }
-        }
-    }
-
-    fn try_checkout_idle_backend(&self) -> Option<Backend> {
-        let mut idle_backends = self.idle.try_lock().ok()?;
-        let backend = idle_backends.pop_front()?;
-        self.idle_backends.fetch_sub(1, Ordering::AcqRel);
-        Some(backend)
-    }
-
-    fn reserve_backend_slot(&self) -> Option<Option<OwnedSemaphorePermit>> {
-        let mut active_backends = self.active_backends.load(Ordering::Acquire);
-        loop {
-            if active_backends >= self.max_backends {
-                return None;
-            }
-            match self.active_backends.compare_exchange_weak(
-                active_backends,
-                active_backends + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => active_backends = observed,
-            }
-        }
-
-        let global_permit = match &self.global_backend_slots {
-            Some(slots) => match Arc::clone(slots).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    self.release_reserved_backend_slot(None);
-                    return None;
-                }
-            },
-            None => None,
-        };
-
-        Some(global_permit)
-    }
-
     async fn connect_reserved_backend(
         &self,
         global_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Backend, PoolError> {
-        match Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await {
+        match self.connector.connect().await {
             Ok(backend) => {
-                self.register_backend(&backend, global_permit);
+                self.backends.register_backend(&backend, global_permit);
                 Ok(backend)
             }
             Err(error) => {
-                self.release_reserved_backend_slot(global_permit);
+                self.backends.release_reserved_backend_slot(global_permit);
+                self.sync_pool_snapshot();
                 Err(PoolError::Connect(error))
             }
         }
@@ -1384,7 +1583,7 @@ impl BackendPool {
 
     #[must_use]
     pub const fn max_backends(&self) -> usize {
-        self.max_backends
+        self.backends.max_backends
     }
 
     #[must_use]
@@ -1394,93 +1593,21 @@ impl BackendPool {
 
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.active_backends.load(Ordering::Acquire)
+        self.backends.active_count()
     }
 
     #[must_use]
     pub fn idle_count(&self) -> usize {
-        self.idle_backends.load(Ordering::Acquire)
+        self.backends.idle_count()
     }
 
     pub async fn reap_idle(&self) {
-        let now = tokio::time::Instant::now();
-        let mut idle = self.idle.lock().await;
-        let mut retained = VecDeque::with_capacity(idle.len());
-        let mut evicted = Vec::new();
-        while let Some(backend) = idle.pop_front() {
-            let lifecycle = self
-                .backend_lifecycle
-                .lock()
-                .expect("backend lifecycle poisoned")
-                .get(&backend.id())
-                .copied();
-            let eviction_reason = lifecycle.and_then(|lifecycle| {
-                (self.lifecycle.idle_timeout != Duration::ZERO
-                    && now.duration_since(lifecycle.last_released_at)
-                        >= self.lifecycle.idle_timeout)
-                    .then_some("idle_timeout")
-                    .or_else(|| {
-                        (self.lifecycle.max_lifetime != Duration::ZERO
-                            && now.duration_since(lifecycle.created_at)
-                                >= self.lifecycle.max_lifetime)
-                            .then_some("max_lifetime")
-                    })
-            });
-            if let Some(reason) = eviction_reason {
-                if retained.len() + idle.len() >= self.lifecycle.min_idle {
-                    evicted.push((backend, reason));
-                } else {
-                    retained.push_back(backend);
-                }
-            } else {
-                retained.push_back(backend);
-            }
-        }
-        *idle = retained;
-        drop(idle);
-
-        for (backend, reason) in evicted {
-            backend.mark_discarded();
-            self.backend_lifecycle
-                .lock()
-                .expect("backend lifecycle poisoned")
-                .remove(&backend.id());
-            self.backend_global_permits
-                .lock()
-                .expect("backend global permits poisoned")
-                .remove(&backend.id());
-            self.notify_global_backend_available();
-            self.active_backends.fetch_sub(1, Ordering::AcqRel);
-            metrics::record_pool_eviction(reason);
-        }
-        self.idle_backends
-            .store(self.idle.lock().await.len(), Ordering::Release);
-        self.backend_available.notify_waiters();
+        self.backends.reap_idle(&self.lifecycle).await;
         self.sync_pool_snapshot();
     }
 
     pub async fn retire_idle_backends(&self) {
-        let mut idle = self.idle.lock().await;
-        let retired: Vec<_> = idle.drain(..).collect();
-        drop(idle);
-
-        for backend in retired {
-            backend.mark_discarded();
-            self.backend_lifecycle
-                .lock()
-                .expect("backend lifecycle poisoned")
-                .remove(&backend.id());
-            self.backend_global_permits
-                .lock()
-                .expect("backend global permits poisoned")
-                .remove(&backend.id());
-            self.notify_global_backend_available();
-            self.active_backends.fetch_sub(1, Ordering::AcqRel);
-            metrics::record_pool_eviction("reload");
-        }
-
-        self.idle_backends.store(0, Ordering::Release);
-        self.backend_available.notify_waiters();
+        self.backends.retire_idle_backends().await;
         self.sync_pool_snapshot();
     }
 
@@ -1569,14 +1696,14 @@ impl BackendPool {
     }
 
     fn sync_pool_snapshot(&self) {
-        let active_backends = self.active_backends.load(Ordering::Acquire);
-        let idle_backends = self.idle_backends.load(Ordering::Acquire);
+        let active_backends = self.backends.active_count();
+        let idle_backends = self.backends.idle_count();
         metrics::record_pool_connections(active_backends, idle_backends);
         self.with_snapshot_store(|snapshot_store| {
             metrics::record_pool_snapshot(
                 snapshot_store,
                 PoolSnapshot {
-                    configured_backends: self.max_backends,
+                    configured_backends: self.backends.max_backends,
                     active_backends,
                     idle_backends,
                     waiting_clients: self.gate.waiting(),
@@ -1593,26 +1720,6 @@ impl BackendPool {
         });
     }
 
-    fn register_backend(&self, backend: &Backend, global_permit: Option<OwnedSemaphorePermit>) {
-        let now = tokio::time::Instant::now();
-        self.backend_lifecycle
-            .lock()
-            .expect("backend lifecycle poisoned")
-            .insert(
-                backend.id(),
-                BackendLifecycle {
-                    created_at: now,
-                    last_released_at: now,
-                },
-            );
-        if let Some(permit) = global_permit {
-            self.backend_global_permits
-                .lock()
-                .expect("backend global permits poisoned")
-                .insert(backend.id(), permit);
-        }
-    }
-
     fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
         self.with_snapshot_store(|snapshot_store| {
             metrics::record_backpressure_snapshot(
@@ -1625,45 +1732,13 @@ impl BackendPool {
     }
 
     async fn return_backend(&self, backend: Backend) {
-        if let Some(lifecycle) = self
-            .backend_lifecycle
-            .lock()
-            .expect("backend lifecycle poisoned")
-            .get_mut(&backend.id())
-        {
-            lifecycle.last_released_at = tokio::time::Instant::now();
-        }
-        self.idle.lock().await.push_back(backend);
-        self.idle_backends.fetch_add(1, Ordering::AcqRel);
-        self.backend_available.notify_one();
+        self.backends.return_backend(backend).await;
         self.sync_pool_snapshot();
     }
 
     fn discard_backend(&self, backend_id: u64) {
-        self.backend_global_permits
-            .lock()
-            .expect("backend global permits poisoned")
-            .remove(&backend_id);
-        self.notify_global_backend_available();
-        self.backend_lifecycle
-            .lock()
-            .expect("backend lifecycle poisoned")
-            .remove(&backend_id);
-        self.release_reserved_backend_slot(None);
-    }
-
-    fn release_reserved_backend_slot(&self, global_permit: Option<OwnedSemaphorePermit>) {
-        drop(global_permit);
-        self.active_backends.fetch_sub(1, Ordering::AcqRel);
-        self.backend_available.notify_waiters();
-        self.notify_global_backend_available();
+        self.backends.discard_backend(backend_id);
         self.sync_pool_snapshot();
-    }
-
-    fn notify_global_backend_available(&self) {
-        if let Some(notify) = &self.global_backend_available {
-            notify.notify_waiters();
-        }
     }
 }
 
@@ -1966,6 +2041,26 @@ mod tests {
 
         assert!(lease.requires_startup());
         assert_eq!(&lease.route_key, &route);
+    }
+
+    #[tokio::test]
+    async fn backend_store_tracks_idle_backends_outside_route_checkout() {
+        let (addr, accepted) = backend_listener().await;
+        let pool = test_pool_with_capacity(addr, 1);
+        let route = route_key("backend-store");
+
+        let checkout = pool
+            .checkout_primary(route)
+            .await
+            .expect("initial checkout");
+        assert_eq!(pool.backends.idle_count(), 0);
+        assert_eq!(pool.backends.active_count(), 1);
+
+        checkout.release().await;
+        wait_for_accepts(&accepted, 1).await;
+
+        assert_eq!(pool.backends.idle_count(), 1);
+        assert_eq!(pool.backends.active_count(), 1);
     }
 
     #[test]
