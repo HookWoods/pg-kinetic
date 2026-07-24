@@ -196,12 +196,13 @@ pub(super) fn classify_backend_frames(
     ready_count: &mut usize,
     forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
 ) -> anyhow::Result<Option<ReadyStatus>> {
-    let mut ready = None;
-    while let Some(frame) = parse_backend_frame(backend_buffer)? {
-        if *injected_parse_completes > 0 && frame.tag == b'1' {
-            *injected_parse_completes -= 1;
-            continue;
-        }
+    let mut drain = crate::io_runtime::BackendResponseDrain::from_state(
+        1,
+        *ready_count,
+        *injected_parse_completes,
+        state.progress.response_started,
+    );
+    let event = drain.drain_with(backend_buffer, forwarded_frames, |frame| {
         state.progress.response_started = true;
         if let Some(sqlstate) = frame.sqlstate() {
             metrics::increment_sqlstate(sqlstate);
@@ -218,16 +219,15 @@ pub(super) fn classify_backend_frames(
             state.session.mark_failed_transaction();
         }
 
-        if let Some(status) = frame.ready_status() {
-            *ready_count += 1;
-            ready = Some(status);
-        }
-        let mut header = [0_u8; 5];
-        header[0] = frame.tag;
-        header[1..].copy_from_slice(&((frame.payload.len() + 4) as i32).to_be_bytes());
-        forwarded_frames.push((header, frame.payload));
-    }
-    Ok(ready)
+        Ok(())
+    })?;
+    *ready_count = drain.ready_count();
+    *injected_parse_completes = drain.injected_parse_completes();
+    Ok(match event {
+        crate::io_runtime::ResponseDrainEvent::Frames { ready, .. } => ready,
+        crate::io_runtime::ResponseDrainEvent::BufferLimitExceeded
+        | crate::io_runtime::ResponseDrainEvent::NeedMoreBytes => None,
+    })
 }
 
 fn expected_ready_count_for_frames(frames: &[FrontendFrame]) -> usize {
