@@ -368,15 +368,20 @@ struct RouteGateEntry {
     metrics: RouteMetricHandles,
 }
 
-#[derive(Debug)]
-pub struct PooledBackend {
-    backend: Option<Backend>,
-    lease: BackendLeaseState,
+pub(crate) trait BackendLeaseOwner<T>: Clone + std::fmt::Debug
+where
+    T: PoolBackendTransport,
+{
+    async fn return_backend(&self, backend: T);
+
+    fn discard_backend(&self, backend_id: u64);
+
+    fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate);
 }
 
 #[derive(Debug)]
-pub(crate) struct BackendLeaseState {
-    pool: Arc<BackendPool>,
+pub(crate) struct BackendLeaseState<O> {
+    pool: O,
     health: Arc<AtomicBool>,
     permit: Option<BackpressurePermit>,
     route_key: RouteKey,
@@ -384,10 +389,10 @@ pub(crate) struct BackendLeaseState {
     requires_startup: bool,
 }
 
-impl BackendLeaseState {
+impl<O> BackendLeaseState<O> {
     #[must_use]
     pub(crate) const fn new(
-        pool: Arc<BackendPool>,
+        pool: O,
         health: Arc<AtomicBool>,
         permit: Option<BackpressurePermit>,
         route_key: RouteKey,
@@ -416,10 +421,31 @@ impl BackendLeaseState {
     fn take_permit(&mut self) {
         self.permit.take();
     }
+}
 
-    fn record_backpressure_counts(&self) {
-        self.pool
-            .record_backpressure_counts(&self.route_key, &self.route_gate);
+#[derive(Debug)]
+pub struct PooledBackendLease<T, O>
+where
+    T: PoolBackendTransport,
+    O: BackendLeaseOwner<T>,
+{
+    backend: Option<T>,
+    lease: BackendLeaseState<O>,
+}
+
+pub type PooledBackend = PooledBackendLease<Backend, Arc<BackendPool>>;
+
+impl BackendLeaseOwner<Backend> for Arc<BackendPool> {
+    async fn return_backend(&self, backend: Backend) {
+        self.as_ref().return_backend(backend).await;
+    }
+
+    fn discard_backend(&self, backend_id: u64) {
+        self.as_ref().discard_backend(backend_id);
+    }
+
+    fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
+        self.as_ref().record_backpressure_counts(route, gate);
     }
 }
 
@@ -1496,15 +1522,15 @@ impl BackendPool {
                                 Some(checkout_route.clone()),
                             );
                             self.sync_pool_snapshot();
-                            return Ok(PooledBackend::new(
-                                backend,
+                            let lease = BackendLeaseState::new(
                                 self.clone(),
                                 Arc::clone(&self.health),
-                                BackpressurePermit::join(route_permit, permit),
+                                Some(BackpressurePermit::join(route_permit, permit)),
                                 checkout_route.clone(),
                                 route_gate_gate.clone(),
                                 true,
-                            ));
+                            );
+                            return Ok(PooledBackendLease::new(backend, lease));
                         }
                         Err(PoolError::Connect(_)) => {}
                         Err(error) => return Err(error),
@@ -1523,15 +1549,15 @@ impl BackendPool {
                 self.attach_backend_snapshot_store(&mut backend);
                 PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
-                return Ok(PooledBackend::new(
-                    backend,
+                let lease = BackendLeaseState::new(
                     self.clone(),
                     Arc::clone(&self.health),
-                    BackpressurePermit::join(route_permit, permit),
+                    Some(BackpressurePermit::join(route_permit, permit)),
                     checkout_route.clone(),
                     route_gate_gate.clone(),
                     false,
-                ));
+                );
+                return Ok(PooledBackendLease::new(backend, lease));
             }
 
             if mode == CheckoutMode::AllowConnect {
@@ -1541,15 +1567,15 @@ impl BackendPool {
                     PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
                     self.sync_pool_snapshot();
 
-                    return Ok(PooledBackend::new(
-                        backend,
+                    let lease = BackendLeaseState::new(
                         self.clone(),
                         Arc::clone(&self.health),
-                        BackpressurePermit::join(route_permit, permit),
+                        Some(BackpressurePermit::join(route_permit, permit)),
                         checkout_route.clone(),
                         route_gate_gate.clone(),
                         true,
-                    ));
+                    );
+                    return Ok(PooledBackendLease::new(backend, lease));
                 }
             }
 
@@ -1572,15 +1598,15 @@ impl BackendPool {
             PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
             self.sync_pool_snapshot();
 
-            Ok(PooledBackend::new(
-                backend,
+            let lease = BackendLeaseState::new(
                 self.clone(),
                 Arc::clone(&self.health),
-                BackpressurePermit::join(route_permit, permit),
+                Some(BackpressurePermit::join(route_permit, permit)),
                 checkout_route.clone(),
                 route_gate_gate.clone(),
                 false,
-            ))
+            );
+            Ok(PooledBackendLease::new(backend, lease))
         };
 
         let result = match timeout(self.checkout_timeout, checkout).await {
@@ -1801,26 +1827,15 @@ fn pool_checkout_outcome(result: &Result<PooledBackend, PoolError>) -> &'static 
     }
 }
 
-impl PooledBackend {
-    fn new(
-        backend: Backend,
-        pool: Arc<BackendPool>,
-        health: Arc<AtomicBool>,
-        permit: BackpressurePermit,
-        route_key: RouteKey,
-        route_gate: BackpressureGate,
-        requires_startup: bool,
-    ) -> Self {
+impl<T, O> PooledBackendLease<T, O>
+where
+    T: PoolBackendTransport,
+    O: BackendLeaseOwner<T>,
+{
+    fn new(backend: T, lease: BackendLeaseState<O>) -> Self {
         Self {
             backend: Some(backend),
-            lease: BackendLeaseState::new(
-                pool,
-                health,
-                Some(permit),
-                route_key,
-                route_gate,
-                requires_startup,
-            ),
+            lease,
         }
     }
 
@@ -1833,13 +1848,13 @@ impl PooledBackend {
     }
 
     #[must_use]
-    pub fn backend(&self) -> &Backend {
+    pub fn backend(&self) -> &T {
         self.backend
             .as_ref()
             .expect("pooled backend exists until release")
     }
 
-    pub fn backend_mut(&mut self) -> &mut Backend {
+    pub fn backend_mut(&mut self) -> &mut T {
         self.backend
             .as_mut()
             .expect("pooled backend exists until release")
@@ -1856,32 +1871,42 @@ impl PooledBackend {
 
     pub async fn release(mut self) {
         if let Some(backend) = self.backend.take() {
-            PoolBackendTransport::mark_idle(&backend, Some(self.lease.route_key.clone()));
+            backend.mark_idle(Some(self.lease.route_key.clone()));
             self.lease.pool.return_backend(backend).await;
         }
 
         self.lease.take_permit();
-        self.lease.record_backpressure_counts();
+        self.lease
+            .pool
+            .record_backpressure_counts(&self.lease.route_key, &self.lease.route_gate);
     }
 
     pub fn discard(mut self) {
         if let Some(backend) = self.backend.take() {
-            PoolBackendTransport::mark_discarded(&backend);
+            backend.mark_discarded();
             self.lease.pool.discard_backend(backend.id());
         }
 
         self.lease.take_permit();
-        self.lease.record_backpressure_counts();
+        self.lease
+            .pool
+            .record_backpressure_counts(&self.lease.route_key, &self.lease.route_gate);
     }
 }
 
-impl Drop for PooledBackend {
+impl<T, O> Drop for PooledBackendLease<T, O>
+where
+    T: PoolBackendTransport,
+    O: BackendLeaseOwner<T>,
+{
     fn drop(&mut self) {
         if let Some(backend) = self.backend.take() {
-            PoolBackendTransport::mark_discarded(&backend);
+            backend.mark_discarded();
             self.lease.pool.discard_backend(backend.id());
             self.lease.take_permit();
-            self.lease.record_backpressure_counts();
+            self.lease
+                .pool
+                .record_backpressure_counts(&self.lease.route_key, &self.lease.route_gate);
         }
     }
 }
@@ -2167,6 +2192,97 @@ mod tests {
         assert_eq!(checked_out.load(Ordering::Relaxed), 1);
         assert_eq!(idled.load(Ordering::Relaxed), 1);
         assert_eq!(discarded.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_backend_lease_accepts_non_tokio_backend_owner() {
+        #[derive(Clone, Debug)]
+        struct MemoryOwner {
+            returned: Arc<AtomicUsize>,
+            discarded: Arc<AtomicUsize>,
+        }
+
+        #[derive(Debug)]
+        struct MemoryBackend {
+            id: u64,
+            idled: Arc<AtomicUsize>,
+            discarded: Arc<AtomicUsize>,
+        }
+
+        impl PoolBackendTransport for MemoryBackend {
+            fn id(&self) -> u64 {
+                self.id
+            }
+
+            fn attach_snapshot_store(&mut self, _snapshot_store: SnapshotStore) {}
+
+            fn mark_checked_out(&self, _route_key: Option<RouteKey>) {}
+
+            fn mark_idle(&self, _route_key: Option<RouteKey>) {
+                self.idled.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn mark_discarded(&self) {
+                self.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        impl BackendLeaseOwner<MemoryBackend> for MemoryOwner {
+            async fn return_backend(&self, _backend: MemoryBackend) {
+                self.returned.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn discard_backend(&self, _backend_id: u64) {
+                self.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn record_backpressure_counts(&self, _route: &RouteKey, _gate: &BackpressureGate) {}
+        }
+
+        let route = route_key("generic-lease");
+        let route_gate = BackpressureGate::new(1, 1);
+        let pool_gate = BackpressureGate::new(1, 1);
+        let permit = BackpressurePermit::join(
+            route_gate
+                .checkout(Duration::from_millis(1))
+                .await
+                .expect("route permit"),
+            pool_gate
+                .checkout(Duration::from_millis(1))
+                .await
+                .expect("pool permit"),
+        );
+        let returned = Arc::new(AtomicUsize::new(0));
+        let owner_discarded = Arc::new(AtomicUsize::new(0));
+        let backend_idled = Arc::new(AtomicUsize::new(0));
+        let backend_discarded = Arc::new(AtomicUsize::new(0));
+        let owner = MemoryOwner {
+            returned: Arc::clone(&returned),
+            discarded: Arc::clone(&owner_discarded),
+        };
+        let backend = MemoryBackend {
+            id: 7,
+            idled: Arc::clone(&backend_idled),
+            discarded: Arc::clone(&backend_discarded),
+        };
+        let lease = BackendLeaseState::new(
+            owner,
+            Arc::new(AtomicBool::new(true)),
+            Some(permit),
+            route,
+            route_gate,
+            false,
+        );
+
+        let pooled = PooledBackendLease::new(backend, lease);
+
+        assert_eq!(pooled.backend_id(), 7);
+        pooled.release().await;
+
+        assert_eq!(returned.load(Ordering::Relaxed), 1);
+        assert_eq!(backend_idled.load(Ordering::Relaxed), 1);
+        assert_eq!(backend_discarded.load(Ordering::Relaxed), 0);
+        assert_eq!(owner_discarded.load(Ordering::Relaxed), 0);
     }
 
     #[test]
