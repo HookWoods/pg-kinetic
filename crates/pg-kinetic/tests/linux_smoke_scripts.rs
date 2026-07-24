@@ -38,6 +38,7 @@ fn bash_scripts_use_the_shared_contract() {
         "scripts/bench/run-read-only.sh",
         "scripts/bench/compare-performance.sh",
         "scripts/bench/profile-performance.sh",
+        "scripts/release/build-optimized-linux.sh",
     ] {
         let script = read_repository_file(path);
         assert!(
@@ -126,6 +127,14 @@ fn benchmark_scripts_preserve_the_product_command_contract() {
     assert!(profile.contains("profile run"));
     assert!(profile.contains("flamegraph"));
     assert!(profile.contains("perf"));
+
+    let optimized_release = read_repository_file("scripts/release/build-optimized-linux.sh");
+    assert!(optimized_release.contains("-Cprofile-generate"));
+    assert!(optimized_release.contains("llvm-profdata merge"));
+    assert!(optimized_release.contains("-Cprofile-use"));
+    assert!(optimized_release.contains("perf2bolt"));
+    assert!(optimized_release.contains("llvm-bolt"));
+    assert!(optimized_release.contains("PG_KINETIC_OPTIMIZED_BINARY"));
 }
 
 #[test]

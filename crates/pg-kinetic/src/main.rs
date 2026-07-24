@@ -38,6 +38,10 @@ use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewR
 use serde::Deserialize;
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[cfg(feature = "allocator-mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(name = "pg-kinetic", about = "Low-overhead PostgreSQL wire proxy")]
 struct Cli {
