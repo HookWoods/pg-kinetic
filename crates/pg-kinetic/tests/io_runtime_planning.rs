@@ -5,8 +5,8 @@ use std::sync::{
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::proxy_runtime::io_runtime::{
-    take_frontend_cycle_bytes, take_startup_packet_bytes, try_enter_client_capacity,
-    FrontendCycleRead, FrontendCycleShape, StartupPacketRead,
+    take_frontend_cycle_bytes, take_startup_packet_bytes, try_enter_backend_capacity,
+    try_enter_client_capacity, FrontendCycleRead, FrontendCycleShape, StartupPacketRead,
 };
 use pg_kinetic::wire::{
     frame::FrontendFrame,
@@ -188,6 +188,20 @@ fn client_capacity_guard_enforces_shared_limit() {
 
     assert_eq!(active.load(Ordering::Acquire), 0);
     assert!(try_enter_client_capacity(&active, 1).is_some());
+}
+
+#[test]
+fn backend_capacity_guard_enforces_shared_limit() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let first = try_enter_backend_capacity(&active, 1).expect("first backend is accepted");
+
+    assert!(try_enter_backend_capacity(&active, 1).is_none());
+    assert_eq!(active.load(Ordering::Acquire), 1);
+
+    drop(first);
+
+    assert_eq!(active.load(Ordering::Acquire), 0);
+    assert!(try_enter_backend_capacity(&active, 1).is_some());
 }
 
 fn frontend_frame(tag: FrontendTag, payload: &[u8]) -> FrontendFrame {

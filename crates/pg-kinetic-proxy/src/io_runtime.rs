@@ -41,11 +41,14 @@ pub enum StartupPacketRead {
 }
 
 #[derive(Debug)]
-pub struct ClientCapacityGuard {
+pub struct CapacityGuard {
     active: Arc<AtomicUsize>,
 }
 
-impl Drop for ClientCapacityGuard {
+pub type ClientCapacityGuard = CapacityGuard;
+pub type BackendCapacityGuard = CapacityGuard;
+
+impl Drop for CapacityGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
@@ -55,9 +58,20 @@ pub fn try_enter_client_capacity(
     active: &Arc<AtomicUsize>,
     max_clients: usize,
 ) -> Option<ClientCapacityGuard> {
+    try_enter_capacity(active, max_clients)
+}
+
+pub fn try_enter_backend_capacity(
+    active: &Arc<AtomicUsize>,
+    max_backends: usize,
+) -> Option<BackendCapacityGuard> {
+    try_enter_capacity(active, max_backends)
+}
+
+fn try_enter_capacity(active: &Arc<AtomicUsize>, limit: usize) -> Option<CapacityGuard> {
     let mut current = active.load(Ordering::Acquire);
     loop {
-        if current >= max_clients {
+        if current >= limit {
             return None;
         }
         match active.compare_exchange_weak(
@@ -67,7 +81,7 @@ pub fn try_enter_client_capacity(
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                return Some(ClientCapacityGuard {
+                return Some(CapacityGuard {
                     active: Arc::clone(active),
                 });
             }

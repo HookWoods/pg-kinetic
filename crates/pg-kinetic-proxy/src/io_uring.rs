@@ -41,6 +41,7 @@ mod linux {
         let stop = Arc::new(AtomicBool::new(false));
         let start_accepting = Arc::new(AtomicBool::new(false));
         let client_capacity = Arc::new(AtomicUsize::new(0));
+        let backend_capacity = Arc::new(AtomicUsize::new(0));
         let lifecycle = LifecycleController::new(
             Arc::new(DrainController::default()),
             config.drain.drain_timeout(),
@@ -54,10 +55,12 @@ mod linux {
             let stop = Arc::clone(&stop);
             let start_accepting = Arc::clone(&start_accepting);
             let client_capacity = Arc::clone(&client_capacity);
+            let backend_capacity = Arc::clone(&backend_capacity);
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
             let max_clients = config.capacity.max_clients;
+            let max_backends = config.capacity.max_backends;
             let drain_timeout = config.drain.drain_timeout();
             let max_client_buffer_bytes = config.qos.max_client_buffer_bytes;
             let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
@@ -83,9 +86,11 @@ mod linux {
                         stop,
                         start_accepting,
                         client_capacity,
+                        backend_capacity,
                         lifecycle.drain_token(),
                         lifecycle.drain_controller(),
                         max_clients,
+                        max_backends,
                         drain_timeout,
                         max_client_buffer_bytes,
                         max_backend_buffer_bytes,
@@ -180,9 +185,11 @@ mod linux {
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
         client_capacity: Arc<AtomicUsize>,
+        backend_capacity: Arc<AtomicUsize>,
         drain: crate::lifecycle::DrainToken,
         drain_controller: Arc<DrainController>,
         max_clients: usize,
+        max_backends: usize,
         drain_timeout: Duration,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
@@ -215,10 +222,13 @@ mod linux {
                 drop(session_guard);
                 continue;
             };
+            let backend_capacity = Arc::clone(&backend_capacity);
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
                     backend_addr,
+                    backend_capacity,
+                    max_backends,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
                 )
@@ -258,6 +268,8 @@ mod linux {
     async fn proxy_connection(
         client: TcpStream,
         backend_addr: SocketAddr,
+        backend_capacity: Arc<AtomicUsize>,
+        max_backends: usize,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
@@ -273,6 +285,14 @@ mod linux {
             )? {
                 crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
                 crate::io_runtime::StartupPacketRead::Cancel { bytes } => {
+                    let Some(backend_capacity_guard) =
+                        crate::io_runtime::try_enter_backend_capacity(
+                            &backend_capacity,
+                            max_backends,
+                        )
+                    else {
+                        anyhow::bail!("backend capacity exceeded");
+                    };
                     let backend = TcpStream::connect_addr(backend_addr)
                         .await
                         .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
@@ -282,6 +302,7 @@ mod linux {
                         .await
                         .context("forward cancel request")?;
                     let _ = backend.shutdown().await;
+                    drop(backend_capacity_guard);
                     return Ok(());
                 }
                 crate::io_runtime::StartupPacketRead::EncryptionRequest => {
@@ -305,6 +326,11 @@ mod linux {
             }
         };
 
+        let Some(_backend_capacity_guard) =
+            crate::io_runtime::try_enter_backend_capacity(&backend_capacity, max_backends)
+        else {
+            anyhow::bail!("backend capacity exceeded");
+        };
         let backend = TcpStream::connect_addr(backend_addr)
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
