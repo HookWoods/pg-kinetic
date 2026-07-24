@@ -282,13 +282,24 @@ mod linux {
         .await?
         {
             crate::proxy::StartupOrCancel::Startup(bytes) => bytes,
-            crate::proxy::StartupOrCancel::Cancel { bytes, .. } => {
-                let backend_addr = runtime_state.default_primary_backend_addr();
-                let backend = TcpStream::connect_addr(backend_addr)
+            crate::proxy::StartupOrCancel::Cancel {
+                process_id,
+                secret_key,
+                ..
+            } => {
+                let Some(target) = runtime_state
+                    .cancel_registry()
+                    .lookup((process_id, secret_key))
+                else {
+                    return Ok(());
+                };
+                let backend = TcpStream::connect_addr(target.backend_addr)
                     .await
-                    .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
+                    .with_context(|| format!("connect io_uring backend {}", target.backend_addr))?;
                 let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-                crate::io_runtime::write_all_to(&mut backend, &bytes)
+                let packet =
+                    crate::cancel::encode_cancel_request(target.process_id, target.secret_key);
+                crate::io_runtime::write_all_to(&mut backend, &packet)
                     .await
                     .context("forward cancel request")?;
                 let _ = crate::io_runtime::shutdown(&mut backend).await;

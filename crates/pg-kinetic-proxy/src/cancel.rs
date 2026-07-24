@@ -161,16 +161,21 @@ pub async fn forward_cancel(target: CancelTarget) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(target.backend_addr)
         .await
         .with_context(|| format!("connect backend {} for cancel", target.backend_addr))?;
-    let mut packet = BytesMut::with_capacity(16);
-    packet.put_i32(16);
-    packet.put_i32(CANCEL_REQUEST_CODE);
-    packet.put_i32(target.process_id);
-    packet.put_i32(target.secret_key);
+    let packet = encode_cancel_request(target.process_id, target.secret_key);
     stream
         .write_all(&packet)
         .await
         .context("write backend cancel request")?;
     Ok(())
+}
+
+pub(crate) fn encode_cancel_request(process_id: i32, secret_key: i32) -> BytesMut {
+    let mut packet = BytesMut::with_capacity(16);
+    packet.put_i32(16);
+    packet.put_i32(CANCEL_REQUEST_CODE);
+    packet.put_i32(process_id);
+    packet.put_i32(secret_key);
+    packet
 }
 
 #[cfg(test)]
@@ -195,5 +200,14 @@ mod tests {
         registry.remove_session(key);
         registry.bind(key, target);
         assert_eq!(registry.lookup(key), None);
+    }
+
+    #[test]
+    fn cancel_packet_uses_target_credentials() {
+        let packet = encode_cancel_request(7, 9);
+        assert_eq!(
+            &packet[..],
+            &[0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9,]
+        );
     }
 }

@@ -163,6 +163,17 @@ pub(super) fn bind_cancel_target(
     client_key: (i32, i32),
     backend: &PooledBackend,
 ) {
+    bind_cancel_target_for_backend(registry, client_key, backend);
+}
+
+pub(super) fn bind_cancel_target_for_backend<B, O>(
+    registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    backend: &crate::pool::PooledBackendLease<B, O>,
+) where
+    B: crate::pool::PoolBackendTransport + crate::proxy::BackendStartupMetadata,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
     if let Some((process_id, secret_key)) = backend.backend().key_data() {
         registry.bind(
             client_key,
@@ -175,20 +186,26 @@ pub(super) fn bind_cancel_target(
     }
 }
 
-pub(super) async fn release_backend_with_cancel_unbind(
+pub(super) async fn release_backend_with_cancel_unbind<B, O>(
     registry: &cancel::CancelRegistry,
     client_key: (i32, i32),
-    backend: PooledBackend,
-) {
+    backend: crate::pool::PooledBackendLease<B, O>,
+) where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
     registry.unbind(client_key).await;
     backend.release().await;
 }
 
-pub(super) async fn discard_backend_with_cancel_unbind(
+pub(super) async fn discard_backend_with_cancel_unbind<B, O>(
     registry: &cancel::CancelRegistry,
     client_key: (i32, i32),
-    backend: PooledBackend,
-) {
+    backend: crate::pool::PooledBackendLease<B, O>,
+) where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
     registry.unbind(client_key).await;
     backend.discard();
 }

@@ -118,11 +118,10 @@ mod recovery;
 mod request_plan;
 mod session_snapshot;
 
+pub(crate) use backend_startup::BackendStartupMetadata;
 use backend_startup::*;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub(crate) use backend_startup::{
-    bootstrap_backend_streams, proxy_startup_streams, BackendStartupMetadata,
-};
+pub(crate) use backend_startup::{bootstrap_backend_streams, proxy_startup_streams};
 use buffer_limit::*;
 use checkout::*;
 pub use checkout::{
@@ -132,9 +131,9 @@ pub use checkout::{
     route_checkout_snapshot_for_target,
 };
 use client_io::{
-    bind_cancel_target, discard_backend_with_cancel_unbind, next_client_cycle,
-    read_startup_packet_with_buffer, release_backend_with_cancel_unbind, CancelSessionGuard,
-    ClientCycle, IdleTimeoutKind, QueryProgress,
+    bind_cancel_target, bind_cancel_target_for_backend, discard_backend_with_cancel_unbind,
+    next_client_cycle, read_startup_packet_with_buffer, release_backend_with_cancel_unbind,
+    CancelSessionGuard, ClientCycle, IdleTimeoutKind, QueryProgress,
 };
 pub(crate) use client_io::{handle_startup_or_cancel, StartupOrCancel};
 pub(crate) use client_io::{read_startup_packet, StartupRead};

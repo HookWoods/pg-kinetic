@@ -3,11 +3,41 @@ use super::*;
 pub(crate) trait BackendStartupMetadata {
     fn is_tls(&self) -> bool;
 
+    fn addr(&self) -> std::net::SocketAddr;
+
+    fn key_data(&self) -> Option<(i32, i32)>;
+
     fn parameter_status(&self) -> &[(String, String)];
 
     fn push_parameter_status(&mut self, name: String, value: String);
 
     fn set_key_data(&mut self, process_id: i32, secret_key: i32);
+}
+
+impl BackendStartupMetadata for crate::backend::Backend {
+    fn is_tls(&self) -> bool {
+        self.is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.key_data()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.set_key_data(process_id, secret_key);
+    }
 }
 
 struct PooledBackendStartup<'a> {
@@ -17,6 +47,14 @@ struct PooledBackendStartup<'a> {
 impl BackendStartupMetadata for PooledBackendStartup<'_> {
     fn is_tls(&self) -> bool {
         self.backend.is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.backend.addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.backend.key_data()
     }
 
     fn parameter_status(&self) -> &[(String, String)] {
@@ -49,6 +87,14 @@ impl crate::io_runtime::RuntimeByteStream for PooledBackendStartup<'_> {
 impl BackendStartupMetadata for PooledBackend {
     fn is_tls(&self) -> bool {
         self.backend().is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.backend().addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.backend().key_data()
     }
 
     fn parameter_status(&self) -> &[(String, String)] {
@@ -494,6 +540,14 @@ mod tests {
     impl BackendStartupMetadata for MemoryStream {
         fn is_tls(&self) -> bool {
             false
+        }
+
+        fn addr(&self) -> std::net::SocketAddr {
+            "127.0.0.1:5432".parse().expect("test address")
+        }
+
+        fn key_data(&self) -> Option<(i32, i32)> {
+            self.key_data
         }
 
         fn parameter_status(&self) -> &[(String, String)] {

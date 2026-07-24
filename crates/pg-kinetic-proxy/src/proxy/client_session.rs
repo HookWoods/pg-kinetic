@@ -60,6 +60,14 @@ where
         self.lease.backend().is_tls()
     }
 
+    fn addr(&self) -> std::net::SocketAddr {
+        self.lease.backend().addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.lease.backend().key_data()
+    }
+
     fn parameter_status(&self) -> &[(String, String)] {
         self.lease.backend().parameter_status()
     }
@@ -210,8 +218,9 @@ where
         return Err(error).context("shared backend startup");
     }
     drop(startup_backend);
+    bind_cancel_target_for_backend(&cancel_registry, client_key, &startup_backend_lease);
     let mut previous_backend_id = Some(startup_backend_lease.backend_id());
-    startup_backend_lease.release().await;
+    release_backend_with_cancel_unbind(&cancel_registry, client_key, startup_backend_lease).await;
 
     let mut session = VirtualSession::default();
     let mut prepared = PreparedCatalog::new(session_id);
@@ -264,7 +273,12 @@ where
                     RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
                 ) {
                     if let Some(held_backend) = held_backend.take() {
-                        held_backend.release().await;
+                        release_backend_with_cancel_unbind(
+                            &cancel_registry,
+                            client_key,
+                            held_backend,
+                        )
+                        .await;
                     }
                     return Err(anyhow::anyhow!(
                         "monoio cycle routing produced unsupported target: {target:?}"
@@ -276,7 +290,12 @@ where
                 );
                 if !reuse_held_backend {
                     if let Some(held_backend) = held_backend.take() {
-                        held_backend.release().await;
+                        release_backend_with_cancel_unbind(
+                            &cancel_registry,
+                            client_key,
+                            held_backend,
+                        )
+                        .await;
                     }
                 }
                 let mut backend = if reuse_held_backend {
@@ -303,10 +322,11 @@ where
                 .await
                 {
                     drop(startup_backend);
-                    backend.discard();
+                    discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
                     return Err(error).context("monoio cycle backend startup");
                 }
                 drop(startup_backend);
+                bind_cancel_target_for_backend(&cancel_registry, client_key, &backend);
                 let backend_id = backend.backend_id();
                 if should_replay_shared_session(&session, previous_backend_id, backend_id) {
                     let replay_frames = replay_frames(&session);
@@ -333,7 +353,8 @@ where
                     .await;
                     drop(replay_backend);
                     if let Err(error) = replay_result {
-                        backend.discard();
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
                         return Err(error).context("monoio virtual session replay");
                     }
                 }
@@ -375,17 +396,18 @@ where
                 drop(runtime_backend);
                 if result.is_err() {
                     previous_backend_id = None;
-                    backend.discard();
+                    discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
                 } else if session.pin_reason().is_some() {
                     held_backend = Some(backend);
                 } else {
-                    backend.release().await;
+                    release_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
                 }
                 result?;
             }
             crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
                 if let Some(held_backend) = held_backend.take() {
-                    held_backend.release().await;
+                    release_backend_with_cancel_unbind(&cancel_registry, client_key, held_backend)
+                        .await;
                 }
                 return Ok(());
             }
@@ -397,7 +419,12 @@ where
             crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
                 if crate::io_runtime::read_from(&mut client, &mut client_buffer).await? == 0 {
                     if let Some(held_backend) = held_backend.take() {
-                        held_backend.release().await;
+                        release_backend_with_cancel_unbind(
+                            &cancel_registry,
+                            client_key,
+                            held_backend,
+                        )
+                        .await;
                     }
                     return Ok(());
                 }
