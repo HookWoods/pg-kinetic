@@ -1,8 +1,8 @@
-use std::io;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::{future::Future, io, time::Duration};
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -70,6 +70,19 @@ pub(crate) async fn write_all_to<S: RuntimeByteStream + ?Sized>(
 
 pub(crate) async fn shutdown<S: RuntimeByteStream + ?Sized>(stream: &mut S) -> io::Result<()> {
     stream.shutdown_stream().await
+}
+
+pub(crate) async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    {
+        monoio::time::timeout(duration, future)
+            .await
+            .map_err(|_| ())
+    }
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    {
+        tokio::time::timeout(duration, future).await.map_err(|_| ())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

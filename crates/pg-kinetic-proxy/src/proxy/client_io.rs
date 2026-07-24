@@ -30,7 +30,7 @@ where
                 }
 
                 match idle_timeout {
-                    Some(duration) => match timeout(
+                    Some(duration) => match crate::io_runtime::timeout(
                         duration,
                         crate::io_runtime::read_from(client, client_buffer),
                     )
@@ -319,7 +319,12 @@ pub(super) async fn read_startup_packet_with_buffer(
                     return Ok(StartupRead::BufferLimitExceeded);
                 }
 
-                match timeout(idle_timeout, crate::io_runtime::read_from(client, buffer)).await {
+                match crate::io_runtime::timeout(
+                    idle_timeout,
+                    crate::io_runtime::read_from(client, buffer),
+                )
+                .await
+                {
                     Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
                     Ok(Ok(_)) => {
                         if buffer.len() > max_client_buffer_bytes {

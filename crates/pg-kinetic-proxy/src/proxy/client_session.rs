@@ -176,10 +176,7 @@ where
         backend,
         max_backend_buffer_bytes,
     );
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    let result = monoio::time::timeout(probe_timeout, probe).await;
-    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    let result = tokio::time::timeout(probe_timeout, probe).await;
+    let result = crate::io_runtime::timeout(probe_timeout, probe).await;
 
     result.map_err(|_| anyhow::anyhow!("read-after-write probe timed out"))?
 }

@@ -10,7 +10,6 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tokio::time::timeout;
 
 use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
@@ -1601,7 +1600,7 @@ where
             Ok(PooledBackendLease::new(backend, lease))
         };
 
-        let result = match timeout(self.checkout_timeout, checkout).await {
+        let result = match crate::io_runtime::timeout(self.checkout_timeout, checkout).await {
             Ok(result) => result,
             Err(_) => {
                 metrics::increment_backpressure_event(&route, "timeout");
