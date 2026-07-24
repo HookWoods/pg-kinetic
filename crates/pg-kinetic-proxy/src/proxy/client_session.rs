@@ -28,6 +28,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) buffer_pool: ProxyBufferPool,
     pub(crate) max_client_buffer_bytes: usize,
     pub(crate) max_backend_buffer_bytes: usize,
+    pub(crate) query_timeout: Duration,
     pub(crate) auth: crate::config::AuthConfig,
     pub(crate) auth_users: Option<Arc<UserStore>>,
     pub(crate) auth_query_service: Arc<AuthQueryService>,
@@ -164,6 +165,19 @@ fn apply_read_after_write_probe_result(
     }
 }
 
+async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let error = build_error_response(SqlState::QueryCanceled.as_str(), "query timed out");
+    let mut response = BytesMut::with_capacity(error.len() + 6);
+    response.extend_from_slice(&error);
+    response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
+    crate::io_runtime::write_all_to(client, &response)
+        .await
+        .context("write shared query timeout response")
+}
+
 async fn probe_shared_read_after_write_requirement<S>(
     backend: &mut S,
     probe_timeout: Duration,
@@ -252,6 +266,7 @@ where
         buffer_pool,
         max_client_buffer_bytes,
         max_backend_buffer_bytes,
+        query_timeout,
         auth,
         auth_users,
         auth_query_service,
@@ -524,7 +539,7 @@ where
                 let mut runtime_backend = LeaseRuntimeBackend {
                     lease: &mut backend,
                 };
-                let result = forward_runtime_cycle(
+                let forward = forward_runtime_cycle(
                     &mut client,
                     &mut runtime_backend,
                     &planned.backend_bytes,
@@ -532,10 +547,13 @@ where
                     planned.injected_parse_completes,
                     &mut backend_buffer,
                     max_backend_buffer_bytes,
-                )
-                .await;
+                );
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                let result = crate::io_runtime::monoio_timeout(query_timeout, forward).await;
+                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                let result = crate::io_runtime::tokio_timeout(query_timeout, forward).await;
                 match result {
-                    Ok(status) => {
+                    Ok(Ok(status)) => {
                         if should_probe_read_after_write(
                             committed_write_transaction,
                             read_after_write_protection_enabled,
@@ -561,11 +579,23 @@ where
                             .await;
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         drop(runtime_backend);
                         discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
                             .await;
                         return Err(error);
+                    }
+                    Err(_) => {
+                        drop(runtime_backend);
+                        metrics_crate::counter!(
+                            MetricName::TimeoutTotal.as_str(),
+                            "kind" => "query"
+                        )
+                        .increment(1);
+                        session.mark_unknown_protocol_state();
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        write_shared_query_timeout_response(&mut client).await?;
                     }
                 }
             }

@@ -329,6 +329,7 @@ mod linux {
             buffer_pool,
             max_client_buffer_bytes,
             max_backend_buffer_bytes,
+            query_timeout: effective_config.qos.query_timeout(),
             auth: effective_config.auth.clone(),
             auth_users: crate::reload::load_auth_users(effective_config)?,
             auth_query_service: runtime_state.auth_query_service(),
