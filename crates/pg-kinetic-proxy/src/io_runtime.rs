@@ -142,6 +142,14 @@ impl FrontendCycleShape {
     }
 }
 
+pub fn parse_frontend_cycle_frames(mut bytes: BytesMut) -> anyhow::Result<Vec<FrontendFrame>> {
+    let mut frames = Vec::new();
+    while let Some(frame) = parse_frontend_frame(&mut bytes)? {
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 pub fn take_frontend_cycle_bytes(
     buffer: &mut BytesMut,
     max_client_buffer_bytes: usize,

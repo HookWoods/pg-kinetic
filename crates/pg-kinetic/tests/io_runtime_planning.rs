@@ -6,8 +6,9 @@ use std::sync::{
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::proxy_runtime::io_runtime::StartupEncryptionRequest;
 use pg_kinetic::proxy_runtime::io_runtime::{
-    take_frontend_cycle_bytes, take_startup_packet_bytes, try_enter_backend_capacity,
-    try_enter_client_capacity, FrontendCycleRead, FrontendCycleShape, StartupPacketRead,
+    parse_frontend_cycle_frames, take_frontend_cycle_bytes, take_startup_packet_bytes,
+    try_enter_backend_capacity, try_enter_client_capacity, FrontendCycleRead, FrontendCycleShape,
+    StartupPacketRead,
 };
 use pg_kinetic::wire::{
     frame::FrontendFrame,
@@ -91,7 +92,10 @@ fn frontend_cycle_bytes_take_complete_simple_prefix_and_leave_partial_tail() {
     else {
         panic!("expected complete cycle");
     };
-    assert_eq!(complete.len(), first.len() + second.len());
+    let complete_len = complete.len();
+    let frames = parse_frontend_cycle_frames(complete).expect("cycle frames parse");
+    assert_eq!(complete_len, first.len() + second.len());
+    assert_eq!(frames.len(), 2);
     assert_eq!(shape.expected_ready_count(), 2);
     assert_eq!(bytes.len(), 3);
 }

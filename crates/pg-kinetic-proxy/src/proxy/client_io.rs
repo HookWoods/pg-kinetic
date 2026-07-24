@@ -7,129 +7,56 @@ pub(super) async fn next_client_cycle(
     idle_timeout_kind: IdleTimeoutKind,
     max_client_buffer_bytes: usize,
 ) -> anyhow::Result<Option<ClientCycle>> {
-    let first = loop {
-        if let Some(frame) = parse_frontend_frame(client_buffer)? {
-            break frame;
-        }
-
-        if client_buffer.len() >= max_client_buffer_bytes {
-            return Ok(Some(ClientCycle::BufferLimitExceeded));
-        }
-
-        match idle_timeout {
-            Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
-                Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
-                Ok(Ok(_)) => {
-                    if client_buffer.len() > max_client_buffer_bytes {
-                        return Ok(Some(ClientCycle::BufferLimitExceeded));
-                    }
-                    continue;
-                }
-                Ok(Err(error)) => return Err(error).context("read client"),
-                Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
-            },
-            None => {
-                if client
-                    .read_buf(client_buffer)
-                    .await
-                    .context("read client")?
-                    == 0
-                {
-                    return Ok(Some(ClientCycle::Terminate));
-                }
-
-                if client_buffer.len() > max_client_buffer_bytes {
-                    return Ok(Some(ClientCycle::BufferLimitExceeded));
-                }
+    loop {
+        match crate::io_runtime::take_frontend_cycle_bytes(client_buffer, max_client_buffer_bytes)?
+        {
+            crate::io_runtime::FrontendCycleRead::Complete { bytes, .. } => {
+                return Ok(Some(ClientCycle::Frames(
+                    crate::io_runtime::parse_frontend_cycle_frames(bytes)?,
+                )));
             }
-        }
-    };
-
-    if first.tag == u8::from(FrontendTag::Terminate) {
-        return Ok(Some(ClientCycle::Terminate));
-    }
-
-    if first.tag == u8::from(FrontendTag::Query) {
-        let mut frames = vec![first];
-        drain_buffered_simple_queries(client_buffer, &mut frames)?;
-        return Ok(Some(ClientCycle::Frames(frames)));
-    }
-
-    let mut frames = vec![first];
-    while !frames
-        .iter()
-        .any(|frame| frame.tag == u8::from(FrontendTag::Sync))
-    {
-        if let Some(frame) = parse_frontend_frame(client_buffer)? {
-            frames.push(frame);
-            continue;
-        }
-
-        if client_buffer.len() >= max_client_buffer_bytes {
-            return Ok(Some(ClientCycle::BufferLimitExceeded));
-        }
-
-        match idle_timeout {
-            Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await {
-                Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
-                Ok(Ok(_)) => {
-                    if client_buffer.len() > max_client_buffer_bytes {
-                        return Ok(Some(ClientCycle::BufferLimitExceeded));
-                    }
-                    continue;
-                }
-                Ok(Err(error)) => return Err(error).context("read extended query frame"),
-                Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
-            },
-            None => {
-                if client
-                    .read_buf(client_buffer)
-                    .await
-                    .context("read extended query frame")?
-                    == 0
-                {
-                    return Ok(Some(ClientCycle::Terminate));
-                }
-
-                if client_buffer.len() > max_client_buffer_bytes {
+            crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+                return Ok(Some(ClientCycle::Terminate));
+            }
+            crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+                return Ok(Some(ClientCycle::BufferLimitExceeded));
+            }
+            crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+                if client_buffer.len() >= max_client_buffer_bytes {
                     return Ok(Some(ClientCycle::BufferLimitExceeded));
+                }
+
+                match idle_timeout {
+                    Some(duration) => match timeout(duration, client.read_buf(client_buffer)).await
+                    {
+                        Ok(Ok(0)) => return Ok(Some(ClientCycle::Terminate)),
+                        Ok(Ok(_)) => {
+                            if client_buffer.len() > max_client_buffer_bytes {
+                                return Ok(Some(ClientCycle::BufferLimitExceeded));
+                            }
+                            continue;
+                        }
+                        Ok(Err(error)) => return Err(error).context("read client"),
+                        Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
+                    },
+                    None => {
+                        if client
+                            .read_buf(client_buffer)
+                            .await
+                            .context("read client")?
+                            == 0
+                        {
+                            return Ok(Some(ClientCycle::Terminate));
+                        }
+
+                        if client_buffer.len() > max_client_buffer_bytes {
+                            return Ok(Some(ClientCycle::BufferLimitExceeded));
+                        }
+                    }
                 }
             }
         }
     }
-
-    Ok(Some(ClientCycle::Frames(frames)))
-}
-
-fn drain_buffered_simple_queries(
-    client_buffer: &mut BytesMut,
-    frames: &mut Vec<FrontendFrame>,
-) -> anyhow::Result<()> {
-    while next_complete_frontend_tag(client_buffer) == Some(u8::from(FrontendTag::Query)) {
-        let Some(frame) = parse_frontend_frame(client_buffer)? else {
-            break;
-        };
-        frames.push(frame);
-    }
-
-    Ok(())
-}
-
-fn next_complete_frontend_tag(buffer: &[u8]) -> Option<u8> {
-    if buffer.len() < 5 {
-        return None;
-    }
-
-    let len = i32::from_be_bytes(
-        buffer[1..5]
-            .try_into()
-            .expect("frontend frame length header is present"),
-    );
-    if len < 4 {
-        return Some(buffer[0]);
-    }
-
-    (buffer.len() >= len as usize + 1).then_some(buffer[0])
 }
 
 #[derive(Debug)]
@@ -138,52 +65,6 @@ pub(super) enum ClientCycle {
     Terminate,
     IdleTimeout(IdleTimeoutKind),
     BufferLimitExceeded,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn frontend_frame(tag: FrontendTag, payload: &[u8]) -> BytesMut {
-        let mut frame = BytesMut::with_capacity(payload.len() + 5);
-        frame.put_u8(u8::from(tag));
-        frame.put_i32((payload.len() + 4) as i32);
-        frame.extend_from_slice(payload);
-        frame
-    }
-
-    #[test]
-    fn drains_pipelined_simple_queries_already_in_one_read_buffer() {
-        let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 1\0"));
-        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 2\0"));
-        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 3\0"));
-        let first = parse_frontend_frame(&mut buffer)
-            .expect("first query parses")
-            .expect("first query is complete");
-        let mut frames = vec![first];
-
-        drain_buffered_simple_queries(&mut buffer, &mut frames).expect("drain queries");
-
-        assert_eq!(frames.len(), 3);
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn simple_query_drain_preserves_partial_followup_frame() {
-        let mut buffer = BytesMut::new();
-        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 1\0"));
-        buffer.extend_from_slice(&frontend_frame(FrontendTag::Query, b"select 2\0")[..3]);
-        let first = parse_frontend_frame(&mut buffer)
-            .expect("first query parses")
-            .expect("first query is complete");
-        let mut frames = vec![first];
-
-        drain_buffered_simple_queries(&mut buffer, &mut frames).expect("drain queries");
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(buffer.len(), 3);
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
