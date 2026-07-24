@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use bytes::{BufMut, BytesMut};
+use pg_kinetic::proxy_runtime::io_runtime::StartupEncryptionRequest;
 use pg_kinetic::proxy_runtime::io_runtime::{
     take_frontend_cycle_bytes, take_startup_packet_bytes, try_enter_backend_capacity,
     try_enter_client_capacity, FrontendCycleRead, FrontendCycleShape, StartupPacketRead,
@@ -161,7 +162,12 @@ fn startup_packet_bytes_treat_ssl_and_gss_as_encryption_requests() {
 
         let outcome = take_startup_packet_bytes(&mut bytes, 1024).expect("startup read");
 
-        assert_eq!(outcome, StartupPacketRead::EncryptionRequest);
+        let expected = if code == SSL_REQUEST_CODE {
+            StartupEncryptionRequest::Ssl
+        } else {
+            StartupEncryptionRequest::Gss
+        };
+        assert_eq!(outcome, StartupPacketRead::EncryptionRequest(expected));
         assert!(bytes.is_empty());
     }
 }

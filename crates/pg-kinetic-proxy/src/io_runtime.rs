@@ -34,10 +34,20 @@ pub enum FrontendCycleRead {
 #[derive(Debug, Eq, PartialEq)]
 pub enum StartupPacketRead {
     Packet(BytesMut),
-    Cancel { bytes: BytesMut },
-    EncryptionRequest,
+    Cancel {
+        bytes: BytesMut,
+        process_id: i32,
+        secret_key: i32,
+    },
+    EncryptionRequest(StartupEncryptionRequest),
     BufferLimitExceeded,
     NeedMoreBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupEncryptionRequest {
+    Ssl,
+    Gss,
 }
 
 #[derive(Debug)]
@@ -201,10 +211,20 @@ pub fn take_startup_packet_bytes(
     let packet = buffer.split_to(length);
     match parse_startup_packet(&packet).map_err(anyhow::Error::from)? {
         StartupPacket::Startup { .. } => Ok(StartupPacketRead::Packet(packet)),
-        StartupPacket::CancelRequest { .. } => Ok(StartupPacketRead::Cancel { bytes: packet }),
-        StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
-            Ok(StartupPacketRead::EncryptionRequest)
-        }
+        StartupPacket::CancelRequest {
+            process_id,
+            secret_key,
+        } => Ok(StartupPacketRead::Cancel {
+            bytes: packet,
+            process_id,
+            secret_key,
+        }),
+        StartupPacket::SslRequest => Ok(StartupPacketRead::EncryptionRequest(
+            StartupEncryptionRequest::Ssl,
+        )),
+        StartupPacket::GssEncRequest => Ok(StartupPacketRead::EncryptionRequest(
+            StartupEncryptionRequest::Gss,
+        )),
     }
 }
 

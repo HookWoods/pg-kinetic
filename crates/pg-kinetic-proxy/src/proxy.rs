@@ -88,7 +88,6 @@ use pg_kinetic_wire::{
         build_error_response, encode_backend_key_data, encode_parameter_status,
         parse_backend_frame, parse_parameter_status, BackendFrame, ReadyStatus,
     },
-    error::WireError,
     frame::{parse_frontend_frame, FrontendFrame},
     message::{
         parse_bind_statement_name, parse_close_target, parse_describe_target, parse_parse_message,

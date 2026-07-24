@@ -284,7 +284,7 @@ mod linux {
                 max_client_buffer_bytes,
             )? {
                 crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
-                crate::io_runtime::StartupPacketRead::Cancel { bytes } => {
+                crate::io_runtime::StartupPacketRead::Cancel { bytes, .. } => {
                     let Some(backend_capacity_guard) =
                         crate::io_runtime::try_enter_backend_capacity(
                             &backend_capacity,
@@ -305,7 +305,7 @@ mod linux {
                     drop(backend_capacity_guard);
                     return Ok(());
                 }
-                crate::io_runtime::StartupPacketRead::EncryptionRequest => {
+                crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
                     client
                         .write_all(b"N")
                         .await

@@ -284,108 +284,94 @@ pub(super) async fn read_startup_packet_with_buffer(
         crate::config::ClientTlsMode::Require | crate::config::ClientTlsMode::VerifyClient
     );
     loop {
-        while let Some(packet) = next_startup_packet(buffer)? {
-            match parse_startup_packet(&packet) {
-                Ok(StartupPacket::SslRequest) => {
-                    match client_tls_mode {
-                        crate::config::ClientTlsMode::Disable => {
-                            reject_startup_encryption_request(client).await?;
-                        }
-                        crate::config::ClientTlsMode::Allow
-                        | crate::config::ClientTlsMode::Require
-                        | crate::config::ClientTlsMode::VerifyClient => {
-                            client
-                                .write_all(b"S")
-                                .await
-                                .context("accept startup encryption request")?;
-                            let server_config = client_tls_server_config
-                                .context("client TLS server config is unavailable")?;
-                            let tls_timer =
-                                PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
-                            let tls_result = client.start_tls(server_config).await;
-                            let tls_outcome = match &tls_result {
-                                Ok(())
-                                    if matches!(
-                                        client_tls_mode,
-                                        crate::config::ClientTlsMode::VerifyClient
-                                    ) && !client.has_peer_certificates() =>
-                                {
-                                    MetricOutcome::Rejected
-                                }
-                                Ok(()) => MetricOutcome::Ok,
-                                Err(_) => MetricOutcome::Error,
-                            };
-                            tls_timer.finish(tls_outcome);
-                            tls_result?;
-                            if matches!(client_tls_mode, crate::config::ClientTlsMode::VerifyClient)
-                                && !client.has_peer_certificates()
-                            {
-                                anyhow::bail!("client certificate is required");
-                            }
-                            buffer.clear();
-                        }
-                    }
-                    continue;
-                }
-                Ok(StartupPacket::GssEncRequest) => {
-                    reject_startup_encryption_request(client).await?;
-                    continue;
-                }
-                Ok(StartupPacket::Startup { .. }) if client_tls_required && !client.is_tls() => {
+        match crate::io_runtime::take_startup_packet_bytes(buffer, max_client_buffer_bytes)? {
+            crate::io_runtime::StartupPacketRead::Packet(packet) => {
+                if client_tls_required && !client.is_tls() {
                     anyhow::bail!("client TLS is required");
                 }
-                Ok(StartupPacket::CancelRequest {
+                return Ok(StartupRead::Packet(packet));
+            }
+            crate::io_runtime::StartupPacketRead::Cancel {
+                process_id,
+                secret_key,
+                ..
+            } => {
+                return Ok(StartupRead::Cancel {
                     process_id,
                     secret_key,
-                }) => {
-                    return Ok(StartupRead::Cancel {
-                        process_id,
-                        secret_key,
-                    });
-                }
-                Ok(StartupPacket::Startup { .. }) => return Ok(StartupRead::Packet(packet)),
-                Err(error) => return Err(error).context("parse startup packet"),
+                });
             }
-        }
-
-        if buffer.len() >= max_client_buffer_bytes {
-            return Ok(StartupRead::BufferLimitExceeded);
-        }
-
-        match timeout(idle_timeout, client.read_buf(buffer)).await {
-            Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
-            Ok(Ok(_)) => {
-                if buffer.len() > max_client_buffer_bytes {
-                    return Ok(StartupRead::BufferLimitExceeded);
+            crate::io_runtime::StartupPacketRead::EncryptionRequest(
+                crate::io_runtime::StartupEncryptionRequest::Ssl,
+            ) => {
+                match client_tls_mode {
+                    crate::config::ClientTlsMode::Disable => {
+                        reject_startup_encryption_request(client).await?;
+                    }
+                    crate::config::ClientTlsMode::Allow
+                    | crate::config::ClientTlsMode::Require
+                    | crate::config::ClientTlsMode::VerifyClient => {
+                        client
+                            .write_all(b"S")
+                            .await
+                            .context("accept startup encryption request")?;
+                        let server_config = client_tls_server_config
+                            .context("client TLS server config is unavailable")?;
+                        let tls_timer =
+                            PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
+                        let tls_result = client.start_tls(server_config).await;
+                        let tls_outcome = match &tls_result {
+                            Ok(())
+                                if matches!(
+                                    client_tls_mode,
+                                    crate::config::ClientTlsMode::VerifyClient
+                                ) && !client.has_peer_certificates() =>
+                            {
+                                MetricOutcome::Rejected
+                            }
+                            Ok(()) => MetricOutcome::Ok,
+                            Err(_) => MetricOutcome::Error,
+                        };
+                        tls_timer.finish(tls_outcome);
+                        tls_result?;
+                        if matches!(client_tls_mode, crate::config::ClientTlsMode::VerifyClient)
+                            && !client.has_peer_certificates()
+                        {
+                            anyhow::bail!("client certificate is required");
+                        }
+                        buffer.clear();
+                    }
                 }
                 continue;
             }
-            Ok(Err(error)) => return Err(error).context("read startup"),
-            Err(_) => return Ok(StartupRead::TimedOut),
+            crate::io_runtime::StartupPacketRead::EncryptionRequest(
+                crate::io_runtime::StartupEncryptionRequest::Gss,
+            ) => {
+                reject_startup_encryption_request(client).await?;
+                continue;
+            }
+            crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
+                return Ok(StartupRead::BufferLimitExceeded);
+            }
+            crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
+                if buffer.len() >= max_client_buffer_bytes {
+                    return Ok(StartupRead::BufferLimitExceeded);
+                }
+
+                match timeout(idle_timeout, client.read_buf(buffer)).await {
+                    Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
+                    Ok(Ok(_)) => {
+                        if buffer.len() > max_client_buffer_bytes {
+                            return Ok(StartupRead::BufferLimitExceeded);
+                        }
+                        continue;
+                    }
+                    Ok(Err(error)) => return Err(error).context("read startup"),
+                    Err(_) => return Ok(StartupRead::TimedOut),
+                }
+            }
         }
     }
-}
-
-pub(super) fn next_startup_packet(buffer: &mut BytesMut) -> anyhow::Result<Option<BytesMut>> {
-    if buffer.len() < 4 {
-        return Ok(None);
-    }
-
-    let len = i32::from_be_bytes(
-        buffer[..4]
-            .try_into()
-            .expect("four startup length bytes are present"),
-    );
-    if len < 8 {
-        return Err(WireError::InvalidStartupLength(len)).context("parse startup packet");
-    }
-
-    let len = len as usize;
-    if buffer.len() < len {
-        return Ok(None);
-    }
-
-    Ok(Some(buffer.split_to(len)))
 }
 
 pub(super) async fn reject_startup_encryption_request(
