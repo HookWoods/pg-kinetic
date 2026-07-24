@@ -54,6 +54,7 @@ mod linux {
             let listen_addr = config.connection.listen_addr;
             let backend_addr = config.connection.backend_addr;
             let drain_timeout = config.drain.drain_timeout();
+            let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
             let thread = std::thread::Builder::new()
                 .name(format!("pg-kinetic-iouring-shard-{shard_id}"))
                 .spawn(move || {
@@ -78,6 +79,7 @@ mod linux {
                         lifecycle.drain_token(),
                         lifecycle.drain_controller(),
                         drain_timeout,
+                        max_backend_buffer_bytes,
                         startup_tx,
                     ))
                 })
@@ -171,6 +173,7 @@ mod linux {
         drain: crate::lifecycle::DrainToken,
         drain_controller: Arc<DrainController>,
         drain_timeout: Duration,
+        max_backend_buffer_bytes: usize,
         startup_tx: mpsc::Sender<Result<usize, String>>,
     ) -> anyhow::Result<()> {
         let listener = match bind_reuseport_listener(listen_addr)
@@ -195,7 +198,9 @@ mod linux {
                 continue;
             };
             monoio::spawn(async move {
-                if let Err(error) = proxy_connection(client, backend_addr).await {
+                if let Err(error) =
+                    proxy_connection(client, backend_addr, max_backend_buffer_bytes).await
+                {
                     tracing::debug!(shard_id, error = %error, "io_uring connection ended");
                 }
                 drop(session_guard);
@@ -226,7 +231,11 @@ mod linux {
         }
     }
 
-    async fn proxy_connection(client: TcpStream, backend_addr: SocketAddr) -> anyhow::Result<()> {
+    async fn proxy_connection(
+        client: TcpStream,
+        backend_addr: SocketAddr,
+        max_backend_buffer_bytes: usize,
+    ) -> anyhow::Result<()> {
         let backend = TcpStream::connect_addr(backend_addr)
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
@@ -258,13 +267,20 @@ mod linux {
             if read == 0 {
                 anyhow::bail!("backend closed during startup");
             }
+            if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
+                anyhow::bail!("backend response exceeded configured buffer limit");
+            }
             client
                 .write_all(&backend_buffer)
                 .await
                 .context("write startup response")?;
             backend_scan_buffer.extend_from_slice(&backend_buffer);
             backend_buffer.clear();
-            if ready_seen(&mut backend_scan_buffer, &mut startup_drain)? {
+            if ready_seen(
+                &mut backend_scan_buffer,
+                &mut startup_drain,
+                max_backend_buffer_bytes,
+            )? {
                 break;
             }
         }
@@ -299,13 +315,20 @@ mod linux {
                 if read == 0 {
                     anyhow::bail!("backend closed during response");
                 }
+                if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
+                    anyhow::bail!("backend response exceeded configured buffer limit");
+                }
                 client
                     .write_all(&backend_buffer)
                     .await
                     .context("write backend response")?;
                 backend_scan_buffer.extend_from_slice(&backend_buffer);
                 backend_buffer.clear();
-                if ready_seen(&mut backend_scan_buffer, &mut response_drain)? {
+                if ready_seen(
+                    &mut backend_scan_buffer,
+                    &mut response_drain,
+                    max_backend_buffer_bytes,
+                )? {
                     break;
                 }
             }
@@ -315,9 +338,16 @@ mod linux {
     fn ready_seen(
         buffer: &mut BytesMut,
         drain: &mut crate::io_runtime::BackendResponseDrain,
+        max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<bool> {
         let mut forwarded = Vec::new();
-        let event = drain.drain(buffer, &mut forwarded)?;
+        let event = drain.drain_with_limit(buffer, &mut forwarded, max_backend_buffer_bytes)?;
+        if matches!(
+            event,
+            crate::io_runtime::ResponseDrainEvent::BufferLimitExceeded
+        ) {
+            anyhow::bail!("backend response exceeded configured buffer limit");
+        }
         Ok(matches!(
             event,
             crate::io_runtime::ResponseDrainEvent::Frames { ready: Some(_), .. }

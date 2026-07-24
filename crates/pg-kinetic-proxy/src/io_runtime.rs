@@ -125,6 +125,19 @@ impl BackendResponseDrain {
         self.drain_with(backend_buffer, forwarded_frames, |_| Ok(()))
     }
 
+    pub fn drain_with_limit(
+        &mut self,
+        backend_buffer: &mut BytesMut,
+        forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
+        max_backend_buffer_bytes: usize,
+    ) -> anyhow::Result<ResponseDrainEvent> {
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            return Ok(ResponseDrainEvent::BufferLimitExceeded);
+        }
+
+        self.drain(backend_buffer, forwarded_frames)
+    }
+
     pub fn drain_with(
         &mut self,
         backend_buffer: &mut BytesMut,

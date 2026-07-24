@@ -96,3 +96,21 @@ fn response_drain_hides_injected_parse_completes() {
     assert_eq!(forwarded.len(), 1);
     assert_eq!(forwarded[0].0[0], u8::from(BackendTag::ReadyForQuery));
 }
+
+#[test]
+fn response_drain_reports_buffer_limit_before_forwarding() {
+    let mut drain = BackendResponseDrain::new(1, 0);
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(u8::from(BackendTag::ReadyForQuery));
+    bytes.put_i32(5);
+    bytes.put_u8(b'I');
+    let mut forwarded = Vec::new();
+
+    let event = drain
+        .drain_with_limit(&mut bytes, &mut forwarded, 4)
+        .expect("drain with limit");
+
+    assert_eq!(event, ResponseDrainEvent::BufferLimitExceeded);
+    assert!(forwarded.is_empty());
+    assert!(!bytes.is_empty());
+}
