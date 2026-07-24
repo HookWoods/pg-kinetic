@@ -276,7 +276,6 @@ mod linux {
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
         let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
-        let mut backend_scan_buffer = BytesMut::with_capacity(16 * 1024);
 
         let startup_packet = loop {
             match crate::io_runtime::take_startup_packet_bytes(
@@ -337,29 +336,17 @@ mod linux {
             .context("forward startup")?;
 
         let mut startup_drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
-        loop {
-            let read = crate::io_runtime::read_from(&mut backend, &mut backend_buffer)
-                .await
-                .context("read startup response")?;
-            if read == 0 {
-                anyhow::bail!("backend closed during startup");
-            }
-            if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
-                anyhow::bail!("backend response exceeded configured buffer limit");
-            }
-            crate::io_runtime::write_all_to(&mut client, &backend_buffer)
-                .await
-                .context("write startup response")?;
-            backend_scan_buffer.extend_from_slice(&backend_buffer);
-            backend_buffer.clear();
-            if ready_seen(
-                &mut backend_scan_buffer,
-                &mut startup_drain,
-                max_backend_buffer_bytes,
-            )? {
-                break;
-            }
-        }
+        crate::io_runtime::forward_backend_until_ready(
+            &mut backend,
+            &mut client,
+            &mut backend_buffer,
+            &mut startup_drain,
+            max_backend_buffer_bytes,
+            "read startup response",
+            "write startup response",
+            "backend closed during startup",
+        )
+        .await?;
 
         loop {
             let (client_cycle, expected_ready_count) = loop {
@@ -394,50 +381,18 @@ mod linux {
                 .context("write query")?;
             let mut response_drain =
                 crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
-
-            loop {
-                let read = crate::io_runtime::read_from(&mut backend, &mut backend_buffer)
-                    .await
-                    .context("read backend response")?;
-                if read == 0 {
-                    anyhow::bail!("backend closed during response");
-                }
-                if backend_scan_buffer.len() + backend_buffer.len() > max_backend_buffer_bytes {
-                    anyhow::bail!("backend response exceeded configured buffer limit");
-                }
-                crate::io_runtime::write_all_to(&mut client, &backend_buffer)
-                    .await
-                    .context("write backend response")?;
-                backend_scan_buffer.extend_from_slice(&backend_buffer);
-                backend_buffer.clear();
-                if ready_seen(
-                    &mut backend_scan_buffer,
-                    &mut response_drain,
-                    max_backend_buffer_bytes,
-                )? {
-                    break;
-                }
-            }
+            crate::io_runtime::forward_backend_until_ready(
+                &mut backend,
+                &mut client,
+                &mut backend_buffer,
+                &mut response_drain,
+                max_backend_buffer_bytes,
+                "read backend response",
+                "write backend response",
+                "backend closed during response",
+            )
+            .await?;
         }
-    }
-
-    fn ready_seen(
-        buffer: &mut BytesMut,
-        drain: &mut crate::io_runtime::BackendResponseDrain,
-        max_backend_buffer_bytes: usize,
-    ) -> anyhow::Result<bool> {
-        let mut forwarded = Vec::new();
-        let event = drain.drain_with_limit(buffer, &mut forwarded, max_backend_buffer_bytes)?;
-        if matches!(
-            event,
-            crate::io_runtime::ResponseDrainEvent::BufferLimitExceeded
-        ) {
-            anyhow::bail!("backend response exceeded configured buffer limit");
-        }
-        Ok(matches!(
-            event,
-            crate::io_runtime::ResponseDrainEvent::Frames { ready: Some(_), .. }
-        ))
     }
 
     fn bind_reuseport_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {

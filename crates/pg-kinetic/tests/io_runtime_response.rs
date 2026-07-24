@@ -1,5 +1,7 @@
 use bytes::{BufMut, BytesMut};
-use pg_kinetic::proxy_runtime::io_runtime::{BackendResponseDrain, ResponseDrainEvent};
+use pg_kinetic::proxy_runtime::io_runtime::{
+    drain_backend_response_bytes, BackendBytesDrainEvent, BackendResponseDrain, ResponseDrainEvent,
+};
 use pg_kinetic::wire::{
     backend::{parse_backend_frame, ReadyStatus},
     protocol::BackendTag,
@@ -113,4 +115,32 @@ fn response_drain_reports_buffer_limit_before_forwarding() {
     assert_eq!(event, ResponseDrainEvent::BufferLimitExceeded);
     assert!(forwarded.is_empty());
     assert!(!bytes.is_empty());
+}
+
+#[test]
+fn response_byte_drain_encodes_complete_frames_and_preserves_partial_tail() {
+    let mut drain = BackendResponseDrain::new(1, 0);
+    let mut bytes = BytesMut::new();
+    bytes.put_u8(u8::from(BackendTag::CommandComplete));
+    bytes.put_i32(13);
+    bytes.extend_from_slice(b"SELECT 1\0");
+    bytes.put_u8(u8::from(BackendTag::ReadyForQuery));
+    bytes.put_i32(5);
+    bytes.put_u8(b'I');
+    bytes.put_u8(u8::from(BackendTag::DataRow));
+    bytes.put_i32(10);
+
+    let event = drain_backend_response_bytes(&mut bytes, &mut drain, 1024).expect("drain bytes");
+
+    let BackendBytesDrainEvent::Bytes {
+        bytes: forwarded,
+        ready,
+    } = event
+    else {
+        panic!("expected forwarded bytes");
+    };
+    assert_eq!(ready, Some(ReadyStatus::Idle));
+    assert_eq!(forwarded[0], u8::from(BackendTag::CommandComplete));
+    assert_eq!(forwarded[14], u8::from(BackendTag::ReadyForQuery));
+    assert_eq!(bytes.len(), 5);
 }

@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
 };
 
+use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
 use pg_kinetic_wire::frame::parse_frontend_frame;
@@ -312,6 +313,16 @@ pub enum ResponseDrainEvent {
     NeedMoreBytes,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum BackendBytesDrainEvent {
+    Bytes {
+        bytes: BytesMut,
+        ready: Option<ReadyStatus>,
+    },
+    BufferLimitExceeded,
+    NeedMoreBytes,
+}
+
 #[derive(Debug)]
 pub struct BackendResponseDrain {
     injected_parse_completes: usize,
@@ -420,6 +431,76 @@ impl BackendResponseDrain {
                 ready: None,
                 response_started: self.response_started,
             })
+        }
+    }
+}
+
+pub fn drain_backend_response_bytes(
+    backend_buffer: &mut BytesMut,
+    drain: &mut BackendResponseDrain,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<BackendBytesDrainEvent> {
+    let mut forwarded_frames = Vec::new();
+    match drain.drain_with_limit(
+        backend_buffer,
+        &mut forwarded_frames,
+        max_backend_buffer_bytes,
+    )? {
+        ResponseDrainEvent::Frames { ready, .. } => {
+            let total_len = forwarded_frames
+                .iter()
+                .map(|(header, payload)| header.len() + payload.len())
+                .sum();
+            let mut bytes = BytesMut::with_capacity(total_len);
+            for (header, payload) in forwarded_frames {
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(&payload);
+            }
+            Ok(BackendBytesDrainEvent::Bytes { bytes, ready })
+        }
+        ResponseDrainEvent::BufferLimitExceeded => Ok(BackendBytesDrainEvent::BufferLimitExceeded),
+        ResponseDrainEvent::NeedMoreBytes => Ok(BackendBytesDrainEvent::NeedMoreBytes),
+    }
+}
+
+#[cfg_attr(not(all(target_os = "linux", feature = "io-uring")), allow(dead_code))]
+pub(crate) async fn forward_backend_until_ready<B, C>(
+    backend: &mut B,
+    client: &mut C,
+    backend_buffer: &mut BytesMut,
+    drain: &mut BackendResponseDrain,
+    max_backend_buffer_bytes: usize,
+    read_context: &'static str,
+    write_context: &'static str,
+    closed_message: &'static str,
+) -> anyhow::Result<()>
+where
+    B: RuntimeByteStream + ?Sized,
+    C: RuntimeByteStream + ?Sized,
+{
+    loop {
+        let read = read_from(backend, backend_buffer)
+            .await
+            .with_context(|| read_context)?;
+        if read == 0 {
+            anyhow::bail!(closed_message);
+        }
+
+        match drain_backend_response_bytes(backend_buffer, drain, max_backend_buffer_bytes)? {
+            BackendBytesDrainEvent::Bytes { bytes, ready } => {
+                if !bytes.is_empty() {
+                    write_all_to(client, &bytes)
+                        .await
+                        .with_context(|| write_context)?;
+                }
+                if ready.is_some() {
+                    return Ok(());
+                }
+            }
+            BackendBytesDrainEvent::BufferLimitExceeded => {
+                anyhow::bail!("backend response exceeded configured buffer limit");
+            }
+            BackendBytesDrainEvent::NeedMoreBytes => {}
         }
     }
 }
