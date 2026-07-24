@@ -190,6 +190,94 @@ pub(super) async fn forward_message_cycle(
     }
 }
 
+pub(crate) async fn forward_runtime_cycle<C, B>(
+    client: &mut C,
+    backend: &mut B,
+    cycle: &[u8],
+    expected_ready_count: usize,
+    backend_buffer: &mut BytesMut,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    B: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    crate::io_runtime::write_all_to(backend, cycle)
+        .await
+        .context("write frontend cycle to backend")?;
+    let mut response_drain = crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
+    crate::io_runtime::forward_backend_until_ready(
+        backend,
+        client,
+        backend_buffer,
+        &mut response_drain,
+        max_backend_buffer_bytes,
+        "read backend response",
+        "write backend response",
+        "backend closed during response",
+    )
+    .await
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+    use crate::pool::PoolBackendTransport;
+    use bytes::BytesMut;
+    use std::collections::VecDeque;
+
+    #[derive(Debug)]
+    struct MemoryBackendStream {
+        id: u64,
+        reads: VecDeque<BytesMut>,
+        writes: Vec<BytesMut>,
+    }
+
+    impl crate::io_runtime::RuntimeByteStream for MemoryBackendStream {
+        async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+            let Some(next) = self.reads.pop_front() else {
+                return Ok(0);
+            };
+            let read = next.len();
+            dst.extend_from_slice(&next);
+            Ok(read)
+        }
+
+        async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.writes.push(BytesMut::from(bytes));
+            Ok(())
+        }
+
+        async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::pool::PoolBackendTransport for MemoryBackendStream {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn attach_snapshot_store(&mut self, _snapshot_store: SnapshotStore) {}
+
+        fn mark_checked_out(&self, _route_key: Option<RouteKey>) {}
+
+        fn mark_idle(&self, _route_key: Option<RouteKey>) {}
+
+        fn mark_discarded(&self) {}
+    }
+
+    #[tokio::test]
+    async fn forwarding_accepts_generic_pooled_backend_stream() {
+        let backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        assert_eq!(backend.id(), 1);
+    }
+}
+
 pub(super) fn classify_backend_frames(
     backend_id: u64,
     state: &mut ForwardCycleState<'_>,

@@ -1,12 +1,15 @@
 use super::*;
 
-pub(super) async fn next_client_cycle(
-    client: &mut ClientConnection,
+pub(super) async fn next_client_cycle<C>(
+    client: &mut C,
     client_buffer: &mut BytesMut,
     idle_timeout: Option<Duration>,
     idle_timeout_kind: IdleTimeoutKind,
     max_client_buffer_bytes: usize,
-) -> anyhow::Result<Option<ClientCycle>> {
+) -> anyhow::Result<Option<ClientCycle>>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
     loop {
         match crate::io_runtime::take_frontend_cycle_bytes(client_buffer, max_client_buffer_bytes)?
         {
@@ -60,6 +63,63 @@ pub(super) async fn next_client_cycle(
             }
         }
     }
+}
+
+pub(crate) async fn handle_startup_or_cancel<C>(
+    client: &mut C,
+    client_buffer: &mut BytesMut,
+    max_client_buffer_bytes: usize,
+) -> anyhow::Result<StartupOrCancel>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    loop {
+        match crate::io_runtime::take_startup_packet_bytes(client_buffer, max_client_buffer_bytes)?
+        {
+            crate::io_runtime::StartupPacketRead::Packet(bytes) => {
+                return Ok(StartupOrCancel::Startup(bytes));
+            }
+            crate::io_runtime::StartupPacketRead::Cancel {
+                bytes,
+                process_id,
+                secret_key,
+            } => {
+                return Ok(StartupOrCancel::Cancel {
+                    bytes,
+                    process_id,
+                    secret_key,
+                });
+            }
+            crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
+                crate::io_runtime::write_all_to(client, b"N")
+                    .await
+                    .context("reject startup encryption request")?;
+            }
+            crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
+                return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
+            }
+            crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
+                if crate::io_runtime::read_from(client, client_buffer)
+                    .await
+                    .context("read startup")?
+                    == 0
+                {
+                    return Ok(StartupOrCancel::Finished);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StartupOrCancel {
+    Startup(BytesMut),
+    Cancel {
+        bytes: BytesMut,
+        process_id: i32,
+        secret_key: i32,
+    },
+    Finished,
 }
 
 #[derive(Debug)]

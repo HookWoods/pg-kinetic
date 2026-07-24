@@ -1,5 +1,171 @@
 use super::*;
 
+pub(crate) trait SharedBackendPool<B, O>: Clone + std::fmt::Debug
+where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    async fn checkout_shared(
+        &self,
+        route: RouteKey,
+    ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
+}
+
+#[derive(Debug)]
+pub(crate) struct SharedClientSessionContext<B, O> {
+    pub(crate) pool: O,
+    pub(crate) route: RouteKey,
+    pub(crate) backend_startup_packet: BytesMut,
+    pub(crate) buffer_pool: ProxyBufferPool,
+    pub(crate) max_client_buffer_bytes: usize,
+    pub(crate) max_backend_buffer_bytes: usize,
+    pub(crate) backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    pub(crate) _backend: std::marker::PhantomData<B>,
+}
+
+struct LeaseRuntimeBackend<'a, B, O>
+where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    lease: &'a mut crate::pool::PooledBackendLease<B, O>,
+}
+
+impl<B, O> BackendStartupMetadata for LeaseRuntimeBackend<'_, B, O>
+where
+    B: crate::pool::PoolBackendTransport + BackendStartupMetadata,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    fn is_tls(&self) -> bool {
+        self.lease.backend().is_tls()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.lease.backend().parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.lease.backend_mut().push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.lease
+            .backend_mut()
+            .set_key_data(process_id, secret_key);
+    }
+}
+
+impl<B, O> crate::io_runtime::RuntimeByteStream for LeaseRuntimeBackend<'_, B, O>
+where
+    B: crate::pool::PoolBackendTransport + crate::io_runtime::RuntimeByteStream,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        crate::io_runtime::read_from(self.lease.backend_mut(), dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        crate::io_runtime::write_all_to(self.lease.backend_mut(), bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        crate::io_runtime::shutdown(self.lease.backend_mut()).await
+    }
+}
+
+pub(crate) async fn handle_client_session<C, B, O>(
+    mut client: C,
+    _client_addr: SocketAddr,
+    context: SharedClientSessionContext<B, O>,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream,
+    B: crate::pool::PoolBackendTransport
+        + crate::io_runtime::RuntimeByteStream
+        + BackendStartupMetadata,
+    O: crate::pool::BackendLeaseOwner<B> + SharedBackendPool<B, O>,
+{
+    let SharedClientSessionContext {
+        pool,
+        route,
+        backend_startup_packet,
+        buffer_pool,
+        max_client_buffer_bytes,
+        max_backend_buffer_bytes,
+        backend_credentials,
+        _backend: _,
+    } = context;
+    let mut client_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut buffers = buffer_pool.acquire();
+    let mut backend = pool
+        .checkout_shared(route)
+        .await
+        .map_err(|error| anyhow::anyhow!("shared backend checkout failed: {error:?}"))?;
+    let requires_startup = backend.requires_startup();
+    let mut startup_backend = LeaseRuntimeBackend {
+        lease: &mut backend,
+    };
+    if let Err(error) = crate::proxy::proxy_startup_streams(
+        &mut client,
+        &mut startup_backend,
+        requires_startup,
+        &backend_startup_packet,
+        max_client_buffer_bytes,
+        max_backend_buffer_bytes,
+        true,
+        true,
+        backend_credentials.as_deref(),
+        buffers.buffers_mut(),
+        None,
+    )
+    .await
+    {
+        drop(startup_backend);
+        backend.discard();
+        return Err(error).context("shared backend startup");
+    }
+    drop(startup_backend);
+
+    loop {
+        match crate::io_runtime::take_frontend_cycle_bytes(
+            &mut client_buffer,
+            max_client_buffer_bytes,
+        )? {
+            crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
+                let mut runtime_backend = LeaseRuntimeBackend {
+                    lease: &mut backend,
+                };
+                forward_runtime_cycle(
+                    &mut client,
+                    &mut runtime_backend,
+                    &bytes,
+                    shape.expected_ready_count(),
+                    &mut backend_buffer,
+                    max_backend_buffer_bytes,
+                )
+                .await?;
+            }
+            crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+                backend.release().await;
+                return Ok(());
+            }
+            crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+                backend.discard();
+                return Err(anyhow::anyhow!(
+                    "client request exceeded configured buffer limit"
+                ));
+            }
+            crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+                if crate::io_runtime::read_from(&mut client, &mut client_buffer).await? == 0 {
+                    backend.release().await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct ClientSessionContext {
     pub(super) route_pool_selector: RoutePoolSelector,
     pub(super) config: Config,
