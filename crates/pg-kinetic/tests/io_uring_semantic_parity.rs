@@ -44,3 +44,16 @@ fn io_uring_route_shapes_use_shared_runtime_path() {
     assert_eq!(summary.backend_checkout, "shared_pool");
     assert_eq!(summary.session_lifecycle, "shared_proxy");
 }
+
+#[test]
+fn io_uring_runtime_no_longer_uses_direct_pass_through_loop() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pg-kinetic-proxy/src/io_uring.rs"
+    ))
+    .expect("read io_uring source");
+
+    assert!(!source.contains("take_frontend_cycle_bytes("));
+    assert!(!source.contains("forward_backend_until_ready("));
+    assert!(!source.contains("proxy_startup_streams("));
+}
