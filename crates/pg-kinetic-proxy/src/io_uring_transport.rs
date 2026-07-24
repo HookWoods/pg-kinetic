@@ -209,7 +209,7 @@ pub(crate) struct MonoioBackendPoolSelector {
     default_backend_addr: SocketAddr,
     backend_slots: Arc<tokio::sync::Semaphore>,
     default_pool: Arc<MonoioBackendPool>,
-    route_pools: RwLock<HashMap<PoolKey, Arc<MonoioBackendPool>>>,
+    route_pools: RwLock<HashMap<(PoolKey, SocketAddr), Arc<MonoioBackendPool>>>,
 }
 
 impl MonoioBackendPoolSelector {
@@ -249,7 +249,7 @@ impl MonoioBackendPoolSelector {
             return self.default_pool();
         }
 
-        let key = route.selection_key();
+        let key = (route.selection_key(), backend_addr);
         if let Some(pool) = self
             .route_pools
             .read()
@@ -406,6 +406,7 @@ mod tests {
     fn selector_reuses_default_pool_and_keeps_route_pools_separate() {
         let default_addr = "127.0.0.1:5432".parse().expect("default address");
         let alternate_addr = "127.0.0.1:5433".parse().expect("alternate address");
+        let alternate_addr_again = "127.0.0.1:5434".parse().expect("second alternate address");
         let selector =
             MonoioBackendPoolSelector::new(default_addr, Arc::new(tokio::sync::Semaphore::new(4)));
         let route = RouteKey::new("app", "app", None, None, QueryClass::Default);
@@ -413,10 +414,19 @@ mod tests {
         let default_pool = selector.pool_for_route(&route, default_addr);
         let alternate_pool = selector.pool_for_route(&route, alternate_addr);
         let alternate_pool_again = selector.pool_for_route(&route, alternate_addr);
+        let alternate_pool_for_new_endpoint = selector.pool_for_route(&route, alternate_addr_again);
 
         assert_eq!(default_pool.backend_addr(), default_addr);
         assert_eq!(alternate_pool.backend_addr(), alternate_addr);
         assert!(Arc::ptr_eq(&alternate_pool, &alternate_pool_again));
+        assert_eq!(
+            alternate_pool_for_new_endpoint.backend_addr(),
+            alternate_addr_again
+        );
+        assert!(!Arc::ptr_eq(
+            &alternate_pool,
+            &alternate_pool_for_new_endpoint
+        ));
         assert!(!Arc::ptr_eq(&default_pool, &alternate_pool));
     }
 }
