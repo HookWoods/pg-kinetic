@@ -226,6 +226,7 @@ pub(crate) struct ProxyRuntimeState {
     pressure_route_in_flight_limit: Arc<AtomicUsize>,
     routing_planner: ReadRoutingPlanner,
     auth_query_service: Arc<AuthQueryService>,
+    cancel_registry: Arc<cancel::CancelRegistry>,
 }
 
 pub(crate) struct StartupBackendPlan {
@@ -405,6 +406,12 @@ impl ProxyRuntimeState {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub(crate) fn snapshot_store(&self) -> SnapshotStore {
         self.snapshot_store.clone()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn cancel_registry(&self) -> Arc<cancel::CancelRegistry> {
+        Arc::clone(&self.cancel_registry)
     }
 
     pub(crate) fn startup_primary_backend_addr(
@@ -970,6 +977,7 @@ impl Proxy {
             pressure_route_in_flight_limit,
             routing_planner,
             auth_query_service,
+            cancel_registry: Arc::clone(&self.cancel_registry),
         })
     }
 }

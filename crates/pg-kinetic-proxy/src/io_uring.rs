@@ -321,6 +321,7 @@ mod linux {
             auth_users: crate::reload::load_auth_users(effective_config)?,
             auth_query_service: runtime_state.auth_query_service(),
             backend_credentials,
+            cancel_registry: runtime_state.cancel_registry(),
             route_pools: startup_plan.route_pools,
             route_read_routing_mode: route_policy.routing_planner.read_routing_mode(),
             route_fallback_policy: route_policy.routing_planner.fallback_policy(),

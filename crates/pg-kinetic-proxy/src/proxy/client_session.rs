@@ -32,6 +32,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) auth_users: Option<Arc<UserStore>>,
     pub(crate) auth_query_service: Arc<AuthQueryService>,
     pub(crate) backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    pub(crate) cancel_registry: Arc<cancel::CancelRegistry>,
     pub(crate) route_pools: Arc<RoutePools>,
     pub(crate) routing_planner: ReadRoutingPlanner,
     pub(crate) route_read_routing_mode: ReadRoutingMode,
@@ -146,6 +147,7 @@ where
         auth_users,
         auth_query_service,
         backend_credentials,
+        cancel_registry,
         route_pools,
         routing_planner,
         route_read_routing_mode,
@@ -155,6 +157,8 @@ where
         session_id,
         _backend: _,
     } = context;
+    let client_key = cancel_registry.issue_client_key()?;
+    let _cancel_session = CancelSessionGuard::new(Arc::clone(&cancel_registry), client_key);
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
     let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
     let mut buffers = buffer_pool.acquire();
@@ -197,7 +201,7 @@ where
         true,
         backend_credentials.as_deref(),
         buffers.buffers_mut(),
-        None,
+        Some(client_key),
     )
     .await
     {
