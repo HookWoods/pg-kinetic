@@ -16,7 +16,8 @@ use monoio::{
 
 use crate::{
     metrics,
-    pool::{PoolBackendConnector, PoolBackendTransport},
+    pool::{PoolBackendConnector, PoolBackendTransport, RoutePools},
+    routing::RoutingTarget,
     snapshot::{ServerSnapshot, SnapshotStore},
 };
 use pg_kinetic_core::route::{PoolKey, RouteKey};
@@ -278,6 +279,17 @@ impl MonoioBackendPoolSelector {
             .expect("io_uring route pool selector poisoned");
         Arc::clone(route_pools.entry(key).or_insert_with(|| Arc::clone(&pool)))
     }
+
+    pub(crate) fn pool_for_target(
+        &self,
+        route: &RouteKey,
+        route_pools: &RoutePools,
+        target: &RoutingTarget,
+    ) -> Option<Arc<MonoioBackendPool>> {
+        route_pools
+            .pool_for_target(target)
+            .map(|pool| self.pool_for_route(route, pool.backend_addr()))
+    }
 }
 
 impl crate::pool::BackendLeaseOwner<MonoioBackend> for std::sync::Arc<MonoioBackendPool> {
@@ -405,7 +417,44 @@ impl crate::io_runtime::RuntimeByteStream for MonoioTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::TlsConfig,
+        pool::{BackendPool, BackendPoolRef, ReplicaSelectionStrategy, ReplicaSelector},
+        routing::{ReplicaCandidate, RoutingReason},
+    };
     use pg_kinetic_core::route::{QueryClass, RouteKey};
+
+    fn route_pools(primary_addr: SocketAddr, replica_addr: SocketAddr) -> RoutePools {
+        let primary = BackendPoolRef::primary(BackendPool::new(
+            primary_addr,
+            TlsConfig::default(),
+            1,
+            1,
+            1,
+            1,
+            std::time::Duration::from_millis(500),
+            "DISCARD ALL",
+        ));
+        let replica = BackendPoolRef::replica(
+            7,
+            1,
+            BackendPool::new(
+                replica_addr,
+                TlsConfig::default(),
+                1,
+                1,
+                1,
+                1,
+                std::time::Duration::from_millis(500),
+                "DISCARD ALL",
+            ),
+        );
+        RoutePools::new(
+            primary,
+            vec![replica],
+            ReplicaSelector::new(ReplicaSelectionStrategy::LeastWaiting),
+        )
+    }
 
     #[test]
     fn selector_reuses_default_pool_and_keeps_route_pools_separate() {
@@ -433,5 +482,72 @@ mod tests {
             &alternate_pool_for_new_endpoint
         ));
         assert!(!Arc::ptr_eq(&default_pool, &alternate_pool));
+    }
+
+    #[test]
+    fn selector_maps_primary_and_replica_targets_to_reusable_endpoint_pools() {
+        let default_addr = "127.0.0.1:5432".parse().expect("default address");
+        let replica_addr = "127.0.0.1:5433".parse().expect("replica address");
+        let selector =
+            MonoioBackendPoolSelector::new(default_addr, Arc::new(tokio::sync::Semaphore::new(4)));
+        let route = RouteKey::new("app", "app", None, None, QueryClass::Default);
+        let route_pools = route_pools(default_addr, replica_addr);
+        let primary_target = RoutingTarget::Primary {
+            reason: RoutingReason::Off,
+        };
+        let replica_target = RoutingTarget::Replica {
+            candidate: ReplicaCandidate::new(7, true, None, None),
+            reason: RoutingReason::ReadCandidateQuery,
+        };
+
+        let primary_pool = selector
+            .pool_for_target(&route, &route_pools, &primary_target)
+            .expect("primary target pool");
+        let primary_pool_again = selector
+            .pool_for_target(&route, &route_pools, &primary_target)
+            .expect("primary target pool reuse");
+        let replica_pool = selector
+            .pool_for_target(&route, &route_pools, &replica_target)
+            .expect("replica target pool");
+        let replica_pool_again = selector
+            .pool_for_target(&route, &route_pools, &replica_target)
+            .expect("replica target pool reuse");
+
+        assert_eq!(primary_pool.backend_addr(), default_addr);
+        assert!(Arc::ptr_eq(&primary_pool, &primary_pool_again));
+        assert_eq!(replica_pool.backend_addr(), replica_addr);
+        assert!(Arc::ptr_eq(&replica_pool, &replica_pool_again));
+        assert!(!Arc::ptr_eq(&primary_pool, &replica_pool));
+    }
+
+    #[test]
+    fn selector_does_not_create_pool_for_missing_or_non_checkout_targets() {
+        let primary_addr = "127.0.0.1:5432".parse().expect("primary address");
+        let replica_addr = "127.0.0.1:5433".parse().expect("replica address");
+        let selector =
+            MonoioBackendPoolSelector::new(primary_addr, Arc::new(tokio::sync::Semaphore::new(4)));
+        let route = RouteKey::new("app", "app", None, None, QueryClass::Default);
+        let route_pools = route_pools(primary_addr, replica_addr);
+
+        let unknown_replica = RoutingTarget::Replica {
+            candidate: ReplicaCandidate::new(99, true, None, None),
+            reason: RoutingReason::ReplicaUnavailable,
+        };
+        let wait_target = RoutingTarget::Wait {
+            reason: RoutingReason::FallbackWait,
+        };
+        let reject_target = RoutingTarget::Reject {
+            reason: RoutingReason::FallbackReject,
+        };
+
+        assert!(selector
+            .pool_for_target(&route, &route_pools, &unknown_replica)
+            .is_none());
+        assert!(selector
+            .pool_for_target(&route, &route_pools, &wait_target)
+            .is_none());
+        assert!(selector
+            .pool_for_target(&route, &route_pools, &reject_target)
+            .is_none());
     }
 }
