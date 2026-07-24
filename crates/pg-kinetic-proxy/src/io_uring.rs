@@ -197,17 +197,11 @@ mod linux {
             }
         };
         let _ = startup_tx.send(Ok(shard_id));
-        let backend_pool = crate::io_uring_transport::MonoioBackendPool::new(
-            runtime_state.default_primary_backend_addr(),
-            crate::config::PoolLifecycleConfig::default(),
-            128,
-            128,
-            128,
-            Duration::from_millis(500),
-            Some(backend_slots),
-            None,
-            None,
-        );
+        let backend_pool_selector =
+            Arc::new(crate::io_uring_transport::MonoioBackendPoolSelector::new(
+                runtime_state.default_primary_backend_addr(),
+                backend_slots,
+            ));
 
         wait_for_start_gate(&start_accepting, &stop).await;
         while !stop.load(Ordering::Acquire) && drain.is_accepting() {
@@ -224,7 +218,7 @@ mod linux {
                 continue;
             };
             let buffer_pool = buffer_pool.clone();
-            let backend_pool = Arc::clone(&backend_pool);
+            let backend_pool_selector = Arc::clone(&backend_pool_selector);
             let runtime_state = Arc::clone(&runtime_state);
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
@@ -232,7 +226,7 @@ mod linux {
                     client_addr,
                     runtime_state,
                     buffer_pool,
-                    backend_pool,
+                    backend_pool_selector,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
                 )
@@ -274,7 +268,7 @@ mod linux {
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         buffer_pool: crate::buffers::ProxyBufferPool,
-        backend_pool: Arc<crate::io_uring_transport::MonoioBackendPool>,
+        backend_pool_selector: Arc<crate::io_uring_transport::MonoioBackendPoolSelector>,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
@@ -312,6 +306,10 @@ mod linux {
                     .map(crate::auth::BackendCredentials::username),
             )
             .context("resolve startup backend")?;
+        let backend_pool = backend_pool_selector.pool_for_route(
+            &startup_plan.session_route,
+            startup_plan.primary_backend_addr(),
+        );
         let effective_config = runtime_state.effective_config();
         let context = crate::proxy::SharedClientSessionContext {
             pool: backend_pool,

@@ -1,6 +1,10 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::Instant,
 };
 
@@ -15,7 +19,7 @@ use crate::{
     pool::{PoolBackendConnector, PoolBackendTransport},
     snapshot::{ServerSnapshot, SnapshotStore},
 };
-use pg_kinetic_core::route::RouteKey;
+use pg_kinetic_core::route::{PoolKey, RouteKey};
 
 static NEXT_MONOIO_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -200,6 +204,80 @@ pub(crate) struct MonoioBackendPool {
     core: std::sync::Arc<crate::pool::BackendPoolCore<MonoioBackend, MonoioBackendConnector>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct MonoioBackendPoolSelector {
+    default_backend_addr: SocketAddr,
+    backend_slots: Arc<tokio::sync::Semaphore>,
+    default_pool: Arc<MonoioBackendPool>,
+    route_pools: RwLock<HashMap<PoolKey, Arc<MonoioBackendPool>>>,
+}
+
+impl MonoioBackendPoolSelector {
+    pub(crate) fn new(
+        default_backend_addr: SocketAddr,
+        backend_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        let default_pool = MonoioBackendPool::new(
+            default_backend_addr,
+            crate::config::PoolLifecycleConfig::default(),
+            128,
+            128,
+            128,
+            std::time::Duration::from_millis(500),
+            Some(backend_slots.clone()),
+            None,
+            None,
+        );
+        Self {
+            default_backend_addr,
+            backend_slots,
+            default_pool,
+            route_pools: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn default_pool(&self) -> Arc<MonoioBackendPool> {
+        Arc::clone(&self.default_pool)
+    }
+
+    pub(crate) fn pool_for_route(
+        &self,
+        route: &RouteKey,
+        backend_addr: SocketAddr,
+    ) -> Arc<MonoioBackendPool> {
+        if backend_addr == self.default_backend_addr {
+            return self.default_pool();
+        }
+
+        let key = route.selection_key();
+        if let Some(pool) = self
+            .route_pools
+            .read()
+            .expect("io_uring route pool selector poisoned")
+            .get(&key)
+        {
+            return Arc::clone(pool);
+        }
+
+        let pool = MonoioBackendPool::new(
+            backend_addr,
+            crate::config::PoolLifecycleConfig::default(),
+            128,
+            128,
+            128,
+            std::time::Duration::from_millis(500),
+            Some(self.backend_slots.clone()),
+            None,
+            None,
+        );
+        let mut route_pools = self
+            .route_pools
+            .write()
+            .expect("io_uring route pool selector poisoned");
+        Arc::clone(route_pools.entry(key).or_insert_with(|| Arc::clone(&pool)))
+    }
+}
+
 impl crate::pool::BackendLeaseOwner<MonoioBackend> for std::sync::Arc<MonoioBackendPool> {
     async fn return_backend(&self, backend: MonoioBackend) {
         self.core.return_backend(backend).await;
@@ -254,6 +332,10 @@ impl MonoioBackendPool {
         self.core
             .checkout_with_mode(std::sync::Arc::clone(self), route, mode)
             .await
+    }
+
+    pub(crate) fn backend_addr(&self) -> SocketAddr {
+        self.core.connector.backend_addr()
     }
 }
 
@@ -312,5 +394,29 @@ impl crate::io_runtime::RuntimeByteStream for MonoioTransport {
 
     async fn shutdown_stream(&mut self) -> std::io::Result<()> {
         MonoioTransport::shutdown(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg_kinetic_core::route::{QueryClass, RouteKey};
+
+    #[test]
+    fn selector_reuses_default_pool_and_keeps_route_pools_separate() {
+        let default_addr = "127.0.0.1:5432".parse().expect("default address");
+        let alternate_addr = "127.0.0.1:5433".parse().expect("alternate address");
+        let selector =
+            MonoioBackendPoolSelector::new(default_addr, Arc::new(tokio::sync::Semaphore::new(4)));
+        let route = RouteKey::new("app", "app", None, None, QueryClass::Default);
+
+        let default_pool = selector.pool_for_route(&route, default_addr);
+        let alternate_pool = selector.pool_for_route(&route, alternate_addr);
+        let alternate_pool_again = selector.pool_for_route(&route, alternate_addr);
+
+        assert_eq!(default_pool.backend_addr(), default_addr);
+        assert_eq!(alternate_pool.backend_addr(), alternate_addr);
+        assert!(Arc::ptr_eq(&alternate_pool, &alternate_pool_again));
+        assert!(!Arc::ptr_eq(&default_pool, &alternate_pool));
     }
 }
