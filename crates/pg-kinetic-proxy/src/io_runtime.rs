@@ -1,7 +1,11 @@
 use bytes::{Bytes, BytesMut};
 use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
 use pg_kinetic_wire::frame::parse_frontend_frame;
-use pg_kinetic_wire::{frame::FrontendFrame, protocol::FrontendTag};
+use pg_kinetic_wire::{
+    frame::FrontendFrame,
+    protocol::FrontendTag,
+    startup::{parse_startup_packet, StartupPacket},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrontendCycleShape {
@@ -18,6 +22,15 @@ pub enum FrontendCycleRead {
     Terminate {
         bytes: BytesMut,
     },
+    BufferLimitExceeded,
+    NeedMoreBytes,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum StartupPacketRead {
+    Packet(BytesMut),
+    Cancel { bytes: BytesMut },
+    EncryptionRequest,
     BufferLimitExceeded,
     NeedMoreBytes,
 }
@@ -101,6 +114,43 @@ pub fn take_frontend_cycle_bytes(
     let bytes = buffer.split_to(cycle_len);
     let shape = FrontendCycleShape::from_wire_bytes(&bytes)?.expect("complete cycle has frames");
     Ok(FrontendCycleRead::Complete { bytes, shape })
+}
+
+pub fn take_startup_packet_bytes(
+    buffer: &mut BytesMut,
+    max_client_buffer_bytes: usize,
+) -> anyhow::Result<StartupPacketRead> {
+    if buffer.len() > max_client_buffer_bytes {
+        return Ok(StartupPacketRead::BufferLimitExceeded);
+    }
+    if buffer.len() < 4 {
+        return Ok(StartupPacketRead::NeedMoreBytes);
+    }
+
+    let length = i32::from_be_bytes(
+        buffer[..4]
+            .try_into()
+            .expect("four startup length bytes are present"),
+    );
+    if length < 8 {
+        let packet = BytesMut::from(&buffer[..]);
+        parse_startup_packet(&packet).map_err(anyhow::Error::from)?;
+        unreachable!("invalid startup length should be rejected by parser");
+    }
+
+    let length = length as usize;
+    if buffer.len() < length {
+        return Ok(StartupPacketRead::NeedMoreBytes);
+    }
+
+    let packet = buffer.split_to(length);
+    match parse_startup_packet(&packet).map_err(anyhow::Error::from)? {
+        StartupPacket::Startup { .. } => Ok(StartupPacketRead::Packet(packet)),
+        StartupPacket::CancelRequest { .. } => Ok(StartupPacketRead::Cancel { bytes: packet }),
+        StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
+            Ok(StartupPacketRead::EncryptionRequest)
+        }
+    }
 }
 
 fn complete_frontend_frame_len(bytes: &[u8]) -> anyhow::Result<Option<usize>> {

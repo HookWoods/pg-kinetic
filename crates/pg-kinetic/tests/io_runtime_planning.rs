@@ -1,8 +1,12 @@
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::proxy_runtime::io_runtime::{
-    take_frontend_cycle_bytes, FrontendCycleRead, FrontendCycleShape,
+    take_frontend_cycle_bytes, take_startup_packet_bytes, FrontendCycleRead, FrontendCycleShape,
+    StartupPacketRead,
 };
-use pg_kinetic::wire::{frame::FrontendFrame, protocol::FrontendTag};
+use pg_kinetic::wire::{
+    frame::FrontendFrame,
+    protocol::{FrontendTag, ProtocolVersion, GSSENC_REQUEST_CODE, SSL_REQUEST_CODE},
+};
 
 #[test]
 fn simple_query_frame_encoding_remains_query_tagged() {
@@ -120,6 +124,53 @@ fn frontend_cycle_bytes_treats_terminate_as_complete_close_cycle() {
     assert!(bytes.is_empty());
 }
 
+#[test]
+fn startup_packet_bytes_wait_for_split_packet() {
+    let mut bytes = startup_packet();
+    bytes.truncate(7);
+
+    let outcome = take_startup_packet_bytes(&mut bytes, 1024).expect("startup read");
+
+    assert_eq!(outcome, StartupPacketRead::NeedMoreBytes);
+    assert_eq!(bytes.len(), 7);
+}
+
+#[test]
+fn startup_packet_bytes_take_complete_packet() {
+    let mut bytes = startup_packet();
+    let len = bytes.len();
+
+    let outcome = take_startup_packet_bytes(&mut bytes, 1024).expect("startup read");
+
+    let StartupPacketRead::Packet(packet) = outcome else {
+        panic!("expected startup packet");
+    };
+    assert_eq!(packet.len(), len);
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn startup_packet_bytes_treat_ssl_and_gss_as_encryption_requests() {
+    for code in [SSL_REQUEST_CODE, GSSENC_REQUEST_CODE] {
+        let mut bytes = startup_code_packet(code);
+
+        let outcome = take_startup_packet_bytes(&mut bytes, 1024).expect("startup read");
+
+        assert_eq!(outcome, StartupPacketRead::EncryptionRequest);
+        assert!(bytes.is_empty());
+    }
+}
+
+#[test]
+fn startup_packet_bytes_reports_client_buffer_limit() {
+    let mut bytes = startup_packet();
+
+    let outcome = take_startup_packet_bytes(&mut bytes, 7).expect("startup read");
+
+    assert_eq!(outcome, StartupPacketRead::BufferLimitExceeded);
+    assert!(!bytes.is_empty());
+}
+
 fn frontend_frame(tag: FrontendTag, payload: &[u8]) -> FrontendFrame {
     FrontendFrame {
         tag: u8::from(tag),
@@ -133,4 +184,22 @@ fn encoded_frontend_frame(tag: FrontendTag, payload: &[u8]) -> BytesMut {
     frame.put_i32((payload.len() + 4) as i32);
     frame.extend_from_slice(payload);
     frame
+}
+
+fn startup_packet() -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(ProtocolVersion::V3.to_i32());
+    body.extend_from_slice(b"user\0app\0database\0app\0\0");
+
+    let mut packet = BytesMut::new();
+    packet.put_i32((body.len() + 4) as i32);
+    packet.extend_from_slice(&body);
+    packet
+}
+
+fn startup_code_packet(code: i32) -> BytesMut {
+    let mut packet = BytesMut::new();
+    packet.put_i32(8);
+    packet.put_i32(code);
+    packet
 }

@@ -247,27 +247,58 @@ mod linux {
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
-        let backend = TcpStream::connect_addr(backend_addr)
-            .await
-            .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
-        let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
         let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
         let mut backend_scan_buffer = BytesMut::with_capacity(16 * 1024);
 
-        let read = client
-            .read_into(&mut client_buffer)
+        let startup_packet = loop {
+            match crate::io_runtime::take_startup_packet_bytes(
+                &mut client_buffer,
+                max_client_buffer_bytes,
+            )? {
+                crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
+                crate::io_runtime::StartupPacketRead::Cancel { bytes } => {
+                    let backend = TcpStream::connect_addr(backend_addr)
+                        .await
+                        .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
+                    let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
+                    backend
+                        .write_all(&bytes)
+                        .await
+                        .context("forward cancel request")?;
+                    let _ = backend.shutdown().await;
+                    return Ok(());
+                }
+                crate::io_runtime::StartupPacketRead::EncryptionRequest => {
+                    client
+                        .write_all(b"N")
+                        .await
+                        .context("reject startup encryption request")?;
+                }
+                crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
+                    anyhow::bail!("client startup packet exceeded configured buffer limit");
+                }
+                crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
+                    let read = client
+                        .read_into(&mut client_buffer)
+                        .await
+                        .context("read startup")?;
+                    if read == 0 {
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        let backend = TcpStream::connect_addr(backend_addr)
             .await
-            .context("read startup")?;
-        if read == 0 {
-            return Ok(());
-        }
+            .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
+        let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
         backend
-            .write_all(&client_buffer)
+            .write_all(&startup_packet)
             .await
             .context("forward startup")?;
-        client_buffer.clear();
 
         let mut startup_drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
         loop {
