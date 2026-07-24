@@ -192,6 +192,71 @@ impl PoolBackendConnector<MonoioBackend> for MonoioBackendConnector {
     }
 }
 
+pub(crate) type MonoioPooledBackend =
+    crate::pool::PooledBackendLease<MonoioBackend, std::sync::Arc<MonoioBackendPool>>;
+
+#[derive(Debug)]
+pub(crate) struct MonoioBackendPool {
+    core: std::sync::Arc<crate::pool::BackendPoolCore<MonoioBackend, MonoioBackendConnector>>,
+}
+
+impl crate::pool::BackendLeaseOwner<MonoioBackend> for std::sync::Arc<MonoioBackendPool> {
+    async fn return_backend(&self, backend: MonoioBackend) {
+        self.core.return_backend(backend).await;
+    }
+
+    fn discard_backend(&self, backend_id: u64) {
+        self.core.discard_backend(backend_id);
+    }
+
+    fn record_backpressure_counts(
+        &self,
+        route: &pg_kinetic_core::route::RouteKey,
+        gate: &pg_kinetic_core::backpressure::BackpressureGate,
+    ) {
+        self.core.record_backpressure_counts(route, gate);
+    }
+}
+
+impl MonoioBackendPool {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        backend_addr: SocketAddr,
+        lifecycle: crate::config::PoolLifecycleConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: std::time::Duration,
+        global_backend_slots: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        global_backend_available: Option<std::sync::Arc<tokio::sync::Notify>>,
+        route_dynamic_limit: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            core: crate::pool::BackendPoolCore::new(
+                MonoioBackendConnector::new(backend_addr),
+                lifecycle,
+                max_waiters,
+                route_max_in_flight,
+                route_max_waiters,
+                checkout_timeout,
+                global_backend_slots,
+                global_backend_available,
+                route_dynamic_limit,
+            ),
+        })
+    }
+
+    pub(crate) async fn checkout(
+        self: &std::sync::Arc<Self>,
+        route: pg_kinetic_core::route::RouteKey,
+        mode: crate::pool::CheckoutMode,
+    ) -> Result<MonoioPooledBackend, crate::pool::PoolError> {
+        self.core
+            .checkout_with_mode(std::sync::Arc::clone(self), route, mode)
+            .await
+    }
+}
+
 impl crate::proxy::BackendStartupMetadata for MonoioBackend {
     fn is_tls(&self) -> bool {
         MonoioBackend::is_tls(self)

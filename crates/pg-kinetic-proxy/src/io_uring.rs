@@ -504,12 +504,6 @@ fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
 fn direct_backend_addr(config: &Config) -> anyhow::Result<SocketAddr> {
     use crate::config::{BackendTlsMode, FreshnessConfig, HaConfig, ReadRoutingConfig};
 
-    if !config.pools.is_empty() {
-        anyhow::bail!(
-            "experimental_io_uring currently rejects pool configs until shared pool checkout exists"
-        );
-    }
-
     let routes = config.effective_routes();
     let [route] = routes.as_slice() else {
         anyhow::bail!("experimental_io_uring currently requires a single primary route");

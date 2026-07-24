@@ -162,7 +162,7 @@ fn io_uring_rejects_read_routing_until_route_selection_exists() {
 }
 
 #[test]
-fn io_uring_rejects_pool_configs_until_pool_checkout_exists() {
+fn io_uring_accepts_pool_configs_after_pool_checkout_exists() {
     let mut config = io_uring_config();
     config.pools = vec![PoolConfig {
         database: "app".to_string(),
@@ -171,10 +171,8 @@ fn io_uring_rejects_pool_configs_until_pool_checkout_exists() {
         max_backends: None,
     }];
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("pool checkout is not supported yet");
-
-    assert!(error.to_string().contains("pool configs"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("pool configs are supported after shared checkout");
 }
 
 fn startup_packet(user: &str, database: &str) -> BytesMut {

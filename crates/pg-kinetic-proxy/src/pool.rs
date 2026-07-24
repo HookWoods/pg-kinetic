@@ -1406,24 +1406,17 @@ impl BackendPool {
             "invalid pool lifecycle config"
         );
         let connector = TokioBackendConnector::new(backend_addr, tls, socket);
-        let core = Arc::new(BackendPoolCore {
-            connector: connector.clone(),
-            gate: BackpressureGate::new(lifecycle.max_size, max_waiters),
-            route_gates: StdRwLock::new(HashMap::new()),
-            backends: BackendStore::new(
-                lifecycle.max_size,
-                global_backend_slots,
-                global_backend_available,
-            ),
-            snapshot_store: ArcSwapOption::empty(),
-            health: Arc::new(AtomicBool::new(true)),
+        let core = BackendPoolCore::new(
+            connector.clone(),
+            lifecycle,
             max_waiters,
             route_max_in_flight,
             route_max_waiters,
-            route_dynamic_limit,
             checkout_timeout,
-            lifecycle,
-        });
+            global_backend_slots,
+            global_backend_available,
+            route_dynamic_limit,
+        );
         Arc::new(Self {
             connector,
             reset_query: reset_query.into(),
@@ -1446,7 +1439,7 @@ where
         self.sync_pool_snapshot();
     }
 
-    async fn checkout_with_mode<O>(
+    pub(crate) async fn checkout_with_mode<O>(
         self: &Arc<Self>,
         owner: O,
         route: RouteKey,
@@ -1787,7 +1780,7 @@ where
         });
     }
 
-    fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
+    pub(crate) fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
         self.with_snapshot_store(|snapshot_store| {
             metrics::record_backpressure_snapshot(
                 snapshot_store,
@@ -1798,14 +1791,45 @@ where
         });
     }
 
-    async fn return_backend(&self, backend: T) {
+    pub(crate) async fn return_backend(&self, backend: T) {
         self.backends.return_backend(backend).await;
         self.sync_pool_snapshot();
     }
 
-    fn discard_backend(&self, backend_id: u64) {
+    pub(crate) fn discard_backend(&self, backend_id: u64) {
         self.backends.discard_backend(backend_id);
         self.sync_pool_snapshot();
+    }
+
+    pub(crate) fn new(
+        connector: C,
+        lifecycle: PoolLifecycleConfig,
+        max_waiters: usize,
+        route_max_in_flight: usize,
+        route_max_waiters: usize,
+        checkout_timeout: Duration,
+        global_backend_slots: Option<Arc<Semaphore>>,
+        global_backend_available: Option<Arc<Notify>>,
+        route_dynamic_limit: Option<Arc<AtomicUsize>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            connector,
+            gate: BackpressureGate::new(lifecycle.max_size, max_waiters),
+            route_gates: StdRwLock::new(HashMap::new()),
+            backends: BackendStore::new(
+                lifecycle.max_size,
+                global_backend_slots,
+                global_backend_available,
+            ),
+            snapshot_store: ArcSwapOption::empty(),
+            health: Arc::new(AtomicBool::new(true)),
+            max_waiters,
+            route_max_in_flight,
+            route_max_waiters,
+            route_dynamic_limit,
+            checkout_timeout,
+            lifecycle,
+        })
     }
 
     #[cfg(test)]
