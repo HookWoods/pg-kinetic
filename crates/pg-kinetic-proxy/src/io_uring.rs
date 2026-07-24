@@ -305,13 +305,13 @@ mod linux {
     }
 
     fn ready_seen(buffer: &mut BytesMut) -> anyhow::Result<bool> {
-        while let Some(frame) = pg_kinetic_wire::backend::parse_backend_frame(buffer)? {
-            if frame.ready_status().is_some() {
-                buffer.clear();
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let mut drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
+        let mut forwarded = Vec::new();
+        let event = drain.drain(buffer, &mut forwarded)?;
+        Ok(matches!(
+            event,
+            crate::io_runtime::ResponseDrainEvent::Frames { ready: Some(_), .. }
+        ))
     }
 
     fn bind_reuseport_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
