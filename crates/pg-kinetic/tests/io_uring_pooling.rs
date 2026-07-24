@@ -17,8 +17,7 @@ use pg_kinetic::{config::Config, core::runtime::RuntimeEngine, proxy_runtime::io
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();
-    config.runtime.engine.runtime_engine = RuntimeEngine::ExperimentalIoUring;
-    config.runtime.engine.experimental_runtime_enabled = true;
+    config.runtime.engine.runtime_engine = RuntimeEngine::IoUring;
     config
 }
 
@@ -88,8 +87,7 @@ fn spawn_proxy(backend_addr: SocketAddr) -> (Child, SocketAddr) {
     command
         .env("PG_KINETIC_LISTEN_ADDR", listen_addr.to_string())
         .env("PG_KINETIC_BACKEND_ADDR", backend_addr.to_string())
-        .env("PG_KINETIC_RUNTIME_ENGINE", "experimental_io_uring")
-        .env("PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED", "true")
+        .env("PG_KINETIC_RUNTIME_ENGINE", "io_uring")
         .env("PG_KINETIC_RUNTIME_SHARDS", "1")
         .env("PG_KINETIC_MAX_BACKENDS", "1")
         .env("PG_KINETIC_CHECKOUT_TIMEOUT_MS", "75")

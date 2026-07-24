@@ -69,59 +69,47 @@ where
 pub(crate) async fn handle_startup_or_cancel<C>(
     client: &mut C,
     client_buffer: &mut BytesMut,
+    client_tls_mode: crate::config::ClientTlsMode,
+    client_tls_server_config: Option<&Arc<ServerConfig>>,
     idle_timeout: Duration,
     max_client_buffer_bytes: usize,
+    phase_recorder: &dyn telemetry::PhaseTimingRecorder,
 ) -> anyhow::Result<StartupOrCancel>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: ClientTlsIo + ?Sized,
 {
-    loop {
-        match crate::io_runtime::take_startup_packet_bytes(client_buffer, max_client_buffer_bytes)?
-        {
-            crate::io_runtime::StartupPacketRead::Packet(bytes) => {
-                return Ok(StartupOrCancel::Startup(bytes));
-            }
-            crate::io_runtime::StartupPacketRead::Cancel {
-                process_id,
-                secret_key,
-                ..
-            } => {
-                return Ok(StartupOrCancel::Cancel {
-                    process_id,
-                    secret_key,
-                });
-            }
-            crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
-                crate::io_runtime::write_all_to(client, b"N")
-                    .await
-                    .context("reject startup encryption request")?;
-            }
-            crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
-                return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
-            }
-            crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
-                match crate::io_runtime::read_from_timeout(client, client_buffer, idle_timeout)
-                    .await
-                {
-                    Ok(Ok(0)) => return Ok(StartupOrCancel::Finished),
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => return Err(error).context("read startup"),
-                    Err(_) => {
-                        let error = build_error_response(
-                            SqlState::OperatorIntervention.as_str(),
-                            "startup timed out",
-                        );
-                        let mut response = BytesMut::with_capacity(error.len() + 6);
-                        response.extend_from_slice(&error);
-                        response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
-                        crate::io_runtime::write_all_to(client, &response)
-                            .await
-                            .context("write startup timeout response")?;
-                        return Ok(StartupOrCancel::Finished);
-                    }
-                }
-            }
+    match read_startup_packet_with_buffer(
+        client,
+        client_tls_mode,
+        client_tls_server_config,
+        idle_timeout,
+        max_client_buffer_bytes,
+        client_buffer,
+        phase_recorder,
+    )
+    .await?
+    {
+        StartupRead::Packet(bytes) => Ok(StartupOrCancel::Startup(bytes)),
+        StartupRead::Cancel {
+            process_id,
+            secret_key,
+        } => Ok(StartupOrCancel::Cancel {
+            process_id,
+            secret_key,
+        }),
+        StartupRead::ClientClosed => Ok(StartupOrCancel::Finished),
+        StartupRead::TimedOut => {
+            let error =
+                build_error_response(SqlState::OperatorIntervention.as_str(), "startup timed out");
+            let mut response = BytesMut::with_capacity(error.len() + 6);
+            response.extend_from_slice(&error);
+            response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
+            crate::io_runtime::write_all_to(client, &response)
+                .await
+                .context("write startup timeout response")?;
+            Ok(StartupOrCancel::Finished)
         }
+        StartupRead::BufferLimitExceeded => Err(buffer_limit_exceeded(BufferBudgetKind::Client)),
     }
 }
 
@@ -131,6 +119,51 @@ pub(crate) enum StartupOrCancel {
     Startup(BytesMut),
     Cancel { process_id: i32, secret_key: i32 },
     Finished,
+}
+
+pub(crate) trait ClientTlsIo: crate::io_runtime::RuntimeByteStream {
+    fn is_tls(&self) -> bool;
+
+    fn has_peer_certificates(&self) -> bool;
+
+    async fn read_with_idle_timeout(
+        &mut self,
+        buffer: &mut BytesMut,
+        idle_timeout: Duration,
+    ) -> Result<std::io::Result<usize>, ()>;
+
+    async fn start_tls(
+        &mut self,
+        server_config: &Arc<ServerConfig>,
+        require_client_certificate: bool,
+    ) -> anyhow::Result<()>;
+}
+
+impl ClientTlsIo for ClientConnection {
+    fn is_tls(&self) -> bool {
+        ClientConnection::is_tls(self)
+    }
+
+    fn has_peer_certificates(&self) -> bool {
+        ClientConnection::has_peer_certificates(self)
+    }
+
+    async fn read_with_idle_timeout(
+        &mut self,
+        buffer: &mut BytesMut,
+        idle_timeout: Duration,
+    ) -> Result<std::io::Result<usize>, ()> {
+        crate::io_runtime::tokio_timeout(idle_timeout, crate::io_runtime::read_from(self, buffer))
+            .await
+    }
+
+    async fn start_tls(
+        &mut self,
+        server_config: &Arc<ServerConfig>,
+        _require_client_certificate: bool,
+    ) -> anyhow::Result<()> {
+        ClientConnection::start_tls(self, server_config).await
+    }
 }
 
 #[derive(Debug)]
@@ -242,15 +275,18 @@ pub(crate) async fn read_startup_packet(
     .await
 }
 
-pub(super) async fn read_startup_packet_with_buffer(
-    client: &mut ClientConnection,
+pub(super) async fn read_startup_packet_with_buffer<C>(
+    client: &mut C,
     client_tls_mode: crate::config::ClientTlsMode,
     client_tls_server_config: Option<&Arc<ServerConfig>>,
     idle_timeout: Duration,
     max_client_buffer_bytes: usize,
     buffer: &mut BytesMut,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
-) -> anyhow::Result<StartupRead> {
+) -> anyhow::Result<StartupRead>
+where
+    C: ClientTlsIo + ?Sized,
+{
     let client_tls_required = matches!(
         client_tls_mode,
         crate::config::ClientTlsMode::Require | crate::config::ClientTlsMode::VerifyClient
@@ -283,15 +319,18 @@ pub(super) async fn read_startup_packet_with_buffer(
                     crate::config::ClientTlsMode::Allow
                     | crate::config::ClientTlsMode::Require
                     | crate::config::ClientTlsMode::VerifyClient => {
-                        client
-                            .write_all(b"S")
+                        crate::io_runtime::write_all_to(client, b"S")
                             .await
                             .context("accept startup encryption request")?;
                         let server_config = client_tls_server_config
                             .context("client TLS server config is unavailable")?;
                         let tls_timer =
                             PhaseTimer::start(ProtocolPhase::TlsHandshake, phase_recorder);
-                        let tls_result = client.start_tls(server_config).await;
+                        let require_client_certificate =
+                            matches!(client_tls_mode, crate::config::ClientTlsMode::VerifyClient);
+                        let tls_result = client
+                            .start_tls(server_config, require_client_certificate)
+                            .await;
                         let tls_outcome = match &tls_result {
                             Ok(())
                                 if matches!(
@@ -330,12 +369,7 @@ pub(super) async fn read_startup_packet_with_buffer(
                     return Ok(StartupRead::BufferLimitExceeded);
                 }
 
-                match crate::io_runtime::tokio_timeout(
-                    idle_timeout,
-                    crate::io_runtime::read_from(client, buffer),
-                )
-                .await
-                {
+                match client.read_with_idle_timeout(buffer, idle_timeout).await {
                     Ok(Ok(0)) => return Ok(StartupRead::ClientClosed),
                     Ok(Ok(_)) => {
                         if buffer.len() > max_client_buffer_bytes {
@@ -351,9 +385,10 @@ pub(super) async fn read_startup_packet_with_buffer(
     }
 }
 
-pub(super) async fn reject_startup_encryption_request(
-    client: &mut ClientConnection,
-) -> anyhow::Result<()> {
+pub(super) async fn reject_startup_encryption_request<C>(client: &mut C) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
     crate::io_runtime::write_all_to(client, b"N")
         .await
         .context("reject startup encryption request")

@@ -37,6 +37,10 @@ write_summary() {
   "commands": [
     "cargo fmt --check",
     "cargo test --workspace --locked",
+    "cargo test -p pg-kinetic-proxy --lib socket::tests --features io-uring --locked",
+    "cargo test -p pg-kinetic-proxy --lib io_uring_transport::tests --features io-uring --locked",
+    "PG_KINETIC_RUN_IO_URING_TESTS=1 cargo test -p pg-kinetic --test io_uring_semantic_parity --features io-uring --locked -- --ignored --test-threads=1",
+    "PG_KINETIC_RUN_IO_URING_TESTS=1 cargo test -p pg-kinetic --test io_uring_pooling --features io-uring --locked -- --ignored --test-threads=1",
     "docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic",
     "docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'",
     "cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic",
@@ -68,6 +72,18 @@ cargo fmt --check
 
 stage="cargo test --workspace --locked"
 cargo test --workspace --locked
+
+stage="io_uring proxy socket and pool tests"
+cargo test -p pg-kinetic-proxy --lib socket::tests --features io-uring --locked
+cargo test -p pg-kinetic-proxy --lib io_uring_transport::tests --features io-uring --locked
+
+stage="io_uring semantic and pooling tests"
+PG_KINETIC_RUN_IO_URING_TESTS=1 cargo test -p pg-kinetic \
+  --test io_uring_semantic_parity --features io-uring --locked \
+  -- --ignored --test-threads=1
+PG_KINETIC_RUN_IO_URING_TESTS=1 cargo test -p pg-kinetic \
+  --test io_uring_pooling --features io-uring --locked \
+  -- --ignored --test-threads=1
 
 stage="start PostgreSQL and pg-kinetic"
 "${COMPOSE[@]}" down --volumes --remove-orphans

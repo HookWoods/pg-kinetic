@@ -139,7 +139,7 @@ use client_io::{
     ClientCycle, IdleTimeoutKind, QueryProgress,
 };
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub(crate) use client_io::{handle_startup_or_cancel, StartupOrCancel};
+pub(crate) use client_io::{handle_startup_or_cancel, ClientTlsIo, StartupOrCancel};
 pub(crate) use client_io::{read_startup_packet, StartupRead};
 use client_session::{handle_client, ClientSessionContext};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

@@ -72,16 +72,6 @@ impl PreflightRunner {
         if let Err(error) = selector.validate() {
             report.add_error(PreflightCheck::RuntimeEngine, error.to_string());
         }
-
-        if config.runtime.engine.runtime_engine
-            == pg_kinetic_core::runtime::RuntimeEngine::ExperimentalIoUring
-            && !cfg!(feature = "io-uring")
-        {
-            report.add_error(
-                PreflightCheck::RuntimeEngine,
-                "runtime engine 'experimental_io_uring' requires the io-uring cargo feature",
-            );
-        }
     }
 
     fn validate_tls(&self, tls_config: &TlsConfig, report: &mut PreflightReport) {

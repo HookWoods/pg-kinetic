@@ -11,8 +11,7 @@ use pg_kinetic_core::routing::ReadRoutingMode;
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();
-    config.runtime.engine.runtime_engine = RuntimeEngine::ExperimentalIoUring;
-    config.runtime.engine.experimental_runtime_enabled = true;
+    config.runtime.engine.runtime_engine = RuntimeEngine::IoUring;
     config
 }
 
@@ -86,25 +85,19 @@ fn io_uring_prepares_proxy_capacity_slots_from_shared_runtime_state() {
 }
 
 #[test]
-fn io_uring_rejects_tls_until_tls_stream_adapter_exists() {
+fn io_uring_accepts_client_tls_in_stable_config_boundary() {
     let mut config = io_uring_config();
     config.tls.client_tls_mode = ClientTlsMode::Require;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("TLS requires a monoio-compatible TLS adapter");
-
-    assert!(error.to_string().contains("client_tls_mode=disable"));
+    io_uring::validate_supported_config_for_test(&config).expect("client TLS is stable");
 }
 
 #[test]
-fn io_uring_rejects_backend_tls_until_semantic_runtime_exists() {
+fn io_uring_accepts_backend_tls_in_stable_config_boundary() {
     let mut config = io_uring_config();
     config.tls.backend_tls_mode = BackendTlsMode::Require;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("backend TLS is not supported yet");
-
-    assert!(error.to_string().contains("backend_tls_mode=disable"));
+    io_uring::validate_supported_config_for_test(&config).expect("backend TLS is stable");
 }
 
 #[test]

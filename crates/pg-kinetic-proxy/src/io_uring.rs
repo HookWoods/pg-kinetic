@@ -31,6 +31,7 @@ mod linux {
         let runtime_state = Arc::new(proxy.initialize_runtime_state()?);
         let config = runtime_state.effective_config().clone();
         validate_supported_config(&config)?;
+        let client_tls_server_config = crate::reload::load_client_tls_server_config(&config)?;
         let shard_count = config
             .runtime
             .engine
@@ -52,6 +53,7 @@ mod linux {
             let client_slots = Arc::clone(&client_slots);
             let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
+            let client_tls_server_config = client_tls_server_config.clone();
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
@@ -77,6 +79,7 @@ mod linux {
                         shard_id,
                         listen_addr,
                         runtime_state,
+                        client_tls_server_config,
                         stop,
                         start_accepting,
                         buffer_pool,
@@ -119,7 +122,7 @@ mod linux {
             listen_addr = %config.connection.listen_addr,
             backend_addr = %runtime_state.default_primary_backend_addr(),
             shards = shard_count,
-            "experimental io_uring plaintext pass-through runtime listening"
+            "io_uring runtime listening"
         );
 
         wait_for_shutdown_blocking()?;
@@ -175,6 +178,7 @@ mod linux {
         shard_id: usize,
         listen_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
+        client_tls_server_config: Option<Arc<rustls::ServerConfig>>,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
         buffer_pool: crate::buffers::ProxyBufferPool,
@@ -200,6 +204,8 @@ mod linux {
         let backend_pool_selector =
             Arc::new(crate::io_uring_transport::MonoioBackendPoolSelector::new(
                 runtime_state.default_primary_backend_addr(),
+                runtime_state.effective_config().tls.clone(),
+                runtime_state.effective_config().socket.clone(),
                 backend_slots,
             ));
 
@@ -220,11 +226,13 @@ mod linux {
             let buffer_pool = buffer_pool.clone();
             let backend_pool_selector = Arc::clone(&backend_pool_selector);
             let runtime_state = Arc::clone(&runtime_state);
+            let client_tls_server_config = client_tls_server_config.clone();
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
                     client_addr,
                     runtime_state,
+                    client_tls_server_config,
                     buffer_pool,
                     backend_pool_selector,
                     max_client_buffer_bytes,
@@ -267,6 +275,7 @@ mod linux {
         client: TcpStream,
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
+        client_tls_server_config: Option<Arc<rustls::ServerConfig>>,
         buffer_pool: crate::buffers::ProxyBufferPool,
         backend_pool_selector: Arc<crate::io_uring_transport::MonoioBackendPoolSelector>,
         max_client_buffer_bytes: usize,
@@ -275,11 +284,15 @@ mod linux {
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
         let effective_config = runtime_state.effective_config();
+        let phase_recorder = crate::telemetry::phase_timing_recorder(false);
         let startup_packet = match crate::proxy::handle_startup_or_cancel(
             &mut client,
             &mut client_buffer,
+            effective_config.tls.client_tls_mode,
+            client_tls_server_config.as_ref(),
             effective_config.qos.idle_client_timeout(),
             max_client_buffer_bytes,
+            phase_recorder.as_ref(),
         )
         .await?
         {
@@ -390,9 +403,7 @@ mod linux {
     use super::*;
 
     pub fn run(_config: Config) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "experimental_io_uring requires Linux and the pg-kinetic io-uring cargo feature"
-        )
+        anyhow::bail!("io_uring requires Linux and the pg-kinetic io-uring cargo feature")
     }
 }
 
@@ -473,46 +484,36 @@ pub fn shared_capacity_limits_for_test(config: Config) -> anyhow::Result<(usize,
 }
 
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
-    use crate::config::{BackendTlsMode, ClientTlsMode};
-
-    if config.tls.client_tls_mode != ClientTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires client_tls_mode=disable");
-    }
-    if config.tls.backend_tls_mode != BackendTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires backend_tls_mode=disable");
-    }
+    let _ = config;
     Ok(())
 }
 
 fn direct_backend_addr(config: &Config) -> anyhow::Result<SocketAddr> {
-    use crate::config::{BackendTlsMode, FreshnessConfig, HaConfig, ReadRoutingConfig};
+    use crate::config::{FreshnessConfig, HaConfig, ReadRoutingConfig};
 
     let routes = config.effective_routes();
     let [route] = routes.as_slice() else {
-        anyhow::bail!("experimental_io_uring currently requires a single primary route");
+        anyhow::bail!("io_uring direct backend helper currently requires a single primary route");
     };
     if !route.replicas.is_empty() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects replicas until route selection exists"
+            "io_uring direct backend helper rejects replicas; use shared route selection"
         );
     }
     if route.read_routing != ReadRoutingConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects read routing until route selection exists"
+            "io_uring direct backend helper rejects read routing; use shared route selection"
         );
     }
     if route.freshness != FreshnessConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects freshness policy until route selection exists"
+            "io_uring direct backend helper rejects freshness policy; use shared route selection"
         );
     }
     if route.ha != HaConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects route HA until route selection exists"
+            "io_uring direct backend helper rejects route HA; use shared route selection"
         );
-    }
-    if route.primary.tls_mode != BackendTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires route primary tls_mode=disable");
     }
     Ok(route.primary.address)
 }
@@ -540,13 +541,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_tls() {
+    fn supported_config_accepts_tls() {
         let mut config = Config::default();
         config.tls.client_tls_mode = ClientTlsMode::VerifyClient;
 
-        let error = validate_supported_config(&config).expect_err("client TLS is rejected");
-
-        assert!(error.to_string().contains("client_tls_mode=disable"));
+        validate_supported_config(&config).expect("client TLS uses shared startup path");
     }
 
     #[test]

@@ -4,9 +4,9 @@ fn io_uring_runtime_returns_feature_or_platform_error_when_unavailable() {
     let error = pg_kinetic::proxy_runtime::run_io_uring(pg_kinetic::config::Config::default())
         .expect_err("io_uring runtime should be unavailable");
 
-    assert!(error.to_string().contains(
-        "experimental_io_uring requires Linux and the pg-kinetic io-uring cargo feature"
-    ));
+    assert!(error
+        .to_string()
+        .contains("io_uring requires Linux and the pg-kinetic io-uring cargo feature"));
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

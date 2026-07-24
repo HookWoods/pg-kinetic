@@ -68,6 +68,77 @@ pub fn apply_socket_options(
     socket_kind: &'static str,
 ) -> anyhow::Result<SocketOptionReport> {
     let socket = SockRef::from(stream);
+    apply_socket_options_to_sock_ref(&socket, options, socket_kind)
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub fn apply_monoio_socket_options(
+    stream: &monoio::net::TcpStream,
+    options: &SocketOptions,
+    socket_kind: &'static str,
+) -> anyhow::Result<SocketOptionReport> {
+    let mut report = SocketOptionReport::default();
+    let mut strict_error = None;
+
+    report.tcp_nodelay = apply_socket_option(
+        socket_kind,
+        "tcp_nodelay",
+        options.strict_socket_option_mode,
+        || stream.set_nodelay(options.tcp_nodelay),
+        &mut strict_error,
+    );
+    report.tcp_keepalive = if options.tcp_keepalive {
+        apply_socket_option(
+            socket_kind,
+            "tcp_keepalive",
+            options.strict_socket_option_mode,
+            || {
+                stream.set_tcp_keepalive(
+                    options.tcp_keepalive_idle,
+                    options.tcp_keepalive_interval,
+                    options.tcp_keepalive_retries,
+                )
+            },
+            &mut strict_error,
+        )
+    } else {
+        let outcome = SocketOptionOutcome::Applied;
+        record_socket_option(socket_kind, "tcp_keepalive", outcome);
+        outcome
+    };
+    report.tcp_user_timeout = unsupported_monoio_socket_option(
+        socket_kind,
+        "tcp_user_timeout",
+        options.tcp_user_timeout.is_some(),
+        options.strict_socket_option_mode,
+        &mut strict_error,
+    );
+    report.tcp_send_buffer_bytes = unsupported_monoio_socket_option(
+        socket_kind,
+        "tcp_send_buffer_bytes",
+        options.tcp_send_buffer_bytes.is_some(),
+        options.strict_socket_option_mode,
+        &mut strict_error,
+    );
+    report.tcp_recv_buffer_bytes = unsupported_monoio_socket_option(
+        socket_kind,
+        "tcp_recv_buffer_bytes",
+        options.tcp_recv_buffer_bytes.is_some(),
+        options.strict_socket_option_mode,
+        &mut strict_error,
+    );
+
+    match strict_error {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
+}
+
+fn apply_socket_options_to_sock_ref(
+    socket: &SockRef<'_>,
+    options: &SocketOptions,
+    socket_kind: &'static str,
+) -> anyhow::Result<SocketOptionReport> {
     let mut report = SocketOptionReport::default();
     let mut strict_error = None;
 
@@ -111,6 +182,32 @@ pub fn apply_socket_options(
         Some(error) => Err(error),
         None => Ok(report),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn unsupported_monoio_socket_option(
+    socket_kind: &'static str,
+    option_name: &'static str,
+    requested: bool,
+    strict: bool,
+    strict_error: &mut Option<anyhow::Error>,
+) -> SocketOptionOutcome {
+    let outcome = if requested {
+        handle_unsupported(
+            socket_kind,
+            option_name,
+            strict,
+            strict_error,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "monoio does not expose this socket option",
+            ),
+        )
+    } else {
+        SocketOptionOutcome::Applied
+    };
+    record_socket_option(socket_kind, option_name, outcome);
+    outcome
 }
 
 pub fn bind_reuseport_listener(
@@ -467,8 +564,14 @@ fn record_socket_option(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    use std::{thread, time::Duration};
 
     use super::bind_reuseport_listener;
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    use super::{SocketOptionOutcome, SocketOptions};
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    use crate::config::SocketConfig;
 
     #[tokio::test]
     async fn two_reuseport_listeners_share_one_address() {
@@ -476,5 +579,81 @@ mod tests {
         let first = bind_reuseport_listener(addr, 1024).expect("first bind");
         let bound = first.local_addr().expect("local addr");
         let _second = bind_reuseport_listener(bound, 1024).expect("second bind");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn monoio_socket_config(strict_socket_option_mode: bool) -> SocketConfig {
+        SocketConfig {
+            tcp_nodelay: true,
+            tcp_keepalive: true,
+            tcp_keepalive_idle_ms: Some(1_000),
+            tcp_keepalive_interval_ms: Some(2_000),
+            tcp_keepalive_retries: Some(3),
+            tcp_user_timeout_ms: Some(3_000),
+            tcp_send_buffer_bytes: Some(4_096),
+            tcp_recv_buffer_bytes: Some(8_192),
+            strict_socket_option_mode,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    async fn connected_monoio_stream() -> monoio::net::TcpStream {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind monoio socket test listener");
+        let addr = listener.local_addr().expect("monoio socket test addr");
+        thread::spawn(move || {
+            let Ok((_stream, _)) = listener.accept() else {
+                return;
+            };
+            thread::sleep(Duration::from_millis(250));
+        });
+        monoio::net::TcpStream::connect_addr(addr)
+            .await
+            .expect("connect monoio socket test stream")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[monoio::test_all]
+    async fn monoio_socket_options_report_unsupported_knobs_without_strict_mode() {
+        let stream = connected_monoio_stream().await;
+        let report = super::apply_monoio_socket_options(
+            &stream,
+            &SocketOptions::from(&monoio_socket_config(false)),
+            "test",
+        )
+        .expect("non-strict monoio socket options apply");
+
+        assert_eq!(report.tcp_nodelay, SocketOptionOutcome::Applied);
+        assert_eq!(report.tcp_keepalive, SocketOptionOutcome::Applied);
+        assert_eq!(report.tcp_user_timeout, SocketOptionOutcome::Unsupported);
+        assert_eq!(
+            report.tcp_send_buffer_bytes,
+            SocketOptionOutcome::Unsupported
+        );
+        assert_eq!(
+            report.tcp_recv_buffer_bytes,
+            SocketOptionOutcome::Unsupported
+        );
+        assert!(stream.nodelay().expect("read monoio TCP_NODELAY"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[monoio::test_all]
+    async fn monoio_socket_options_fail_unsupported_knobs_in_strict_mode() {
+        let stream = connected_monoio_stream().await;
+        let error = super::apply_monoio_socket_options(
+            &stream,
+            &SocketOptions::from(&monoio_socket_config(true)),
+            "test",
+        )
+        .expect_err("strict monoio socket options should fail");
+
+        let error = error.to_string();
+        assert!(
+            error.contains("tcp_recv_buffer_bytes")
+                || error.contains("tcp_send_buffer_bytes")
+                || error.contains("tcp_user_timeout"),
+            "unexpected strict socket error: {error}"
+        );
     }
 }

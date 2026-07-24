@@ -16,16 +16,19 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
-    config::{Config, ReadRoutingConfig, RouteConfig},
+    config::{BackendTlsMode, ClientTlsMode, Config, ReadRoutingConfig, RouteConfig, TlsConfig},
     core::runtime::RuntimeEngine,
     proxy_runtime::io_uring,
 };
 use pg_kinetic_core::routing::ReadRoutingMode;
+use pg_kinetic_proxy::tls::{load_backend_client_config, load_server_config};
+use tokio_rustls::rustls::{
+    pki_types::ServerName, ClientConnection, ServerConnection, StreamOwned,
+};
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();
-    config.runtime.engine.runtime_engine = RuntimeEngine::ExperimentalIoUring;
-    config.runtime.engine.experimental_runtime_enabled = true;
+    config.runtime.engine.runtime_engine = RuntimeEngine::IoUring;
     config
 }
 
@@ -373,14 +376,73 @@ fn io_uring_discards_backend_after_ambiguous_failure() {
     assert_eq!(backend.accepted(), 1, "failed backend must be discarded");
 }
 
+#[test]
+#[ignore = "requires Linux io_uring runtime and TLS fixtures"]
+fn io_uring_accepts_client_tls_and_connects_backend_tls() {
+    assert!(
+        linux_io_uring_prerequisites_available(),
+        "set PG_KINETIC_RUN_IO_URING_TESTS=1 on supported Linux"
+    );
+
+    let backend = TlsTestBackend::start();
+    let client_cert_path = fixture_path("server-chain.pem")
+        .to_string_lossy()
+        .into_owned();
+    let client_key_path = fixture_path("server-key.pem")
+        .to_string_lossy()
+        .into_owned();
+    let backend_ca_path = fixture_path("ca.pem").to_string_lossy().into_owned();
+    let (mut proxy, proxy_addr) = spawn_proxy(
+        backend.addr,
+        &[
+            ("PG_KINETIC_CLIENT_TLS_MODE", "require"),
+            ("PG_KINETIC_CLIENT_TLS_CERT_PATH", client_cert_path.as_str()),
+            ("PG_KINETIC_CLIENT_TLS_KEY_PATH", client_key_path.as_str()),
+            ("PG_KINETIC_BACKEND_TLS_MODE", "verify_full"),
+            ("PG_KINETIC_BACKEND_TLS_CA_PATH", backend_ca_path.as_str()),
+            ("PG_KINETIC_BACKEND_TLS_SERVER_NAME", "localhost"),
+        ],
+    );
+    let mut client = connect_tls_client(proxy_addr);
+
+    client
+        .write_all(&startup_packet("postgres", "pgkinetic"))
+        .expect("write TLS startup packet");
+    client.flush().expect("flush TLS startup packet");
+    let startup_response = read_tls_until_ready(&mut client);
+    assert!(
+        startup_response
+            .windows(5)
+            .any(|frame| frame == b"R\0\0\0\x08"),
+        "TLS startup should receive AuthenticationOk: {startup_response:?}"
+    );
+
+    client
+        .write_all(&query_packet("select 1"))
+        .expect("write TLS query packet");
+    client.flush().expect("flush TLS query packet");
+    let query_response = read_tls_until_ready(&mut client);
+    assert!(
+        query_response.contains(&b'D'),
+        "TLS query should receive DataRow: {query_response:?}"
+    );
+    assert!(
+        query_response.contains(&b'1'),
+        "TLS query should receive select value: {query_response:?}"
+    );
+
+    drop(client);
+    stop_proxy(&mut proxy);
+    assert_eq!(backend.accepted(), 1, "TLS session should use one backend");
+}
+
 fn spawn_proxy(backend_addr: SocketAddr, extra_env: &[(&str, &str)]) -> (Child, SocketAddr) {
     let listen_addr = unused_addr();
     let mut command = Command::new(env!("CARGO_BIN_EXE_pg-kinetic"));
     command
         .env("PG_KINETIC_LISTEN_ADDR", listen_addr.to_string())
         .env("PG_KINETIC_BACKEND_ADDR", backend_addr.to_string())
-        .env("PG_KINETIC_RUNTIME_ENGINE", "experimental_io_uring")
-        .env("PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED", "true")
+        .env("PG_KINETIC_RUNTIME_ENGINE", "io_uring")
         .env("PG_KINETIC_RUNTIME_SHARDS", "1")
         .env("PG_KINETIC_MAX_BACKENDS", "4")
         .env("PG_KINETIC_STARTUP_BACKEND_CHECKS_ENABLED", "false");
@@ -408,6 +470,79 @@ fn unused_addr() -> SocketAddr {
         .expect("bind ephemeral listener")
         .local_addr()
         .expect("ephemeral listener address")
+}
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tls")
+        .join(name)
+}
+
+fn client_tls_config() -> TlsConfig {
+    TlsConfig {
+        client_tls_mode: ClientTlsMode::Disable,
+        client_cert_path: None,
+        client_key_path: None,
+        client_ca_path: None,
+        backend_tls_mode: BackendTlsMode::Disable,
+        backend_ca_path: Some(fixture_path("ca.pem")),
+        backend_server_name: Some(String::from("localhost")),
+    }
+}
+
+fn proxy_tls_config() -> TlsConfig {
+    TlsConfig {
+        client_tls_mode: ClientTlsMode::Require,
+        client_cert_path: Some(fixture_path("server-chain.pem")),
+        client_key_path: Some(fixture_path("server-key.pem")),
+        client_ca_path: None,
+        backend_tls_mode: BackendTlsMode::Disable,
+        backend_ca_path: Some(fixture_path("ca.pem")),
+        backend_server_name: Some(String::from("localhost")),
+    }
+}
+
+fn connect_tls_client(proxy: SocketAddr) -> StreamOwned<ClientConnection, TcpStream> {
+    let mut stream = TcpStream::connect(proxy).expect("connect TLS client");
+    stream
+        .write_all(&pg_kinetic::wire::tls::ssl_request_packet())
+        .expect("write client SSLRequest");
+    let mut response = [0_u8; 1];
+    stream
+        .read_exact(&mut response)
+        .expect("read client SSLResponse");
+    assert_eq!(response, *b"S");
+
+    let server_name = ServerName::try_from("localhost").expect("server name");
+    let connection = ClientConnection::new(
+        load_backend_client_config(&client_tls_config()).expect("client TLS config"),
+        server_name,
+    )
+    .expect("client TLS connection");
+    StreamOwned::new(connection, stream)
+}
+
+fn read_tls_until_ready(stream: &mut StreamOwned<ClientConnection, TcpStream>) -> Vec<u8> {
+    stream
+        .sock
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set TLS client read timeout");
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                response.extend_from_slice(&chunk[..read]);
+                if response.windows(5).any(|frame| frame == b"Z\0\0\0\x05") {
+                    break;
+                }
+            }
+        }
+    }
+    response
 }
 
 fn write_auth_users_file(contents: &str) -> PathBuf {
@@ -622,6 +757,112 @@ impl Drop for TestBackend {
             let _ = thread.join();
         }
     }
+}
+
+struct TlsTestBackend {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    accepted: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TlsTestBackend {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS PostgreSQL test backend");
+        listener
+            .set_nonblocking(true)
+            .expect("make TLS PostgreSQL test backend nonblocking");
+        let addr = listener.local_addr().expect("TLS backend address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let thread_stop = Arc::clone(&stop);
+        let thread_accepted = Arc::clone(&accepted);
+        let server_config = load_server_config(&proxy_tls_config()).expect("backend TLS config");
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        thread_accepted.fetch_add(1, Ordering::Relaxed);
+                        let server_config = Arc::clone(&server_config);
+                        thread::spawn(move || handle_tls_backend(stream, server_config));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            stop,
+            accepted,
+            thread: Some(thread),
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TlsTestBackend {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_tls_backend(
+    mut stream: TcpStream,
+    server_config: Arc<tokio_rustls::rustls::ServerConfig>,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set TLS backend read timeout");
+    let mut ssl_request = [0_u8; 8];
+    if stream.read_exact(&mut ssl_request).is_err() {
+        return;
+    }
+    if ssl_request != pg_kinetic::wire::tls::ssl_request_packet()[..] {
+        return;
+    }
+    if stream.write_all(b"S").is_err() {
+        return;
+    }
+
+    let connection = match ServerConnection::new(server_config) {
+        Ok(connection) => connection,
+        Err(_) => return,
+    };
+    let mut stream = StreamOwned::new(connection, stream);
+    let mut header = [0_u8; 4];
+    if stream.read_exact(&mut header).is_err() {
+        return;
+    }
+    let body_len = i32::from_be_bytes(header) as usize - 4;
+    let mut body = vec![0_u8; body_len];
+    if stream.read_exact(&mut body).is_err() {
+        return;
+    }
+    if stream.write_all(&auth_ok_ready()).is_err() || stream.flush().is_err() {
+        return;
+    }
+
+    let mut query_header = [0_u8; 5];
+    if stream.read_exact(&mut query_header).is_err() {
+        return;
+    }
+    let query_len =
+        i32::from_be_bytes(query_header[1..].try_into().expect("query length")) as usize - 4;
+    let mut query = vec![0_u8; query_len];
+    if stream.read_exact(&mut query).is_err() {
+        return;
+    }
+    let _ = stream.write_all(&select_one_ready());
+    let _ = stream.flush();
 }
 
 fn handle_backend(mut stream: TcpStream, behavior: BackendBehavior, connection_number: usize) {
