@@ -133,8 +133,12 @@ use client_io::{
     read_startup_packet_with_buffer, release_backend_with_cancel_unbind, CancelSessionGuard,
     ClientCycle, IdleTimeoutKind, QueryProgress,
 };
+pub(crate) use client_io::{handle_startup_or_cancel, StartupOrCancel};
 pub(crate) use client_io::{read_startup_packet, StartupRead};
 use client_session::{handle_client, ClientSessionContext};
+pub(crate) use client_session::{
+    handle_client_session, SharedBackendPool, SharedClientSessionContext,
+};
 pub(crate) use connection::ClientConnection;
 use connection::{backend_failure, BackendFailure};
 pub use connection::{retry_disposition, BackendFailureKind, RetryDisposition};

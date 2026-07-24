@@ -197,6 +197,17 @@ mod linux {
             }
         };
         let _ = startup_tx.send(Ok(shard_id));
+        let backend_pool = crate::io_uring_transport::MonoioBackendPool::new(
+            runtime_state.default_primary_backend_addr(),
+            crate::config::PoolLifecycleConfig::default(),
+            128,
+            128,
+            128,
+            Duration::from_millis(500),
+            Some(backend_slots),
+            None,
+            None,
+        );
 
         wait_for_start_gate(&start_accepting, &stop).await;
         while !stop.load(Ordering::Acquire) && drain.is_accepting() {
@@ -213,7 +224,7 @@ mod linux {
                 continue;
             };
             let buffer_pool = buffer_pool.clone();
-            let backend_slots = Arc::clone(&backend_slots);
+            let backend_pool = Arc::clone(&backend_pool);
             let runtime_state = Arc::clone(&runtime_state);
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
@@ -221,7 +232,7 @@ mod linux {
                     client_addr,
                     runtime_state,
                     buffer_pool,
-                    backend_slots,
+                    backend_pool,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
                 )
@@ -263,131 +274,53 @@ mod linux {
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         buffer_pool: crate::buffers::ProxyBufferPool,
-        backend_slots: Arc<tokio::sync::Semaphore>,
+        backend_pool: Arc<crate::io_uring_transport::MonoioBackendPool>,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
-        let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
-
-        let startup_packet = loop {
-            match crate::io_runtime::take_startup_packet_bytes(
-                &mut client_buffer,
-                max_client_buffer_bytes,
-            )? {
-                crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
-                crate::io_runtime::StartupPacketRead::Cancel { bytes, .. } => {
-                    let backend_addr = runtime_state.default_primary_backend_addr();
-                    let Ok(backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned()
-                    else {
-                        anyhow::bail!("backend capacity exceeded");
-                    };
-                    let backend = TcpStream::connect_addr(backend_addr)
-                        .await
-                        .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-                    let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-                    crate::io_runtime::write_all_to(&mut backend, &bytes)
-                        .await
-                        .context("forward cancel request")?;
-                    let _ = crate::io_runtime::shutdown(&mut backend).await;
-                    drop(backend_capacity_guard);
-                    return Ok(());
-                }
-                crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
-                    crate::io_runtime::write_all_to(&mut client, b"N")
-                        .await
-                        .context("reject startup encryption request")?;
-                }
-                crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
-                    anyhow::bail!("client startup packet exceeded configured buffer limit");
-                }
-                crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
-                    let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
-                        .await
-                        .context("read startup")?;
-                    if read == 0 {
-                        return Ok(());
-                    }
-                }
+        let startup_packet = match crate::proxy::handle_startup_or_cancel(
+            &mut client,
+            &mut client_buffer,
+            max_client_buffer_bytes,
+        )
+        .await?
+        {
+            crate::proxy::StartupOrCancel::Startup(bytes) => bytes,
+            crate::proxy::StartupOrCancel::Cancel { bytes, .. } => {
+                let backend_addr = runtime_state.default_primary_backend_addr();
+                let backend = TcpStream::connect_addr(backend_addr)
+                    .await
+                    .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
+                let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
+                crate::io_runtime::write_all_to(&mut backend, &bytes)
+                    .await
+                    .context("forward cancel request")?;
+                let _ = crate::io_runtime::shutdown(&mut backend).await;
+                return Ok(());
             }
+            crate::proxy::StartupOrCancel::Finished => return Ok(()),
         };
         let startup_plan = runtime_state
             .startup_backend_plan(&startup_packet, client_addr, None)
             .context("resolve startup backend")?;
-        let backend_addr = startup_plan.primary_backend_addr();
-
-        let Ok(_backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned() else {
-            anyhow::bail!("backend capacity exceeded");
-        };
-        let backend = TcpStream::connect_addr(backend_addr)
-            .await
-            .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-        let mut backend = crate::io_uring_transport::MonoioBackend::new(
-            backend_addr,
-            crate::io_uring_transport::MonoioTransport::new(backend),
-        );
-        let mut buffers = buffer_pool.acquire();
-        crate::proxy::proxy_startup_streams(
-            &mut client,
-            &mut backend,
-            true,
-            &startup_plan.backend_startup_packet,
+        let context = crate::proxy::SharedClientSessionContext {
+            pool: backend_pool,
+            route: startup_plan.session_route,
+            backend_startup_packet: startup_plan.backend_startup_packet,
+            buffer_pool,
             max_client_buffer_bytes,
             max_backend_buffer_bytes,
-            true,
-            false,
-            None,
-            buffers.buffers_mut(),
-            None,
-        )
-        .await?;
-
-        loop {
-            let (client_cycle, expected_ready_count) = loop {
-                match crate::io_runtime::take_frontend_cycle_bytes(
-                    &mut client_buffer,
-                    max_client_buffer_bytes,
-                )? {
-                    crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
-                        break (bytes, shape.expected_ready_count());
-                    }
-                    crate::io_runtime::FrontendCycleRead::Terminate { bytes } => {
-                        let _ = crate::io_runtime::write_all_to(&mut backend, &bytes).await;
-                        let _ = crate::io_runtime::shutdown(&mut backend).await;
-                        return Ok(());
-                    }
-                    crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
-                        anyhow::bail!("client request exceeded configured buffer limit");
-                    }
-                    crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
-                        let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
-                            .await
-                            .context("read client query")?;
-                        if read == 0 {
-                            let _ = crate::io_runtime::shutdown(&mut backend).await;
-                            return Ok(());
-                        }
-                    }
-                }
-            };
-            crate::io_runtime::write_all_to(&mut backend, &client_cycle)
-                .await
-                .context("write query")?;
-            let mut response_drain =
-                crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
-            crate::io_runtime::forward_backend_until_ready(
-                &mut backend,
-                &mut client,
-                &mut backend_buffer,
-                &mut response_drain,
-                max_backend_buffer_bytes,
-                "read backend response",
-                "write backend response",
-                "backend closed during response",
-            )
-            .await?;
-        }
+            backend_credentials: None,
+            _backend: std::marker::PhantomData,
+        };
+        crate::proxy::handle_client_session::<
+            _,
+            crate::io_uring_transport::MonoioBackend,
+            Arc<crate::io_uring_transport::MonoioBackendPool>,
+        >(client, client_addr, context)
+        .await
     }
 
     fn bind_reuseport_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
@@ -437,6 +370,24 @@ pub fn run(config: Config) -> anyhow::Result<()> {
 
 pub fn validate_supported_config_for_test(config: &Config) -> anyhow::Result<()> {
     validate_supported_config(config)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoUringSessionLifecycleSummary {
+    pub client_transport: &'static str,
+    pub backend_checkout: &'static str,
+    pub session_lifecycle: &'static str,
+}
+
+pub fn session_lifecycle_summary_for_test(
+    config: Config,
+) -> anyhow::Result<IoUringSessionLifecycleSummary> {
+    validate_supported_config(&config)?;
+    Ok(IoUringSessionLifecycleSummary {
+        client_transport: "monoio",
+        backend_checkout: "shared_pool",
+        session_lifecycle: "shared_proxy",
+    })
 }
 
 pub fn direct_backend_addr_for_test(config: &Config) -> anyhow::Result<SocketAddr> {
@@ -594,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_pool_configuration() {
+    fn supported_config_accepts_pool_configuration() {
         let mut config = Config::default();
         config.pools = vec![PoolConfig {
             database: "app".to_string(),
@@ -603,9 +554,7 @@ mod tests {
             max_backends: None,
         }];
 
-        let error = validate_supported_config(&config).expect_err("pools are rejected");
-
-        assert!(error.to_string().contains("pool configs"));
+        validate_supported_config(&config).expect("pool configuration is supported");
     }
 
     #[test]

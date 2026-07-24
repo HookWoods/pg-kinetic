@@ -257,6 +257,18 @@ impl MonoioBackendPool {
     }
 }
 
+impl crate::proxy::SharedBackendPool<MonoioBackend, std::sync::Arc<MonoioBackendPool>>
+    for std::sync::Arc<MonoioBackendPool>
+{
+    async fn checkout_shared(
+        &self,
+        route: pg_kinetic_core::route::RouteKey,
+    ) -> Result<MonoioPooledBackend, crate::pool::PoolError> {
+        self.checkout(route, crate::pool::CheckoutMode::AllowConnect)
+            .await
+    }
+}
+
 impl crate::proxy::BackendStartupMetadata for MonoioBackend {
     fn is_tls(&self) -> bool {
         MonoioBackend::is_tls(self)
