@@ -195,6 +195,7 @@ pub(crate) async fn forward_runtime_cycle<C, B>(
     backend: &mut B,
     cycle: &[u8],
     expected_ready_count: usize,
+    injected_parse_completes: usize,
     backend_buffer: &mut BytesMut,
     max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<()>
@@ -205,7 +206,10 @@ where
     crate::io_runtime::write_all_to(backend, cycle)
         .await
         .context("write frontend cycle to backend")?;
-    let mut response_drain = crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
+    let mut response_drain = crate::io_runtime::BackendResponseDrain::new(
+        expected_ready_count,
+        injected_parse_completes,
+    );
     crate::io_runtime::forward_backend_until_ready(
         backend,
         client,
@@ -275,6 +279,41 @@ mod generic_tests {
             writes: Vec::new(),
         };
         assert_eq!(backend.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_drains_injected_parse_before_ready() {
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::from([
+                BytesMut::from(&b"1\x00\x00\x00\x04"[..]),
+                BytesMut::from(&b"Z\x00\x00\x00\x05I"[..]),
+            ]),
+            writes: Vec::new(),
+        };
+
+        forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"Q",
+            1,
+            1,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect("forwarding should ignore the injected ParseComplete");
+
+        assert_eq!(backend.writes, vec![BytesMut::from(&b"Q"[..])]);
+        assert_eq!(
+            client.writes,
+            vec![BytesMut::from(&b"Z\x00\x00\x00\x05I"[..])]
+        );
     }
 }
 

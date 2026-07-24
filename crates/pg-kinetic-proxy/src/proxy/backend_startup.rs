@@ -246,14 +246,33 @@ pub(super) async fn bootstrap_backend(
     startup_packet: &[u8],
     backend_credentials: Option<&auth::BackendCredentials>,
 ) -> anyhow::Result<()> {
-    if !backend.requires_startup() {
+    let requires_startup = backend.requires_startup();
+    let mut startup_backend = PooledBackendStartup {
+        backend: backend.backend_mut(),
+    };
+    bootstrap_backend_streams(
+        &mut startup_backend,
+        requires_startup,
+        startup_packet,
+        backend_credentials,
+    )
+    .await
+}
+
+pub(crate) async fn bootstrap_backend_streams<B>(
+    backend: &mut B,
+    requires_startup: bool,
+    startup_packet: &[u8],
+    backend_credentials: Option<&auth::BackendCredentials>,
+) -> anyhow::Result<()>
+where
+    B: crate::io_runtime::RuntimeByteStream + BackendStartupMetadata,
+{
+    if !requires_startup {
         return Ok(());
     }
 
-    backend
-        .backend_mut()
-        .stream_mut()
-        .write_all(startup_packet)
+    crate::io_runtime::write_all_to(backend, startup_packet)
         .await
         .context("forward backend startup")?;
 
@@ -263,10 +282,7 @@ pub(super) async fn bootstrap_backend(
         .map(auth::BackendAuthSession::new)
         .transpose()?;
     loop {
-        backend
-            .backend_mut()
-            .stream_mut()
-            .read_buf(&mut backend_buffer)
+        crate::io_runtime::read_from(backend, &mut backend_buffer)
             .await
             .context("read backend startup response")?;
 
@@ -275,12 +291,9 @@ pub(super) async fn bootstrap_backend(
                 let code = auth_request_code(&frame.payload)?;
                 if let Some(backend_auth) = backend_auth.as_mut() {
                     if let Some(response) =
-                        backend_auth.respond(&frame.payload, backend.backend_mut().is_tls())?
+                        backend_auth.respond(&frame.payload, backend.is_tls())?
                     {
-                        backend
-                            .backend_mut()
-                            .stream_mut()
-                            .write_all(&response)
+                        crate::io_runtime::write_all_to(backend, &response)
                             .await
                             .context("respond to backend bootstrap authentication request")?;
                     }

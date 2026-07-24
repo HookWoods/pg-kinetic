@@ -312,6 +312,7 @@ mod linux {
             pool: backend_pool_selector,
             route: startup_plan.session_route,
             route_user: startup_plan.route_user,
+            route_application_name: startup_plan.route_application_name,
             backend_startup_packet: startup_plan.backend_startup_packet,
             buffer_pool,
             max_client_buffer_bytes,

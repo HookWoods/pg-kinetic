@@ -23,6 +23,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) pool: P,
     pub(crate) route: RouteKey,
     pub(crate) route_user: String,
+    pub(crate) route_application_name: Option<String>,
     pub(crate) backend_startup_packet: BytesMut,
     pub(crate) buffer_pool: ProxyBufferPool,
     pub(crate) max_client_buffer_bytes: usize,
@@ -108,6 +109,7 @@ where
         pool,
         route,
         route_user,
+        mut route_application_name,
         backend_startup_packet,
         buffer_pool,
         max_client_buffer_bytes,
@@ -182,6 +184,7 @@ where
     let mut prepared = PreparedCatalog::new(session_id);
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
+    let mut held_backend = None;
 
     loop {
         match crate::io_runtime::take_frontend_cycle_bytes(
@@ -231,26 +234,24 @@ where
                         "monoio cycle routing produced unsupported target: {target:?}"
                     ));
                 }
-                let mut backend = pool
-                    .checkout_shared_target(route.clone(), &route_pools, &target)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("monoio target checkout failed: {error:?}"))?;
+                let mut backend = if let Some(held_backend) = held_backend.take() {
+                    held_backend
+                } else {
+                    pool.checkout_shared_target(route.clone(), &route_pools, &target)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("monoio target checkout failed: {error:?}")
+                        })?
+                };
                 let requires_startup = backend.requires_startup();
                 let mut startup_backend = LeaseRuntimeBackend {
                     lease: &mut backend,
                 };
-                if let Err(error) = crate::proxy::proxy_startup_streams(
-                    &mut client,
+                if let Err(error) = crate::proxy::bootstrap_backend_streams(
                     &mut startup_backend,
                     requires_startup,
                     &backend_startup_packet,
-                    max_client_buffer_bytes,
-                    max_backend_buffer_bytes,
-                    true,
-                    true,
                     backend_credentials.as_deref(),
-                    buffers.buffers_mut(),
-                    None,
                 )
                 .await
                 {
@@ -265,7 +266,6 @@ where
                     .map(|plan| plan.command.clone())
                     .collect();
                 let mut progress = QueryProgress::default();
-                let mut route_application_name = None;
                 let mut forward_state = ForwardCycleState {
                     session: &mut session,
                     prepared: &mut prepared,
@@ -289,6 +289,7 @@ where
                     &mut runtime_backend,
                     &planned.backend_bytes,
                     shape.expected_ready_count(),
+                    planned.injected_parse_completes,
                     &mut backend_buffer,
                     max_backend_buffer_bytes,
                 )
@@ -296,6 +297,8 @@ where
                 drop(runtime_backend);
                 if result.is_err() {
                     backend.discard();
+                } else if session.pin_reason().is_some() {
+                    held_backend = Some(backend);
                 } else {
                     backend.release().await;
                 }

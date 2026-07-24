@@ -120,7 +120,9 @@ mod session_snapshot;
 
 use backend_startup::*;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub(crate) use backend_startup::{proxy_startup_streams, BackendStartupMetadata};
+pub(crate) use backend_startup::{
+    bootstrap_backend_streams, proxy_startup_streams, BackendStartupMetadata,
+};
 use buffer_limit::*;
 use checkout::*;
 pub use checkout::{
