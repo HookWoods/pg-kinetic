@@ -67,8 +67,10 @@ fn io_uring_enforces_global_backend_capacity() {
         .expect("write second startup");
     let response = read_with_timeout(&mut second, Duration::from_secs(2));
     assert!(
-        response.windows(5).any(|field| field == b"53301")
-            || response.windows(5).any(|field| field == b"57014"),
+        response.windows(5).any(|field| field == b"53300")
+            && response
+                .windows(b"backend checkout timed out".len())
+                .any(|field| field == b"backend checkout timed out"),
         "second checkout should observe global capacity timeout: {response:?}"
     );
 
