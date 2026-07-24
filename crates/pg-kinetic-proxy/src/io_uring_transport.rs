@@ -181,10 +181,6 @@ impl MonoioBackendConnector {
     pub(crate) const fn new(backend_addr: SocketAddr) -> Self {
         Self { backend_addr }
     }
-
-    pub(crate) const fn backend_addr(&self) -> SocketAddr {
-        self.backend_addr
-    }
 }
 
 impl PoolBackendConnector<MonoioBackend> for MonoioBackendConnector {

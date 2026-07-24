@@ -190,6 +190,7 @@ pub(super) async fn forward_message_cycle(
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
 pub(crate) async fn forward_runtime_cycle<C, B>(
     client: &mut C,
     backend: &mut B,

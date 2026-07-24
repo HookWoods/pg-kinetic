@@ -65,6 +65,7 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) async fn handle_startup_or_cancel<C>(
     client: &mut C,
     client_buffer: &mut BytesMut,
@@ -111,6 +112,7 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 #[derive(Debug)]
 pub(crate) enum StartupOrCancel {
     Startup(BytesMut),

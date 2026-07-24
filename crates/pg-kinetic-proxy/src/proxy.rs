@@ -61,6 +61,8 @@ use pg_kinetic_core::routing::{
     BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode,
     RoutingReason as CoreRoutingReason,
 };
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use pg_kinetic_core::secrets::UserStore;
 use pg_kinetic_core::{
     cleanup::{cleanup_action, CleanupAction},
     constants::{MetricName, PreparedEvent},
@@ -75,7 +77,6 @@ use pg_kinetic_core::{
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{PoolKey, QueryClass, RouteKey},
     runtime::{RuntimeLifecycleState, ShutdownReason},
-    secrets::UserStore,
     session::PinReason as SessionPinReason,
     session::TransactionState,
     shard_extract::{extract_shard_hint, ShardHint},
@@ -130,14 +131,18 @@ pub use checkout::{
     checkout_postgres_error_for_target, policy_audit_event_from_decision,
     route_checkout_snapshot_for_target,
 };
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use client_io::bind_cancel_target_for_backend;
 use client_io::{
-    bind_cancel_target, bind_cancel_target_for_backend, discard_backend_with_cancel_unbind,
-    next_client_cycle, read_startup_packet_with_buffer, release_backend_with_cancel_unbind,
-    CancelSessionGuard, ClientCycle, IdleTimeoutKind, QueryProgress,
+    bind_cancel_target, discard_backend_with_cancel_unbind, next_client_cycle,
+    read_startup_packet_with_buffer, release_backend_with_cancel_unbind, CancelSessionGuard,
+    ClientCycle, IdleTimeoutKind, QueryProgress,
 };
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) use client_io::{handle_startup_or_cancel, StartupOrCancel};
 pub(crate) use client_io::{read_startup_packet, StartupRead};
 use client_session::{handle_client, ClientSessionContext};
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) use client_session::{
     handle_client_session, SharedBackendPool, SharedClientSessionContext,
 };
@@ -206,6 +211,7 @@ pub(crate) struct ShardContext {
     pub runtime_shard_observability: bool,
 }
 
+#[cfg_attr(not(all(target_os = "linux", feature = "io-uring")), allow(dead_code))]
 pub(crate) struct ProxyRuntimeState {
     effective_config: Config,
     phase_metrics_enabled: bool,

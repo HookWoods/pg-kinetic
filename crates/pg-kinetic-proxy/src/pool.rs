@@ -444,6 +444,7 @@ impl<O> BackendLeaseState<O> {
 }
 
 #[derive(Debug)]
+#[allow(private_bounds)]
 pub struct PooledBackendLease<T, O>
 where
     T: PoolBackendTransport,
@@ -1981,6 +1982,7 @@ where
     }
 }
 
+#[allow(private_bounds)]
 impl<T, O> PooledBackendLease<T, O>
 where
     T: PoolBackendTransport,

@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) trait SharedBackendPool<B, O>: Clone + std::fmt::Debug
 where
     B: crate::pool::PoolBackendTransport,
@@ -19,6 +20,7 @@ where
     ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) pool: P,
     pub(crate) route: RouteKey,
@@ -47,6 +49,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) _backend: std::marker::PhantomData<(B, O)>,
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 struct LeaseRuntimeBackend<'a, B, O>
 where
     B: crate::pool::PoolBackendTransport,
@@ -55,6 +58,7 @@ where
     lease: &'a mut crate::pool::PooledBackendLease<B, O>,
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 impl<B, O> BackendStartupMetadata for LeaseRuntimeBackend<'_, B, O>
 where
     B: crate::pool::PoolBackendTransport + BackendStartupMetadata,
@@ -87,6 +91,7 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 impl<B, O> crate::io_runtime::RuntimeByteStream for LeaseRuntimeBackend<'_, B, O>
 where
     B: crate::pool::PoolBackendTransport + crate::io_runtime::RuntimeByteStream,
@@ -105,8 +110,10 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 struct DiscardRuntimeStream;
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 impl crate::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
     async fn read_into(&mut self, _dst: &mut BytesMut) -> std::io::Result<usize> {
         Ok(0)
@@ -121,10 +128,12 @@ impl crate::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
 fn should_reuse_held_backend(session: &VirtualSession, held_backend_id: Option<u64>) -> bool {
     session.pin_reason().is_some() && held_backend_id.is_some()
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn cleanup_held_shared_backend<B, O>(
     cancel_registry: &cancel::CancelRegistry,
     client_key: (i32, i32),
@@ -138,6 +147,7 @@ async fn cleanup_held_shared_backend<B, O>(
     }
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
 fn should_replay_shared_session(
     session: &VirtualSession,
     previous_backend_id: Option<u64>,
@@ -146,6 +156,7 @@ fn should_replay_shared_session(
     session.has_replayable_settings() && previous_backend_id != Some(backend_id)
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
 fn should_probe_read_after_write(
     committed_write_transaction: bool,
     read_after_write_protection_enabled: bool,
@@ -156,6 +167,7 @@ fn should_probe_read_after_write(
         && status == ReadyStatus::Idle
 }
 
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
 fn apply_read_after_write_probe_result(
     session: &mut VirtualSession,
     result: anyhow::Result<PgLsn>,
@@ -166,6 +178,7 @@ fn apply_read_after_write_probe_result(
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn write_shared_error_response<C>(
     client: &mut C,
     sqlstate: &str,
@@ -183,6 +196,7 @@ where
         .context("write shared error response")
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
@@ -190,6 +204,7 @@ where
     write_shared_error_response(client, SqlState::QueryCanceled.as_str(), "query timed out").await
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn handle_shared_pool_checkout_error<C>(
     client: &mut C,
     error: crate::pool::PoolError,
@@ -217,6 +232,7 @@ where
     Ok(true)
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn probe_shared_read_after_write_requirement<S>(
     backend: &mut S,
     probe_timeout: Duration,
@@ -237,6 +253,7 @@ where
     result.map_err(|_| anyhow::anyhow!("read-after-write probe timed out"))?
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn probe_shared_read_after_write_requirement_without_timeout<S>(
     backend: &mut S,
     max_backend_buffer_bytes: usize,
@@ -283,6 +300,7 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub(crate) async fn handle_client_session<C, B, O, P>(
     mut client: C,
     _client_addr: SocketAddr,
