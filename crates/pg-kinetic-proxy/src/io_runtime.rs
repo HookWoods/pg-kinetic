@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use bytes::{Bytes, BytesMut};
 use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
 use pg_kinetic_wire::frame::parse_frontend_frame;
@@ -33,6 +38,42 @@ pub enum StartupPacketRead {
     EncryptionRequest,
     BufferLimitExceeded,
     NeedMoreBytes,
+}
+
+#[derive(Debug)]
+pub struct ClientCapacityGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ClientCapacityGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub fn try_enter_client_capacity(
+    active: &Arc<AtomicUsize>,
+    max_clients: usize,
+) -> Option<ClientCapacityGuard> {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= max_clients {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(ClientCapacityGuard {
+                    active: Arc::clone(active),
+                });
+            }
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 impl FrontendCycleShape {

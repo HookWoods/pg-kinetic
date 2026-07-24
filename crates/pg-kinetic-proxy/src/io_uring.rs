@@ -9,7 +9,7 @@ mod linux {
     use std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc::{self, RecvTimeoutError},
             Arc,
         },
@@ -40,6 +40,7 @@ mod linux {
             .unwrap_or_else(default_shard_count);
         let stop = Arc::new(AtomicBool::new(false));
         let start_accepting = Arc::new(AtomicBool::new(false));
+        let client_capacity = Arc::new(AtomicUsize::new(0));
         let lifecycle = LifecycleController::new(
             Arc::new(DrainController::default()),
             config.drain.drain_timeout(),
@@ -52,9 +53,11 @@ mod linux {
         for shard_id in 0..shard_count {
             let stop = Arc::clone(&stop);
             let start_accepting = Arc::clone(&start_accepting);
+            let client_capacity = Arc::clone(&client_capacity);
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
+            let max_clients = config.capacity.max_clients;
             let drain_timeout = config.drain.drain_timeout();
             let max_client_buffer_bytes = config.qos.max_client_buffer_bytes;
             let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
@@ -79,8 +82,10 @@ mod linux {
                         backend_addr,
                         stop,
                         start_accepting,
+                        client_capacity,
                         lifecycle.drain_token(),
                         lifecycle.drain_controller(),
+                        max_clients,
                         drain_timeout,
                         max_client_buffer_bytes,
                         max_backend_buffer_bytes,
@@ -174,8 +179,10 @@ mod linux {
         backend_addr: SocketAddr,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
+        client_capacity: Arc<AtomicUsize>,
         drain: crate::lifecycle::DrainToken,
         drain_controller: Arc<DrainController>,
+        max_clients: usize,
         drain_timeout: Duration,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
@@ -202,6 +209,12 @@ mod linux {
             let Some(session_guard) = drain.try_enter() else {
                 continue;
             };
+            let Some(client_capacity_guard) =
+                crate::io_runtime::try_enter_client_capacity(&client_capacity, max_clients)
+            else {
+                drop(session_guard);
+                continue;
+            };
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
@@ -213,6 +226,7 @@ mod linux {
                 {
                     tracing::debug!(shard_id, error = %error, "io_uring connection ended");
                 }
+                drop(client_capacity_guard);
                 drop(session_guard);
             });
         }
