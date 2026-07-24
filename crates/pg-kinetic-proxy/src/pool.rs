@@ -1856,6 +1856,10 @@ impl BackendPool {
         self.core.attach_snapshot_store(snapshot_store);
     }
 
+    pub fn with_snapshot_store(&self, f: impl FnOnce(&SnapshotStore)) {
+        self.core.with_snapshot_store(f);
+    }
+
     pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
         self.checkout_primary(route).await
     }
