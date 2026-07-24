@@ -54,6 +54,7 @@ mod linux {
             let listen_addr = config.connection.listen_addr;
             let backend_addr = config.connection.backend_addr;
             let drain_timeout = config.drain.drain_timeout();
+            let max_client_buffer_bytes = config.qos.max_client_buffer_bytes;
             let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
             let thread = std::thread::Builder::new()
                 .name(format!("pg-kinetic-iouring-shard-{shard_id}"))
@@ -79,6 +80,7 @@ mod linux {
                         lifecycle.drain_token(),
                         lifecycle.drain_controller(),
                         drain_timeout,
+                        max_client_buffer_bytes,
                         max_backend_buffer_bytes,
                         startup_tx,
                     ))
@@ -173,6 +175,7 @@ mod linux {
         drain: crate::lifecycle::DrainToken,
         drain_controller: Arc<DrainController>,
         drain_timeout: Duration,
+        max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
         startup_tx: mpsc::Sender<Result<usize, String>>,
     ) -> anyhow::Result<()> {
@@ -198,8 +201,13 @@ mod linux {
                 continue;
             };
             monoio::spawn(async move {
-                if let Err(error) =
-                    proxy_connection(client, backend_addr, max_backend_buffer_bytes).await
+                if let Err(error) = proxy_connection(
+                    client,
+                    backend_addr,
+                    max_client_buffer_bytes,
+                    max_backend_buffer_bytes,
+                )
+                .await
                 {
                     tracing::debug!(shard_id, error = %error, "io_uring connection ended");
                 }
@@ -234,6 +242,7 @@ mod linux {
     async fn proxy_connection(
         client: TcpStream,
         backend_addr: SocketAddr,
+        max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
         let backend = TcpStream::connect_addr(backend_addr)
@@ -286,24 +295,38 @@ mod linux {
         }
 
         loop {
-            let read = client
-                .read_into(&mut client_buffer)
-                .await
-                .context("read client query")?;
-            if read == 0 {
-                let _ = backend.shutdown().await;
-                return Ok(());
-            }
-            let expected_ready_count =
-                crate::io_runtime::FrontendCycleShape::from_wire_bytes(&client_buffer)?.map_or(
-                    1,
-                    crate::io_runtime::FrontendCycleShape::expected_ready_count,
-                );
+            let (client_cycle, expected_ready_count) = loop {
+                match crate::io_runtime::take_frontend_cycle_bytes(
+                    &mut client_buffer,
+                    max_client_buffer_bytes,
+                )? {
+                    crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
+                        break (bytes, shape.expected_ready_count());
+                    }
+                    crate::io_runtime::FrontendCycleRead::Terminate { bytes } => {
+                        let _ = backend.write_all(&bytes).await;
+                        let _ = backend.shutdown().await;
+                        return Ok(());
+                    }
+                    crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+                        anyhow::bail!("client request exceeded configured buffer limit");
+                    }
+                    crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+                        let read = client
+                            .read_into(&mut client_buffer)
+                            .await
+                            .context("read client query")?;
+                        if read == 0 {
+                            let _ = backend.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                }
+            };
             backend
-                .write_all(&client_buffer)
+                .write_all(&client_cycle)
                 .await
                 .context("write query")?;
-            client_buffer.clear();
             let mut response_drain =
                 crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
 

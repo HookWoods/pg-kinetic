@@ -9,6 +9,19 @@ pub struct FrontendCycleShape {
     needs_sync: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum FrontendCycleRead {
+    Complete {
+        bytes: BytesMut,
+        shape: FrontendCycleShape,
+    },
+    Terminate {
+        bytes: BytesMut,
+    },
+    BufferLimitExceeded,
+    NeedMoreBytes,
+}
+
 impl FrontendCycleShape {
     #[must_use]
     pub fn from_frames(frames: &[FrontendFrame]) -> Self {
@@ -48,6 +61,77 @@ impl FrontendCycleShape {
     #[must_use]
     pub const fn needs_sync(self) -> bool {
         self.needs_sync
+    }
+}
+
+pub fn take_frontend_cycle_bytes(
+    buffer: &mut BytesMut,
+    max_client_buffer_bytes: usize,
+) -> anyhow::Result<FrontendCycleRead> {
+    if buffer.len() > max_client_buffer_bytes {
+        return Ok(FrontendCycleRead::BufferLimitExceeded);
+    }
+
+    let Some(first_len) = complete_frontend_frame_len(buffer)? else {
+        return Ok(FrontendCycleRead::NeedMoreBytes);
+    };
+
+    let first_tag = buffer[0];
+    let mut cycle_len = first_len;
+    if first_tag == u8::from(FrontendTag::Terminate) {
+        return Ok(FrontendCycleRead::Terminate {
+            bytes: buffer.split_to(cycle_len),
+        });
+    } else if first_tag == u8::from(FrontendTag::Query) {
+        while let Some(next_len) = complete_frontend_frame_len(&buffer[cycle_len..])? {
+            if buffer[cycle_len] != u8::from(FrontendTag::Query) {
+                break;
+            }
+            cycle_len += next_len;
+        }
+    } else {
+        while !buffer[..cycle_len].ends_with_sync_frame()? {
+            let Some(next_len) = complete_frontend_frame_len(&buffer[cycle_len..])? else {
+                return Ok(FrontendCycleRead::NeedMoreBytes);
+            };
+            cycle_len += next_len;
+        }
+    }
+
+    let bytes = buffer.split_to(cycle_len);
+    let shape = FrontendCycleShape::from_wire_bytes(&bytes)?.expect("complete cycle has frames");
+    Ok(FrontendCycleRead::Complete { bytes, shape })
+}
+
+fn complete_frontend_frame_len(bytes: &[u8]) -> anyhow::Result<Option<usize>> {
+    const HEADER_LEN: usize = 5;
+    if bytes.len() < HEADER_LEN {
+        return Ok(None);
+    }
+
+    let length = i32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    if length < 4 {
+        let mut invalid = BytesMut::from(bytes);
+        parse_frontend_frame(&mut invalid)?;
+        unreachable!("invalid frontend length should be rejected by parser");
+    }
+
+    let total_len = 1 + length as usize;
+    Ok((bytes.len() >= total_len).then_some(total_len))
+}
+
+trait FrontendCycleBytes {
+    fn ends_with_sync_frame(&self) -> anyhow::Result<bool>;
+}
+
+impl FrontendCycleBytes for [u8] {
+    fn ends_with_sync_frame(&self) -> anyhow::Result<bool> {
+        let mut scan = BytesMut::from(self);
+        let mut last_is_sync = false;
+        while let Some(frame) = parse_frontend_frame(&mut scan)? {
+            last_is_sync = frame.tag == u8::from(FrontendTag::Sync);
+        }
+        Ok(last_is_sync && scan.is_empty())
     }
 }
 
