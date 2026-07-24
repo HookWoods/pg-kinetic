@@ -1064,27 +1064,41 @@ pub(super) async fn complete_client_startup(
     let client_key = request.cancel_registry.issue_client_key()?;
     let cancel_session = CancelSessionGuard::new(Arc::clone(request.cancel_registry), client_key);
 
-    let (route_database, route_user, route_application_name) = startup_route_key(&startup_packet)?;
-    let session_route = route_key(
-        &route_database,
-        &route_user,
-        route_application_name.as_deref(),
+    let startup_plan = match request.route_pool_selector.startup_backend_plan(
+        &startup_packet,
         request.client_addr,
-    );
-    let Some(route_pools) = request.route_pool_selector.resolve(&session_route) else {
-        startup_timer.finish(MetricOutcome::Rejected);
-        let message = format!(
-            "database \"{route_database}\" for user \"{route_user}\" is not configured on this proxy"
-        );
-        error_response_and_ready_with_state(
-            request.client,
-            INVALID_CATALOG_NAME_SQLSTATE,
-            &message,
-            ReadyStatus::Idle,
-        )
-        .await?;
-        return Ok(SessionStartupOutcome::Finished);
+        request
+            .backend_credentials
+            .as_deref()
+            .map(auth::BackendCredentials::username),
+    ) {
+        Ok(plan) => plan,
+        Err(StartupBackendPlanError::UnknownRoute { database, user }) => {
+            let message = format!(
+                "database \"{database}\" for user \"{user}\" is not configured on this proxy"
+            );
+            startup_timer.finish(MetricOutcome::Rejected);
+            error_response_and_ready_with_state(
+                request.client,
+                INVALID_CATALOG_NAME_SQLSTATE,
+                &message,
+                ReadyStatus::Idle,
+            )
+            .await?;
+            return Ok(SessionStartupOutcome::Finished);
+        }
+        Err(StartupBackendPlanError::Invalid(error)) => {
+            startup_timer.finish(MetricOutcome::Error);
+            return Err(error);
+        }
     };
+    let route_database = startup_plan.route_database.clone();
+    let route_user = startup_plan.route_user.clone();
+    let route_application_name = startup_plan.route_application_name.clone();
+    let session_route = startup_plan.session_route.clone();
+    let route_pools = Arc::clone(&startup_plan.route_pools);
+    let backend_startup_packet = startup_plan.backend_startup_packet.clone();
+
     update_client_snapshot(
         request.client_snapshot_handle,
         request.session_id,
@@ -1134,14 +1148,6 @@ pub(super) async fn complete_client_startup(
             }
         }
     }
-
-    let backend_startup_packet = rewrite_backend_startup_user(
-        &startup_packet,
-        request
-            .backend_credentials
-            .as_deref()
-            .map(auth::BackendCredentials::username),
-    )?;
 
     request.pause.wait_if_paused().await;
     let mut backend = match checkout_backend(CheckoutBackendRequest {

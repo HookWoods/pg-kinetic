@@ -213,6 +213,31 @@ pub(crate) struct ProxyRuntimeState {
     auth_query_service: Arc<AuthQueryService>,
 }
 
+pub(crate) struct StartupBackendPlan {
+    pub(crate) route_database: String,
+    pub(crate) route_user: String,
+    pub(crate) route_application_name: Option<String>,
+    pub(crate) session_route: RouteKey,
+    pub(crate) route_pools: Arc<RoutePools>,
+    pub(crate) backend_startup_packet: BytesMut,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StartupBackendPlanError {
+    #[error("database \"{database}\" for user \"{user}\" is not configured on this proxy")]
+    UnknownRoute { database: String, user: String },
+
+    #[error(transparent)]
+    Invalid(#[from] anyhow::Error),
+}
+
+impl StartupBackendPlan {
+    #[must_use]
+    pub(crate) fn primary_backend_addr(&self) -> SocketAddr {
+        self.route_pools.primary().backend_addr()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RoutePoolSelector {
     default_pools: Option<Arc<RoutePools>>,
@@ -256,6 +281,38 @@ impl RoutePoolSelector {
             targets.register_registry(Arc::clone(&self.registry));
         }
     }
+
+    fn startup_backend_plan(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+        backend_user: Option<&str>,
+    ) -> Result<StartupBackendPlan, StartupBackendPlanError> {
+        let (route_database, route_user, route_application_name) =
+            startup_route_key(startup_packet)?;
+        let session_route = route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        );
+        let Some(route_pools) = self.resolve(&session_route) else {
+            return Err(StartupBackendPlanError::UnknownRoute {
+                database: route_database,
+                user: route_user,
+            });
+        };
+        let backend_startup_packet = rewrite_backend_startup_user(startup_packet, backend_user)?;
+
+        Ok(StartupBackendPlan {
+            route_database,
+            route_user,
+            route_application_name,
+            session_route,
+            route_pools,
+            backend_startup_packet,
+        })
+    }
 }
 
 impl ProxyRuntimeState {
@@ -276,21 +333,22 @@ impl ProxyRuntimeState {
         startup_packet: &[u8],
         client_addr: SocketAddr,
     ) -> anyhow::Result<SocketAddr> {
-        let (route_database, route_user, route_application_name) =
-            startup_route_key(startup_packet)?;
-        let session_route = route_key(
-            &route_database,
-            &route_user,
-            route_application_name.as_deref(),
-            client_addr,
-        );
-        let Some(route_pools) = self.route_pool_selector.resolve(&session_route) else {
-            anyhow::bail!(
-                "database \"{route_database}\" for user \"{route_user}\" is not configured on this proxy"
-            );
-        };
+        Ok(self
+            .startup_backend_plan(startup_packet, client_addr, None)?
+            .primary_backend_addr())
+    }
 
-        Ok(route_pools.primary().backend_addr())
+    pub(crate) fn startup_backend_plan(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+        backend_user: Option<&str>,
+    ) -> anyhow::Result<StartupBackendPlan> {
+        Ok(self.route_pool_selector.startup_backend_plan(
+            startup_packet,
+            client_addr,
+            backend_user,
+        )?)
     }
 }
 

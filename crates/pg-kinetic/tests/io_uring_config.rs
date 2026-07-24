@@ -55,6 +55,25 @@ fn io_uring_resolves_startup_backend_through_shared_runtime_state() {
 }
 
 #[test]
+fn io_uring_prepares_backend_startup_from_shared_runtime_plan() {
+    let mut config = io_uring_config();
+    config.routes = vec![RouteConfig::from_backend_addr(
+        "127.0.0.1:6544".parse().expect("route addr"),
+    )];
+    let startup_packet = startup_packet("postgres", "pgkinetic");
+
+    let plan = io_uring::startup_backend_plan_for_test(
+        config,
+        &startup_packet,
+        "127.0.0.1:54321".parse().expect("client addr"),
+    )
+    .expect("startup plan resolves through shared runtime state");
+
+    assert_eq!(plan.backend_addr.to_string(), "127.0.0.1:6544");
+    assert_eq!(plan.backend_startup_packet, startup_packet);
+}
+
+#[test]
 fn io_uring_prepares_proxy_capacity_slots_from_shared_runtime_state() {
     let mut config = io_uring_config();
     config.capacity.max_clients = 17;

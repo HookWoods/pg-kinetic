@@ -305,9 +305,10 @@ mod linux {
                 }
             }
         };
-        let backend_addr = runtime_state
-            .startup_primary_backend_addr(&startup_packet, client_addr)
+        let startup_plan = runtime_state
+            .startup_backend_plan(&startup_packet, client_addr, None)
             .context("resolve startup backend")?;
+        let backend_addr = startup_plan.primary_backend_addr();
 
         let Ok(_backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned() else {
             anyhow::bail!("backend capacity exceeded");
@@ -316,7 +317,7 @@ mod linux {
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
         let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-        crate::io_runtime::write_all_to(&mut backend, &startup_packet)
+        crate::io_runtime::write_all_to(&mut backend, &startup_plan.backend_startup_packet)
             .await
             .context("forward startup")?;
 
@@ -442,6 +443,27 @@ pub fn startup_backend_addr_for_test(
     let proxy = crate::proxy::Proxy::new(config);
     let runtime_state = proxy.initialize_runtime_state()?;
     runtime_state.startup_primary_backend_addr(startup_packet, client_addr)
+}
+
+#[derive(Debug)]
+pub struct StartupBackendPlanForTest {
+    pub backend_addr: SocketAddr,
+    pub backend_startup_packet: bytes::BytesMut,
+}
+
+pub fn startup_backend_plan_for_test(
+    config: Config,
+    startup_packet: &[u8],
+    client_addr: SocketAddr,
+) -> anyhow::Result<StartupBackendPlanForTest> {
+    validate_supported_config(&config)?;
+    let proxy = crate::proxy::Proxy::new(config);
+    let runtime_state = proxy.initialize_runtime_state()?;
+    let plan = runtime_state.startup_backend_plan(startup_packet, client_addr, None)?;
+    Ok(StartupBackendPlanForTest {
+        backend_addr: plan.primary_backend_addr(),
+        backend_startup_packet: plan.backend_startup_packet,
+    })
 }
 
 pub fn shared_capacity_limits_for_test(config: Config) -> anyhow::Result<(usize, usize)> {
