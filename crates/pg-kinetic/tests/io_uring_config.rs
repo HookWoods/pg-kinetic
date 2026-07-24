@@ -86,12 +86,12 @@ fn io_uring_prepares_proxy_capacity_slots_from_shared_runtime_state() {
 }
 
 #[test]
-fn io_uring_rejects_client_tls_until_semantic_runtime_exists() {
+fn io_uring_rejects_tls_until_tls_stream_adapter_exists() {
     let mut config = io_uring_config();
     config.tls.client_tls_mode = ClientTlsMode::Require;
 
     let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("client TLS is not supported yet");
+        .expect_err("TLS requires a monoio-compatible TLS adapter");
 
     assert!(error.to_string().contains("client_tls_mode=disable"));
 }
