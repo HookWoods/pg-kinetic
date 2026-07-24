@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use pg_kinetic::proxy_runtime::io_runtime::FrontendCycleShape;
 use pg_kinetic::wire::{frame::FrontendFrame, protocol::FrontendTag};
 
@@ -45,9 +45,32 @@ fn frontend_cycle_shape_requires_sync_for_extended_protocol_frames() {
     assert!(shape.needs_sync());
 }
 
+#[test]
+fn frontend_cycle_shape_from_wire_bytes_counts_complete_simple_queries() {
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(&encoded_frontend_frame(FrontendTag::Query, b"select 1\0"));
+    bytes.extend_from_slice(&encoded_frontend_frame(FrontendTag::Query, b"select 2\0"));
+    bytes.extend_from_slice(&encoded_frontend_frame(FrontendTag::Query, b"select 3\0")[..3]);
+
+    let shape = FrontendCycleShape::from_wire_bytes(&bytes)
+        .expect("shape parses")
+        .expect("complete prefix");
+
+    assert_eq!(shape.expected_ready_count(), 2);
+    assert!(!shape.needs_sync());
+}
+
 fn frontend_frame(tag: FrontendTag, payload: &[u8]) -> FrontendFrame {
     FrontendFrame {
         tag: u8::from(tag),
         payload: bytes::Bytes::copy_from_slice(payload),
     }
+}
+
+fn encoded_frontend_frame(tag: FrontendTag, payload: &[u8]) -> BytesMut {
+    let mut frame = BytesMut::with_capacity(payload.len() + 5);
+    frame.put_u8(u8::from(tag));
+    frame.put_i32((payload.len() + 4) as i32);
+    frame.extend_from_slice(payload);
+    frame
 }

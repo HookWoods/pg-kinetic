@@ -249,6 +249,7 @@ mod linux {
             .context("forward startup")?;
         client_buffer.clear();
 
+        let mut startup_drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
         loop {
             let read = backend
                 .read_into(&mut backend_buffer)
@@ -263,7 +264,7 @@ mod linux {
                 .context("write startup response")?;
             backend_scan_buffer.extend_from_slice(&backend_buffer);
             backend_buffer.clear();
-            if ready_seen(&mut backend_scan_buffer)? {
+            if ready_seen(&mut backend_scan_buffer, &mut startup_drain)? {
                 break;
             }
         }
@@ -281,7 +282,14 @@ mod linux {
                 .write_all(&client_buffer)
                 .await
                 .context("write query")?;
+            let expected_ready_count =
+                crate::io_runtime::FrontendCycleShape::from_wire_bytes(&client_buffer)?.map_or(
+                    1,
+                    crate::io_runtime::FrontendCycleShape::expected_ready_count,
+                );
             client_buffer.clear();
+            let mut response_drain =
+                crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
 
             loop {
                 let read = backend
@@ -297,15 +305,17 @@ mod linux {
                     .context("write backend response")?;
                 backend_scan_buffer.extend_from_slice(&backend_buffer);
                 backend_buffer.clear();
-                if ready_seen(&mut backend_scan_buffer)? {
+                if ready_seen(&mut backend_scan_buffer, &mut response_drain)? {
                     break;
                 }
             }
         }
     }
 
-    fn ready_seen(buffer: &mut BytesMut) -> anyhow::Result<bool> {
-        let mut drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
+    fn ready_seen(
+        buffer: &mut BytesMut,
+        drain: &mut crate::io_runtime::BackendResponseDrain,
+    ) -> anyhow::Result<bool> {
         let mut forwarded = Vec::new();
         let event = drain.drain(buffer, &mut forwarded)?;
         Ok(matches!(

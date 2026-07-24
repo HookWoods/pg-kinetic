@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
+use pg_kinetic_wire::frame::parse_frontend_frame;
 use pg_kinetic_wire::{frame::FrontendFrame, protocol::FrontendTag};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,20 @@ impl FrontendCycleShape {
         Self {
             expected_ready_count: query_count.max(1),
             needs_sync,
+        }
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> anyhow::Result<Option<Self>> {
+        let mut buffer = BytesMut::from(bytes);
+        let mut frames = Vec::new();
+        while let Some(frame) = parse_frontend_frame(&mut buffer)? {
+            frames.push(frame);
+        }
+
+        if frames.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Self::from_frames(&frames)))
         }
     }
 
