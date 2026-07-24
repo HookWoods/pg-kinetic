@@ -287,12 +287,13 @@ mod linux {
                 secret_key,
                 ..
             } => {
-                let Some(target) = runtime_state
+                let Some(lease) = runtime_state
                     .cancel_registry()
-                    .lookup((process_id, secret_key))
+                    .acquire_forwarding((process_id, secret_key))
                 else {
                     return Ok(());
                 };
+                let target = lease.target();
                 let backend = TcpStream::connect_addr(target.backend_addr)
                     .await
                     .with_context(|| format!("connect io_uring backend {}", target.backend_addr))?;

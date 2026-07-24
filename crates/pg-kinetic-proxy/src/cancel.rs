@@ -34,12 +34,18 @@ struct CancelBinding {
     forwarding_done: Notify,
 }
 
-struct CancelLease {
+pub(crate) struct CancelForwardingLease {
     binding: Arc<CancelBinding>,
     target: CancelTarget,
 }
 
-impl Drop for CancelLease {
+impl CancelForwardingLease {
+    pub(crate) fn target(&self) -> CancelTarget {
+        self.target
+    }
+}
+
+impl Drop for CancelForwardingLease {
     fn drop(&mut self) {
         self.binding.forwarding.store(false, Ordering::Release);
         self.binding.forwarding_done.notify_waiters();
@@ -112,7 +118,7 @@ impl CancelRegistry {
             })
     }
 
-    async fn acquire(&self, key: (i32, i32)) -> Option<CancelLease> {
+    pub(crate) fn acquire_forwarding(&self, key: (i32, i32)) -> Option<CancelForwardingLease> {
         let binding = self
             .entries
             .read()
@@ -133,7 +139,7 @@ impl CancelRegistry {
             .as_ref()
             .copied();
         match target {
-            Some(target) => Some(CancelLease { binding, target }),
+            Some(target) => Some(CancelForwardingLease { binding, target }),
             None => {
                 binding.forwarding.store(false, Ordering::Release);
                 binding.forwarding_done.notify_waiters();
@@ -143,10 +149,10 @@ impl CancelRegistry {
     }
 
     pub async fn forward_cancel(&self, key: (i32, i32)) -> anyhow::Result<()> {
-        let Some(lease) = self.acquire(key).await else {
+        let Some(lease) = self.acquire_forwarding(key) else {
             return Ok(());
         };
-        forward_cancel(lease.target).await
+        forward_cancel(lease.target()).await
     }
 
     pub fn remove_session(&self, key: (i32, i32)) {
@@ -180,6 +186,8 @@ pub(crate) fn encode_cancel_request(process_id: i32, secret_key: i32) -> BytesMu
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[tokio::test]
@@ -199,6 +207,37 @@ mod tests {
         assert_eq!(registry.lookup(key), None);
         registry.remove_session(key);
         registry.bind(key, target);
+        assert_eq!(registry.lookup(key), None);
+    }
+
+    #[tokio::test]
+    async fn unbind_waits_for_forwarding_lease() {
+        let registry = Arc::new(CancelRegistry::default());
+        let key = registry.issue_client_key().expect("client key");
+        registry.bind(
+            key,
+            CancelTarget {
+                backend_addr: "127.0.0.1:5432".parse().expect("addr"),
+                process_id: 7,
+                secret_key: 9,
+            },
+        );
+        let lease = registry.acquire_forwarding(key).expect("forwarding lease");
+
+        let unbind_registry = Arc::clone(&registry);
+        let mut unbind = tokio::spawn(async move {
+            unbind_registry.unbind(key).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut unbind)
+            .await
+            .is_err());
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(1), unbind)
+            .await
+            .expect("unbind completes after lease drop")
+            .expect("unbind task completes");
         assert_eq!(registry.lookup(key), None);
     }
 
