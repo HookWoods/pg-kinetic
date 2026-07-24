@@ -1664,12 +1664,17 @@ fn build_route_pools_for_pool(
 
 #[cfg(test)]
 mod tests {
-    use std::{io::IoSlice, sync::Arc, time::Duration};
+    use std::{
+        io::IoSlice,
+        sync::{atomic::AtomicUsize, Arc},
+        time::Duration,
+    };
 
     use super::{
-        auth_request_expects_client_response, cgroup_shard_cap,
+        auth_request_expects_client_response, build_route_pools, cgroup_shard_cap,
         connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count,
         BufferReusePolicy, Config, RoutePolicy, RoutePoolRegistry, RoutePoolSelector,
+        SnapshotStore,
     };
     use crate::config::{
         BackendEndpointConfig, FreshnessConfig, HaConfig, ReadRoutingConfig, RouteConfig,
@@ -1696,10 +1701,28 @@ mod tests {
     }
 
     #[test]
-    fn configured_selector_carries_policy_by_selected_route() {
-        let route = RouteKey::new("tenant", "alice", None, None, QueryClass::Default);
-        let route_config = RouteConfig {
+    fn startup_plan_carries_policy_by_selected_route() {
+        let first_route = RouteKey::new("tenant", "alice", None, None, QueryClass::Default);
+        let second_route = RouteKey::new("tenant", "bob", None, None, QueryClass::Default);
+        let first_route_config = RouteConfig {
             primary: BackendEndpointConfig::default(),
+            replicas: Vec::new(),
+            read_routing: ReadRoutingConfig {
+                read_routing_mode: ReadRoutingMode::PreferReplica,
+                fallback_policy: FallbackPolicy::Primary,
+            },
+            freshness: FreshnessConfig {
+                freshness_policy: FreshnessPolicy::None,
+                max_replica_lag_ms: 11,
+                read_after_write_timeout_ms: 125,
+            },
+            ha: HaConfig::default(),
+        };
+        let second_route_config = RouteConfig {
+            primary: BackendEndpointConfig {
+                address: "127.0.0.1:6544".parse().expect("valid backend address"),
+                ..BackendEndpointConfig::default()
+            },
             replicas: Vec::new(),
             read_routing: ReadRoutingConfig {
                 read_routing_mode: ReadRoutingMode::RequireReplica,
@@ -1712,27 +1735,126 @@ mod tests {
             },
             ha: HaConfig::default(),
         };
-        let policy = RoutePolicy::from_route_config(&route_config);
+        let config = Config::default();
+        let snapshot_store = SnapshotStore::new();
+        let pressure_route_in_flight_limit = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(RoutePoolRegistry::new());
+        registry.insert(
+            first_route.clone(),
+            build_route_pools(
+                &config,
+                &first_route_config,
+                snapshot_store.clone(),
+                None,
+                None,
+                Arc::clone(&pressure_route_in_flight_limit),
+            ),
+        );
+        registry.insert(
+            second_route.clone(),
+            build_route_pools(
+                &config,
+                &second_route_config,
+                snapshot_store,
+                None,
+                None,
+                pressure_route_in_flight_limit,
+            ),
+        );
         let selector = RoutePoolSelector::configured(
-            Arc::new(RoutePoolRegistry::new()),
-            [(route.selection_key(), policy)].into_iter().collect(),
+            registry,
+            [
+                (
+                    first_route.selection_key(),
+                    RoutePolicy::from_route_config(&first_route_config),
+                ),
+                (
+                    second_route.selection_key(),
+                    RoutePolicy::from_route_config(&second_route_config),
+                ),
+            ]
+            .into_iter()
+            .collect(),
         );
 
-        let selected = selector.policy(&route).expect("selected route policy");
+        let first_plan = selector
+            .startup_backend_plan(
+                &startup_packet("tenant", "alice"),
+                "127.0.0.1:7000".parse().expect("valid client address"),
+                None,
+            )
+            .expect("first startup plan");
         assert_eq!(
-            selected.routing_planner.read_routing_mode(),
+            first_plan.session_route.selection_key(),
+            first_route.selection_key()
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.read_routing_mode(),
+            ReadRoutingMode::PreferReplica
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.fallback_policy(),
+            FallbackPolicy::Primary
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.max_replica_lag_ms(),
+            11
+        );
+        assert_eq!(
+            first_plan.route_policy.read_after_write_timeout,
+            Duration::from_millis(125)
+        );
+        assert!(!first_plan.route_policy.read_after_write_protection_enabled);
+
+        let second_plan = selector
+            .startup_backend_plan(
+                &startup_packet("tenant", "bob"),
+                "127.0.0.1:7000".parse().expect("valid client address"),
+                None,
+            )
+            .expect("second startup plan");
+        assert_eq!(
+            second_plan.session_route.selection_key(),
+            second_route.selection_key()
+        );
+        assert_eq!(
+            second_plan.route_policy.routing_planner.read_routing_mode(),
             ReadRoutingMode::RequireReplica
         );
         assert_eq!(
-            selected.routing_planner.fallback_policy(),
+            second_plan.route_policy.routing_planner.fallback_policy(),
             FallbackPolicy::Reject
         );
-        assert_eq!(selected.routing_planner.max_replica_lag_ms(), 42);
         assert_eq!(
-            selected.read_after_write_timeout,
+            second_plan
+                .route_policy
+                .routing_planner
+                .max_replica_lag_ms(),
+            42
+        );
+        assert_eq!(
+            second_plan.route_policy.read_after_write_timeout,
             Duration::from_millis(750)
         );
-        assert!(selected.read_after_write_protection_enabled);
+        assert!(second_plan.route_policy.read_after_write_protection_enabled);
+    }
+
+    fn startup_packet(database: &str, user: &str) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0, 0, 0, 0]);
+        packet.extend_from_slice(&196_608_i32.to_be_bytes());
+        packet.extend_from_slice(b"database");
+        packet.push(0);
+        packet.extend_from_slice(database.as_bytes());
+        packet.push(0);
+        packet.extend_from_slice(b"user");
+        packet.push(0);
+        packet.extend_from_slice(user.as_bytes());
+        packet.push(0);
+        packet.push(0);
+        let length = (packet.len() as i32).to_be_bytes();
+        packet[..4].copy_from_slice(&length);
+        packet
     }
 
     #[test]
