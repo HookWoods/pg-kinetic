@@ -75,6 +75,7 @@ use pg_kinetic_core::{
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
     runtime::{RuntimeLifecycleState, ShutdownReason},
+    secrets::UserStore,
     session::PinReason as SessionPinReason,
     session::TransactionState,
     shard_extract::{extract_shard_hint, ShardHint},
@@ -332,6 +333,16 @@ impl ProxyRuntimeState {
     #[must_use]
     pub(crate) fn default_primary_backend_addr(&self) -> SocketAddr {
         self.control_route_pools.primary().backend_addr()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn backend_credentials(&self) -> Option<Arc<auth::BackendCredentials>> {
+        self.backend_credentials.load()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn auth_query_service(&self) -> Arc<AuthQueryService> {
+        Arc::clone(&self.auth_query_service)
     }
 
     pub(crate) fn startup_primary_backend_addr(

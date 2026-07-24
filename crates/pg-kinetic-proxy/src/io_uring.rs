@@ -302,17 +302,29 @@ mod linux {
             }
             crate::proxy::StartupOrCancel::Finished => return Ok(()),
         };
+        let backend_credentials = runtime_state.backend_credentials();
         let startup_plan = runtime_state
-            .startup_backend_plan(&startup_packet, client_addr, None)
+            .startup_backend_plan(
+                &startup_packet,
+                client_addr,
+                backend_credentials
+                    .as_deref()
+                    .map(crate::auth::BackendCredentials::username),
+            )
             .context("resolve startup backend")?;
+        let effective_config = runtime_state.effective_config();
         let context = crate::proxy::SharedClientSessionContext {
             pool: backend_pool,
             route: startup_plan.session_route,
+            route_user: startup_plan.route_user,
             backend_startup_packet: startup_plan.backend_startup_packet,
             buffer_pool,
             max_client_buffer_bytes,
             max_backend_buffer_bytes,
-            backend_credentials: None,
+            auth: effective_config.auth.clone(),
+            auth_users: crate::reload::load_auth_users(effective_config)?,
+            auth_query_service: runtime_state.auth_query_service(),
+            backend_credentials,
             _backend: std::marker::PhantomData,
         };
         crate::proxy::handle_client_session::<
@@ -437,16 +449,13 @@ pub fn shared_capacity_limits_for_test(config: Config) -> anyhow::Result<(usize,
 }
 
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
-    use crate::config::{AuthMode, BackendTlsMode, ClientTlsMode};
+    use crate::config::{BackendTlsMode, ClientTlsMode};
 
     if config.tls.client_tls_mode != ClientTlsMode::Disable {
         anyhow::bail!("experimental_io_uring currently requires client_tls_mode=disable");
     }
     if config.tls.backend_tls_mode != BackendTlsMode::Disable {
         anyhow::bail!("experimental_io_uring currently requires backend_tls_mode=disable");
-    }
-    if config.auth.auth_mode != AuthMode::PassThrough {
-        anyhow::bail!("experimental_io_uring currently requires auth_mode=pass_through");
     }
     direct_backend_addr(config)?;
     Ok(())
@@ -500,13 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_managed_auth() {
+    fn supported_config_accepts_managed_auth() {
         let mut config = Config::default();
         config.auth.auth_mode = AuthMode::Trust;
 
-        let error = validate_supported_config(&config).expect_err("managed auth is rejected");
-
-        assert!(error.to_string().contains("auth_mode=pass_through"));
+        validate_supported_config(&config).expect("managed auth uses shared auth path");
     }
 
     #[test]

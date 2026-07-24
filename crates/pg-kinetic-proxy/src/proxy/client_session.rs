@@ -15,10 +15,14 @@ where
 pub(crate) struct SharedClientSessionContext<B, O> {
     pub(crate) pool: O,
     pub(crate) route: RouteKey,
+    pub(crate) route_user: String,
     pub(crate) backend_startup_packet: BytesMut,
     pub(crate) buffer_pool: ProxyBufferPool,
     pub(crate) max_client_buffer_bytes: usize,
     pub(crate) max_backend_buffer_bytes: usize,
+    pub(crate) auth: crate::config::AuthConfig,
+    pub(crate) auth_users: Option<Arc<UserStore>>,
+    pub(crate) auth_query_service: Arc<AuthQueryService>,
     pub(crate) backend_credentials: Option<Arc<auth::BackendCredentials>>,
     pub(crate) _backend: std::marker::PhantomData<B>,
 }
@@ -88,16 +92,40 @@ where
     let SharedClientSessionContext {
         pool,
         route,
+        route_user,
         backend_startup_packet,
         buffer_pool,
         max_client_buffer_bytes,
         max_backend_buffer_bytes,
+        auth,
+        auth_users,
+        auth_query_service,
         backend_credentials,
         _backend: _,
     } = context;
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
     let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
     let mut buffers = buffer_pool.acquire();
+    if !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
+        let users = auth_users
+            .as_deref()
+            .context("auth user store unavailable")?;
+        match auth::authenticate_client(
+            &mut client,
+            &route_user,
+            &auth,
+            users,
+            Some(auth_query_service.as_ref()),
+            max_client_buffer_bytes,
+            max_backend_buffer_bytes,
+        )
+        .await
+        .with_context(|| format!("authenticate client {}", route_user))?
+        {
+            auth::ClientAuthOutcome::PassThrough | auth::ClientAuthOutcome::Authenticated => {}
+            auth::ClientAuthOutcome::Rejected => return Ok(()),
+        }
+    }
     let mut backend = pool
         .checkout_shared(route)
         .await

@@ -108,14 +108,12 @@ fn io_uring_rejects_backend_tls_until_semantic_runtime_exists() {
 }
 
 #[test]
-fn io_uring_rejects_auth_modes_until_auth_path_exists() {
+fn io_uring_accepts_auth_modes_through_shared_session_lifecycle() {
     let mut config = io_uring_config();
     config.auth.auth_mode = AuthMode::Trust;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("auth modes are not supported yet");
-
-    assert!(error.to_string().contains("auth_mode=pass_through"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("auth modes use shared session lifecycle");
 }
 
 #[test]
