@@ -357,13 +357,30 @@ impl MonoioBackendPool {
 }
 
 impl crate::proxy::SharedBackendPool<MonoioBackend, std::sync::Arc<MonoioBackendPool>>
-    for std::sync::Arc<MonoioBackendPool>
+    for std::sync::Arc<MonoioBackendPoolSelector>
 {
     async fn checkout_shared(
         &self,
         route: pg_kinetic_core::route::RouteKey,
+        route_pools: &RoutePools,
     ) -> Result<MonoioPooledBackend, crate::pool::PoolError> {
-        self.checkout(route, crate::pool::CheckoutMode::AllowConnect)
+        self.pool_for_route(&route, route_pools.primary().backend_addr())
+            .checkout(route, crate::pool::CheckoutMode::AllowConnect)
+            .await
+    }
+
+    async fn checkout_shared_target(
+        &self,
+        route: pg_kinetic_core::route::RouteKey,
+        route_pools: &RoutePools,
+        target: &RoutingTarget,
+    ) -> Result<MonoioPooledBackend, crate::pool::PoolError> {
+        let Some(pool) = self.pool_for_target(&route, route_pools, target) else {
+            return Err(crate::pool::PoolError::Backpressure(
+                pg_kinetic_core::backpressure::BackpressureError::Closed,
+            ));
+        };
+        pool.checkout(route, crate::pool::CheckoutMode::AllowConnect)
             .await
     }
 }

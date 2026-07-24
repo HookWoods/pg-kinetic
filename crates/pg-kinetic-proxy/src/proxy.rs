@@ -149,6 +149,11 @@ use request_plan::*;
 use session_snapshot::*;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 const INVALID_CATALOG_NAME_SQLSTATE: &str = "3D000";
@@ -215,6 +220,7 @@ pub(crate) struct ProxyRuntimeState {
     mirror_dispatcher: Arc<MirrorDispatcher>,
     route_pool_selector: RoutePoolSelector,
     control_route_pools: Arc<RoutePools>,
+    snapshot_store: SnapshotStore,
     pressure_route_in_flight_limit: Arc<AtomicUsize>,
     routing_planner: ReadRoutingPlanner,
     auth_query_service: Arc<AuthQueryService>,
@@ -392,6 +398,11 @@ impl ProxyRuntimeState {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub(crate) fn auth_query_service(&self) -> Arc<AuthQueryService> {
         Arc::clone(&self.auth_query_service)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn snapshot_store(&self) -> SnapshotStore {
+        self.snapshot_store.clone()
     }
 
     pub(crate) fn startup_primary_backend_addr(
@@ -953,6 +964,7 @@ impl Proxy {
             mirror_dispatcher,
             route_pool_selector,
             control_route_pools,
+            snapshot_store: self.snapshot_store.clone(),
             pressure_route_in_flight_limit,
             routing_planner,
             auth_query_service,

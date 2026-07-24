@@ -8,12 +8,19 @@ where
     async fn checkout_shared(
         &self,
         route: RouteKey,
+        route_pools: &RoutePools,
+    ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
+
+    async fn checkout_shared_target(
+        &self,
+        route: RouteKey,
+        route_pools: &RoutePools,
+        target: &RoutingTarget,
     ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
 }
 
-#[derive(Debug)]
-pub(crate) struct SharedClientSessionContext<B, O> {
-    pub(crate) pool: O,
+pub(crate) struct SharedClientSessionContext<B, O, P> {
+    pub(crate) pool: P,
     pub(crate) route: RouteKey,
     pub(crate) route_user: String,
     pub(crate) backend_startup_packet: BytesMut,
@@ -24,7 +31,14 @@ pub(crate) struct SharedClientSessionContext<B, O> {
     pub(crate) auth_users: Option<Arc<UserStore>>,
     pub(crate) auth_query_service: Arc<AuthQueryService>,
     pub(crate) backend_credentials: Option<Arc<auth::BackendCredentials>>,
-    pub(crate) _backend: std::marker::PhantomData<B>,
+    pub(crate) route_pools: Arc<RoutePools>,
+    pub(crate) routing_planner: ReadRoutingPlanner,
+    pub(crate) route_read_routing_mode: ReadRoutingMode,
+    pub(crate) route_fallback_policy: FallbackPolicy,
+    pub(crate) snapshot_store: SnapshotStore,
+    pub(crate) phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    pub(crate) session_id: u64,
+    pub(crate) _backend: std::marker::PhantomData<(B, O)>,
 }
 
 struct LeaseRuntimeBackend<'a, B, O>
@@ -77,17 +91,18 @@ where
     }
 }
 
-pub(crate) async fn handle_client_session<C, B, O>(
+pub(crate) async fn handle_client_session<C, B, O, P>(
     mut client: C,
     _client_addr: SocketAddr,
-    context: SharedClientSessionContext<B, O>,
+    context: SharedClientSessionContext<B, O, P>,
 ) -> anyhow::Result<()>
 where
     C: crate::io_runtime::RuntimeByteStream,
     B: crate::pool::PoolBackendTransport
         + crate::io_runtime::RuntimeByteStream
         + BackendStartupMetadata,
-    O: crate::pool::BackendLeaseOwner<B> + SharedBackendPool<B, O>,
+    O: crate::pool::BackendLeaseOwner<B>,
+    P: SharedBackendPool<B, O>,
 {
     let SharedClientSessionContext {
         pool,
@@ -101,6 +116,13 @@ where
         auth_users,
         auth_query_service,
         backend_credentials,
+        route_pools,
+        routing_planner,
+        route_read_routing_mode,
+        route_fallback_policy,
+        snapshot_store,
+        phase_recorder,
+        session_id,
         _backend: _,
     } = context;
     let mut client_buffer = BytesMut::with_capacity(16 * 1024);
@@ -126,13 +148,13 @@ where
             auth::ClientAuthOutcome::Rejected => return Ok(()),
         }
     }
-    let mut backend = pool
-        .checkout_shared(route)
+    let mut startup_backend_lease = pool
+        .checkout_shared(route.clone(), &route_pools)
         .await
         .map_err(|error| anyhow::anyhow!("shared backend checkout failed: {error:?}"))?;
-    let requires_startup = backend.requires_startup();
+    let requires_startup = startup_backend_lease.requires_startup();
     let mut startup_backend = LeaseRuntimeBackend {
-        lease: &mut backend,
+        lease: &mut startup_backend_lease,
     };
     if let Err(error) = crate::proxy::proxy_startup_streams(
         &mut client,
@@ -150,10 +172,16 @@ where
     .await
     {
         drop(startup_backend);
-        backend.discard();
+        startup_backend_lease.discard();
         return Err(error).context("shared backend startup");
     }
     drop(startup_backend);
+    startup_backend_lease.release().await;
+
+    let mut session = VirtualSession::default();
+    let mut prepared = PreparedCatalog::new(session_id);
+    let prepared_snapshot_handle = snapshot_store.prepared_handle();
+    let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
 
     loop {
         match crate::io_runtime::take_frontend_cycle_bytes(
@@ -161,32 +189,128 @@ where
             max_client_buffer_bytes,
         )? {
             crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
+                let frames = crate::io_runtime::parse_frontend_cycle_frames(bytes)?;
+                if frames.is_empty() {
+                    continue;
+                }
+                let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
+                let request_plans = request_plans_for_frames(
+                    &prepared,
+                    &frames,
+                    full_routing_analysis,
+                    &mut sql_plan_cache,
+                )
+                .context("build request plan before monoio backend checkout")?;
+                update_transaction_state_from_request_plans(
+                    &mut session,
+                    &request_plans,
+                    full_routing_analysis,
+                )
+                .context("update transaction state before monoio backend checkout")?;
+                let selection = ReadRoutingSelection {
+                    planner: &routing_planner,
+                    route_pools: &route_pools,
+                    snapshot_store: &snapshot_store,
+                    read_routing_mode: route_read_routing_mode,
+                    fallback_policy: route_fallback_policy,
+                    session: &session,
+                    request_plan: request_plans.first(),
+                };
+                let target = if full_routing_analysis {
+                    select_checkout_target(&selection)
+                } else {
+                    RoutingTarget::Primary {
+                        reason: RoutingReason::Off,
+                    }
+                };
+                if matches!(
+                    target,
+                    RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "monoio cycle routing produced unsupported target: {target:?}"
+                    ));
+                }
+                let mut backend = pool
+                    .checkout_shared_target(route.clone(), &route_pools, &target)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("monoio target checkout failed: {error:?}"))?;
+                let requires_startup = backend.requires_startup();
+                let mut startup_backend = LeaseRuntimeBackend {
+                    lease: &mut backend,
+                };
+                if let Err(error) = crate::proxy::proxy_startup_streams(
+                    &mut client,
+                    &mut startup_backend,
+                    requires_startup,
+                    &backend_startup_packet,
+                    max_client_buffer_bytes,
+                    max_backend_buffer_bytes,
+                    true,
+                    true,
+                    backend_credentials.as_deref(),
+                    buffers.buffers_mut(),
+                    None,
+                )
+                .await
+                {
+                    drop(startup_backend);
+                    backend.discard();
+                    return Err(error).context("monoio cycle backend startup");
+                }
+                drop(startup_backend);
+                let simple_query_commands: Vec<SqlCommand> = request_plans
+                    .iter()
+                    .filter(|plan| plan.updates_session_state)
+                    .map(|plan| plan.command.clone())
+                    .collect();
+                let mut progress = QueryProgress::default();
+                let mut route_application_name = None;
+                let mut forward_state = ForwardCycleState {
+                    session: &mut session,
+                    prepared: &mut prepared,
+                    prepared_snapshot_handle: prepared_snapshot_handle.clone(),
+                    route_application_name: &mut route_application_name,
+                    progress: &mut progress,
+                };
+                let planned = plan_frontend_cycle(
+                    backend.backend_id(),
+                    &mut forward_state,
+                    &frames,
+                    &simple_query_commands,
+                    buffers.buffers_mut(),
+                    phase_recorder.as_ref(),
+                )?;
                 let mut runtime_backend = LeaseRuntimeBackend {
                     lease: &mut backend,
                 };
-                forward_runtime_cycle(
+                let result = forward_runtime_cycle(
                     &mut client,
                     &mut runtime_backend,
-                    &bytes,
+                    &planned.backend_bytes,
                     shape.expected_ready_count(),
                     &mut backend_buffer,
                     max_backend_buffer_bytes,
                 )
-                .await?;
+                .await;
+                drop(runtime_backend);
+                if result.is_err() {
+                    backend.discard();
+                } else {
+                    backend.release().await;
+                }
+                result?;
             }
             crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
-                backend.release().await;
                 return Ok(());
             }
             crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
-                backend.discard();
                 return Err(anyhow::anyhow!(
                     "client request exceeded configured buffer limit"
                 ));
             }
             crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
                 if crate::io_runtime::read_from(&mut client, &mut client_buffer).await? == 0 {
-                    backend.release().await;
                     return Ok(());
                 }
             }

@@ -306,13 +306,10 @@ mod linux {
                     .map(crate::auth::BackendCredentials::username),
             )
             .context("resolve startup backend")?;
-        let backend_pool = backend_pool_selector.pool_for_route(
-            &startup_plan.session_route,
-            startup_plan.primary_backend_addr(),
-        );
         let effective_config = runtime_state.effective_config();
+        let route_policy = startup_plan.route_policy;
         let context = crate::proxy::SharedClientSessionContext {
-            pool: backend_pool,
+            pool: backend_pool_selector,
             route: startup_plan.session_route,
             route_user: startup_plan.route_user,
             backend_startup_packet: startup_plan.backend_startup_packet,
@@ -323,12 +320,20 @@ mod linux {
             auth_users: crate::reload::load_auth_users(effective_config)?,
             auth_query_service: runtime_state.auth_query_service(),
             backend_credentials,
+            route_pools: startup_plan.route_pools,
+            route_read_routing_mode: route_policy.routing_planner.read_routing_mode(),
+            route_fallback_policy: route_policy.routing_planner.fallback_policy(),
+            routing_planner: route_policy.routing_planner,
+            snapshot_store: runtime_state.snapshot_store(),
+            phase_recorder: crate::telemetry::phase_timing_recorder(false),
+            session_id: crate::proxy::next_session_id(),
             _backend: std::marker::PhantomData,
         };
         crate::proxy::handle_client_session::<
             _,
             crate::io_uring_transport::MonoioBackend,
             Arc<crate::io_uring_transport::MonoioBackendPool>,
+            Arc<crate::io_uring_transport::MonoioBackendPoolSelector>,
         >(client, client_addr, context)
         .await
     }
