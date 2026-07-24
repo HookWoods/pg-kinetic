@@ -73,7 +73,7 @@ use pg_kinetic_core::{
     },
     prepare::{InvalidationScope, PreparedCatalog},
     recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
-    route::{QueryClass, RouteKey},
+    route::{PoolKey, QueryClass, RouteKey},
     runtime::{RuntimeLifecycleState, ShutdownReason},
     secrets::UserStore,
     session::PinReason as SessionPinReason,
@@ -226,7 +226,35 @@ pub(crate) struct StartupBackendPlan {
     pub(crate) route_application_name: Option<String>,
     pub(crate) session_route: RouteKey,
     pub(crate) route_pools: Arc<RoutePools>,
+    pub(crate) route_policy: RoutePolicy,
     pub(crate) backend_startup_packet: BytesMut,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoutePolicy {
+    pub(crate) routing_planner: ReadRoutingPlanner,
+    pub(crate) read_after_write_timeout: Duration,
+    pub(crate) read_after_write_protection_enabled: bool,
+}
+
+impl RoutePolicy {
+    fn from_route_config(route_config: &RouteConfig) -> Self {
+        Self {
+            routing_planner: ReadRoutingPlanner::new(
+                route_config.read_routing.read_routing_mode,
+                route_config.read_routing.fallback_policy,
+                route_config.freshness.freshness_policy,
+                route_config.freshness.max_replica_lag_ms,
+            ),
+            read_after_write_timeout: Duration::from_millis(
+                route_config.freshness.read_after_write_timeout_ms,
+            ),
+            read_after_write_protection_enabled: matches!(
+                route_config.freshness.freshness_policy,
+                FreshnessPolicy::SessionWriteLsn | FreshnessPolicy::SessionWriteLsnAndMaxLag
+            ),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -248,23 +276,32 @@ impl StartupBackendPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct RoutePoolSelector {
     default_pools: Option<Arc<RoutePools>>,
+    default_policy: Option<RoutePolicy>,
     registry: Arc<RoutePoolRegistry>,
+    policies: Arc<HashMap<PoolKey, RoutePolicy>>,
 }
 
 impl RoutePoolSelector {
     #[must_use]
-    fn default(default_pools: Arc<RoutePools>) -> Self {
+    fn default(default_pools: Arc<RoutePools>, default_policy: RoutePolicy) -> Self {
         Self {
             default_pools: Some(default_pools),
+            default_policy: Some(default_policy),
             registry: Arc::new(RoutePoolRegistry::new()),
+            policies: Arc::new(HashMap::new()),
         }
     }
 
     #[must_use]
-    fn configured(registry: Arc<RoutePoolRegistry>) -> Self {
+    fn configured(
+        registry: Arc<RoutePoolRegistry>,
+        policies: HashMap<PoolKey, RoutePolicy>,
+    ) -> Self {
         Self {
             default_pools: None,
+            default_policy: None,
             registry,
+            policies: Arc::new(policies),
         }
     }
 
@@ -274,6 +311,14 @@ impl RoutePoolSelector {
             .route_pools(route)
             .map(Arc::new)
             .or_else(|| self.default_pools.as_ref().map(Arc::clone))
+    }
+
+    #[must_use]
+    fn policy(&self, route: &RouteKey) -> Option<RoutePolicy> {
+        self.policies
+            .get(&route.selection_key())
+            .copied()
+            .or(self.default_policy)
     }
 
     #[must_use]
@@ -309,6 +354,9 @@ impl RoutePoolSelector {
                 user: route_user,
             });
         };
+        let route_policy = self
+            .policy(&session_route)
+            .context("missing policy for selected route")?;
         let backend_startup_packet = rewrite_backend_startup_user(startup_packet, backend_user)?;
 
         Ok(StartupBackendPlan {
@@ -317,6 +365,7 @@ impl RoutePoolSelector {
             route_application_name,
             session_route,
             route_pools,
+            route_policy,
             backend_startup_packet,
         })
     }
@@ -1537,12 +1586,16 @@ fn build_route_pool_selector(
             pressure_route_in_flight_limit,
         ));
         return (
-            RoutePoolSelector::default(Arc::clone(&default_pools)),
+            RoutePoolSelector::default(
+                Arc::clone(&default_pools),
+                RoutePolicy::from_route_config(default_route_config),
+            ),
             default_pools,
         );
     }
 
     let registry = Arc::new(RoutePoolRegistry::new());
+    let mut policies = HashMap::with_capacity(config.pools.len());
     let global_backend_available = Arc::new(tokio::sync::Notify::new());
     let mut control_route_pools = None;
     for pool_config in &config.pools {
@@ -1553,6 +1606,7 @@ fn build_route_pool_selector(
             None,
             QueryClass::Default,
         );
+        let route_config = RouteConfig::from_backend_addr(pool_config.backend_addr);
         let pools = build_route_pools_for_pool(
             config,
             pool_config,
@@ -1565,10 +1619,21 @@ fn build_route_pool_selector(
             control_route_pools = Some(Arc::new(pools.clone()));
         }
         registry.insert(route, pools);
+        policies.insert(
+            RouteKey::new(
+                pool_config.database.as_str(),
+                pool_config.user.as_str(),
+                None,
+                None,
+                QueryClass::Default,
+            )
+            .selection_key(),
+            RoutePolicy::from_route_config(&route_config),
+        );
     }
 
     (
-        RoutePoolSelector::configured(registry),
+        RoutePoolSelector::configured(registry, policies),
         control_route_pools.expect("non-empty pools has a control pool"),
     )
 }
@@ -1599,12 +1664,19 @@ fn build_route_pools_for_pool(
 
 #[cfg(test)]
 mod tests {
-    use std::io::IoSlice;
+    use std::{io::IoSlice, sync::Arc, time::Duration};
 
     use super::{
         auth_request_expects_client_response, cgroup_shard_cap,
         connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count,
-        BufferReusePolicy, Config,
+        BufferReusePolicy, Config, RoutePolicy, RoutePoolRegistry, RoutePoolSelector,
+    };
+    use crate::config::{
+        BackendEndpointConfig, FreshnessConfig, HaConfig, ReadRoutingConfig, RouteConfig,
+    };
+    use pg_kinetic_core::{
+        route::{QueryClass, RouteKey},
+        routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     };
 
     fn auth_payload(code: i32) -> [u8; 4] {
@@ -1621,6 +1693,46 @@ mod tests {
     fn sasl_final_and_ok_do_not_expect_client_responses() {
         assert!(!auth_request_expects_client_response(&auth_payload(12)).unwrap());
         assert!(!auth_request_expects_client_response(&auth_payload(0)).unwrap());
+    }
+
+    #[test]
+    fn configured_selector_carries_policy_by_selected_route() {
+        let route = RouteKey::new("tenant", "alice", None, None, QueryClass::Default);
+        let route_config = RouteConfig {
+            primary: BackendEndpointConfig::default(),
+            replicas: Vec::new(),
+            read_routing: ReadRoutingConfig {
+                read_routing_mode: ReadRoutingMode::RequireReplica,
+                fallback_policy: FallbackPolicy::Reject,
+            },
+            freshness: FreshnessConfig {
+                freshness_policy: FreshnessPolicy::SessionWriteLsnAndMaxLag,
+                max_replica_lag_ms: 42,
+                read_after_write_timeout_ms: 750,
+            },
+            ha: HaConfig::default(),
+        };
+        let policy = RoutePolicy::from_route_config(&route_config);
+        let selector = RoutePoolSelector::configured(
+            Arc::new(RoutePoolRegistry::new()),
+            [(route.selection_key(), policy)].into_iter().collect(),
+        );
+
+        let selected = selector.policy(&route).expect("selected route policy");
+        assert_eq!(
+            selected.routing_planner.read_routing_mode(),
+            ReadRoutingMode::RequireReplica
+        );
+        assert_eq!(
+            selected.routing_planner.fallback_policy(),
+            FallbackPolicy::Reject
+        );
+        assert_eq!(selected.routing_planner.max_replica_lag_ms(), 42);
+        assert_eq!(
+            selected.read_after_write_timeout,
+            Duration::from_millis(750)
+        );
+        assert!(selected.read_after_write_protection_enabled);
     }
 
     #[test]

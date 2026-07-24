@@ -219,7 +219,7 @@ pub(super) async fn handle_client(
     let ClientSessionContext {
         route_pool_selector,
         config,
-        routing_planner,
+        routing_planner: _global_routing_planner,
         session_id,
         snapshot_store,
         client_snapshot_handle,
@@ -274,6 +274,7 @@ pub(super) async fn handle_client(
         route_fallback_policy,
         read_after_write_timeout,
         read_after_write_protection_enabled,
+        routing_planner,
         prepared_snapshot_handle,
         recovery_snapshot_handle,
         mut route_application_name,
@@ -1167,6 +1168,7 @@ pub(super) struct SessionStartupState {
     pub(super) route_fallback_policy: FallbackPolicy,
     pub(super) read_after_write_timeout: Duration,
     pub(super) read_after_write_protection_enabled: bool,
+    pub(super) routing_planner: ReadRoutingPlanner,
     pub(super) prepared_snapshot_handle: PreparedSnapshotHandle,
     pub(super) recovery_snapshot_handle: RecoverySnapshotHandle,
     pub(super) route_application_name: Option<String>,
@@ -1185,20 +1187,6 @@ pub(super) async fn complete_client_startup(
     let auth = request.config.auth.clone();
     let performance = request.config.performance.clone();
     let qos = request.config.qos.clone();
-    let route_config = request
-        .config
-        .effective_routes()
-        .into_iter()
-        .next()
-        .context("missing effective route config")?;
-    let route_read_routing_mode = route_config.read_routing.read_routing_mode;
-    let route_fallback_policy = route_config.read_routing.fallback_policy;
-    let read_after_write_timeout =
-        Duration::from_millis(route_config.freshness.read_after_write_timeout_ms);
-    let read_after_write_protection_enabled = matches!(
-        route_config.freshness.freshness_policy,
-        FreshnessPolicy::SessionWriteLsn | FreshnessPolicy::SessionWriteLsnAndMaxLag
-    );
     let prepared_snapshot_handle = request.snapshot_store.prepared_handle();
     let recovery_snapshot_handle = request.snapshot_store.recovery_handle();
 
@@ -1291,6 +1279,12 @@ pub(super) async fn complete_client_startup(
     let route_application_name = startup_plan.route_application_name.clone();
     let session_route = startup_plan.session_route.clone();
     let route_pools = Arc::clone(&startup_plan.route_pools);
+    let route_policy = startup_plan.route_policy;
+    let route_read_routing_mode = route_policy.routing_planner.read_routing_mode();
+    let route_fallback_policy = route_policy.routing_planner.fallback_policy();
+    let read_after_write_timeout = route_policy.read_after_write_timeout;
+    let read_after_write_protection_enabled = route_policy.read_after_write_protection_enabled;
+    let routing_planner = route_policy.routing_planner;
     let backend_startup_packet = startup_plan.backend_startup_packet.clone();
 
     update_client_snapshot(
@@ -1463,6 +1457,7 @@ pub(super) async fn complete_client_startup(
         route_fallback_policy,
         read_after_write_timeout,
         read_after_write_protection_enabled,
+        routing_planner,
         prepared_snapshot_handle,
         recovery_snapshot_handle,
         route_application_name,
