@@ -121,6 +121,19 @@ fn should_reuse_held_backend(session: &VirtualSession, held_backend_id: Option<u
     session.pin_reason().is_some() && held_backend_id.is_some()
 }
 
+async fn cleanup_held_shared_backend<B, O>(
+    cancel_registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    held_backend: &mut Option<crate::pool::PooledBackendLease<B, O>>,
+) where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    if let Some(held_backend) = held_backend.take() {
+        release_backend_with_cancel_unbind(cancel_registry, client_key, held_backend).await;
+    }
+}
+
 fn should_replay_shared_session(
     session: &VirtualSession,
     previous_backend_id: Option<u64>,
@@ -229,29 +242,64 @@ where
     let mut held_backend: Option<crate::pool::PooledBackendLease<B, O>> = None;
 
     loop {
-        match crate::io_runtime::take_frontend_cycle_bytes(
+        let cycle = match crate::io_runtime::take_frontend_cycle_bytes(
             &mut client_buffer,
             max_client_buffer_bytes,
-        )? {
+        ) {
+            Ok(cycle) => cycle,
+            Err(error) => {
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
+                return Err(error).context("read frontend cycle");
+            }
+        };
+        match cycle {
             crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
-                let frames = crate::io_runtime::parse_frontend_cycle_frames(bytes)?;
+                let frames = match crate::io_runtime::parse_frontend_cycle_frames(bytes) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error).context("parse frontend cycle");
+                    }
+                };
                 if frames.is_empty() {
                     continue;
                 }
                 let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
-                let request_plans = request_plans_for_frames(
+                let request_plans = match request_plans_for_frames(
                     &prepared,
                     &frames,
                     full_routing_analysis,
                     &mut sql_plan_cache,
                 )
-                .context("build request plan before monoio backend checkout")?;
-                update_transaction_state_from_request_plans(
+                .context("build request plan before monoio backend checkout")
+                {
+                    Ok(request_plans) => request_plans,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = update_transaction_state_from_request_plans(
                     &mut session,
                     &request_plans,
                     full_routing_analysis,
                 )
-                .context("update transaction state before monoio backend checkout")?;
+                .context("update transaction state before monoio backend checkout")
+                {
+                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
+                        .await;
+                    return Err(error);
+                }
                 let selection = ReadRoutingSelection {
                     planner: &routing_planner,
                     route_pools: &route_pools,
@@ -272,14 +320,8 @@ where
                     target,
                     RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
                 ) {
-                    if let Some(held_backend) = held_backend.take() {
-                        release_backend_with_cancel_unbind(
-                            &cancel_registry,
-                            client_key,
-                            held_backend,
-                        )
+                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
                         .await;
-                    }
                     return Err(anyhow::anyhow!(
                         "monoio cycle routing produced unsupported target: {target:?}"
                     ));
@@ -289,14 +331,8 @@ where
                     held_backend.as_ref().map(|backend| backend.backend_id()),
                 );
                 if !reuse_held_backend {
-                    if let Some(held_backend) = held_backend.take() {
-                        release_backend_with_cancel_unbind(
-                            &cancel_registry,
-                            client_key,
-                            held_backend,
-                        )
+                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
                         .await;
-                    }
                 }
                 let mut backend = if reuse_held_backend {
                     held_backend
@@ -372,14 +408,22 @@ where
                     route_application_name: &mut route_application_name,
                     progress: &mut progress,
                 };
-                let planned = plan_frontend_cycle(
+                let planned = match plan_frontend_cycle(
                     backend.backend_id(),
                     &mut forward_state,
                     &frames,
                     &simple_query_commands,
                     buffers.buffers_mut(),
                     phase_recorder.as_ref(),
-                )?;
+                ) {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        drop(forward_state);
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        return Err(error).context("plan monoio cycle");
+                    }
+                };
                 let mut runtime_backend = LeaseRuntimeBackend {
                     lease: &mut backend,
                 };
@@ -405,28 +449,36 @@ where
                 result?;
             }
             crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
-                if let Some(held_backend) = held_backend.take() {
-                    release_backend_with_cancel_unbind(&cancel_registry, client_key, held_backend)
-                        .await;
-                }
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
                 return Ok(());
             }
             crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
                 return Err(anyhow::anyhow!(
                     "client request exceeded configured buffer limit"
                 ));
             }
             crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
-                if crate::io_runtime::read_from(&mut client, &mut client_buffer).await? == 0 {
-                    if let Some(held_backend) = held_backend.take() {
-                        release_backend_with_cancel_unbind(
+                match crate::io_runtime::read_from(&mut client, &mut client_buffer).await {
+                    Ok(0) => {
+                        cleanup_held_shared_backend(
                             &cancel_registry,
                             client_key,
-                            held_backend,
+                            &mut held_backend,
                         )
                         .await;
+                        return Ok(());
                     }
-                    return Ok(());
+                    Ok(_) => {}
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error).context("read frontend data");
+                    }
                 }
             }
         }
