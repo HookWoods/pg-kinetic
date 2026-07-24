@@ -92,6 +92,34 @@ where
     }
 }
 
+struct DiscardRuntimeStream;
+
+impl crate::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
+    async fn read_into(&mut self, _dst: &mut BytesMut) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    async fn write_all_bytes(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn should_reuse_held_backend(session: &VirtualSession, held_backend_id: Option<u64>) -> bool {
+    session.pin_reason().is_some() && held_backend_id.is_some()
+}
+
+fn should_replay_shared_session(
+    session: &VirtualSession,
+    previous_backend_id: Option<u64>,
+    backend_id: u64,
+) -> bool {
+    session.has_replayable_settings() && previous_backend_id != Some(backend_id)
+}
+
 pub(crate) async fn handle_client_session<C, B, O, P>(
     mut client: C,
     _client_addr: SocketAddr,
@@ -178,13 +206,14 @@ where
         return Err(error).context("shared backend startup");
     }
     drop(startup_backend);
+    let mut previous_backend_id = Some(startup_backend_lease.backend_id());
     startup_backend_lease.release().await;
 
     let mut session = VirtualSession::default();
     let mut prepared = PreparedCatalog::new(session_id);
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
-    let mut held_backend = None;
+    let mut held_backend: Option<crate::pool::PooledBackendLease<B, O>> = None;
 
     loop {
         match crate::io_runtime::take_frontend_cycle_bytes(
@@ -230,12 +259,26 @@ where
                     target,
                     RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
                 ) {
+                    if let Some(held_backend) = held_backend.take() {
+                        held_backend.release().await;
+                    }
                     return Err(anyhow::anyhow!(
                         "monoio cycle routing produced unsupported target: {target:?}"
                     ));
                 }
-                let mut backend = if let Some(held_backend) = held_backend.take() {
+                let reuse_held_backend = should_reuse_held_backend(
+                    &session,
+                    held_backend.as_ref().map(|backend| backend.backend_id()),
+                );
+                if !reuse_held_backend {
+                    if let Some(held_backend) = held_backend.take() {
+                        held_backend.release().await;
+                    }
+                }
+                let mut backend = if reuse_held_backend {
                     held_backend
+                        .take()
+                        .expect("held backend exists when reuse is selected")
                 } else {
                     pool.checkout_shared_target(route.clone(), &route_pools, &target)
                         .await
@@ -260,6 +303,37 @@ where
                     return Err(error).context("monoio cycle backend startup");
                 }
                 drop(startup_backend);
+                let backend_id = backend.backend_id();
+                if should_replay_shared_session(&session, previous_backend_id, backend_id) {
+                    let replay_frames = replay_frames(&session);
+                    let mut replay_bytes = BytesMut::new();
+                    for frame in &replay_frames {
+                        replay_bytes.extend_from_slice(&encode_frontend_frame(frame));
+                    }
+                    let replay_shape =
+                        crate::io_runtime::FrontendCycleShape::from_frames(&replay_frames);
+                    let mut replay_backend_buffer = BytesMut::with_capacity(16 * 1024);
+                    let mut discard_client = DiscardRuntimeStream;
+                    let mut replay_backend = LeaseRuntimeBackend {
+                        lease: &mut backend,
+                    };
+                    let replay_result = forward_runtime_cycle(
+                        &mut discard_client,
+                        &mut replay_backend,
+                        &replay_bytes,
+                        replay_shape.expected_ready_count(),
+                        0,
+                        &mut replay_backend_buffer,
+                        max_backend_buffer_bytes,
+                    )
+                    .await;
+                    drop(replay_backend);
+                    if let Err(error) = replay_result {
+                        backend.discard();
+                        return Err(error).context("monoio virtual session replay");
+                    }
+                }
+                previous_backend_id = Some(backend_id);
                 let simple_query_commands: Vec<SqlCommand> = request_plans
                     .iter()
                     .filter(|plan| plan.updates_session_state)
@@ -296,6 +370,7 @@ where
                 .await;
                 drop(runtime_backend);
                 if result.is_err() {
+                    previous_backend_id = None;
                     backend.discard();
                 } else if session.pin_reason().is_some() {
                     held_backend = Some(backend);
@@ -305,6 +380,9 @@ where
                 result?;
             }
             crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+                if let Some(held_backend) = held_backend.take() {
+                    held_backend.release().await;
+                }
                 return Ok(());
             }
             crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
@@ -314,6 +392,9 @@ where
             }
             crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
                 if crate::io_runtime::read_from(&mut client, &mut client_buffer).await? == 0 {
+                    if let Some(held_backend) = held_backend.take() {
+                        held_backend.release().await;
+                    }
                     return Ok(());
                 }
             }
@@ -1634,4 +1715,36 @@ pub(super) async fn finalize_held_backend_on_disconnect(
         request.debug_sampler,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_session_replays_replayable_settings_on_backend_change() {
+        let mut session = VirtualSession::default();
+        session.apply_sql(classify("set application_name = 'api'"));
+
+        assert!(should_replay_shared_session(&session, Some(1), 2));
+        assert!(!should_replay_shared_session(&session, Some(2), 2));
+    }
+
+    #[test]
+    fn shared_session_does_not_replay_without_replayable_settings() {
+        let session = VirtualSession::default();
+
+        assert!(!should_replay_shared_session(&session, Some(1), 2));
+    }
+
+    #[test]
+    fn unpinned_session_releases_held_backend_before_retargeting() {
+        let mut session = VirtualSession::default();
+        session.apply_sql(classify("begin"));
+        assert!(should_reuse_held_backend(&session, Some(7)));
+
+        session.apply_sql(classify("commit"));
+
+        assert!(!should_reuse_held_backend(&session, Some(7)));
+    }
 }
