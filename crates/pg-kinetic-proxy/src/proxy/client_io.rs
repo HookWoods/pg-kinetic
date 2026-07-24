@@ -69,6 +69,7 @@ where
 pub(crate) async fn handle_startup_or_cancel<C>(
     client: &mut C,
     client_buffer: &mut BytesMut,
+    idle_timeout: Duration,
     max_client_buffer_bytes: usize,
 ) -> anyhow::Result<StartupOrCancel>
 where
@@ -99,12 +100,25 @@ where
                 return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
             }
             crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
-                if crate::io_runtime::read_from(client, client_buffer)
+                match crate::io_runtime::read_from_timeout(client, client_buffer, idle_timeout)
                     .await
-                    .context("read startup")?
-                    == 0
                 {
-                    return Ok(StartupOrCancel::Finished);
+                    Ok(Ok(0)) => return Ok(StartupOrCancel::Finished),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => return Err(error).context("read startup"),
+                    Err(_) => {
+                        let error = build_error_response(
+                            SqlState::OperatorIntervention.as_str(),
+                            "startup timed out",
+                        );
+                        let mut response = BytesMut::with_capacity(error.len() + 6);
+                        response.extend_from_slice(&error);
+                        response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
+                        crate::io_runtime::write_all_to(client, &response)
+                            .await
+                            .context("write startup timeout response")?;
+                        return Ok(StartupOrCancel::Finished);
+                    }
                 }
             }
         }

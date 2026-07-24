@@ -1,16 +1,17 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    pin::pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::{BufMut, BytesMut};
 use monoio::{
-    io::{AsyncReadRent, AsyncWriteRent},
+    io::{AsyncReadRent, AsyncWriteRent, CancelableAsyncReadRent},
     net::TcpStream,
 };
 
@@ -23,6 +24,8 @@ use crate::{
 use pg_kinetic_core::route::{PoolKey, RouteKey};
 
 static NEXT_MONOIO_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
+const MONOIO_READ_BUFFER_BYTES: usize = 16 * 1024;
+const ECANCELED: i32 = 125;
 
 #[derive(Debug)]
 pub struct MonoioTransport {
@@ -35,11 +38,14 @@ impl MonoioTransport {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            read_buf: vec![0; 16 * 1024],
+            read_buf: vec![0; MONOIO_READ_BUFFER_BYTES],
         }
     }
 
     pub async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        if self.read_buf.is_empty() {
+            self.read_buf.resize(MONOIO_READ_BUFFER_BYTES, 0);
+        }
         let buffer = std::mem::take(&mut self.read_buf);
         let (result, buffer) = self.stream.read(buffer).await;
         self.read_buf = buffer;
@@ -48,6 +54,52 @@ impl MonoioTransport {
             dst.put_slice(&self.read_buf[..read]);
         }
         Ok(read)
+    }
+
+    pub async fn read_into_timeout(
+        &mut self,
+        dst: &mut BytesMut,
+        duration: Duration,
+    ) -> Result<std::io::Result<usize>, ()> {
+        if self.read_buf.is_empty() {
+            self.read_buf.resize(MONOIO_READ_BUFFER_BYTES, 0);
+        }
+
+        let canceler = monoio::io::Canceller::new();
+        let handle = canceler.handle();
+        let buffer = std::mem::take(&mut self.read_buf);
+        let mut timer = pin!(monoio::time::sleep(duration));
+        let mut read = pin!(self.stream.cancelable_read(buffer, handle));
+
+        monoio::select! {
+            _ = &mut timer => {
+                canceler.cancel();
+                let (result, buffer) = read.await;
+                self.read_buf = buffer;
+                match result {
+                    Ok(read) => {
+                        if read > 0 {
+                            dst.put_slice(&self.read_buf[..read]);
+                        }
+                        Ok(Ok(read))
+                    }
+                    Err(error) if error.raw_os_error() == Some(ECANCELED) => Err(()),
+                    Err(error) => Ok(Err(error)),
+                }
+            }
+            (result, buffer) = &mut read => {
+                self.read_buf = buffer;
+                match result {
+                    Ok(read) => {
+                        if read > 0 {
+                            dst.put_slice(&self.read_buf[..read]);
+                        }
+                        Ok(Ok(read))
+                    }
+                    Err(error) => Ok(Err(error)),
+                }
+            }
+        }
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -430,6 +482,14 @@ impl crate::io_runtime::RuntimeByteStream for MonoioBackend {
 impl crate::io_runtime::RuntimeByteStream for MonoioTransport {
     async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
         MonoioTransport::read_into(self, dst).await
+    }
+
+    async fn read_into_timeout(
+        &mut self,
+        dst: &mut BytesMut,
+        duration: Duration,
+    ) -> Result<std::io::Result<usize>, ()> {
+        MonoioTransport::read_into_timeout(self, dst, duration).await
     }
 
     async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {

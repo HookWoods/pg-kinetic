@@ -31,6 +31,8 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) max_client_buffer_bytes: usize,
     pub(crate) max_backend_buffer_bytes: usize,
     pub(crate) query_timeout: Duration,
+    pub(crate) idle_client_timeout: Duration,
+    pub(crate) idle_transaction_timeout: Duration,
     pub(crate) overload_error_code: String,
     pub(crate) auth: crate::config::AuthConfig,
     pub(crate) auth_users: Option<Arc<UserStore>>,
@@ -205,6 +207,44 @@ where
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn write_shared_idle_timeout_response<C>(
+    client: &mut C,
+    kind: IdleTimeoutKind,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    metrics_crate::counter!(
+        MetricName::TimeoutTotal.as_str(),
+        "kind" => match kind {
+            IdleTimeoutKind::Client => "idle_client",
+            IdleTimeoutKind::Transaction => "idle_transaction",
+        }
+    )
+    .increment(1);
+
+    match kind {
+        IdleTimeoutKind::Client => {
+            write_shared_error_response(
+                client,
+                SqlState::OperatorIntervention.as_str(),
+                "idle client timed out",
+            )
+            .await
+        }
+        IdleTimeoutKind::Transaction => {
+            let error = build_error_response(
+                SqlState::OperatorIntervention.as_str(),
+                "idle transaction timed out",
+            );
+            crate::io_runtime::write_all_to(client, &error)
+                .await
+                .context("write shared idle transaction timeout response")
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn handle_shared_pool_checkout_error<C>(
     client: &mut C,
     error: crate::pool::PoolError,
@@ -324,6 +364,8 @@ where
         max_client_buffer_bytes,
         max_backend_buffer_bytes,
         query_timeout,
+        idle_client_timeout,
+        idle_transaction_timeout,
         overload_error_code,
         auth,
         auth_users,
@@ -366,48 +408,72 @@ where
             auth::ClientAuthOutcome::Rejected => return Ok(()),
         }
     }
-    let mut startup_backend_lease = match pool.checkout_shared(route.clone(), &route_pools).await {
-        Ok(lease) => lease,
+    let mut startup_proxied = true;
+    let mut previous_backend_id = match pool.checkout_shared(route.clone(), &route_pools).await {
+        Ok(mut startup_backend_lease) => {
+            let requires_startup = startup_backend_lease.requires_startup();
+            let mut startup_backend = LeaseRuntimeBackend {
+                lease: &mut startup_backend_lease,
+            };
+            if let Err(error) = crate::proxy::proxy_startup_streams(
+                &mut client,
+                &mut startup_backend,
+                requires_startup,
+                &backend_startup_packet,
+                max_client_buffer_bytes,
+                max_backend_buffer_bytes,
+                true,
+                true,
+                backend_credentials.as_deref(),
+                buffers.buffers_mut(),
+                Some(client_key),
+            )
+            .await
+            {
+                drop(startup_backend);
+                startup_backend_lease.discard();
+                return Err(error).context("shared backend startup");
+            }
+            drop(startup_backend);
+            bind_cancel_target_for_backend(&cancel_registry, client_key, &startup_backend_lease);
+            let previous_backend_id = Some(startup_backend_lease.backend_id());
+            release_backend_with_cancel_unbind(&cancel_registry, client_key, startup_backend_lease)
+                .await;
+            previous_backend_id
+        }
         Err(error) => {
-            handle_shared_pool_checkout_error(&mut client, error, &overload_error_code).await?;
-            return Ok(());
+            if handle_shared_pool_checkout_error(&mut client, error, &overload_error_code).await? {
+                startup_proxied = !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough);
+                None
+            } else {
+                return Ok(());
+            }
         }
     };
-    let requires_startup = startup_backend_lease.requires_startup();
-    let mut startup_backend = LeaseRuntimeBackend {
-        lease: &mut startup_backend_lease,
-    };
-    if let Err(error) = crate::proxy::proxy_startup_streams(
-        &mut client,
-        &mut startup_backend,
-        requires_startup,
-        &backend_startup_packet,
-        max_client_buffer_bytes,
-        max_backend_buffer_bytes,
-        true,
-        true,
-        backend_credentials.as_deref(),
-        buffers.buffers_mut(),
-        Some(client_key),
-    )
-    .await
-    {
-        drop(startup_backend);
-        startup_backend_lease.discard();
-        return Err(error).context("shared backend startup");
-    }
-    drop(startup_backend);
-    bind_cancel_target_for_backend(&cancel_registry, client_key, &startup_backend_lease);
-    let mut previous_backend_id = Some(startup_backend_lease.backend_id());
-    release_backend_with_cancel_unbind(&cancel_registry, client_key, startup_backend_lease).await;
 
     let mut session = VirtualSession::default();
     let mut prepared = PreparedCatalog::new(session_id);
     let prepared_snapshot_handle = snapshot_store.prepared_handle();
     let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
     let mut held_backend: Option<crate::pool::PooledBackendLease<B, O>> = None;
+    let mut wait_for_client_activity_after_timeout = false;
 
     loop {
+        let idle_timeout_kind = if session.pin_reason().is_some() {
+            IdleTimeoutKind::Transaction
+        } else {
+            IdleTimeoutKind::Client
+        };
+        let idle_timeout = if idle_timeout_kind == IdleTimeoutKind::Transaction {
+            idle_transaction_timeout
+        } else {
+            idle_client_timeout
+        };
+        let cycle_timeout = if wait_for_client_activity_after_timeout {
+            None
+        } else {
+            Some(idle_timeout)
+        };
         let cycle = match crate::io_runtime::take_frontend_cycle_bytes(
             &mut client_buffer,
             max_client_buffer_bytes,
@@ -435,6 +501,7 @@ where
                 if frames.is_empty() {
                     continue;
                 }
+                wait_for_client_activity_after_timeout = false;
                 let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
                 let request_plans = match request_plans_for_frames(
                     &prepared,
@@ -535,19 +602,37 @@ where
                 let mut startup_backend = LeaseRuntimeBackend {
                     lease: &mut backend,
                 };
-                if let Err(error) = crate::proxy::bootstrap_backend_streams(
-                    &mut startup_backend,
-                    requires_startup,
-                    &backend_startup_packet,
-                    backend_credentials.as_deref(),
-                )
-                .await
-                {
+                let startup_result = if startup_proxied {
+                    crate::proxy::bootstrap_backend_streams(
+                        &mut startup_backend,
+                        requires_startup,
+                        &backend_startup_packet,
+                        backend_credentials.as_deref(),
+                    )
+                    .await
+                } else {
+                    crate::proxy::proxy_startup_streams(
+                        &mut client,
+                        &mut startup_backend,
+                        requires_startup,
+                        &backend_startup_packet,
+                        max_client_buffer_bytes,
+                        max_backend_buffer_bytes,
+                        true,
+                        true,
+                        backend_credentials.as_deref(),
+                        buffers.buffers_mut(),
+                        Some(client_key),
+                    )
+                    .await
+                };
+                if let Err(error) = startup_result {
                     drop(startup_backend);
                     discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
                     return Err(error).context("monoio cycle backend startup");
                 }
                 drop(startup_backend);
+                startup_proxied = true;
                 bind_cancel_target_for_backend(&cancel_registry, client_key, &backend);
                 let backend_id = backend.backend_id();
                 if should_replay_shared_session(&session, previous_backend_id, backend_id) {
@@ -684,8 +769,19 @@ where
                 ));
             }
             crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
-                match crate::io_runtime::read_from(&mut client, &mut client_buffer).await {
-                    Ok(0) => {
+                let read = match cycle_timeout {
+                    Some(timeout) => {
+                        crate::io_runtime::read_from_timeout(
+                            &mut client,
+                            &mut client_buffer,
+                            timeout,
+                        )
+                        .await
+                    }
+                    None => Ok(crate::io_runtime::read_from(&mut client, &mut client_buffer).await),
+                };
+                match read {
+                    Ok(Ok(0)) => {
                         cleanup_held_shared_backend(
                             &cancel_registry,
                             client_key,
@@ -694,8 +790,8 @@ where
                         .await;
                         return Ok(());
                     }
-                    Ok(_) => {}
-                    Err(error) => {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
                         cleanup_held_shared_backend(
                             &cancel_registry,
                             client_key,
@@ -703,6 +799,31 @@ where
                         )
                         .await;
                         return Err(error).context("read frontend data");
+                    }
+                    Err(_) => {
+                        if idle_timeout_kind == IdleTimeoutKind::Transaction {
+                            if let Some(backend) = held_backend.take() {
+                                discard_backend_with_cancel_unbind(
+                                    &cancel_registry,
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
+                            }
+                        } else {
+                            cleanup_held_shared_backend(
+                                &cancel_registry,
+                                client_key,
+                                &mut held_backend,
+                            )
+                            .await;
+                        }
+                        client_buffer.clear();
+                        write_shared_idle_timeout_response(&mut client, idle_timeout_kind).await?;
+                        if idle_timeout_kind == IdleTimeoutKind::Transaction {
+                            return Ok(());
+                        }
+                        wait_for_client_activity_after_timeout = true;
                     }
                 }
             }

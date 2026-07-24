@@ -274,9 +274,11 @@ mod linux {
     ) -> anyhow::Result<()> {
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
+        let effective_config = runtime_state.effective_config();
         let startup_packet = match crate::proxy::handle_startup_or_cancel(
             &mut client,
             &mut client_buffer,
+            effective_config.qos.idle_client_timeout(),
             max_client_buffer_bytes,
         )
         .await?
@@ -318,7 +320,6 @@ mod linux {
                     .map(crate::auth::BackendCredentials::username),
             )
             .context("resolve startup backend")?;
-        let effective_config = runtime_state.effective_config();
         let route_policy = startup_plan.route_policy;
         let context = crate::proxy::SharedClientSessionContext {
             pool: backend_pool_selector,
@@ -330,6 +331,8 @@ mod linux {
             max_client_buffer_bytes,
             max_backend_buffer_bytes,
             query_timeout: effective_config.qos.query_timeout(),
+            idle_client_timeout: effective_config.qos.idle_client_timeout(),
+            idle_transaction_timeout: effective_config.qos.idle_transaction_timeout(),
             overload_error_code: effective_config.qos.overload_error_code.clone(),
             auth: effective_config.auth.clone(),
             auth_users: crate::reload::load_auth_users(effective_config)?,

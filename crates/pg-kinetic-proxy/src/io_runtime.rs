@@ -49,6 +49,15 @@ pub enum StartupPacketRead {
 pub(crate) trait RuntimeByteStream {
     async fn read_into(&mut self, dst: &mut BytesMut) -> io::Result<usize>;
 
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    async fn read_into_timeout(
+        &mut self,
+        dst: &mut BytesMut,
+        duration: Duration,
+    ) -> Result<io::Result<usize>, ()> {
+        monoio_timeout(duration, self.read_into(dst)).await
+    }
+
     async fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     async fn shutdown_stream(&mut self) -> io::Result<()>;
@@ -66,6 +75,15 @@ pub(crate) async fn write_all_to<S: RuntimeByteStream + ?Sized>(
     bytes: &[u8],
 ) -> io::Result<()> {
     stream.write_all_bytes(bytes).await
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) async fn read_from_timeout<S: RuntimeByteStream + ?Sized>(
+    stream: &mut S,
+    dst: &mut BytesMut,
+    duration: Duration,
+) -> Result<io::Result<usize>, ()> {
+    stream.read_into_timeout(dst, duration).await
 }
 
 pub(crate) async fn shutdown<S: RuntimeByteStream + ?Sized>(stream: &mut S) -> io::Result<()> {
