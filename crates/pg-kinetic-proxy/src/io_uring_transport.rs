@@ -390,6 +390,14 @@ impl crate::proxy::BackendStartupMetadata for MonoioBackend {
         MonoioBackend::is_tls(self)
     }
 
+    fn addr(&self) -> std::net::SocketAddr {
+        MonoioBackend::addr(self)
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        MonoioBackend::key_data(self)
+    }
+
     fn parameter_status(&self) -> &[(String, String)] {
         MonoioBackend::parameter_status(self)
     }
