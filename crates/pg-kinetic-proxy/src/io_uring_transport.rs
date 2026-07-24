@@ -201,6 +201,7 @@ pub(crate) type MonoioPooledBackend =
 
 #[derive(Debug)]
 pub(crate) struct MonoioBackendPool {
+    backend_addr: SocketAddr,
     core: std::sync::Arc<crate::pool::BackendPoolCore<MonoioBackend, MonoioBackendConnector>>,
 }
 
@@ -310,6 +311,7 @@ impl MonoioBackendPool {
         route_dynamic_limit: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            backend_addr,
             core: crate::pool::BackendPoolCore::new(
                 MonoioBackendConnector::new(backend_addr),
                 lifecycle,
@@ -335,7 +337,7 @@ impl MonoioBackendPool {
     }
 
     pub(crate) fn backend_addr(&self) -> SocketAddr {
-        self.core.connector.backend_addr()
+        self.backend_addr
     }
 }
 
