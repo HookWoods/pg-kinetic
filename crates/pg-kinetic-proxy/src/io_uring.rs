@@ -38,6 +38,7 @@ mod linux {
             .unwrap_or_else(default_shard_count);
         let stop = Arc::new(AtomicBool::new(false));
         let start_accepting = Arc::new(AtomicBool::new(false));
+        let buffer_pool = proxy.buffer_pool();
         let client_slots = proxy.client_slots();
         let backend_slots = proxy.backend_slots();
         let lifecycle = proxy.lifecycle_controller();
@@ -47,6 +48,7 @@ mod linux {
         for shard_id in 0..shard_count {
             let stop = Arc::clone(&stop);
             let start_accepting = Arc::clone(&start_accepting);
+            let buffer_pool = buffer_pool.clone();
             let client_slots = Arc::clone(&client_slots);
             let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
@@ -77,6 +79,7 @@ mod linux {
                         runtime_state,
                         stop,
                         start_accepting,
+                        buffer_pool,
                         client_slots,
                         backend_slots,
                         lifecycle.drain_token(),
@@ -174,6 +177,7 @@ mod linux {
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
+        buffer_pool: crate::buffers::ProxyBufferPool,
         client_slots: Arc<tokio::sync::Semaphore>,
         backend_slots: Arc<tokio::sync::Semaphore>,
         drain: crate::lifecycle::DrainToken,
@@ -208,6 +212,7 @@ mod linux {
                 drop(session_guard);
                 continue;
             };
+            let buffer_pool = buffer_pool.clone();
             let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
             monoio::spawn(async move {
@@ -215,6 +220,7 @@ mod linux {
                     client,
                     client_addr,
                     runtime_state,
+                    buffer_pool,
                     backend_slots,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
@@ -256,6 +262,7 @@ mod linux {
         client: TcpStream,
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
+        buffer_pool: crate::buffers::ProxyBufferPool,
         backend_slots: Arc<tokio::sync::Semaphore>,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
@@ -316,21 +323,21 @@ mod linux {
         let backend = TcpStream::connect_addr(backend_addr)
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-        let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-        crate::io_runtime::write_all_to(&mut backend, &startup_plan.backend_startup_packet)
-            .await
-            .context("forward startup")?;
-
-        let mut startup_drain = crate::io_runtime::BackendResponseDrain::new(1, 0);
-        crate::io_runtime::forward_backend_until_ready(
-            &mut backend,
+        let mut backend =
+            IoUringStartupBackend::new(crate::io_uring_transport::MonoioTransport::new(backend));
+        let mut buffers = buffer_pool.acquire();
+        crate::proxy::proxy_startup_streams(
             &mut client,
-            &mut backend_buffer,
-            &mut startup_drain,
+            &mut backend,
+            true,
+            &startup_plan.backend_startup_packet,
+            max_client_buffer_bytes,
             max_backend_buffer_bytes,
-            "read startup response",
-            "write startup response",
-            "backend closed during startup",
+            true,
+            false,
+            None,
+            buffers.buffers_mut(),
+            None,
         )
         .await?;
 
@@ -378,6 +385,54 @@ mod linux {
                 "backend closed during response",
             )
             .await?;
+        }
+    }
+
+    struct IoUringStartupBackend {
+        transport: crate::io_uring_transport::MonoioTransport,
+        parameter_status: Vec<(String, String)>,
+        key_data: Option<(i32, i32)>,
+    }
+
+    impl IoUringStartupBackend {
+        fn new(transport: crate::io_uring_transport::MonoioTransport) -> Self {
+            Self {
+                transport,
+                parameter_status: Vec::new(),
+                key_data: None,
+            }
+        }
+    }
+
+    impl crate::proxy::BackendStartupMetadata for IoUringStartupBackend {
+        fn is_tls(&self) -> bool {
+            false
+        }
+
+        fn parameter_status(&self) -> &[(String, String)] {
+            &self.parameter_status
+        }
+
+        fn push_parameter_status(&mut self, name: String, value: String) {
+            self.parameter_status.push((name, value));
+        }
+
+        fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+            self.key_data = Some((process_id, secret_key));
+        }
+    }
+
+    impl crate::io_runtime::RuntimeByteStream for IoUringStartupBackend {
+        async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+            crate::io_runtime::read_from(&mut self.transport, dst).await
+        }
+
+        async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            crate::io_runtime::write_all_to(&mut self.transport, bytes).await
+        }
+
+        async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+            crate::io_runtime::shutdown(&mut self.transport).await
         }
     }
 

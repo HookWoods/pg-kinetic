@@ -1,5 +1,69 @@
 use super::*;
 
+pub(crate) trait BackendStartupMetadata {
+    fn is_tls(&self) -> bool;
+
+    fn parameter_status(&self) -> &[(String, String)];
+
+    fn push_parameter_status(&mut self, name: String, value: String);
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32);
+}
+
+struct PooledBackendStartup<'a> {
+    backend: &'a mut crate::backend::Backend,
+}
+
+impl BackendStartupMetadata for PooledBackendStartup<'_> {
+    fn is_tls(&self) -> bool {
+        self.backend.is_tls()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.backend.parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.backend.push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.backend.set_key_data(process_id, secret_key);
+    }
+}
+
+impl crate::io_runtime::RuntimeByteStream for PooledBackendStartup<'_> {
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        crate::io_runtime::read_from(self.backend.stream_mut(), dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        crate::io_runtime::write_all_to(self.backend.stream_mut(), bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        crate::io_runtime::shutdown(self.backend.stream_mut()).await
+    }
+}
+
+impl BackendStartupMetadata for PooledBackend {
+    fn is_tls(&self) -> bool {
+        self.backend().is_tls()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.backend().parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.backend_mut().push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.backend_mut().set_key_data(process_id, secret_key);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn proxy_startup(
     client: &mut ClientConnection,
@@ -14,26 +78,61 @@ pub(super) async fn proxy_startup(
     _phase_recorder: &dyn telemetry::PhaseTimingRecorder,
     client_key: (i32, i32),
 ) -> anyhow::Result<()> {
-    if !backend.requires_startup() {
+    let requires_startup = backend.requires_startup();
+    let mut startup_backend = PooledBackendStartup {
+        backend: backend.backend_mut(),
+    };
+    proxy_startup_streams(
+        client,
+        &mut startup_backend,
+        requires_startup,
+        startup_packet,
+        max_client_buffer_bytes,
+        max_backend_buffer_bytes,
+        forward_backend_auth_requests_to_client,
+        emit_auth_ok_when_backend_requires_no_startup,
+        backend_credentials,
+        buffers,
+        Some(client_key),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_startup_streams<C, B>(
+    client: &mut C,
+    backend: &mut B,
+    requires_startup: bool,
+    startup_packet: &[u8],
+    max_client_buffer_bytes: usize,
+    max_backend_buffer_bytes: usize,
+    forward_backend_auth_requests_to_client: bool,
+    emit_auth_ok_when_backend_requires_no_startup: bool,
+    backend_credentials: Option<&auth::BackendCredentials>,
+    buffers: &mut SessionBufferSet,
+    client_key: Option<(i32, i32)>,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    B: crate::io_runtime::RuntimeByteStream + BackendStartupMetadata,
+{
+    if !requires_startup {
+        let client_key =
+            client_key.context("client key is required for synthetic startup ready")?;
         let startup_response = synthetic_startup_ready(
             emit_auth_ok_when_backend_requires_no_startup,
-            backend.backend_mut().parameter_status(),
+            backend.parameter_status(),
             client_key,
         );
-        client
-            .write_all(&startup_response)
+        crate::io_runtime::write_all_to(client, &startup_response)
             .await
             .context("write synthetic startup response")?;
         return Ok(());
     }
 
-    backend
-        .backend_mut()
-        .stream_mut()
-        .write_all(startup_packet)
+    crate::io_runtime::write_all_to(backend, startup_packet)
         .await
         .context("forward startup")?;
-
     buffers.client_read_mut().clear();
     buffers.backend_read_mut().clear();
     let mut backend_auth = backend_credentials
@@ -46,10 +145,7 @@ pub(super) async fn proxy_startup(
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
-        backend
-            .backend_mut()
-            .stream_mut()
-            .read_buf(buffers.backend_read_mut())
+        crate::io_runtime::read_from(backend, buffers.backend_read_mut())
             .await
             .context("read startup response")?;
         buffers.observe_backend_read();
@@ -62,12 +158,9 @@ pub(super) async fn proxy_startup(
                 let code = auth_request_code(&frame.payload)?;
                 if let Some(backend_auth) = backend_auth.as_mut() {
                     if let Some(response) =
-                        backend_auth.respond(&frame.payload, backend.backend_mut().is_tls())?
+                        backend_auth.respond(&frame.payload, backend.is_tls())?
                     {
-                        backend
-                            .backend_mut()
-                            .stream_mut()
-                            .write_all(&response)
+                        crate::io_runtime::write_all_to(backend, &response)
                             .await
                             .context("respond to backend authentication request")?;
                     }
@@ -75,8 +168,7 @@ pub(super) async fn proxy_startup(
                 }
                 if code == 0 {
                     if forward_backend_auth_requests_to_client {
-                        client
-                            .write_all(&encode_backend_frame(&frame))
+                        crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
                             .await
                             .context("forward startup response")?;
                     }
@@ -84,8 +176,7 @@ pub(super) async fn proxy_startup(
                 }
 
                 if forward_backend_auth_requests_to_client {
-                    client
-                        .write_all(&encode_backend_frame(&frame))
+                    crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
                         .await
                         .context("forward startup response")?;
 
@@ -95,8 +186,7 @@ pub(super) async fn proxy_startup(
                         }
 
                         buffers.client_read_mut().clear();
-                        let read = client
-                            .read_buf(buffers.client_read_mut())
+                        let read = crate::io_runtime::read_from(client, buffers.client_read_mut())
                             .await
                             .context("read startup auth response")?;
                         anyhow::ensure!(read > 0, "client disconnected during startup auth");
@@ -104,10 +194,7 @@ pub(super) async fn proxy_startup(
                         if buffers.client_read_mut().len() > max_client_buffer_bytes {
                             return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
                         }
-                        backend
-                            .backend_mut()
-                            .stream_mut()
-                            .write_all(buffers.client_read_mut())
+                        crate::io_runtime::write_all_to(backend, buffers.client_read_mut())
                             .await
                             .context("forward startup auth response")?;
                         buffers.client_read_mut().clear();
@@ -120,22 +207,29 @@ pub(super) async fn proxy_startup(
             } else {
                 capture_backend_parameter_status(backend, &frame);
                 if capture_backend_key_data(backend, &frame) {
-                    client
-                        .write_all(&encode_backend_key_data(client_key.0, client_key.1))
+                    if let Some(client_key) = client_key {
+                        crate::io_runtime::write_all_to(
+                            client,
+                            &encode_backend_key_data(client_key.0, client_key.1),
+                        )
                         .await
                         .context("write synthetic backend key data")?;
-                    sent_backend_key_data = true;
-                    continue;
+                        sent_backend_key_data = true;
+                        continue;
+                    }
                 }
                 if frame.ready_status().is_some() && !sent_backend_key_data {
-                    client
-                        .write_all(&encode_backend_key_data(client_key.0, client_key.1))
+                    if let Some(client_key) = client_key {
+                        crate::io_runtime::write_all_to(
+                            client,
+                            &encode_backend_key_data(client_key.0, client_key.1),
+                        )
                         .await
                         .context("write synthetic backend key data")?;
-                    sent_backend_key_data = true;
+                        sent_backend_key_data = true;
+                    }
                 }
-                client
-                    .write_all(&encode_backend_frame(&frame))
+                crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
                     .await
                     .context("forward startup response")?;
             }
@@ -240,17 +334,23 @@ pub(super) fn synthetic_startup_ready(
     bytes
 }
 
-pub(super) fn capture_backend_parameter_status(backend: &mut PooledBackend, frame: &BackendFrame) {
+pub(super) fn capture_backend_parameter_status(
+    backend: &mut impl BackendStartupMetadata,
+    frame: &BackendFrame,
+) {
     if frame.tag != u8::from(BackendTag::ParameterStatus) {
         return;
     }
 
     if let Some((name, value)) = parse_parameter_status(&frame.payload) {
-        backend.backend_mut().push_parameter_status(name, value);
+        backend.push_parameter_status(name, value);
     }
 }
 
-pub(super) fn capture_backend_key_data(backend: &mut PooledBackend, frame: &BackendFrame) -> bool {
+pub(super) fn capture_backend_key_data(
+    backend: &mut impl BackendStartupMetadata,
+    frame: &BackendFrame,
+) -> bool {
     if frame.tag != u8::from(BackendTag::BackendKeyData) {
         return false;
     }
@@ -260,7 +360,7 @@ pub(super) fn capture_backend_key_data(backend: &mut PooledBackend, frame: &Back
             i32::from_be_bytes(frame.payload[0..4].try_into().expect("process id bytes"));
         let secret_key =
             i32::from_be_bytes(frame.payload[4..8].try_into().expect("secret key bytes"));
-        backend.backend_mut().set_key_data(process_id, secret_key);
+        backend.set_key_data(process_id, secret_key);
     }
 
     true
@@ -285,4 +385,117 @@ pub(super) fn ready_for_query(status: ReadyStatus) -> BytesMut {
 pub(super) fn auth_request_expects_client_response(payload: &[u8]) -> anyhow::Result<bool> {
     let code = auth_request_code(payload)?;
     Ok(matches!(code, 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io};
+
+    use super::*;
+    use crate::io_runtime::RuntimeByteStream;
+
+    #[tokio::test]
+    async fn startup_stream_helper_forwards_backend_ready_without_pooled_backend() {
+        let startup_packet = BytesMut::from(&b"startup"[..]);
+        let backend_frames = encoded_auth_ok_ready();
+        let mut client = MemoryStream::default();
+        let mut backend = MemoryStream::with_reads([backend_frames]);
+        let pool = ProxyBufferPool::new(
+            BufferReusePolicy::default(),
+            OversizedBufferPolicy::default(),
+        );
+        let mut lease = pool.acquire();
+        let buffers = lease.buffers_mut();
+
+        proxy_startup_streams(
+            &mut client,
+            &mut backend,
+            true,
+            &startup_packet,
+            1024,
+            1024,
+            true,
+            false,
+            None,
+            buffers,
+            Some((12, 34)),
+        )
+        .await
+        .expect("startup succeeds");
+
+        assert_eq!(backend.written, startup_packet);
+        assert!(client.written.starts_with(&encoded_auth_ok()));
+        assert!(client.written.ends_with(&ready_for_query_idle()));
+    }
+
+    #[derive(Default)]
+    struct MemoryStream {
+        reads: VecDeque<BytesMut>,
+        written: BytesMut,
+        parameter_status: Vec<(String, String)>,
+        key_data: Option<(i32, i32)>,
+    }
+
+    impl MemoryStream {
+        fn with_reads(reads: impl IntoIterator<Item = BytesMut>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                written: BytesMut::new(),
+                parameter_status: Vec::new(),
+                key_data: None,
+            }
+        }
+    }
+
+    impl BackendStartupMetadata for MemoryStream {
+        fn is_tls(&self) -> bool {
+            false
+        }
+
+        fn parameter_status(&self) -> &[(String, String)] {
+            &self.parameter_status
+        }
+
+        fn push_parameter_status(&mut self, name: String, value: String) {
+            self.parameter_status.push((name, value));
+        }
+
+        fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+            self.key_data = Some((process_id, secret_key));
+        }
+    }
+
+    impl RuntimeByteStream for MemoryStream {
+        async fn read_into(&mut self, dst: &mut BytesMut) -> io::Result<usize> {
+            let Some(mut next) = self.reads.pop_front() else {
+                return Ok(0);
+            };
+            let len = next.len();
+            dst.extend_from_slice(&next.split());
+            Ok(len)
+        }
+
+        async fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.written.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        async fn shutdown_stream(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn encoded_auth_ok_ready() -> BytesMut {
+        let mut bytes = encoded_auth_ok();
+        bytes.extend_from_slice(&ready_for_query_idle());
+        bytes
+    }
+
+    fn encoded_auth_ok() -> BytesMut {
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(u8::from(BackendTag::Authentication));
+        bytes.put_i32(8);
+        bytes.put_i32(0);
+        bytes
+    }
 }

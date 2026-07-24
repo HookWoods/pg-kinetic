@@ -118,6 +118,8 @@ mod request_plan;
 mod session_snapshot;
 
 use backend_startup::*;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) use backend_startup::{proxy_startup_streams, BackendStartupMetadata};
 use buffer_limit::*;
 use checkout::*;
 pub use checkout::{
@@ -408,6 +410,12 @@ impl Proxy {
     #[must_use]
     pub(crate) fn available_backend_slots(&self) -> usize {
         self.backend_slots.available_permits()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn buffer_pool(&self) -> ProxyBufferPool {
+        self.buffer_pool.clone()
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
