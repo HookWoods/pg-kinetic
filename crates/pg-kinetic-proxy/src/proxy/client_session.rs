@@ -29,6 +29,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) max_client_buffer_bytes: usize,
     pub(crate) max_backend_buffer_bytes: usize,
     pub(crate) query_timeout: Duration,
+    pub(crate) overload_error_code: String,
     pub(crate) auth: crate::config::AuthConfig,
     pub(crate) auth_users: Option<Arc<UserStore>>,
     pub(crate) auth_query_service: Arc<AuthQueryService>,
@@ -165,17 +166,55 @@ fn apply_read_after_write_probe_result(
     }
 }
 
-async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
+async fn write_shared_error_response<C>(
+    client: &mut C,
+    sqlstate: &str,
+    message: &str,
+) -> anyhow::Result<()>
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
 {
-    let error = build_error_response(SqlState::QueryCanceled.as_str(), "query timed out");
+    let error = build_error_response(sqlstate, message);
     let mut response = BytesMut::with_capacity(error.len() + 6);
     response.extend_from_slice(&error);
     response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
     crate::io_runtime::write_all_to(client, &response)
         .await
-        .context("write shared query timeout response")
+        .context("write shared error response")
+}
+
+async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    write_shared_error_response(client, SqlState::QueryCanceled.as_str(), "query timed out").await
+}
+
+async fn handle_shared_pool_checkout_error<C>(
+    client: &mut C,
+    error: crate::pool::PoolError,
+    overload_error_code: &str,
+) -> anyhow::Result<bool>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let (message, close) = match error {
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::QueueFull,
+        ) => ("backend checkout queue is full", false),
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Timeout,
+        ) => ("backend checkout timed out", false),
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Closed,
+        ) => ("", true),
+        crate::pool::PoolError::Connect(error) => return Err(error),
+    };
+    if close {
+        return Ok(false);
+    }
+    write_shared_error_response(client, overload_error_code, message).await?;
+    Ok(true)
 }
 
 async fn probe_shared_read_after_write_requirement<S>(
@@ -267,6 +306,7 @@ where
         max_client_buffer_bytes,
         max_backend_buffer_bytes,
         query_timeout,
+        overload_error_code,
         auth,
         auth_users,
         auth_query_service,
@@ -308,10 +348,13 @@ where
             auth::ClientAuthOutcome::Rejected => return Ok(()),
         }
     }
-    let mut startup_backend_lease = pool
-        .checkout_shared(route.clone(), &route_pools)
-        .await
-        .map_err(|error| anyhow::anyhow!("shared backend checkout failed: {error:?}"))?;
+    let mut startup_backend_lease = match pool.checkout_shared(route.clone(), &route_pools).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            handle_shared_pool_checkout_error(&mut client, error, &overload_error_code).await?;
+            return Ok(());
+        }
+    };
     let requires_startup = startup_backend_lease.requires_startup();
     let mut startup_backend = LeaseRuntimeBackend {
         lease: &mut startup_backend_lease,
@@ -451,11 +494,24 @@ where
                         .take()
                         .expect("held backend exists when reuse is selected")
                 } else {
-                    pool.checkout_shared_target(route.clone(), &route_pools, &target)
+                    match pool
+                        .checkout_shared_target(route.clone(), &route_pools, &target)
                         .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("monoio target checkout failed: {error:?}")
-                        })?
+                    {
+                        Ok(backend) => backend,
+                        Err(error) => {
+                            if handle_shared_pool_checkout_error(
+                                &mut client,
+                                error,
+                                &overload_error_code,
+                            )
+                            .await?
+                            {
+                                continue;
+                            }
+                            return Ok(());
+                        }
+                    }
                 };
                 let requires_startup = backend.requires_startup();
                 let mut startup_backend = LeaseRuntimeBackend {
