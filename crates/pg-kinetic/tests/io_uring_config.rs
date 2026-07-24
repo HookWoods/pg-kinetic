@@ -1,9 +1,11 @@
+use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{
         AuthMode, BackendTlsMode, ClientTlsMode, Config, PoolConfig, ReadRoutingConfig, RouteConfig,
     },
     core::runtime::RuntimeEngine,
     proxy_runtime::io_uring,
+    wire::protocol::ProtocolVersion,
 };
 use pg_kinetic_core::routing::ReadRoutingMode;
 
@@ -30,6 +32,24 @@ fn io_uring_accepts_single_primary_route_boundary() {
     )];
 
     let resolved = io_uring::direct_backend_addr_for_test(&config).expect("route is supported");
+
+    assert_eq!(resolved.to_string(), "127.0.0.1:6544");
+}
+
+#[test]
+fn io_uring_resolves_startup_backend_through_shared_runtime_state() {
+    let mut config = io_uring_config();
+    config.routes = vec![RouteConfig::from_backend_addr(
+        "127.0.0.1:6544".parse().expect("route addr"),
+    )];
+    let startup_packet = startup_packet("postgres", "pgkinetic");
+
+    let resolved = io_uring::startup_backend_addr_for_test(
+        config,
+        &startup_packet,
+        "127.0.0.1:54321".parse().expect("client addr"),
+    )
+    .expect("startup route resolves through proxy runtime state");
 
     assert_eq!(resolved.to_string(), "127.0.0.1:6544");
 }
@@ -124,4 +144,21 @@ fn io_uring_rejects_pool_configs_until_pool_checkout_exists() {
         .expect_err("pool checkout is not supported yet");
 
     assert!(error.to_string().contains("pool configs"));
+}
+
+fn startup_packet(user: &str, database: &str) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_i32(ProtocolVersion::V3.to_i32());
+    body.extend_from_slice(b"user\0");
+    body.extend_from_slice(user.as_bytes());
+    body.put_u8(0);
+    body.extend_from_slice(b"database\0");
+    body.extend_from_slice(database.as_bytes());
+    body.put_u8(0);
+    body.put_u8(0);
+
+    let mut packet = BytesMut::with_capacity(body.len() + 4);
+    packet.put_i32((body.len() + 4) as i32);
+    packet.extend_from_slice(&body);
+    packet
 }

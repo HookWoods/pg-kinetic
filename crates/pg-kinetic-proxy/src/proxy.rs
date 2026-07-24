@@ -193,7 +193,7 @@ pub(crate) struct ShardContext {
     pub runtime_shard_observability: bool,
 }
 
-struct ProxyRuntimeState {
+pub(crate) struct ProxyRuntimeState {
     effective_config: Config,
     phase_metrics_enabled: bool,
     phase_timing_sample_rate: f64,
@@ -258,6 +258,42 @@ impl RoutePoolSelector {
     }
 }
 
+impl ProxyRuntimeState {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn effective_config(&self) -> &Config {
+        &self.effective_config
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn default_primary_backend_addr(&self) -> SocketAddr {
+        self.control_route_pools.primary().backend_addr()
+    }
+
+    pub(crate) fn startup_primary_backend_addr(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+    ) -> anyhow::Result<SocketAddr> {
+        let (route_database, route_user, route_application_name) =
+            startup_route_key(startup_packet)?;
+        let session_route = route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        );
+        let Some(route_pools) = self.route_pool_selector.resolve(&session_route) else {
+            anyhow::bail!(
+                "database \"{route_database}\" for user \"{route_user}\" is not configured on this proxy"
+            );
+        };
+
+        Ok(route_pools.primary().backend_addr())
+    }
+}
+
 impl Proxy {
     #[must_use]
     pub fn new(config: Config) -> Self {
@@ -307,7 +343,7 @@ impl Proxy {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let state = self.initialize_runtime_state().await?;
+        let state = self.initialize_runtime_state()?;
 
         let listener = TcpListener::bind(state.effective_config.connection.listen_addr)
             .await
@@ -417,7 +453,7 @@ impl Proxy {
     }
 
     async fn run_thread_per_core_inner(self) -> anyhow::Result<()> {
-        let state = self.initialize_runtime_state().await?;
+        let state = self.initialize_runtime_state()?;
         let listen_addr =
             resolve_runtime_listen_addr(state.effective_config.connection.listen_addr)?;
         let resource_limits = limits::detect_cgroup_limits();
@@ -685,7 +721,7 @@ impl Proxy {
         }
     }
 
-    async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
+    pub(crate) fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
         effective_config.validate().map_err(anyhow::Error::msg)?;
         reload::validate_runtime_assets(&effective_config)?;

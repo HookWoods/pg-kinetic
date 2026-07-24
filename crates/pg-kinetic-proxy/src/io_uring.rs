@@ -24,15 +24,13 @@ mod linux {
     };
     use pg_kinetic_core::runtime::ShutdownReason;
 
-    use crate::{
-        drain::DrainController,
-        lifecycle::{wait_for_shutdown_signal, LifecycleController},
-    };
+    use crate::{drain::DrainController, lifecycle::wait_for_shutdown_signal};
 
     pub fn run(config: Config) -> anyhow::Result<()> {
+        let proxy = crate::proxy::Proxy::new(config);
+        let runtime_state = Arc::new(proxy.initialize_runtime_state()?);
+        let config = runtime_state.effective_config().clone();
         validate_supported_config(&config)?;
-
-        let backend_addr = direct_backend_addr(&config)?;
         let shard_count = config
             .runtime
             .engine
@@ -42,12 +40,7 @@ mod linux {
         let start_accepting = Arc::new(AtomicBool::new(false));
         let client_capacity = Arc::new(AtomicUsize::new(0));
         let backend_capacity = Arc::new(AtomicUsize::new(0));
-        let lifecycle = LifecycleController::new(
-            Arc::new(DrainController::default()),
-            config.drain.drain_timeout(),
-            config.runtime.lifecycle.shutdown_grace(),
-            config.runtime.lifecycle.readiness_fail_during_drain,
-        );
+        let lifecycle = proxy.lifecycle_controller();
         let mut shard_threads = Vec::with_capacity(shard_count);
         let (startup_tx, startup_rx) = mpsc::channel();
 
@@ -56,6 +49,7 @@ mod linux {
             let start_accepting = Arc::clone(&start_accepting);
             let client_capacity = Arc::clone(&client_capacity);
             let backend_capacity = Arc::clone(&backend_capacity);
+            let runtime_state = Arc::clone(&runtime_state);
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
@@ -82,7 +76,7 @@ mod linux {
                     runtime.block_on(run_shard(
                         shard_id,
                         listen_addr,
-                        backend_addr,
+                        runtime_state,
                         stop,
                         start_accepting,
                         client_capacity,
@@ -124,7 +118,7 @@ mod linux {
 
         tracing::info!(
             listen_addr = %config.connection.listen_addr,
-            backend_addr = %backend_addr,
+            backend_addr = %runtime_state.default_primary_backend_addr(),
             shards = shard_count,
             "experimental io_uring plaintext pass-through runtime listening"
         );
@@ -181,7 +175,7 @@ mod linux {
     async fn run_shard(
         shard_id: usize,
         listen_addr: SocketAddr,
-        backend_addr: SocketAddr,
+        runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
         client_capacity: Arc<AtomicUsize>,
@@ -208,7 +202,7 @@ mod linux {
 
         wait_for_start_gate(&start_accepting, &stop).await;
         while !stop.load(Ordering::Acquire) && drain.is_accepting() {
-            let (client, _client_addr) =
+            let (client, client_addr) =
                 listener.accept().await.context("accept io_uring client")?;
             if stop.load(Ordering::Acquire) {
                 break;
@@ -223,10 +217,12 @@ mod linux {
                 continue;
             };
             let backend_capacity = Arc::clone(&backend_capacity);
+            let runtime_state = Arc::clone(&runtime_state);
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
-                    backend_addr,
+                    client_addr,
+                    runtime_state,
                     backend_capacity,
                     max_backends,
                     max_client_buffer_bytes,
@@ -267,7 +263,8 @@ mod linux {
 
     async fn proxy_connection(
         client: TcpStream,
-        backend_addr: SocketAddr,
+        client_addr: SocketAddr,
+        runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         backend_capacity: Arc<AtomicUsize>,
         max_backends: usize,
         max_client_buffer_bytes: usize,
@@ -284,6 +281,7 @@ mod linux {
             )? {
                 crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
                 crate::io_runtime::StartupPacketRead::Cancel { bytes, .. } => {
+                    let backend_addr = runtime_state.default_primary_backend_addr();
                     let Some(backend_capacity_guard) =
                         crate::io_runtime::try_enter_backend_capacity(
                             &backend_capacity,
@@ -321,6 +319,9 @@ mod linux {
                 }
             }
         };
+        let backend_addr = runtime_state
+            .startup_primary_backend_addr(&startup_packet, client_addr)
+            .context("resolve startup backend")?;
 
         let Some(_backend_capacity_guard) =
             crate::io_runtime::try_enter_backend_capacity(&backend_capacity, max_backends)
@@ -446,6 +447,17 @@ pub fn validate_supported_config_for_test(config: &Config) -> anyhow::Result<()>
 
 pub fn direct_backend_addr_for_test(config: &Config) -> anyhow::Result<SocketAddr> {
     direct_backend_addr(config)
+}
+
+pub fn startup_backend_addr_for_test(
+    config: Config,
+    startup_packet: &[u8],
+    client_addr: SocketAddr,
+) -> anyhow::Result<SocketAddr> {
+    validate_supported_config(&config)?;
+    let proxy = crate::proxy::Proxy::new(config);
+    let runtime_state = proxy.initialize_runtime_state()?;
+    runtime_state.startup_primary_backend_addr(startup_packet, client_addr)
 }
 
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
