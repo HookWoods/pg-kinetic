@@ -30,9 +30,26 @@ use pg_kinetic_core::{
 pub struct BackendPool {
     connector: TokioBackendConnector,
     reset_query: Arc<str>,
+    core: Arc<BackendPoolCore<Backend, TokioBackendConnector>>,
+}
+
+pub(crate) trait PoolBackendConnector<T>: Clone + std::fmt::Debug
+where
+    T: PoolBackendTransport,
+{
+    async fn connect(&self) -> anyhow::Result<T>;
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendPoolCore<T, C>
+where
+    T: PoolBackendTransport,
+    C: PoolBackendConnector<T>,
+{
+    connector: C,
     gate: BackpressureGate,
     route_gates: StdRwLock<HashMap<PoolKey, RouteGateEntry>>,
-    backends: BackendStore<Backend>,
+    backends: BackendStore<T>,
     snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
     max_waiters: usize,
@@ -100,7 +117,9 @@ impl TokioBackendConnector {
     fn connection_settings(&self) -> (TlsConfig, SocketConfig) {
         (self.tls.clone(), self.socket.clone())
     }
+}
 
+impl PoolBackendConnector<Backend> for TokioBackendConnector {
     async fn connect(&self) -> anyhow::Result<Backend> {
         Backend::connect_with_socket(self.backend_addr, &self.tls, &self.socket).await
     }
@@ -437,15 +456,15 @@ pub type PooledBackend = PooledBackendLease<Backend, Arc<BackendPool>>;
 
 impl BackendLeaseOwner<Backend> for Arc<BackendPool> {
     async fn return_backend(&self, backend: Backend) {
-        self.as_ref().return_backend(backend).await;
+        self.as_ref().core.return_backend(backend).await;
     }
 
     fn discard_backend(&self, backend_id: u64) {
-        self.as_ref().discard_backend(backend_id);
+        self.as_ref().core.discard_backend(backend_id);
     }
 
     fn record_backpressure_counts(&self, route: &RouteKey, gate: &BackpressureGate) {
-        self.as_ref().record_backpressure_counts(route, gate);
+        self.as_ref().core.record_backpressure_counts(route, gate);
     }
 }
 
@@ -606,21 +625,21 @@ impl BackendPoolRef {
 
     #[must_use]
     pub fn idle_backends(&self) -> usize {
-        self.inner.pool.backends.idle_count()
+        self.inner.pool.core.backends.idle_count()
     }
 
     #[must_use]
     pub fn max_backends(&self) -> usize {
-        self.inner.pool.max_backends()
+        self.inner.pool.core.max_backends()
     }
 
     #[must_use]
     pub fn snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
-            configured_backends: self.inner.pool.max_backends(),
-            active_backends: self.inner.pool.active_count(),
-            idle_backends: self.inner.pool.idle_count(),
-            waiting_clients: self.inner.pool.gate.waiting(),
+            configured_backends: self.inner.pool.core.max_backends(),
+            active_backends: self.inner.pool.core.active_count(),
+            idle_backends: self.inner.pool.core.idle_count(),
+            waiting_clients: self.inner.pool.core.gate.waiting(),
         }
     }
 
@@ -630,7 +649,7 @@ impl BackendPoolRef {
                 id,
                 role,
                 weight: weight.max(1),
-                healthy: Arc::clone(&pool.health),
+                healthy: Arc::clone(&pool.core.health),
                 waiting_hint: AtomicUsize::new(0),
                 pool,
             }),
@@ -1386,9 +1405,9 @@ impl BackendPool {
             lifecycle.validate().is_ok(),
             "invalid pool lifecycle config"
         );
-        Arc::new(Self {
-            connector: TokioBackendConnector::new(backend_addr, tls, socket),
-            reset_query: reset_query.into(),
+        let connector = TokioBackendConnector::new(backend_addr, tls, socket);
+        let core = Arc::new(BackendPoolCore {
+            connector: connector.clone(),
             gate: BackpressureGate::new(lifecycle.max_size, max_waiters),
             route_gates: StdRwLock::new(HashMap::new()),
             backends: BackendStore::new(
@@ -1404,9 +1423,20 @@ impl BackendPool {
             route_dynamic_limit,
             checkout_timeout,
             lifecycle,
+        });
+        Arc::new(Self {
+            connector,
+            reset_query: reset_query.into(),
+            core,
         })
     }
+}
 
+impl<T, C> BackendPoolCore<T, C>
+where
+    T: PoolBackendTransport,
+    C: PoolBackendConnector<T>,
+{
     pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
         self.snapshot_store
             .store(Some(Arc::new(snapshot_store.clone())));
@@ -1416,46 +1446,15 @@ impl BackendPool {
         self.sync_pool_snapshot();
     }
 
-    pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
-        self.checkout_primary(route).await
-    }
-
-    pub async fn checkout_primary(
+    async fn checkout_with_mode<O>(
         self: &Arc<Self>,
-        route: RouteKey,
-    ) -> Result<PooledBackend, PoolError> {
-        self.checkout_with_mode(route, CheckoutMode::AllowConnect)
-            .await
-    }
-
-    pub async fn checkout_reusable(
-        self: &Arc<Self>,
-        route: RouteKey,
-    ) -> Result<PooledBackend, PoolError> {
-        self.checkout_primary_reusable(route).await
-    }
-
-    pub async fn checkout_primary_reusable(
-        self: &Arc<Self>,
-        route: RouteKey,
-    ) -> Result<PooledBackend, PoolError> {
-        self.checkout_with_mode(route, CheckoutMode::ReuseOnly)
-            .await
-    }
-
-    pub async fn checkout_primary_prefer_connect(
-        self: &Arc<Self>,
-        route: RouteKey,
-    ) -> Result<PooledBackend, PoolError> {
-        self.checkout_with_mode(route, CheckoutMode::PreferConnect)
-            .await
-    }
-
-    async fn checkout_with_mode(
-        self: &Arc<Self>,
+        owner: O,
         route: RouteKey,
         mode: CheckoutMode,
-    ) -> Result<PooledBackend, PoolError> {
+    ) -> Result<PooledBackendLease<T, O>, PoolError>
+    where
+        O: BackendLeaseOwner<T>,
+    {
         let route_gate_started = Instant::now();
         let route_gate = self.route_gate(&route);
         let route_gate_wait_ms = route_gate_started.elapsed().as_secs_f64() * 1_000.0;
@@ -1523,7 +1522,7 @@ impl BackendPool {
                             );
                             self.sync_pool_snapshot();
                             let lease = BackendLeaseState::new(
-                                self.clone(),
+                                owner.clone(),
                                 Arc::clone(&self.health),
                                 Some(BackpressurePermit::join(route_permit, permit)),
                                 checkout_route.clone(),
@@ -1550,7 +1549,7 @@ impl BackendPool {
                 PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
                 let lease = BackendLeaseState::new(
-                    self.clone(),
+                    owner.clone(),
                     Arc::clone(&self.health),
                     Some(BackpressurePermit::join(route_permit, permit)),
                     checkout_route.clone(),
@@ -1568,7 +1567,7 @@ impl BackendPool {
                     self.sync_pool_snapshot();
 
                     let lease = BackendLeaseState::new(
-                        self.clone(),
+                        owner.clone(),
                         Arc::clone(&self.health),
                         Some(BackpressurePermit::join(route_permit, permit)),
                         checkout_route.clone(),
@@ -1599,7 +1598,7 @@ impl BackendPool {
             self.sync_pool_snapshot();
 
             let lease = BackendLeaseState::new(
-                self.clone(),
+                owner.clone(),
                 Arc::clone(&self.health),
                 Some(BackpressurePermit::join(route_permit, permit)),
                 checkout_route.clone(),
@@ -1633,7 +1632,7 @@ impl BackendPool {
     async fn connect_reserved_backend(
         &self,
         global_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Backend, PoolError> {
+    ) -> Result<T, PoolError> {
         match self.connector.connect().await {
             Ok(backend) => {
                 self.backends.register_backend(&backend, global_permit);
@@ -1648,12 +1647,12 @@ impl BackendPool {
     }
 
     #[must_use]
-    pub const fn max_backends(&self) -> usize {
+    pub fn max_backends(&self) -> usize {
         self.backends.max_backends
     }
 
     #[must_use]
-    pub const fn lifecycle_config(&self) -> &PoolLifecycleConfig {
+    pub fn lifecycle_config(&self) -> &PoolLifecycleConfig {
         &self.lifecycle
     }
 
@@ -1677,7 +1676,11 @@ impl BackendPool {
         self.sync_pool_snapshot();
     }
 
-    pub fn start_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn start_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()>
+    where
+        T: Send + Sync + 'static,
+        C: Send + Sync + 'static,
+    {
         let pool = Arc::clone(self);
         let interval = [pool.lifecycle.idle_timeout, pool.lifecycle.max_lifetime]
             .into_iter()
@@ -1695,23 +1698,18 @@ impl BackendPool {
     }
 
     #[must_use]
-    pub const fn max_waiters(&self) -> usize {
+    pub fn max_waiters(&self) -> usize {
         self.max_waiters
     }
 
     #[must_use]
-    pub const fn route_max_in_flight(&self) -> usize {
+    pub fn route_max_in_flight(&self) -> usize {
         self.route_max_in_flight
     }
 
     #[must_use]
-    pub const fn route_max_waiters(&self) -> usize {
+    pub fn route_max_waiters(&self) -> usize {
         self.route_max_waiters
-    }
-
-    #[must_use]
-    pub fn reset_query(&self) -> &str {
-        &self.reset_query
     }
 
     fn route_gate(&self, route: &RouteKey) -> RouteGateEntry {
@@ -1755,9 +1753,9 @@ impl BackendPool {
         }
     }
 
-    fn attach_backend_snapshot_store<T>(&self, backend: &mut T)
+    fn attach_backend_snapshot_store<U>(&self, backend: &mut U)
     where
-        T: PoolBackendTransport,
+        U: PoolBackendTransport,
     {
         self.with_snapshot_store(|snapshot_store| {
             backend.attach_snapshot_store(snapshot_store.clone());
@@ -1800,7 +1798,7 @@ impl BackendPool {
         });
     }
 
-    async fn return_backend(&self, backend: Backend) {
+    async fn return_backend(&self, backend: T) {
         self.backends.return_backend(backend).await;
         self.sync_pool_snapshot();
     }
@@ -1808,6 +1806,120 @@ impl BackendPool {
     fn discard_backend(&self, backend_id: u64) {
         self.backends.discard_backend(backend_id);
         self.sync_pool_snapshot();
+    }
+
+    #[cfg(test)]
+    fn new_for_test(connector: C, lifecycle: PoolLifecycleConfig) -> Arc<Self> {
+        Arc::new(Self {
+            connector,
+            gate: BackpressureGate::new(lifecycle.max_size, 1),
+            route_gates: StdRwLock::new(HashMap::new()),
+            backends: BackendStore::new(lifecycle.max_size, None, None),
+            snapshot_store: ArcSwapOption::empty(),
+            health: Arc::new(AtomicBool::new(true)),
+            max_waiters: 1,
+            route_max_in_flight: 1,
+            route_max_waiters: 1,
+            route_dynamic_limit: None,
+            checkout_timeout: Duration::from_millis(200),
+            lifecycle,
+        })
+    }
+}
+
+impl BackendPool {
+    pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
+        self.core.attach_snapshot_store(snapshot_store);
+    }
+
+    pub async fn checkout(self: &Arc<Self>, route: RouteKey) -> Result<PooledBackend, PoolError> {
+        self.checkout_primary(route).await
+    }
+
+    pub async fn checkout_primary(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.core
+            .checkout_with_mode(Arc::clone(self), route, CheckoutMode::AllowConnect)
+            .await
+    }
+
+    pub async fn checkout_reusable(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.checkout_primary_reusable(route).await
+    }
+
+    pub async fn checkout_primary_reusable(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.core
+            .checkout_with_mode(Arc::clone(self), route, CheckoutMode::ReuseOnly)
+            .await
+    }
+
+    pub async fn checkout_primary_prefer_connect(
+        self: &Arc<Self>,
+        route: RouteKey,
+    ) -> Result<PooledBackend, PoolError> {
+        self.core
+            .checkout_with_mode(Arc::clone(self), route, CheckoutMode::PreferConnect)
+            .await
+    }
+
+    #[must_use]
+    pub fn max_backends(&self) -> usize {
+        self.core.max_backends()
+    }
+
+    #[must_use]
+    pub fn lifecycle_config(&self) -> &PoolLifecycleConfig {
+        self.core.lifecycle_config()
+    }
+
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.core.active_count()
+    }
+
+    #[must_use]
+    pub fn idle_count(&self) -> usize {
+        self.core.idle_count()
+    }
+
+    pub async fn reap_idle(&self) {
+        self.core.reap_idle().await;
+    }
+
+    pub async fn retire_idle_backends(&self) {
+        self.core.retire_idle_backends().await;
+    }
+
+    pub fn start_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.core.start_reaper()
+    }
+
+    #[must_use]
+    pub fn max_waiters(&self) -> usize {
+        self.core.max_waiters()
+    }
+
+    #[must_use]
+    pub fn route_max_in_flight(&self) -> usize {
+        self.core.route_max_in_flight()
+    }
+
+    #[must_use]
+    pub fn route_max_waiters(&self) -> usize {
+        self.core.route_max_waiters()
+    }
+
+    #[must_use]
+    pub fn reset_query(&self) -> &str {
+        &self.reset_query
     }
 }
 
@@ -1819,7 +1931,11 @@ fn backpressure_outcome(error: BackpressureError) -> &'static str {
     }
 }
 
-fn pool_checkout_outcome(result: &Result<PooledBackend, PoolError>) -> &'static str {
+fn pool_checkout_outcome<T, O>(result: &Result<PooledBackendLease<T, O>, PoolError>) -> &'static str
+where
+    T: PoolBackendTransport,
+    O: BackendLeaseOwner<T>,
+{
     match result {
         Ok(_) => "ok",
         Err(PoolError::Backpressure(error)) => backpressure_outcome(*error),
@@ -2100,7 +2216,7 @@ mod tests {
 
         let lease = BackendLeaseState::new(
             Arc::clone(&pool),
-            Arc::clone(&pool.health),
+            Arc::clone(&pool.core.health),
             Some(permit),
             route.clone(),
             route_gate,
@@ -2121,14 +2237,14 @@ mod tests {
             .checkout_primary(route)
             .await
             .expect("initial checkout");
-        assert_eq!(pool.backends.idle_count(), 0);
-        assert_eq!(pool.backends.active_count(), 1);
+        assert_eq!(pool.core.backends.idle_count(), 0);
+        assert_eq!(pool.core.backends.active_count(), 1);
 
         checkout.release().await;
         wait_for_accepts(&accepted, 1).await;
 
-        assert_eq!(pool.backends.idle_count(), 1);
-        assert_eq!(pool.backends.active_count(), 1);
+        assert_eq!(pool.core.backends.idle_count(), 1);
+        assert_eq!(pool.core.backends.active_count(), 1);
     }
 
     #[tokio::test]
@@ -2283,6 +2399,63 @@ mod tests {
         assert_eq!(backend_idled.load(Ordering::Relaxed), 1);
         assert_eq!(backend_discarded.load(Ordering::Relaxed), 0);
         assert_eq!(owner_discarded.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn backend_pool_core_connects_through_transport_connector() {
+        #[derive(Clone, Debug)]
+        struct MemoryConnector {
+            connected: Arc<AtomicUsize>,
+        }
+
+        #[derive(Debug)]
+        struct MemoryBackend {
+            id: u64,
+        }
+
+        impl PoolBackendTransport for MemoryBackend {
+            fn id(&self) -> u64 {
+                self.id
+            }
+
+            fn attach_snapshot_store(&mut self, _snapshot_store: SnapshotStore) {}
+
+            fn mark_checked_out(&self, _route_key: Option<RouteKey>) {}
+
+            fn mark_idle(&self, _route_key: Option<RouteKey>) {}
+
+            fn mark_discarded(&self) {}
+        }
+
+        impl PoolBackendConnector<MemoryBackend> for MemoryConnector {
+            async fn connect(&self) -> anyhow::Result<MemoryBackend> {
+                let id = self.connected.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+                Ok(MemoryBackend { id })
+            }
+        }
+
+        let connected = Arc::new(AtomicUsize::new(0));
+        let core = BackendPoolCore::new_for_test(
+            MemoryConnector {
+                connected: Arc::clone(&connected),
+            },
+            PoolLifecycleConfig {
+                max_size: 1,
+                min_idle: 0,
+                idle_timeout: Duration::ZERO,
+                max_lifetime: Duration::ZERO,
+            },
+        );
+
+        let permit = core.backends.reserve_backend_slot().expect("slot");
+        let backend = core
+            .connect_reserved_backend(permit)
+            .await
+            .expect("connected backend");
+
+        assert_eq!(backend.id(), 1);
+        assert_eq!(connected.load(Ordering::Relaxed), 1);
+        assert_eq!(core.backends.active_count(), 1);
     }
 
     #[test]

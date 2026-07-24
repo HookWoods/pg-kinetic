@@ -12,7 +12,7 @@ use monoio::{
 
 use crate::{
     metrics,
-    pool::PoolBackendTransport,
+    pool::{PoolBackendConnector, PoolBackendTransport},
     snapshot::{ServerSnapshot, SnapshotStore},
 };
 use pg_kinetic_core::route::RouteKey;
@@ -164,6 +164,31 @@ impl PoolBackendTransport for MonoioBackend {
         if let Some(snapshot_store) = self.snapshot_store.as_ref() {
             metrics::remove_server_snapshot(snapshot_store, self.id);
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MonoioBackendConnector {
+    backend_addr: SocketAddr,
+}
+
+impl MonoioBackendConnector {
+    pub(crate) const fn new(backend_addr: SocketAddr) -> Self {
+        Self { backend_addr }
+    }
+
+    pub(crate) const fn backend_addr(&self) -> SocketAddr {
+        self.backend_addr
+    }
+}
+
+impl PoolBackendConnector<MonoioBackend> for MonoioBackendConnector {
+    async fn connect(&self) -> anyhow::Result<MonoioBackend> {
+        let stream = TcpStream::connect_addr(self.backend_addr).await?;
+        Ok(MonoioBackend::new(
+            self.backend_addr,
+            MonoioTransport::new(stream),
+        ))
     }
 }
 
