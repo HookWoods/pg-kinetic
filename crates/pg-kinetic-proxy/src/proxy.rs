@@ -342,6 +342,28 @@ impl Proxy {
         self.snapshot_store.clone()
     }
 
+    #[must_use]
+    pub(crate) fn available_client_slots(&self) -> usize {
+        self.client_slots.available_permits()
+    }
+
+    #[must_use]
+    pub(crate) fn available_backend_slots(&self) -> usize {
+        self.backend_slots.available_permits()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn client_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.client_slots)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn backend_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.backend_slots)
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
         let state = self.initialize_runtime_state()?;
 

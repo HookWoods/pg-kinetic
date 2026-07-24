@@ -55,6 +55,18 @@ fn io_uring_resolves_startup_backend_through_shared_runtime_state() {
 }
 
 #[test]
+fn io_uring_prepares_proxy_capacity_slots_from_shared_runtime_state() {
+    let mut config = io_uring_config();
+    config.capacity.max_clients = 17;
+    config.capacity.max_backends = 19;
+
+    let limits = io_uring::shared_capacity_limits_for_test(config)
+        .expect("io_uring prepares shared proxy capacity slots");
+
+    assert_eq!(limits, (17, 19));
+}
+
+#[test]
 fn io_uring_rejects_client_tls_until_semantic_runtime_exists() {
     let mut config = io_uring_config();
     config.tls.client_tls_mode = ClientTlsMode::Require;

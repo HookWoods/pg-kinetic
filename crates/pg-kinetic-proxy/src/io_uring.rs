@@ -9,7 +9,7 @@ mod linux {
     use std::{
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
             mpsc::{self, RecvTimeoutError},
             Arc,
         },
@@ -38,8 +38,8 @@ mod linux {
             .unwrap_or_else(default_shard_count);
         let stop = Arc::new(AtomicBool::new(false));
         let start_accepting = Arc::new(AtomicBool::new(false));
-        let client_capacity = Arc::new(AtomicUsize::new(0));
-        let backend_capacity = Arc::new(AtomicUsize::new(0));
+        let client_slots = proxy.client_slots();
+        let backend_slots = proxy.backend_slots();
         let lifecycle = proxy.lifecycle_controller();
         let mut shard_threads = Vec::with_capacity(shard_count);
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -47,14 +47,12 @@ mod linux {
         for shard_id in 0..shard_count {
             let stop = Arc::clone(&stop);
             let start_accepting = Arc::clone(&start_accepting);
-            let client_capacity = Arc::clone(&client_capacity);
-            let backend_capacity = Arc::clone(&backend_capacity);
+            let client_slots = Arc::clone(&client_slots);
+            let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
-            let max_clients = config.capacity.max_clients;
-            let max_backends = config.capacity.max_backends;
             let drain_timeout = config.drain.drain_timeout();
             let max_client_buffer_bytes = config.qos.max_client_buffer_bytes;
             let max_backend_buffer_bytes = config.qos.max_backend_buffer_bytes;
@@ -79,12 +77,10 @@ mod linux {
                         runtime_state,
                         stop,
                         start_accepting,
-                        client_capacity,
-                        backend_capacity,
+                        client_slots,
+                        backend_slots,
                         lifecycle.drain_token(),
                         lifecycle.drain_controller(),
-                        max_clients,
-                        max_backends,
                         drain_timeout,
                         max_client_buffer_bytes,
                         max_backend_buffer_bytes,
@@ -178,12 +174,10 @@ mod linux {
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
-        client_capacity: Arc<AtomicUsize>,
-        backend_capacity: Arc<AtomicUsize>,
+        client_slots: Arc<tokio::sync::Semaphore>,
+        backend_slots: Arc<tokio::sync::Semaphore>,
         drain: crate::lifecycle::DrainToken,
         drain_controller: Arc<DrainController>,
-        max_clients: usize,
-        max_backends: usize,
         drain_timeout: Duration,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
@@ -210,21 +204,18 @@ mod linux {
             let Some(session_guard) = drain.try_enter() else {
                 continue;
             };
-            let Some(client_capacity_guard) =
-                crate::io_runtime::try_enter_client_capacity(&client_capacity, max_clients)
-            else {
+            let Ok(client_capacity_guard) = Arc::clone(&client_slots).try_acquire_owned() else {
                 drop(session_guard);
                 continue;
             };
-            let backend_capacity = Arc::clone(&backend_capacity);
+            let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
                     client_addr,
                     runtime_state,
-                    backend_capacity,
-                    max_backends,
+                    backend_slots,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
                 )
@@ -265,8 +256,7 @@ mod linux {
         client: TcpStream,
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
-        backend_capacity: Arc<AtomicUsize>,
-        max_backends: usize,
+        backend_slots: Arc<tokio::sync::Semaphore>,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
@@ -282,11 +272,7 @@ mod linux {
                 crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
                 crate::io_runtime::StartupPacketRead::Cancel { bytes, .. } => {
                     let backend_addr = runtime_state.default_primary_backend_addr();
-                    let Some(backend_capacity_guard) =
-                        crate::io_runtime::try_enter_backend_capacity(
-                            &backend_capacity,
-                            max_backends,
-                        )
+                    let Ok(backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned()
                     else {
                         anyhow::bail!("backend capacity exceeded");
                     };
@@ -323,9 +309,7 @@ mod linux {
             .startup_primary_backend_addr(&startup_packet, client_addr)
             .context("resolve startup backend")?;
 
-        let Some(_backend_capacity_guard) =
-            crate::io_runtime::try_enter_backend_capacity(&backend_capacity, max_backends)
-        else {
+        let Ok(_backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned() else {
             anyhow::bail!("backend capacity exceeded");
         };
         let backend = TcpStream::connect_addr(backend_addr)
@@ -458,6 +442,16 @@ pub fn startup_backend_addr_for_test(
     let proxy = crate::proxy::Proxy::new(config);
     let runtime_state = proxy.initialize_runtime_state()?;
     runtime_state.startup_primary_backend_addr(startup_packet, client_addr)
+}
+
+pub fn shared_capacity_limits_for_test(config: Config) -> anyhow::Result<(usize, usize)> {
+    validate_supported_config(&config)?;
+    let proxy = crate::proxy::Proxy::new(config);
+    let _runtime_state = proxy.initialize_runtime_state()?;
+    Ok((
+        proxy.available_client_slots(),
+        proxy.available_backend_slots(),
+    ))
 }
 
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
