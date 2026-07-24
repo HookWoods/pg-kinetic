@@ -81,12 +81,11 @@ where
                 return Ok(StartupOrCancel::Startup(bytes));
             }
             crate::io_runtime::StartupPacketRead::Cancel {
-                bytes,
                 process_id,
                 secret_key,
+                ..
             } => {
                 return Ok(StartupOrCancel::Cancel {
-                    bytes,
                     process_id,
                     secret_key,
                 });
@@ -116,11 +115,7 @@ where
 #[derive(Debug)]
 pub(crate) enum StartupOrCancel {
     Startup(BytesMut),
-    Cancel {
-        bytes: BytesMut,
-        process_id: i32,
-        secret_key: i32,
-    },
+    Cancel { process_id: i32, secret_key: i32 },
     Finished,
 }
 
