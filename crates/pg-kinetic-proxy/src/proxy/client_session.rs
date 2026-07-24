@@ -37,6 +37,8 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) routing_planner: ReadRoutingPlanner,
     pub(crate) route_read_routing_mode: ReadRoutingMode,
     pub(crate) route_fallback_policy: FallbackPolicy,
+    pub(crate) read_after_write_timeout: Duration,
+    pub(crate) read_after_write_protection_enabled: bool,
     pub(crate) snapshot_store: SnapshotStore,
     pub(crate) phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     pub(crate) session_id: u64,
@@ -142,6 +144,92 @@ fn should_replay_shared_session(
     session.has_replayable_settings() && previous_backend_id != Some(backend_id)
 }
 
+fn should_probe_read_after_write(
+    committed_write_transaction: bool,
+    read_after_write_protection_enabled: bool,
+    status: ReadyStatus,
+) -> bool {
+    committed_write_transaction
+        && read_after_write_protection_enabled
+        && status == ReadyStatus::Idle
+}
+
+fn apply_read_after_write_probe_result(
+    session: &mut VirtualSession,
+    result: anyhow::Result<PgLsn>,
+) {
+    match result {
+        Ok(lsn) => session.set_read_after_write_required(lsn),
+        Err(_) => session.set_read_after_write_unknown(),
+    }
+}
+
+async fn probe_shared_read_after_write_requirement<S>(
+    backend: &mut S,
+    probe_timeout: Duration,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<PgLsn>
+where
+    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let probe = probe_shared_read_after_write_requirement_without_timeout(
+        backend,
+        max_backend_buffer_bytes,
+    );
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    let result = monoio::time::timeout(probe_timeout, probe).await;
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    let result = tokio::time::timeout(probe_timeout, probe).await;
+
+    result.map_err(|_| anyhow::anyhow!("read-after-write probe timed out"))?
+}
+
+async fn probe_shared_read_after_write_requirement_without_timeout<S>(
+    backend: &mut S,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<PgLsn>
+where
+    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let frame = simple_query_frame("SELECT pg_current_wal_lsn()");
+    crate::io_runtime::write_all_to(backend, &encode_frontend_frame(&frame))
+        .await
+        .context("write read-after-write probe")?;
+
+    let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut probe_lsn = None;
+    loop {
+        if backend_buffer.len() >= max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
+        let read = crate::io_runtime::read_from(backend, &mut backend_buffer)
+            .await
+            .context("read read-after-write probe response")?;
+        if read == 0 {
+            anyhow::bail!("backend disconnected during read-after-write probe");
+        }
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
+        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            match frame.tag {
+                tag if tag == u8::from(BackendTag::DataRow) && probe_lsn.is_none() => {
+                    probe_lsn = parse_read_after_write_lsn(&frame.payload)?;
+                }
+                tag if tag == u8::from(BackendTag::ErrorResponse) => {
+                    anyhow::bail!("backend returned error during read-after-write probe");
+                }
+                tag if tag == u8::from(BackendTag::ReadyForQuery) => {
+                    return probe_lsn.context("read-after-write probe returned no LSN");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 pub(crate) async fn handle_client_session<C, B, O, P>(
     mut client: C,
     _client_addr: SocketAddr,
@@ -173,6 +261,8 @@ where
         routing_planner,
         route_read_routing_mode,
         route_fallback_policy,
+        read_after_write_timeout,
+        read_after_write_protection_enabled,
         snapshot_store,
         phase_recorder,
         session_id,
@@ -289,17 +379,24 @@ where
                         return Err(error);
                     }
                 };
-                if let Err(error) = update_transaction_state_from_request_plans(
+                let committed_write_transaction = match update_transaction_state_from_request_plans(
                     &mut session,
                     &request_plans,
                     full_routing_analysis,
                 )
                 .context("update transaction state before monoio backend checkout")
                 {
-                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
+                    Ok(committed_write_transaction) => committed_write_transaction,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
                         .await;
-                    return Err(error);
-                }
+                        return Err(error);
+                    }
+                };
                 let selection = ReadRoutingSelection {
                     planner: &routing_planner,
                     route_pools: &route_pools,
@@ -437,16 +534,40 @@ where
                     max_backend_buffer_bytes,
                 )
                 .await;
-                drop(runtime_backend);
-                if result.is_err() {
-                    previous_backend_id = None;
-                    discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
-                } else if session.pin_reason().is_some() {
-                    held_backend = Some(backend);
-                } else {
-                    release_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
+                match result {
+                    Ok(status) => {
+                        if should_probe_read_after_write(
+                            committed_write_transaction,
+                            read_after_write_protection_enabled,
+                            status,
+                        ) {
+                            let freshness_outcome = probe_shared_read_after_write_requirement(
+                                &mut runtime_backend,
+                                read_after_write_timeout,
+                                max_backend_buffer_bytes,
+                            )
+                            .await;
+                            apply_read_after_write_probe_result(&mut session, freshness_outcome);
+                        }
+                        drop(runtime_backend);
+                        if session.pin_reason().is_some() {
+                            held_backend = Some(backend);
+                        } else {
+                            release_backend_with_cancel_unbind(
+                                &cancel_registry,
+                                client_key,
+                                backend,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        drop(runtime_backend);
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        return Err(error);
+                    }
                 }
-                result?;
             }
             crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
                 cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
@@ -1829,5 +1950,42 @@ mod tests {
         session.apply_sql(classify("commit"));
 
         assert!(!should_reuse_held_backend(&session, Some(7)));
+    }
+
+    #[test]
+    fn shared_freshness_probe_updates_session_state() {
+        let mut session = VirtualSession::default();
+
+        assert!(should_probe_read_after_write(true, true, ReadyStatus::Idle));
+        apply_read_after_write_probe_result(&mut session, Ok(PgLsn::new(42)));
+        assert_eq!(
+            session.read_after_write_state(),
+            ReadAfterWriteState::Required(PgLsn::new(42))
+        );
+
+        apply_read_after_write_probe_result(&mut session, Err(anyhow::anyhow!("probe failed")));
+        assert_eq!(
+            session.read_after_write_state(),
+            ReadAfterWriteState::Unknown
+        );
+    }
+
+    #[test]
+    fn shared_freshness_probe_requires_committed_idle_protected_cycle() {
+        assert!(!should_probe_read_after_write(
+            false,
+            true,
+            ReadyStatus::Idle
+        ));
+        assert!(!should_probe_read_after_write(
+            true,
+            false,
+            ReadyStatus::Idle
+        ));
+        assert!(!should_probe_read_after_write(
+            true,
+            true,
+            ReadyStatus::InTransaction
+        ));
     }
 }

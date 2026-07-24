@@ -198,7 +198,7 @@ pub(crate) async fn forward_runtime_cycle<C, B>(
     injected_parse_completes: usize,
     backend_buffer: &mut BytesMut,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<()>
+) -> anyhow::Result<ReadyStatus>
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
     B: crate::io_runtime::RuntimeByteStream + ?Sized,

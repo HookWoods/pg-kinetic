@@ -473,7 +473,7 @@ pub(crate) async fn forward_backend_until_ready<B, C>(
     read_context: &'static str,
     write_context: &'static str,
     closed_message: &'static str,
-) -> anyhow::Result<()>
+) -> anyhow::Result<ReadyStatus>
 where
     B: RuntimeByteStream + ?Sized,
     C: RuntimeByteStream + ?Sized,
@@ -494,7 +494,7 @@ where
                         .with_context(|| write_context)?;
                 }
                 if ready.is_some() {
-                    return Ok(());
+                    return Ok(ready.expect("ready status is present"));
                 }
             }
             BackendBytesDrainEvent::BufferLimitExceeded => {

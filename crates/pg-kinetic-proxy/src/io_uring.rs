@@ -337,6 +337,8 @@ mod linux {
             route_pools: startup_plan.route_pools,
             route_read_routing_mode: route_policy.routing_planner.read_routing_mode(),
             route_fallback_policy: route_policy.routing_planner.fallback_policy(),
+            read_after_write_timeout: route_policy.read_after_write_timeout,
+            read_after_write_protection_enabled: route_policy.read_after_write_protection_enabled,
             routing_planner: route_policy.routing_planner,
             snapshot_store: runtime_state.snapshot_store(),
             phase_recorder: crate::telemetry::phase_timing_recorder(false),
