@@ -68,12 +68,56 @@ struct RouteGateEntry {
 #[derive(Debug)]
 pub struct PooledBackend {
     backend: Option<Backend>,
+    lease: BackendLeaseState,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendLeaseState {
     pool: Arc<BackendPool>,
     health: Arc<AtomicBool>,
     permit: Option<BackpressurePermit>,
     route_key: RouteKey,
     route_gate: BackpressureGate,
     requires_startup: bool,
+}
+
+impl BackendLeaseState {
+    #[must_use]
+    pub(crate) const fn new(
+        pool: Arc<BackendPool>,
+        health: Arc<AtomicBool>,
+        permit: Option<BackpressurePermit>,
+        route_key: RouteKey,
+        route_gate: BackpressureGate,
+        requires_startup: bool,
+    ) -> Self {
+        Self {
+            pool,
+            health,
+            permit,
+            route_key,
+            route_gate,
+            requires_startup,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn requires_startup(&self) -> bool {
+        self.requires_startup
+    }
+
+    fn mark_failed(&self) {
+        self.health.store(false, Ordering::Release);
+    }
+
+    fn take_permit(&mut self) {
+        self.permit.take();
+    }
+
+    fn record_backpressure_counts(&self) {
+        self.pool
+            .record_backpressure_counts(&self.route_key, &self.route_gate);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1156,15 +1200,15 @@ impl BackendPool {
                             self.attach_backend_snapshot_store(&mut backend);
                             backend.mark_checked_out(Some(checkout_route.clone()));
                             self.sync_pool_snapshot();
-                            return Ok(PooledBackend {
-                                backend: Some(backend),
-                                pool: self.clone(),
-                                health: Arc::clone(&self.health),
-                                permit: Some(BackpressurePermit::join(route_permit, permit)),
-                                route_key: checkout_route.clone(),
-                                route_gate: route_gate_gate.clone(),
-                                requires_startup: true,
-                            });
+                            return Ok(PooledBackend::new(
+                                backend,
+                                self.clone(),
+                                Arc::clone(&self.health),
+                                BackpressurePermit::join(route_permit, permit),
+                                checkout_route.clone(),
+                                route_gate_gate.clone(),
+                                true,
+                            ));
                         }
                         Err(PoolError::Connect(_)) => {}
                         Err(error) => return Err(error),
@@ -1183,15 +1227,15 @@ impl BackendPool {
                 self.attach_backend_snapshot_store(&mut backend);
                 backend.mark_checked_out(Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
-                return Ok(PooledBackend {
-                    backend: Some(backend),
-                    pool: self.clone(),
-                    health: Arc::clone(&self.health),
-                    permit: Some(BackpressurePermit::join(route_permit, permit)),
-                    route_key: checkout_route.clone(),
-                    route_gate: route_gate_gate.clone(),
-                    requires_startup: false,
-                });
+                return Ok(PooledBackend::new(
+                    backend,
+                    self.clone(),
+                    Arc::clone(&self.health),
+                    BackpressurePermit::join(route_permit, permit),
+                    checkout_route.clone(),
+                    route_gate_gate.clone(),
+                    false,
+                ));
             }
 
             if mode == CheckoutMode::AllowConnect {
@@ -1201,15 +1245,15 @@ impl BackendPool {
                     backend.mark_checked_out(Some(checkout_route.clone()));
                     self.sync_pool_snapshot();
 
-                    return Ok(PooledBackend {
-                        backend: Some(backend),
-                        pool: self.clone(),
-                        health: Arc::clone(&self.health),
-                        permit: Some(BackpressurePermit::join(route_permit, permit)),
-                        route_key: checkout_route.clone(),
-                        route_gate: route_gate_gate.clone(),
-                        requires_startup: true,
-                    });
+                    return Ok(PooledBackend::new(
+                        backend,
+                        self.clone(),
+                        Arc::clone(&self.health),
+                        BackpressurePermit::join(route_permit, permit),
+                        checkout_route.clone(),
+                        route_gate_gate.clone(),
+                        true,
+                    ));
                 }
             }
 
@@ -1232,15 +1276,15 @@ impl BackendPool {
             backend.mark_checked_out(Some(checkout_route.clone()));
             self.sync_pool_snapshot();
 
-            Ok(PooledBackend {
-                backend: Some(backend),
-                pool: self.clone(),
-                health: Arc::clone(&self.health),
-                permit: Some(BackpressurePermit::join(route_permit, permit)),
-                route_key: checkout_route.clone(),
-                route_gate: route_gate_gate.clone(),
-                requires_startup: false,
-            })
+            Ok(PooledBackend::new(
+                backend,
+                self.clone(),
+                Arc::clone(&self.health),
+                BackpressurePermit::join(route_permit, permit),
+                checkout_route.clone(),
+                route_gate_gate.clone(),
+                false,
+            ))
         };
 
         let result = match timeout(self.checkout_timeout, checkout).await {
@@ -1640,6 +1684,28 @@ fn pool_checkout_outcome(result: &Result<PooledBackend, PoolError>) -> &'static 
 }
 
 impl PooledBackend {
+    fn new(
+        backend: Backend,
+        pool: Arc<BackendPool>,
+        health: Arc<AtomicBool>,
+        permit: BackpressurePermit,
+        route_key: RouteKey,
+        route_gate: BackpressureGate,
+        requires_startup: bool,
+    ) -> Self {
+        Self {
+            backend: Some(backend),
+            lease: BackendLeaseState::new(
+                pool,
+                health,
+                Some(permit),
+                route_key,
+                route_gate,
+                requires_startup,
+            ),
+        }
+    }
+
     #[must_use]
     pub fn backend_id(&self) -> u64 {
         self.backend
@@ -1662,34 +1728,32 @@ impl PooledBackend {
     }
 
     pub fn mark_failed(&self) {
-        self.health.store(false, Ordering::Release);
+        self.lease.mark_failed();
     }
 
     #[must_use]
     pub const fn requires_startup(&self) -> bool {
-        self.requires_startup
+        self.lease.requires_startup()
     }
 
     pub async fn release(mut self) {
         if let Some(backend) = self.backend.take() {
-            backend.mark_idle(Some(self.route_key.clone()));
-            self.pool.return_backend(backend).await;
+            backend.mark_idle(Some(self.lease.route_key.clone()));
+            self.lease.pool.return_backend(backend).await;
         }
 
-        self.permit.take();
-        self.pool
-            .record_backpressure_counts(&self.route_key, &self.route_gate);
+        self.lease.take_permit();
+        self.lease.record_backpressure_counts();
     }
 
     pub fn discard(mut self) {
         if let Some(backend) = self.backend.take() {
             backend.mark_discarded();
-            self.pool.discard_backend(backend.id());
+            self.lease.pool.discard_backend(backend.id());
         }
 
-        self.permit.take();
-        self.pool
-            .record_backpressure_counts(&self.route_key, &self.route_gate);
+        self.lease.take_permit();
+        self.lease.record_backpressure_counts();
     }
 }
 
@@ -1697,10 +1761,9 @@ impl Drop for PooledBackend {
     fn drop(&mut self) {
         if let Some(backend) = self.backend.take() {
             backend.mark_discarded();
-            self.pool.discard_backend(backend.id());
-            self.permit.take();
-            self.pool
-                .record_backpressure_counts(&self.route_key, &self.route_gate);
+            self.lease.pool.discard_backend(backend.id());
+            self.lease.take_permit();
+            self.lease.record_backpressure_counts();
         }
     }
 }
@@ -1873,6 +1936,36 @@ mod tests {
 
         assert!(second.requires_startup());
         wait_for_accepts(&accepted, 2).await;
+    }
+
+    #[tokio::test]
+    async fn backend_lease_state_keeps_startup_requirement_transport_neutral() {
+        let route = route_key("lease-state");
+        let pool = test_pool("127.0.0.1:1".parse().expect("addr"));
+        let route_gate = BackpressureGate::new(1, 1);
+        let pool_gate = BackpressureGate::new(1, 1);
+        let permit = BackpressurePermit::join(
+            route_gate
+                .checkout(Duration::from_millis(1))
+                .await
+                .expect("route permit"),
+            pool_gate
+                .checkout(Duration::from_millis(1))
+                .await
+                .expect("pool permit"),
+        );
+
+        let lease = BackendLeaseState::new(
+            Arc::clone(&pool),
+            Arc::clone(&pool.health),
+            Some(permit),
+            route.clone(),
+            route_gate,
+            true,
+        );
+
+        assert!(lease.requires_startup());
+        assert_eq!(&lease.route_key, &route);
     }
 
     #[test]
