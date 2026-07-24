@@ -476,7 +476,6 @@ fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
     if config.tls.backend_tls_mode != BackendTlsMode::Disable {
         anyhow::bail!("experimental_io_uring currently requires backend_tls_mode=disable");
     }
-    direct_backend_addr(config)?;
     Ok(())
 }
 
@@ -558,14 +557,15 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_multiple_route_configurations() {
+    fn direct_backend_addr_rejects_multiple_route_configurations() {
         let mut config = Config::default();
         config.routes = vec![
             RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr")),
             RouteConfig::from_backend_addr("127.0.0.1:6545".parse().expect("route addr")),
         ];
 
-        let error = validate_supported_config(&config).expect_err("multiple routes are rejected");
+        let error =
+            direct_backend_addr(&config).expect_err("direct route helper rejects multiple routes");
 
         assert!(error.to_string().contains("single primary route"));
     }
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_read_routing() {
+    fn direct_backend_addr_rejects_read_routing() {
         let mut config = Config::default();
         let mut route =
             RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
@@ -594,7 +594,8 @@ mod tests {
         };
         config.routes = vec![route];
 
-        let error = validate_supported_config(&config).expect_err("read routing is rejected");
+        let error =
+            direct_backend_addr(&config).expect_err("direct route helper rejects read routing");
 
         assert!(error.to_string().contains("read routing"));
     }
