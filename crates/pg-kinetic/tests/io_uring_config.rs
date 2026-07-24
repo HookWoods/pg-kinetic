@@ -12,6 +12,14 @@ fn io_uring_config() -> Config {
 }
 
 #[test]
+fn io_uring_accepts_current_plain_pass_through_boundary() {
+    let config = io_uring_config();
+
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("plain pass-through io_uring boundary remains supported");
+}
+
+#[test]
 fn io_uring_rejects_client_tls_until_semantic_runtime_exists() {
     let mut config = io_uring_config();
     config.tls.client_tls_mode = ClientTlsMode::Require;
