@@ -323,8 +323,10 @@ mod linux {
         let backend = TcpStream::connect_addr(backend_addr)
             .await
             .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-        let mut backend =
-            IoUringStartupBackend::new(crate::io_uring_transport::MonoioTransport::new(backend));
+        let mut backend = crate::io_uring_transport::MonoioBackend::new(
+            backend_addr,
+            crate::io_uring_transport::MonoioTransport::new(backend),
+        );
         let mut buffers = buffer_pool.acquire();
         crate::proxy::proxy_startup_streams(
             &mut client,
@@ -385,54 +387,6 @@ mod linux {
                 "backend closed during response",
             )
             .await?;
-        }
-    }
-
-    struct IoUringStartupBackend {
-        transport: crate::io_uring_transport::MonoioTransport,
-        parameter_status: Vec<(String, String)>,
-        key_data: Option<(i32, i32)>,
-    }
-
-    impl IoUringStartupBackend {
-        fn new(transport: crate::io_uring_transport::MonoioTransport) -> Self {
-            Self {
-                transport,
-                parameter_status: Vec::new(),
-                key_data: None,
-            }
-        }
-    }
-
-    impl crate::proxy::BackendStartupMetadata for IoUringStartupBackend {
-        fn is_tls(&self) -> bool {
-            false
-        }
-
-        fn parameter_status(&self) -> &[(String, String)] {
-            &self.parameter_status
-        }
-
-        fn push_parameter_status(&mut self, name: String, value: String) {
-            self.parameter_status.push((name, value));
-        }
-
-        fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
-            self.key_data = Some((process_id, secret_key));
-        }
-    }
-
-    impl crate::io_runtime::RuntimeByteStream for IoUringStartupBackend {
-        async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
-            crate::io_runtime::read_from(&mut self.transport, dst).await
-        }
-
-        async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-            crate::io_runtime::write_all_to(&mut self.transport, bytes).await
-        }
-
-        async fn shutdown_stream(&mut self) -> std::io::Result<()> {
-            crate::io_runtime::shutdown(&mut self.transport).await
         }
     }
 

@@ -32,7 +32,7 @@ pub struct BackendPool {
     reset_query: Arc<str>,
     gate: BackpressureGate,
     route_gates: StdRwLock<HashMap<PoolKey, RouteGateEntry>>,
-    backends: BackendStore,
+    backends: BackendStore<Backend>,
     snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
     max_waiters: usize,
@@ -41,6 +41,40 @@ pub struct BackendPool {
     route_dynamic_limit: Option<Arc<AtomicUsize>>,
     checkout_timeout: Duration,
     lifecycle: PoolLifecycleConfig,
+}
+
+pub(crate) trait PoolBackendTransport: std::fmt::Debug {
+    fn id(&self) -> u64;
+
+    fn attach_snapshot_store(&mut self, snapshot_store: SnapshotStore);
+
+    fn mark_checked_out(&self, route_key: Option<RouteKey>);
+
+    fn mark_idle(&self, route_key: Option<RouteKey>);
+
+    fn mark_discarded(&self);
+}
+
+impl PoolBackendTransport for Backend {
+    fn id(&self) -> u64 {
+        self.id()
+    }
+
+    fn attach_snapshot_store(&mut self, snapshot_store: SnapshotStore) {
+        Backend::attach_snapshot_store(self, snapshot_store);
+    }
+
+    fn mark_checked_out(&self, route_key: Option<RouteKey>) {
+        Backend::mark_checked_out(self, route_key);
+    }
+
+    fn mark_idle(&self, route_key: Option<RouteKey>) {
+        Backend::mark_idle(self, route_key);
+    }
+
+    fn mark_discarded(&self) {
+        Backend::mark_discarded(self);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,8 +107,8 @@ impl TokioBackendConnector {
 }
 
 #[derive(Debug)]
-struct BackendStore {
-    idle: Mutex<VecDeque<Backend>>,
+struct BackendStore<T> {
+    idle: Mutex<VecDeque<T>>,
     lifecycle: StdMutex<HashMap<u64, BackendLifecycle>>,
     global_permits: StdMutex<HashMap<u64, OwnedSemaphorePermit>>,
     available: Notify,
@@ -85,7 +119,10 @@ struct BackendStore {
     max_backends: usize,
 }
 
-impl BackendStore {
+impl<T> BackendStore<T>
+where
+    T: PoolBackendTransport,
+{
     fn new(
         max_backends: usize,
         global_slots: Option<Arc<Semaphore>>,
@@ -104,7 +141,7 @@ impl BackendStore {
         }
     }
 
-    async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<Backend> {
+    async fn checkout_idle_backend(&self, wait_for_backend: bool) -> Option<T> {
         loop {
             let notified = self.available.notified();
             if let Some(backend) = self.try_checkout_idle_backend() {
@@ -124,7 +161,7 @@ impl BackendStore {
         }
     }
 
-    fn try_checkout_idle_backend(&self) -> Option<Backend> {
+    fn try_checkout_idle_backend(&self) -> Option<T> {
         let mut idle_backends = self.idle.try_lock().ok()?;
         let backend = idle_backends.pop_front()?;
         self.idle_backends.fetch_sub(1, Ordering::AcqRel);
@@ -162,7 +199,7 @@ impl BackendStore {
         Some(global_permit)
     }
 
-    fn register_backend(&self, backend: &Backend, global_permit: Option<OwnedSemaphorePermit>) {
+    fn register_backend(&self, backend: &T, global_permit: Option<OwnedSemaphorePermit>) {
         let now = tokio::time::Instant::now();
         self.lifecycle
             .lock()
@@ -182,7 +219,7 @@ impl BackendStore {
         }
     }
 
-    async fn return_backend(&self, backend: Backend) {
+    async fn return_backend(&self, backend: T) {
         if let Some(lifecycle) = self
             .lifecycle
             .lock()
@@ -1454,7 +1491,10 @@ impl BackendPool {
                     match self.connect_reserved_backend(global_permit).await {
                         Ok(mut backend) => {
                             self.attach_backend_snapshot_store(&mut backend);
-                            backend.mark_checked_out(Some(checkout_route.clone()));
+                            PoolBackendTransport::mark_checked_out(
+                                &backend,
+                                Some(checkout_route.clone()),
+                            );
                             self.sync_pool_snapshot();
                             return Ok(PooledBackend::new(
                                 backend,
@@ -1481,7 +1521,7 @@ impl BackendPool {
             };
             if let Some(mut backend) = idle_backend {
                 self.attach_backend_snapshot_store(&mut backend);
-                backend.mark_checked_out(Some(checkout_route.clone()));
+                PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
                 self.sync_pool_snapshot();
                 return Ok(PooledBackend::new(
                     backend,
@@ -1498,7 +1538,7 @@ impl BackendPool {
                 if let Some(global_permit) = self.backends.reserve_backend_slot() {
                     let mut backend = self.connect_reserved_backend(global_permit).await?;
                     self.attach_backend_snapshot_store(&mut backend);
-                    backend.mark_checked_out(Some(checkout_route.clone()));
+                    PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
                     self.sync_pool_snapshot();
 
                     return Ok(PooledBackend::new(
@@ -1529,7 +1569,7 @@ impl BackendPool {
                 }
             };
             self.attach_backend_snapshot_store(&mut backend);
-            backend.mark_checked_out(Some(checkout_route.clone()));
+            PoolBackendTransport::mark_checked_out(&backend, Some(checkout_route.clone()));
             self.sync_pool_snapshot();
 
             Ok(PooledBackend::new(
@@ -1689,7 +1729,10 @@ impl BackendPool {
         }
     }
 
-    fn attach_backend_snapshot_store(&self, backend: &mut Backend) {
+    fn attach_backend_snapshot_store<T>(&self, backend: &mut T)
+    where
+        T: PoolBackendTransport,
+    {
         self.with_snapshot_store(|snapshot_store| {
             backend.attach_snapshot_store(snapshot_store.clone());
         });
@@ -1813,7 +1856,7 @@ impl PooledBackend {
 
     pub async fn release(mut self) {
         if let Some(backend) = self.backend.take() {
-            backend.mark_idle(Some(self.lease.route_key.clone()));
+            PoolBackendTransport::mark_idle(&backend, Some(self.lease.route_key.clone()));
             self.lease.pool.return_backend(backend).await;
         }
 
@@ -1823,7 +1866,7 @@ impl PooledBackend {
 
     pub fn discard(mut self) {
         if let Some(backend) = self.backend.take() {
-            backend.mark_discarded();
+            PoolBackendTransport::mark_discarded(&backend);
             self.lease.pool.discard_backend(backend.id());
         }
 
@@ -1835,7 +1878,7 @@ impl PooledBackend {
 impl Drop for PooledBackend {
     fn drop(&mut self) {
         if let Some(backend) = self.backend.take() {
-            backend.mark_discarded();
+            PoolBackendTransport::mark_discarded(&backend);
             self.lease.pool.discard_backend(backend.id());
             self.lease.take_permit();
             self.lease.record_backpressure_counts();
@@ -2061,6 +2104,69 @@ mod tests {
 
         assert_eq!(pool.backends.idle_count(), 1);
         assert_eq!(pool.backends.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn backend_store_accepts_non_tokio_backend_transport() {
+        #[derive(Debug)]
+        struct MemoryBackend {
+            id: u64,
+            checked_out: Arc<AtomicUsize>,
+            idled: Arc<AtomicUsize>,
+            discarded: Arc<AtomicUsize>,
+        }
+
+        impl PoolBackendTransport for MemoryBackend {
+            fn id(&self) -> u64 {
+                self.id
+            }
+
+            fn attach_snapshot_store(&mut self, _snapshot_store: SnapshotStore) {}
+
+            fn mark_checked_out(&self, _route_key: Option<RouteKey>) {
+                self.checked_out.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn mark_idle(&self, _route_key: Option<RouteKey>) {
+                self.idled.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn mark_discarded(&self) {
+                self.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let checked_out = Arc::new(AtomicUsize::new(0));
+        let idled = Arc::new(AtomicUsize::new(0));
+        let discarded = Arc::new(AtomicUsize::new(0));
+        let store = BackendStore::<MemoryBackend>::new(1, None, None);
+        let backend = MemoryBackend {
+            id: 42,
+            checked_out: Arc::clone(&checked_out),
+            idled: Arc::clone(&idled),
+            discarded: Arc::clone(&discarded),
+        };
+
+        let slot = store.reserve_backend_slot().expect("backend slot");
+        store.register_backend(&backend, slot);
+        backend.mark_checked_out(Some(route_key("memory")));
+        backend.mark_idle(Some(route_key("memory")));
+        store.return_backend(backend).await;
+
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(store.idle_count(), 1);
+        assert_eq!(
+            store
+                .checkout_idle_backend(false)
+                .await
+                .expect("memory backend")
+                .id(),
+            42
+        );
+
+        assert_eq!(checked_out.load(Ordering::Relaxed), 1);
+        assert_eq!(idled.load(Ordering::Relaxed), 1);
+        assert_eq!(discarded.load(Ordering::Relaxed), 0);
     }
 
     #[test]

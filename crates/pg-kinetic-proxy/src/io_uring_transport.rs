@@ -1,8 +1,23 @@
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
+
 use bytes::{BufMut, BytesMut};
 use monoio::{
     io::{AsyncReadRent, AsyncWriteRent},
     net::TcpStream,
 };
+
+use crate::{
+    metrics,
+    pool::PoolBackendTransport,
+    snapshot::{ServerSnapshot, SnapshotStore},
+};
+use pg_kinetic_core::route::RouteKey;
+
+static NEXT_MONOIO_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct MonoioTransport {
@@ -50,6 +65,137 @@ impl MonoioTransport {
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.stream.shutdown().await
+    }
+}
+
+#[derive(Debug)]
+pub struct MonoioBackend {
+    id: u64,
+    transport: MonoioTransport,
+    addr: SocketAddr,
+    connected_at: Instant,
+    snapshot_store: Option<SnapshotStore>,
+    parameter_status: Vec<(String, String)>,
+    key_data: Option<(i32, i32)>,
+}
+
+impl MonoioBackend {
+    #[must_use]
+    pub fn new(addr: SocketAddr, transport: MonoioTransport) -> Self {
+        Self {
+            id: NEXT_MONOIO_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
+            transport,
+            addr,
+            connected_at: Instant::now(),
+            snapshot_store: None,
+            parameter_status: Vec::new(),
+            key_data: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    #[must_use]
+    pub const fn is_tls(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub fn parameter_status(&self) -> &[(String, String)] {
+        &self.parameter_status
+    }
+
+    pub fn push_parameter_status(&mut self, name: String, value: String) {
+        if let Some((_, existing_value)) = self
+            .parameter_status
+            .iter_mut()
+            .find(|(existing_name, _)| *existing_name == name)
+        {
+            *existing_value = value;
+        } else {
+            self.parameter_status.push((name, value));
+        }
+    }
+
+    #[must_use]
+    pub const fn key_data(&self) -> Option<(i32, i32)> {
+        self.key_data
+    }
+
+    pub fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.key_data = Some((process_id, secret_key));
+    }
+
+    fn publish_snapshot(&self, state: &'static str, route_key: Option<RouteKey>) {
+        if let Some(snapshot_store) = self.snapshot_store.as_ref() {
+            let mut snapshot = ServerSnapshot::new(self.id, state, self.connected_at.elapsed());
+            snapshot.route_key = route_key;
+            metrics::record_server_snapshot(snapshot_store, snapshot);
+        }
+    }
+}
+
+impl PoolBackendTransport for MonoioBackend {
+    fn id(&self) -> u64 {
+        self.id()
+    }
+
+    fn attach_snapshot_store(&mut self, snapshot_store: SnapshotStore) {
+        self.snapshot_store = Some(snapshot_store);
+    }
+
+    fn mark_checked_out(&self, route_key: Option<RouteKey>) {
+        self.publish_snapshot("checked_out", route_key);
+    }
+
+    fn mark_idle(&self, route_key: Option<RouteKey>) {
+        self.publish_snapshot("idle", route_key);
+    }
+
+    fn mark_discarded(&self) {
+        if let Some(snapshot_store) = self.snapshot_store.as_ref() {
+            metrics::remove_server_snapshot(snapshot_store, self.id);
+        }
+    }
+}
+
+impl crate::proxy::BackendStartupMetadata for MonoioBackend {
+    fn is_tls(&self) -> bool {
+        MonoioBackend::is_tls(self)
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        MonoioBackend::parameter_status(self)
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        MonoioBackend::push_parameter_status(self, name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        MonoioBackend::set_key_data(self, process_id, secret_key);
+    }
+}
+
+impl crate::io_runtime::RuntimeByteStream for MonoioBackend {
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        crate::io_runtime::read_from(&mut self.transport, dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        crate::io_runtime::write_all_to(&mut self.transport, bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        crate::io_runtime::shutdown(&mut self.transport).await
     }
 }
 
