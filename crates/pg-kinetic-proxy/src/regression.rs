@@ -323,7 +323,15 @@ impl RegressionRunner {
         };
 
         let duration_ms = started.elapsed().as_millis();
-        let output = fs::read_to_string(&artifact_path).unwrap_or_default();
+        // Surface a read failure as a runner error. Defaulting to an empty string
+        // reports infrastructure breakage as "success marker was not observed",
+        // which sends whoever reads the report after the wrong problem.
+        let output = fs::read_to_string(&artifact_path).map_err(|error| {
+            RegressionError::Runner(format!(
+                "read regression output {}: {error}",
+                artifact_path.display()
+            ))
+        })?;
         if !matches!(case.artifact_policy(), RegressionArtifactPolicy::Large) {
             let _ = fs::remove_file(&artifact_path);
         }

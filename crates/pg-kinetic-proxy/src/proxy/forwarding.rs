@@ -84,8 +84,10 @@ pub(super) async fn forward_message_cycle(
     let needs_sync = planned.needs_sync;
     let cycle_shape = crate::io_runtime::FrontendCycleShape::from_frames(frames);
     let expected_ready_count = cycle_shape.expected_ready_count();
-    let mut injected_parse_completes = planned.injected_parse_completes;
-    let mut ready_count = 0_usize;
+    let mut progress = crate::io_runtime::BackendCycleProgress {
+        injected_parse_completes: planned.injected_parse_completes,
+        ..Default::default()
+    };
 
     backend
         .backend_mut()
@@ -115,7 +117,16 @@ pub(super) async fn forward_message_cycle(
     buffers.clear_backend_write();
 
     let rows_timer = PhaseTimer::start(ProtocolPhase::Rows, phase_recorder);
-    buffers.backend_read_mut().clear();
+    if cycle_shape.expects_no_response() {
+        // Nothing to wait for: the cycle elicits no backend reply at all.
+        buffers.trim_empty_buffers();
+        rows_timer.finish(MetricOutcome::Ok);
+        return Ok(ForwardOutcome::Flushed);
+    }
+    // The read buffer is deliberately not cleared here. A Flush-delimited cycle
+    // can return with a partially received frame still buffered, and those bytes
+    // belong to the response this cycle continues reading. Cross-session reuse is
+    // safe because the buffer pool clears on recycle.
     loop {
         if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             record_buffer_limit(BufferBudgetKind::Backend);
@@ -155,8 +166,8 @@ pub(super) async fn forward_message_cycle(
             backend.backend_id(),
             state,
             &mut backend_read,
-            &mut injected_parse_completes,
-            &mut ready_count,
+            cycle_shape,
+            &mut progress,
             &mut forwarded_frames,
         )?;
         *buffers.backend_read_mut() = backend_read;
@@ -172,7 +183,8 @@ pub(super) async fn forward_message_cycle(
             if client.write_all_vectored(&client_write).await.is_err() {
                 buffers.restore_backend_frames(forwarded_frames);
                 buffers.trim_empty_buffers();
-                if let Some(status) = ready.filter(|_| ready_count >= expected_ready_count) {
+                if let Some(status) = ready.filter(|_| progress.ready_count >= expected_ready_count)
+                {
                     rows_timer.finish(MetricOutcome::Canceled);
                     return Ok(ForwardOutcome::ClientDisconnectedAfterReady(status));
                 }
@@ -183,13 +195,16 @@ pub(super) async fn forward_message_cycle(
         }
         buffers.restore_backend_frames(forwarded_frames);
 
-        if let Some(status) = ready.filter(|_| ready_count >= expected_ready_count) {
+        if let Some(status) = ready.filter(|_| progress.ready_count >= expected_ready_count) {
             buffers.trim_empty_buffers();
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));
         }
 
-        if !cycle_shape.expects_ready() && has_forwarded_frames {
+        // Only stop once every pending request has been answered. Returning on the
+        // first read that produced frames would strand the rest of a split response
+        // and deadlock a client waiting on it.
+        if !cycle_shape.expects_ready() && flush_cycle_complete(cycle_shape, progress) {
             buffers.trim_empty_buffers();
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Flushed);
@@ -197,16 +212,26 @@ pub(super) async fn forward_message_cycle(
     }
 }
 
+fn flush_cycle_complete(
+    shape: crate::io_runtime::FrontendCycleShape,
+    progress: crate::io_runtime::BackendCycleProgress,
+) -> bool {
+    progress.saw_error || progress.completion_count >= shape.expected_completion_count()
+}
+
 #[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+/// Returns the narrow two-variant outcome on purpose: the runtime path can only
+/// finish on `ReadyForQuery` or a completed `Flush` cycle, and encoding that in
+/// the type keeps callers from having to assert it at runtime.
 pub(crate) async fn forward_runtime_cycle<C, B>(
     client: &mut C,
     backend: &mut B,
     cycle: &[u8],
-    expected_ready_count: usize,
+    shape: crate::io_runtime::FrontendCycleShape,
     injected_parse_completes: usize,
     backend_buffer: &mut BytesMut,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<ForwardOutcome>
+) -> anyhow::Result<crate::io_runtime::BackendForwardOutcome>
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
     B: crate::io_runtime::RuntimeByteStream + ?Sized,
@@ -214,11 +239,9 @@ where
     crate::io_runtime::write_all_to(backend, cycle)
         .await
         .context("write frontend cycle to backend")?;
-    let mut response_drain = crate::io_runtime::BackendResponseDrain::new(
-        expected_ready_count,
-        injected_parse_completes,
-    );
-    match crate::io_runtime::forward_backend_until_cycle_complete(
+    let mut response_drain =
+        crate::io_runtime::BackendResponseDrain::for_cycle(shape, injected_parse_completes);
+    crate::io_runtime::forward_backend_until_cycle_complete(
         backend,
         client,
         backend_buffer,
@@ -228,13 +251,7 @@ where
         "write backend response",
         "backend closed during response",
     )
-    .await?
-    {
-        crate::io_runtime::BackendForwardOutcome::Ready(status) => {
-            Ok(ForwardOutcome::Ready(status))
-        }
-        crate::io_runtime::BackendForwardOutcome::Flushed => Ok(ForwardOutcome::Flushed),
-    }
+    .await
 }
 
 #[cfg(test)]
@@ -295,6 +312,75 @@ mod generic_tests {
         assert_eq!(backend.id(), 1);
     }
 
+    fn cycle_shape(tags: &[FrontendTag]) -> crate::io_runtime::FrontendCycleShape {
+        let frames = tags
+            .iter()
+            .map(|tag| FrontendFrame {
+                tag: u8::from(*tag),
+                payload: Bytes::new(),
+            })
+            .collect::<Vec<_>>();
+        crate::io_runtime::FrontendCycleShape::from_frames(&frames)
+    }
+
+    /// Guards the stop condition the pooled (non-runtime) forwarding loop uses for
+    /// Flush-delimited cycles, where there is no ReadyForQuery to wait on.
+    #[test]
+    fn flush_cycle_completes_only_once_every_pending_reply_arrived() {
+        let shape = cycle_shape(&[
+            FrontendTag::Parse,
+            FrontendTag::Describe,
+            FrontendTag::Flush,
+        ]);
+        assert_eq!(shape.expected_completion_count(), 2);
+        assert!(!shape.expects_ready());
+
+        let mut progress = crate::io_runtime::BackendCycleProgress::default();
+        assert!(!flush_cycle_complete(shape, progress));
+
+        // ParseComplete only: the Describe reply is still outstanding.
+        progress.completion_count = 1;
+        assert!(!flush_cycle_complete(shape, progress));
+
+        // RowDescription closes the Describe: the cycle is done.
+        progress.completion_count = 2;
+        assert!(flush_cycle_complete(shape, progress));
+
+        // An ErrorResponse ends the cycle even with replies outstanding, because
+        // the backend discards the rest of it until it sees a Sync.
+        let errored = crate::io_runtime::BackendCycleProgress {
+            saw_error: true,
+            ..Default::default()
+        };
+        assert!(flush_cycle_complete(shape, errored));
+    }
+
+    #[test]
+    fn sync_terminated_cycles_do_not_use_the_completion_budget() {
+        let shape = cycle_shape(&[
+            FrontendTag::Parse,
+            FrontendTag::Bind,
+            FrontendTag::Execute,
+            FrontendTag::Sync,
+        ]);
+        assert!(shape.expects_ready());
+        assert_eq!(shape.expected_ready_count(), 1);
+        assert_eq!(shape.expected_completion_count(), 0);
+        assert!(!shape.expects_no_response());
+    }
+
+    #[test]
+    fn mixed_cycles_expect_one_ready_per_simple_query_plus_the_sync() {
+        let shape = cycle_shape(&[
+            FrontendTag::Query,
+            FrontendTag::Parse,
+            FrontendTag::Bind,
+            FrontendTag::Execute,
+            FrontendTag::Sync,
+        ]);
+        assert_eq!(shape.expected_ready_count(), 2);
+    }
+
     #[tokio::test]
     async fn runtime_forwarding_drains_injected_parse_before_ready() {
         let mut client = MemoryBackendStream {
@@ -315,7 +401,7 @@ mod generic_tests {
             &mut client,
             &mut backend,
             b"Q",
-            1,
+            cycle_shape(&[FrontendTag::Query]),
             1,
             &mut BytesMut::new(),
             1024,
@@ -331,7 +417,12 @@ mod generic_tests {
     }
 
     #[tokio::test]
-    async fn runtime_forwarding_returns_after_flush_response_without_ready() {
+    async fn runtime_forwarding_waits_for_every_flush_completion_across_reads() {
+        // Parse + Describe(statement) + Flush expects ParseComplete and then
+        // ParameterDescription followed by RowDescription. Splitting them across
+        // reads must not end the cycle early: a client blocked on RowDescription
+        // before sending Bind would deadlock against a proxy that returned after
+        // the first read.
         let mut client = MemoryBackendStream {
             id: 2,
             reads: VecDeque::new(),
@@ -339,7 +430,11 @@ mod generic_tests {
         };
         let mut backend = MemoryBackendStream {
             id: 1,
-            reads: VecDeque::from([BytesMut::from(&b"1\x00\x00\x00\x04"[..])]),
+            reads: VecDeque::from([
+                BytesMut::from(&b"1\x00\x00\x00\x04"[..]),
+                BytesMut::from(&b"t\x00\x00\x00\x06\x00\x00"[..]),
+                BytesMut::from(&b"T\x00\x00\x00\x06\x00\x00"[..]),
+            ]),
             writes: Vec::new(),
         };
 
@@ -347,23 +442,105 @@ mod generic_tests {
             &mut client,
             &mut backend,
             b"H\x00\x00\x00\x04",
-            0,
+            cycle_shape(&[
+                FrontendTag::Parse,
+                FrontendTag::Describe,
+                FrontendTag::Flush,
+            ]),
             0,
             &mut BytesMut::new(),
             1024,
         )
         .await
-        .expect("flush forwarding returns after available backend frames");
+        .expect("flush forwarding completes once every pending reply arrived");
 
-        assert!(matches!(outcome, ForwardOutcome::Flushed));
+        assert!(matches!(
+            outcome,
+            crate::io_runtime::BackendForwardOutcome::Flushed
+        ));
         assert_eq!(
             backend.writes,
             vec![BytesMut::from(&b"H\x00\x00\x00\x04"[..])]
         );
+        // Every frame reaches the client, including the ones after the first read.
         assert_eq!(
             client.writes,
-            vec![BytesMut::from(&b"1\x00\x00\x00\x04"[..])]
+            vec![
+                BytesMut::from(&b"1\x00\x00\x00\x04"[..]),
+                BytesMut::from(&b"t\x00\x00\x00\x06\x00\x00"[..]),
+                BytesMut::from(&b"T\x00\x00\x00\x06\x00\x00"[..]),
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_ends_flush_cycle_on_error_response() {
+        // After an ErrorResponse the backend discards the rest of the cycle until
+        // it sees a Sync, so the outstanding completions never arrive.
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::from([BytesMut::from(&b"E\x00\x00\x00\x05\x00"[..])]),
+            writes: Vec::new(),
+        };
+
+        let outcome = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"H\x00\x00\x00\x04",
+            cycle_shape(&[
+                FrontendTag::Parse,
+                FrontendTag::Describe,
+                FrontendTag::Flush,
+            ]),
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect("an error ends the flush cycle without the remaining completions");
+
+        assert!(matches!(
+            outcome,
+            crate::io_runtime::BackendForwardOutcome::Flushed
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_returns_immediately_when_no_reply_is_expected() {
+        // A lone Flush gets no response at all; waiting on the backend would hang.
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+
+        let outcome = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"H\x00\x00\x00\x04",
+            cycle_shape(&[FrontendTag::Flush]),
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect("a cycle with no expected reply returns without reading");
+
+        assert!(matches!(
+            outcome,
+            crate::io_runtime::BackendForwardOutcome::Flushed
+        ));
+        assert!(client.writes.is_empty());
     }
 }
 
@@ -371,16 +548,12 @@ pub(super) fn classify_backend_frames(
     backend_id: u64,
     state: &mut ForwardCycleState<'_>,
     backend_buffer: &mut BytesMut,
-    injected_parse_completes: &mut usize,
-    ready_count: &mut usize,
+    shape: crate::io_runtime::FrontendCycleShape,
+    progress: &mut crate::io_runtime::BackendCycleProgress,
     forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
 ) -> anyhow::Result<Option<ReadyStatus>> {
-    let mut drain = crate::io_runtime::BackendResponseDrain::from_state(
-        1,
-        *ready_count,
-        *injected_parse_completes,
-        state.progress.response_started,
-    );
+    progress.response_started = state.progress.response_started;
+    let mut drain = crate::io_runtime::BackendResponseDrain::resume(shape, *progress);
     let event = drain.drain_with(backend_buffer, forwarded_frames, |frame| {
         state.progress.response_started = true;
         if let Some(sqlstate) = frame.sqlstate() {
@@ -400,8 +573,7 @@ pub(super) fn classify_backend_frames(
 
         Ok(())
     })?;
-    *ready_count = drain.ready_count();
-    *injected_parse_completes = drain.injected_parse_completes();
+    *progress = drain.progress();
     Ok(match event {
         crate::io_runtime::ResponseDrainEvent::Frames { ready, .. } => ready,
         crate::io_runtime::ResponseDrainEvent::BufferLimitExceeded

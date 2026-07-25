@@ -191,27 +191,6 @@ pub struct AdminTable {
     rows: Vec<AdminRow>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_admin_command, AdminCommand, AdminView};
-
-    #[test]
-    fn parses_runtime_shards_view_without_changing_runtime_view() {
-        assert_eq!(
-            parse_admin_command("SHOW RUNTIME").view(),
-            Some(AdminView::Runtime)
-        );
-        assert_eq!(
-            parse_admin_command("SHOW RUNTIME SHARDS").view(),
-            Some(AdminView::RuntimeShards)
-        );
-        assert!(matches!(
-            parse_admin_command("SHOW RUNTIME POOLS"),
-            AdminCommand::Unknown(_)
-        ));
-    }
-}
-
 impl AdminTable {
     #[must_use]
     pub fn new(view: AdminView, columns: Vec<AdminColumn>, rows: Vec<AdminRow>) -> Self {
@@ -235,5 +214,26 @@ impl AdminTable {
     #[must_use]
     pub fn rows(&self) -> &[AdminRow] {
         &self.rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_admin_command, AdminCommand, AdminView};
+
+    #[test]
+    fn parses_runtime_shards_view_without_changing_runtime_view() {
+        assert_eq!(
+            parse_admin_command("SHOW RUNTIME").view(),
+            Some(AdminView::Runtime)
+        );
+        assert_eq!(
+            parse_admin_command("SHOW RUNTIME SHARDS").view(),
+            Some(AdminView::RuntimeShards)
+        );
+        assert!(matches!(
+            parse_admin_command("SHOW RUNTIME POOLS"),
+            AdminCommand::Unknown(_)
+        ));
     }
 }

@@ -652,7 +652,7 @@ where
                         &mut discard_client,
                         &mut replay_backend,
                         &replay_bytes,
-                        replay_shape.expected_ready_count(),
+                        replay_shape,
                         0,
                         &mut replay_backend_buffer,
                         max_backend_buffer_bytes,
@@ -702,7 +702,7 @@ where
                     &mut client,
                     &mut runtime_backend,
                     &planned.backend_bytes,
-                    shape.expected_ready_count(),
+                    shape,
                     planned.injected_parse_completes,
                     &mut backend_buffer,
                     max_backend_buffer_bytes,
@@ -713,7 +713,7 @@ where
                 let result = crate::io_runtime::tokio_timeout(query_timeout, forward).await;
                 match result {
                     Ok(Ok(outcome)) => match outcome {
-                        ForwardOutcome::Ready(status) => {
+                        crate::io_runtime::BackendForwardOutcome::Ready(status) => {
                             if should_probe_read_after_write(
                                 committed_write_transaction,
                                 read_after_write_protection_enabled,
@@ -742,14 +742,9 @@ where
                                 .await;
                             }
                         }
-                        ForwardOutcome::Flushed => {
+                        crate::io_runtime::BackendForwardOutcome::Flushed => {
                             drop(runtime_backend);
                             held_backend = Some(backend);
-                        }
-                        ForwardOutcome::ClientDisconnectedAfterReady(_)
-                        | ForwardOutcome::AbandonedResponse { .. }
-                        | ForwardOutcome::BufferLimitExceeded => {
-                            unreachable!("runtime forwarding only returns ready or flushed");
                         }
                     },
                     Ok(Err(error)) => {
@@ -913,7 +908,7 @@ pub(super) async fn handle_client(
     })
     .await?
     {
-        SessionStartupOutcome::Ready(startup) => startup,
+        SessionStartupOutcome::Ready(startup) => *startup,
         SessionStartupOutcome::Finished => return Ok(()),
     };
     let SessionStartupState {
@@ -1810,7 +1805,9 @@ pub(super) struct SessionStartupRequest<'a> {
 }
 
 pub(super) enum SessionStartupOutcome {
-    Ready(SessionStartupState),
+    // Boxed because `SessionStartupState` is large and `Finished` is empty:
+    // returning it inline would size every result at the larger variant.
+    Ready(Box<SessionStartupState>),
     Finished,
 }
 
@@ -2103,23 +2100,25 @@ pub(super) async fn complete_client_startup(
         request.session_started.elapsed(),
     );
 
-    Ok(SessionStartupOutcome::Ready(SessionStartupState {
-        _cancel_session: cancel_session,
-        client_key,
-        performance,
-        qos,
-        route_read_routing_mode,
-        route_fallback_policy,
-        read_after_write_timeout,
-        read_after_write_protection_enabled,
-        routing_planner,
-        prepared_snapshot_handle,
-        recovery_snapshot_handle,
-        route_application_name,
-        session_route,
-        route_pools,
-        backend_startup_packet,
-    }))
+    Ok(SessionStartupOutcome::Ready(Box::new(
+        SessionStartupState {
+            _cancel_session: cancel_session,
+            client_key,
+            performance,
+            qos,
+            route_read_routing_mode,
+            route_fallback_policy,
+            read_after_write_timeout,
+            read_after_write_protection_enabled,
+            routing_planner,
+            prepared_snapshot_handle,
+            recovery_snapshot_handle,
+            route_application_name,
+            session_route,
+            route_pools,
+            backend_startup_packet,
+        },
+    )))
 }
 
 pub(super) struct FinalizeHeldBackendRequest<'a> {

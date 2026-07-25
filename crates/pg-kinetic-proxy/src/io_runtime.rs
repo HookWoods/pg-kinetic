@@ -10,14 +10,48 @@ use pg_kinetic_wire::backend::{parse_backend_frame, BackendFrame, ReadyStatus};
 use pg_kinetic_wire::frame::parse_frontend_frame;
 use pg_kinetic_wire::{
     frame::FrontendFrame,
-    protocol::FrontendTag,
+    protocol::{BackendTag, FrontendTag},
     startup::{parse_startup_packet, StartupPacket},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FrontendCycleShape {
     expected_ready_count: usize,
+    expected_completion_count: usize,
     needs_sync: bool,
+}
+
+/// A frontend message that ends the extended-protocol cycle the proxy is reading.
+fn is_extended_cycle_boundary(tag: u8) -> bool {
+    tag == u8::from(FrontendTag::Sync) || tag == u8::from(FrontendTag::Flush)
+}
+
+/// Frontend messages that each elicit exactly one terminating backend reply.
+///
+/// Only used for `Flush`-delimited cycles, which have no `ReadyForQuery` to mark
+/// the end of the response. See `is_backend_cycle_completion`.
+fn expects_backend_completion(tag: u8) -> bool {
+    tag == u8::from(FrontendTag::Parse)
+        || tag == u8::from(FrontendTag::Bind)
+        || tag == u8::from(FrontendTag::Describe)
+        || tag == u8::from(FrontendTag::Execute)
+        || tag == u8::from(FrontendTag::Close)
+}
+
+/// Backend messages that terminate the reply to a single frontend request.
+///
+/// `ParameterDescription` and `DataRow` are deliberately absent: they precede a
+/// terminating `RowDescription`/`NoData` and `CommandComplete` respectively, so
+/// counting them would overshoot the expected completion count.
+fn is_backend_cycle_completion(tag: u8) -> bool {
+    tag == u8::from(BackendTag::ParseComplete)
+        || tag == u8::from(BackendTag::BindComplete)
+        || tag == u8::from(BackendTag::CloseComplete)
+        || tag == u8::from(BackendTag::RowDescription)
+        || tag == u8::from(BackendTag::NoData)
+        || tag == u8::from(BackendTag::CommandComplete)
+        || tag == u8::from(BackendTag::EmptyQueryResponse)
+        || tag == u8::from(BackendTag::PortalSuspended)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -194,23 +228,30 @@ impl FrontendCycleShape {
             .iter()
             .filter(|frame| frame.tag == u8::from(FrontendTag::Query))
             .count();
-        let simple_query_cycle = query_count == frames.len();
         let needs_sync = frames
             .iter()
             .any(|frame| frame.tag != u8::from(FrontendTag::Query));
-        let expected_ready_count = if simple_query_cycle {
-            query_count.max(1)
-        } else if frames
+        let ends_with_sync = frames
             .last()
-            .is_some_and(|frame| frame.tag == u8::from(FrontendTag::Sync))
-        {
-            1
+            .is_some_and(|frame| frame.tag == u8::from(FrontendTag::Sync));
+        // Every simple query answers with its own ReadyForQuery, and a trailing
+        // Sync adds one more for the extended-protocol part of the cycle. Summing
+        // both keeps mixed cycles correct instead of collapsing them to one.
+        let expected_ready_count = query_count + usize::from(ends_with_sync);
+        // Without a Sync there is no ReadyForQuery to wait for, so the end of the
+        // response is defined by one terminating reply per pending request.
+        let expected_completion_count = if expected_ready_count == 0 {
+            frames
+                .iter()
+                .filter(|frame| expects_backend_completion(frame.tag))
+                .count()
         } else {
             0
         };
 
         Self {
             expected_ready_count,
+            expected_completion_count,
             needs_sync,
         }
     }
@@ -237,6 +278,19 @@ impl FrontendCycleShape {
     #[must_use]
     pub const fn expects_ready(self) -> bool {
         self.expected_ready_count > 0
+    }
+
+    /// Terminating backend replies expected when the cycle has no `Sync`.
+    #[must_use]
+    pub const fn expected_completion_count(self) -> usize {
+        self.expected_completion_count
+    }
+
+    /// A cycle the backend never answers, such as a lone `Flush` or `Sync`-less
+    /// batch of no-reply frames. Waiting on the backend for one would hang.
+    #[must_use]
+    pub const fn expects_no_response(self) -> bool {
+        self.expected_ready_count == 0 && self.expected_completion_count == 0
     }
 
     #[must_use]
@@ -279,10 +333,15 @@ pub fn take_frontend_cycle_bytes(
             cycle_len += next_len;
         }
     } else {
-        while !buffer[..cycle_len].ends_with_extended_cycle_boundary()? {
+        // Walk forward tracking the tag at each frame offset. Re-scanning the
+        // accumulated prefix on every iteration would copy and re-parse it once
+        // per frame, which is quadratic for pipelined batches.
+        let mut last_tag = first_tag;
+        while !is_extended_cycle_boundary(last_tag) {
             let Some(next_len) = complete_frontend_frame_len(&buffer[cycle_len..])? else {
                 return Ok(FrontendCycleRead::NeedMoreBytes);
             };
+            last_tag = buffer[cycle_len];
             cycle_len += next_len;
         }
     }
@@ -356,22 +415,6 @@ fn complete_frontend_frame_len(bytes: &[u8]) -> anyhow::Result<Option<usize>> {
     Ok((bytes.len() >= total_len).then_some(total_len))
 }
 
-trait FrontendCycleBytes {
-    fn ends_with_extended_cycle_boundary(&self) -> anyhow::Result<bool>;
-}
-
-impl FrontendCycleBytes for [u8] {
-    fn ends_with_extended_cycle_boundary(&self) -> anyhow::Result<bool> {
-        let mut scan = BytesMut::from(self);
-        let mut boundary = false;
-        while let Some(frame) = parse_frontend_frame(&mut scan)? {
-            boundary = frame.tag == u8::from(FrontendTag::Sync)
-                || frame.tag == u8::from(FrontendTag::Flush);
-        }
-        Ok(boundary && scan.is_empty())
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct PlannedFrontendCycle {
     pub backend_bytes: BytesMut,
@@ -399,11 +442,24 @@ pub enum BackendBytesDrainEvent {
     NeedMoreBytes,
 }
 
+/// Counters carried across the reads that make up one backend response cycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BackendCycleProgress {
+    pub ready_count: usize,
+    pub injected_parse_completes: usize,
+    pub completion_count: usize,
+    pub saw_error: bool,
+    pub response_started: bool,
+}
+
 #[derive(Debug)]
 pub struct BackendResponseDrain {
     injected_parse_completes: usize,
     ready_count: usize,
     expected_ready_count: usize,
+    completion_count: usize,
+    expected_completion_count: usize,
+    saw_error: bool,
     response_started: bool,
 }
 
@@ -414,22 +470,49 @@ impl BackendResponseDrain {
             injected_parse_completes,
             ready_count: 0,
             expected_ready_count,
+            completion_count: 0,
+            expected_completion_count: 0,
+            saw_error: false,
+            response_started: false,
+        }
+    }
+
+    /// Drain for one frontend cycle, carrying the cycle's completion budget so
+    /// `Flush`-delimited responses know when they are finished.
+    #[must_use]
+    pub const fn for_cycle(shape: FrontendCycleShape, injected_parse_completes: usize) -> Self {
+        Self {
+            injected_parse_completes,
+            ready_count: 0,
+            expected_ready_count: shape.expected_ready_count,
+            completion_count: 0,
+            expected_completion_count: shape.expected_completion_count,
+            saw_error: false,
             response_started: false,
         }
     }
 
     #[must_use]
-    pub const fn from_state(
-        expected_ready_count: usize,
-        ready_count: usize,
-        injected_parse_completes: usize,
-        response_started: bool,
-    ) -> Self {
+    pub const fn resume(shape: FrontendCycleShape, progress: BackendCycleProgress) -> Self {
         Self {
-            injected_parse_completes,
-            ready_count,
-            expected_ready_count,
-            response_started,
+            injected_parse_completes: progress.injected_parse_completes,
+            ready_count: progress.ready_count,
+            expected_ready_count: shape.expected_ready_count,
+            completion_count: progress.completion_count,
+            expected_completion_count: shape.expected_completion_count,
+            saw_error: progress.saw_error,
+            response_started: progress.response_started,
+        }
+    }
+
+    #[must_use]
+    pub const fn progress(&self) -> BackendCycleProgress {
+        BackendCycleProgress {
+            ready_count: self.ready_count,
+            injected_parse_completes: self.injected_parse_completes,
+            completion_count: self.completion_count,
+            saw_error: self.saw_error,
+            response_started: self.response_started,
         }
     }
 
@@ -451,6 +534,16 @@ impl BackendResponseDrain {
     #[must_use]
     pub const fn expects_ready(&self) -> bool {
         self.expected_ready_count > 0
+    }
+
+    /// True once a `Sync`-less cycle has been fully answered.
+    ///
+    /// An `ErrorResponse` ends it early: the backend discards every remaining
+    /// message in the cycle until it sees a `Sync`, so the outstanding
+    /// completions will never arrive.
+    #[must_use]
+    pub const fn flush_cycle_complete(&self) -> bool {
+        self.saw_error || self.completion_count >= self.expected_completion_count
     }
 
     pub fn drain(
@@ -482,7 +575,10 @@ impl BackendResponseDrain {
     ) -> anyhow::Result<ResponseDrainEvent> {
         let mut ready = None;
         while let Some(frame) = parse_backend_frame(backend_buffer)? {
-            if self.injected_parse_completes > 0 && frame.tag == b'1' {
+            if self.injected_parse_completes > 0 && frame.tag == u8::from(BackendTag::ParseComplete)
+            {
+                // Reply to a Parse the proxy injected, not one the client sent:
+                // swallow it and leave the completion count untouched.
                 self.injected_parse_completes -= 1;
                 continue;
             }
@@ -492,6 +588,12 @@ impl BackendResponseDrain {
             if let Some(status) = frame.ready_status() {
                 self.ready_count += 1;
                 ready = Some(status);
+            }
+            if is_backend_cycle_completion(frame.tag) {
+                self.completion_count += 1;
+            }
+            if frame.tag == u8::from(BackendTag::ErrorResponse) {
+                self.saw_error = true;
             }
 
             let mut header = [0_u8; 5];
@@ -598,6 +700,11 @@ where
     B: RuntimeByteStream + ?Sized,
     C: RuntimeByteStream + ?Sized,
 {
+    if !drain.expects_ready() && drain.flush_cycle_complete() {
+        // Nothing to wait for: the cycle elicits no backend reply at all.
+        return Ok(BackendForwardOutcome::Flushed);
+    }
+
     loop {
         let read = read_from(backend, backend_buffer)
             .await
@@ -616,7 +723,10 @@ where
                 if let Some(status) = ready {
                     return Ok(BackendForwardOutcome::Ready(status));
                 }
-                if !drain.expects_ready() && !bytes.is_empty() {
+                // Only stop once every pending request has been answered.
+                // Returning on the first non-empty read would strand the rest of
+                // a split response and deadlock a client waiting on it.
+                if !drain.expects_ready() && drain.flush_cycle_complete() {
                     return Ok(BackendForwardOutcome::Flushed);
                 }
             }

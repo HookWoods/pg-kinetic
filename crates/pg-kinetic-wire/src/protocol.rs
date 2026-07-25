@@ -45,11 +45,19 @@ impl From<FrontendTag> for u8 {
 pub enum BackendTag {
     Authentication,
     BackendKeyData,
+    BindComplete,
+    CloseComplete,
     CommandComplete,
     DataRow,
+    EmptyQueryResponse,
     ErrorResponse,
+    NoData,
+    ParameterDescription,
     ParameterStatus,
+    ParseComplete,
+    PortalSuspended,
     ReadyForQuery,
+    RowDescription,
 }
 
 impl From<BackendTag> for u8 {
@@ -57,11 +65,19 @@ impl From<BackendTag> for u8 {
         match tag {
             BackendTag::Authentication => b'R',
             BackendTag::BackendKeyData => b'K',
+            BackendTag::BindComplete => b'2',
+            BackendTag::CloseComplete => b'3',
             BackendTag::CommandComplete => b'C',
             BackendTag::DataRow => b'D',
+            BackendTag::EmptyQueryResponse => b'I',
             BackendTag::ErrorResponse => b'E',
+            BackendTag::NoData => b'n',
+            BackendTag::ParameterDescription => b't',
             BackendTag::ParameterStatus => b'S',
+            BackendTag::ParseComplete => b'1',
+            BackendTag::PortalSuspended => b's',
             BackendTag::ReadyForQuery => b'Z',
+            BackendTag::RowDescription => b'T',
         }
     }
 }
