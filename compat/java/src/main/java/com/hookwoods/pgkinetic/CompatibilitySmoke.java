@@ -10,6 +10,10 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import javax.sql.DataSource;
@@ -42,13 +46,20 @@ public final class CompatibilitySmoke {
             printSkip("feature-unsupported", library() + " mapping is optional for this protocol smoke");
             return;
         }
+        String jdbcUrl;
+        try {
+            jdbcUrl = toJdbcUrl(url);
+        } catch (IllegalArgumentException error) {
+            printFail(error.getClass().getSimpleName() + ": " + error.getMessage(), 0);
+            return;
+        }
 
         long started = System.nanoTime();
         List<String> cases = new ArrayList<>();
         try {
             String selected = library();
             if ("jdbc".equals(selected)) {
-                try (Connection connection = DriverManager.getConnection(url)) {
+                try (Connection connection = DriverManager.getConnection(jdbcUrl)) {
                     cases.add(caseResult("startup-connect", "connected"));
                     try (PreparedStatement statement = connection.prepareStatement(
                             "SELECT id, name FROM compat_items WHERE id = ?")) {
@@ -75,7 +86,7 @@ public final class CompatibilitySmoke {
 
             if ("hikari".equals(selected)) {
                 HikariConfig config = new HikariConfig();
-                config.setJdbcUrl(url);
+                config.setJdbcUrl(jdbcUrl);
                 config.setMaximumPoolSize(1);
                 config.setConnectionTimeout(5000);
                 try (HikariDataSource pool = new HikariDataSource(config)) {
@@ -87,7 +98,7 @@ public final class CompatibilitySmoke {
 
             if ("datasource".equals(selected)) {
                 PGSimpleDataSource dataSource = new PGSimpleDataSource();
-                dataSource.setUrl(url);
+                dataSource.setUrl(jdbcUrl);
                 try (Connection connection = dataSource.getConnection()) {
                     cases.add(caseResult("startup-connect", "connected"));
                     try (PreparedStatement statement = connection.prepareStatement(
@@ -104,7 +115,7 @@ public final class CompatibilitySmoke {
             }
 
             if ("spring-jdbc".equals(selected)) {
-                DriverManagerDataSource dataSource = new DriverManagerDataSource(url);
+                DriverManagerDataSource dataSource = new DriverManagerDataSource(jdbcUrl);
                 JdbcTemplate template = new JdbcTemplate((DataSource) dataSource);
                 Integer count = template.queryForObject("SELECT count(*) FROM compat_items", Integer.class);
                 if (count == null || count < 1) throw new IllegalStateException("spring-jdbc query returned no rows");
@@ -144,6 +155,45 @@ public final class CompatibilitySmoke {
             + "\",\"language\":\"java\",\"outcome\":\"fail\",\"duration_ms\":"
             + (nanos / 1_000_000) + ",\"error_summary\":\"" + escape(detail) + "\"}");
         System.exit(1);
+    }
+
+    private static String toJdbcUrl(String value) {
+        if (value.startsWith("jdbc:postgresql:")) {
+            return value;
+        }
+        try {
+            URI uri = new URI(value);
+            if (!"postgres".equals(uri.getScheme()) && !"postgresql".equals(uri.getScheme())) {
+                throw new IllegalArgumentException("unsupported PostgreSQL URL scheme");
+            }
+            StringBuilder jdbc = new StringBuilder("jdbc:postgresql://")
+                .append(uri.getHost());
+            if (uri.getPort() > 0) {
+                jdbc.append(":").append(uri.getPort());
+            }
+            String path = uri.getRawPath();
+            jdbc.append(path == null || path.isBlank() ? "/" : path);
+
+            String separator = "?";
+            if (uri.getRawQuery() != null && !uri.getRawQuery().isBlank()) {
+                jdbc.append("?").append(uri.getRawQuery());
+                separator = "&";
+            }
+            String userInfo = uri.getRawUserInfo();
+            if (userInfo != null && !userInfo.isBlank()) {
+                String[] credentials = userInfo.split(":", 2);
+                jdbc.append(separator).append("user=")
+                    .append(URLDecoder.decode(credentials[0], StandardCharsets.UTF_8));
+                separator = "&";
+                if (credentials.length > 1) {
+                    jdbc.append(separator).append("password=")
+                        .append(URLDecoder.decode(credentials[1], StandardCharsets.UTF_8));
+                }
+            }
+            return jdbc.toString();
+        } catch (URISyntaxException error) {
+            throw new IllegalArgumentException("invalid PostgreSQL URL", error);
+        }
     }
 
     private static String escape(String value) {

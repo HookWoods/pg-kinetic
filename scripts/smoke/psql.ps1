@@ -46,7 +46,7 @@ function Invoke-PsqlScalar {
         $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
         Push-Location $repoRoot
         try {
-            return (& docker compose -f bench/compose.yml exec -T postgres env `
+            return (& docker compose -f bench/compose.yml exec -T pg-kinetic-db env `
                 "PGPASSWORD=$Password" `
                 "PGSSLMODE=$SslMode" `
                 "PGGSSENCMODE=$GssEncMode" `

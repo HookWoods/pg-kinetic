@@ -177,9 +177,15 @@ v1 uses a single shared backend service identity: pg-kinetic does not infer per-
 | `runtime.node.node_id` | string | generated host/process id | `--node-id` | `PG_KINETIC_NODE_ID` | restart | Empty or invalid ids fail parse. |
 | `runtime.engine.runtime_engine` | enum | `thread_per_core` | `--runtime-engine` | `PG_KINETIC_RUNTIME_ENGINE` | restart | Values are `thread_per_core`, `tokio_default`, `tokio_current_thread`, and [`io_uring`](./production-runtime.md#runtime-engine-selection). |
 | `runtime.engine.experimental_runtime_enabled` | bool | `false` | `--experimental-runtime-enabled` | `PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED` | restart | Legacy compatibility field; stable runtime engines do not require it. |
+| `runtime.engine.runtime_shards` | optional integer | unset | `--runtime-shards` | `PG_KINETIC_RUNTIME_SHARDS` | restart | Overrides automatic runtime shard sizing; `0` fails validation. |
 | `runtime.production.control_plane_enabled` | bool | `false` | `--control-plane-enabled` | `PG_KINETIC_CONTROL_PLANE_ENABLED` | restart | No control-plane runtime is documented as production-ready. |
 | `runtime.production.mirroring_enabled` | bool | `false` | `--mirroring-enabled` | `PG_KINETIC_MIRRORING_ENABLED` | restart | Live proxy still constructs a disabled mirror dispatcher. |
 | `runtime.production.adaptive_enabled` | bool | `false` | `--adaptive-enabled` | `PG_KINETIC_ADAPTIVE_ENABLED` | restart | Starts recommendation/simulation controller when true. |
+| `runtime.production.pressure.enabled` | bool | `false` | `--pressure-enabled` | `PG_KINETIC_PRESSURE_ENABLED` | restart | Enables PSI-driven dynamic route in-flight pressure limits. |
+| `runtime.production.pressure.cpu_high_pct` | float | `20.0` | `--pressure-cpu-high-pct` | `PG_KINETIC_PRESSURE_CPU_HIGH_PCT` | restart | CPU PSI `some avg10` threshold; values must be finite and within `0.0..=100.0`. |
+| `runtime.production.pressure.mem_high_pct` | float | `10.0` | `--pressure-mem-high-pct` | `PG_KINETIC_PRESSURE_MEM_HIGH_PCT` | restart | Memory PSI `some avg10` threshold; values must be finite and within `0.0..=100.0`. |
+| `runtime.production.pressure.min_in_flight_floor` | integer | `1` | `--pressure-min-in-flight-floor` | `PG_KINETIC_PRESSURE_MIN_IN_FLIGHT_FLOOR` | restart | Lowest dynamic per-route in-flight limit when pressure is high; must be greater than zero. |
+| `runtime.production.pressure.window_ms` | milliseconds | `5000` | `--pressure-window-ms` | `PG_KINETIC_PRESSURE_WINDOW_MS` | restart | Pressure control tick window; must be greater than zero. |
 | `runtime.production.adaptive_mode` | enum | `recommend` | `--adaptive-mode` | `PG_KINETIC_ADAPTIVE_MODE` | restart | Values are `recommend` and `apply`; apply mode records simulated apply outcomes only. |
 | `runtime.production.adaptive_window_ms` | milliseconds | `60000` | `--adaptive-window-ms` | `PG_KINETIC_ADAPTIVE_WINDOW_MS` | restart | Must be greater than zero. |
 | `runtime.production.adaptive_min_confidence` | float | `0.8` | `--adaptive-min-confidence` | `PG_KINETIC_ADAPTIVE_MIN_CONFIDENCE` | restart | Must be finite and within `0.0..=1.0`. |
@@ -188,6 +194,8 @@ v1 uses a single shared backend service identity: pg-kinetic does not infer per-
 | `runtime.production.adaptive_max_change_percent` | integer | `10` | `--adaptive-max-change-percent` | `PG_KINETIC_ADAPTIVE_MAX_CHANGE_PERCENT` | restart | Must be between `1` and `100`. |
 
 The internal `apply` and `guardrail` wrappers are flattened by the parser. They are not TOML table names.
+
+The top-level pool lifecycle settings are flattened in TOML and CLI parsing. They populate the internal `pool_lifecycle` fields `max_size`, `min_idle`, `idle_timeout`, and `max_lifetime`.
 
 Reload compatibility is strict. Any runtime field change, including adaptive runtime scalar fields, is restart-required. Accepted reloads affect new client connections and reloadable assets such as auth user file contents or TLS certificate file contents at unchanged paths; they do not change existing sessions or already checked-out backends. Backend service credentials are resolved for each new backend authentication exchange, so rotating the injected environment value takes effect after idle backends are discarded or recycled.
 

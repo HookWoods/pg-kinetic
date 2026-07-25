@@ -132,10 +132,11 @@ the compatibility workflow because those jobs install language-specific
 toolchains and client libraries.
 
 ```bash
-docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+docker compose -f bench/compose.yml up --detach --wait --build pg-direct pg-kinetic
 cargo fmt --check
 cargo test --workspace --locked
-cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T pg-direct psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T pg-kinetic-db psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
 cargo run -p xtask -- compat --language rust --target direct-postgres --smoke
 cargo run -p xtask -- compat --language rust --target pg-kinetic --smoke
 docker compose -f bench/compose.yml down --volumes

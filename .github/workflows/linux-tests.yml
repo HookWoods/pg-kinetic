@@ -55,16 +55,16 @@ jobs:
       - name: Start local PostgreSQL stack
         run: |
           docker compose -f bench/compose.yml down --volumes --remove-orphans
-          docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+          docker compose -f bench/compose.yml up --detach --wait --build pg-kinetic
       - name: Verify proxy query path
-        run: docker compose -f bench/compose.yml exec -T postgres env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
+        run: docker compose -f bench/compose.yml exec -T pg-kinetic-db env PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h pg-kinetic -p 6543 -U postgres -d pgkinetic -c 'select 1'
       - name: Run Linux checks
         run: cargo run -p xtask -- ci-linux
       - name: Upload Linux Compose logs
         if: failure()
         run: |
           mkdir -p target/release-evidence/linux
-          docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic postgres \
+          docker compose -f bench/compose.yml logs --no-color --timestamps pg-kinetic pg-kinetic-db \
             | tee target/release-evidence/linux/compose.log
       - name: Publish Linux failure evidence
         if: failure()

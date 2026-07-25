@@ -218,7 +218,7 @@ enum ProbePlan {
 }
 
 fn probe(addr: SocketAddr, expected_role: BackendRole) -> Arc<EndpointHealthProbe> {
-    probe_with_timeout(addr, expected_role, Duration::from_millis(75))
+    probe_with_timeout(addr, expected_role, Duration::from_secs(1))
 }
 
 fn probe_with_timeout(

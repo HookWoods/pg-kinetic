@@ -93,13 +93,15 @@ Structural report generation does not require a database. Live suite execution
 requires both target services and explicit opt-in:
 
 ```bash
-docker compose -f bench/compose.yml up -d --build postgres pg-kinetic
+docker compose -f bench/compose.yml up -d --build pg-direct pg-kinetic
 export PG_KINETIC_COMPAT_LIVE=1
 export PG_KINETIC_COMPAT_SERVICES=direct-postgres,pg-kinetic
 export DATABASE_URL_DIRECT=postgres://postgres:postgres@127.0.0.1:55432/pgkinetic
 export DATABASE_URL_PROXY=postgres://postgres:postgres@127.0.0.1:58432/pgkinetic
 psql "$DATABASE_URL_DIRECT" -f compat/common/schema.sql
 psql "$DATABASE_URL_DIRECT" -f compat/common/seed.sql
+psql "$DATABASE_URL_PROXY" -f compat/common/schema.sql
+psql "$DATABASE_URL_PROXY" -f compat/common/seed.sql
 cargo run -p xtask -- compat --language rust --target pg-kinetic
 ```
 
