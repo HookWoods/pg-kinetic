@@ -62,6 +62,20 @@ pub(super) fn plan_frontend_cycle(
     })
 }
 
+enum CopyDuplexEvent {
+    Backend(std::io::Result<usize>),
+    Client(std::io::Result<usize>),
+}
+
+/// Backend messages that hand control of the exchange to the client.
+///
+/// `CopyInResponse` starts `COPY ... FROM STDIN`; `CopyBothResponse` starts the
+/// replication handshake. `CopyOutResponse` is deliberately absent: the backend
+/// keeps producing there, so the ordinary read loop already handles it.
+fn is_copy_from_client_request(tag: u8) -> bool {
+    tag == u8::from(BackendTag::CopyInResponse) || tag == u8::from(BackendTag::CopyBothResponse)
+}
+
 pub(super) async fn forward_message_cycle(
     client: &mut ClientConnection,
     backend: &mut PooledBackend,
@@ -127,6 +141,13 @@ pub(super) async fn forward_message_cycle(
     // can return with a partially received frame still buffered, and those bytes
     // belong to the response this cycle continues reading. Cross-session reuse is
     // safe because the buffer pool clears on recycle.
+    // Set once the backend asks the client for data (COPY ... FROM STDIN, or the
+    // replication CopyBoth handshake). From that point the client drives the
+    // exchange, so reading only the backend would deadlock: the backend waits for
+    // rows the proxy never collects.
+    let mut client_drives_copy = false;
+    let mut copy_from_client = BytesMut::new();
+
     loop {
         if buffers.backend_read_mut().len() >= max_backend_buffer_bytes {
             record_buffer_limit(BufferBudgetKind::Backend);
@@ -134,18 +155,67 @@ pub(super) async fn forward_message_cycle(
             return Ok(ForwardOutcome::BufferLimitExceeded);
         }
 
-        let read = backend
-            .backend_mut()
-            .stream_mut()
-            .read_buf(buffers.backend_read_mut())
-            .await
-            .map_err(|error| {
-                backend_failure(
-                    BackendFailureKind::Read,
-                    state.progress.response_started,
-                    anyhow::Error::new(error).context("read backend frame"),
-                )
-            })?;
+        let read = if client_drives_copy {
+            copy_from_client.clear();
+            let event = tokio::select! {
+                // Bias to the backend so an ErrorResponse ending the copy is seen
+                // promptly rather than after another round of client rows.
+                biased;
+                result = backend
+                    .backend_mut()
+                    .stream_mut()
+                    .read_buf(buffers.backend_read_mut()) => CopyDuplexEvent::Backend(result),
+                result = client.read_buf(&mut copy_from_client) => CopyDuplexEvent::Client(result),
+            };
+
+            match event {
+                CopyDuplexEvent::Backend(result) => result.map_err(|error| {
+                    backend_failure(
+                        BackendFailureKind::Read,
+                        state.progress.response_started,
+                        anyhow::Error::new(error).context("read backend frame"),
+                    )
+                })?,
+                CopyDuplexEvent::Client(result) => {
+                    // CopyData/CopyDone/CopyFail need no rewriting, so the client's
+                    // bytes go to the backend verbatim.
+                    let client_read = result.context("read client copy data")?;
+                    if client_read == 0 {
+                        rows_timer.finish(MetricOutcome::Canceled);
+                        return Ok(ForwardOutcome::AbandonedResponse { needs_sync });
+                    }
+                    let stream = backend.backend_mut().stream_mut();
+                    stream.write_all(&copy_from_client).await.map_err(|error| {
+                        backend_failure(
+                            BackendFailureKind::Write,
+                            state.progress.response_started,
+                            anyhow::Error::new(error).context("write client copy data"),
+                        )
+                    })?;
+                    stream.flush().await.map_err(|error| {
+                        backend_failure(
+                            BackendFailureKind::Write,
+                            state.progress.response_started,
+                            anyhow::Error::new(error).context("flush client copy data"),
+                        )
+                    })?;
+                    continue;
+                }
+            }
+        } else {
+            backend
+                .backend_mut()
+                .stream_mut()
+                .read_buf(buffers.backend_read_mut())
+                .await
+                .map_err(|error| {
+                    backend_failure(
+                        BackendFailureKind::Read,
+                        state.progress.response_started,
+                        anyhow::Error::new(error).context("read backend frame"),
+                    )
+                })?
+        };
         if read == 0 {
             return Err(backend_failure(
                 BackendFailureKind::Read,
@@ -172,6 +242,11 @@ pub(super) async fn forward_message_cycle(
         )?;
         *buffers.backend_read_mut() = backend_read;
         let has_forwarded_frames = !forwarded_frames.is_empty();
+        if !client_drives_copy {
+            client_drives_copy = forwarded_frames
+                .iter()
+                .any(|(header, _)| is_copy_from_client_request(header[0]));
+        }
 
         if has_forwarded_frames {
             let mut client_write = Vec::with_capacity(forwarded_frames.len() * 2);

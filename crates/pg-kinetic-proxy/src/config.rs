@@ -600,7 +600,11 @@ impl RuntimeEngineConfig {
 impl Default for RuntimeEngineConfig {
     fn default() -> Self {
         Self {
-            runtime_engine: RuntimeEngine::TokioDefault,
+            // Must match the clap/serde default. `merge_file_config` decides a CLI
+            // value was set explicitly by comparing it against `Config::default()`,
+            // so a disagreement here makes an unspecified flag look explicit and
+            // silently override the config file.
+            runtime_engine: default_runtime_engine(),
             experimental_runtime_enabled: false,
             runtime_shards: None,
         }
@@ -1818,7 +1822,7 @@ pub struct PerformanceConfig {
     pub backend_reset_query: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct AdminConfig {
     #[arg(long, env = "PG_KINETIC_ADMIN_ADDR")]
@@ -1839,6 +1843,21 @@ pub struct AdminConfig {
 
     #[arg(long, env = "PG_KINETIC_ADMIN_MAX_CLIENTS", default_value_t = 8)]
     pub admin_max_clients: usize,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        // Kept in step with the clap defaults above; see
+        // `clap_defaults_match_config_default`. A derived Default would give 0 here
+        // and make an unspecified flag override the config file.
+        Self {
+            admin_addr: None,
+            admin_require_tls: false,
+            admin_allowed_user: None,
+            admin_query_timeout_ms: 1_000,
+            admin_max_clients: 8,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]

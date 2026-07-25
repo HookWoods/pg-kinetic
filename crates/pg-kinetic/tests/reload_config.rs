@@ -596,3 +596,49 @@ async fn invalid_reload_keeps_previous_config_active() {
 
     assert_eq!(active_config.read().await.qos.query_timeout_ms, 2_222);
 }
+
+#[test]
+fn clap_defaults_match_config_default() {
+    use clap::Parser;
+
+    // `merge_file_config` decides a CLI value was supplied explicitly by comparing
+    // it against `Config::default()`. If clap's default for a field disagrees with
+    // the `Default` impl, an unspecified flag looks explicit and silently
+    // overrides the config file — which is how a `runtime_engine` set in a file
+    // was being ignored at startup.
+    let parsed = Config::parse_from(["pg-kinetic"]);
+
+    assert_eq!(
+        parsed,
+        Config::default(),
+        "clap defaults and Config::default() must agree, or the config file loses \
+         to flags the operator never passed"
+    );
+}
+
+#[tokio::test]
+async fn startup_config_keeps_restart_only_file_values() {
+    let config_file = write_temp_file(
+        "startup-runtime",
+        ".toml",
+        r#"
+[connection]
+listen_addr = "127.0.0.1:6551"
+backend_addr = "127.0.0.1:5432"
+
+[runtime.engine]
+runtime_engine = "tokio_current_thread"
+"#,
+    );
+
+    let mut base = Config::default();
+    base.reload.config_file = Some(config_file.clone());
+
+    let effective = load_effective_config(&base).expect("load effective config");
+
+    assert_eq!(
+        effective.runtime.engine.runtime_engine,
+        pg_kinetic::core::cluster::runtime::RuntimeEngine::TokioCurrentThread
+    );
+    let _ = fs::remove_file(config_file);
+}

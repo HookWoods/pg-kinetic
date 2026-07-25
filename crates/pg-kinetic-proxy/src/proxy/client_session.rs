@@ -885,6 +885,25 @@ pub(super) struct ClientSessionContext {
     pub(super) auth_query_service: Arc<AuthQueryService>,
 }
 
+/// What woke an idle session: the client's next request, or the held backend
+/// speaking unprompted.
+enum IdleEvent {
+    Client(Option<ClientCycle>),
+    Backend(std::io::Result<usize>),
+}
+
+/// Drops a held backend that failed while the client was idle, so the next
+/// request checks out a fresh one rather than reusing a broken socket.
+async fn discard_held_backend(
+    cancel_registry: &Arc<cancel::CancelRegistry>,
+    client_key: (i32, i32),
+    held_backend: &mut Option<PooledBackend>,
+) {
+    if let Some(backend) = held_backend.take() {
+        discard_backend_with_cancel_unbind(cancel_registry, client_key, backend).await;
+    }
+}
+
 /// One span per connection, not per query: it costs a single span creation on
 /// accept and is what makes the individual log lines emitted deeper in the stack
 /// (auth outcome, checkout failure, drain decision) attributable to a client.
@@ -969,6 +988,7 @@ pub(super) async fn handle_client(
     let mut prepared = PreparedCatalog::new(session_id);
     let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
     let mut held_backend: Option<PooledBackend> = None;
+    let mut async_backend_frames = BytesMut::new();
     let mut wait_for_client_activity_after_timeout = false;
     let mut mirror_query_id = 0_u64;
 
@@ -992,16 +1012,66 @@ pub(super) async fn handle_client(
             Some(idle_timeout)
         };
 
-        let Some(cycle) = next_client_cycle(
-            &mut client,
-            session_buffers.client_read_mut(),
-            cycle_timeout,
-            idle_timeout_kind,
-            qos.max_client_buffer_bytes,
-        )
-        .await?
-        else {
-            continue;
+        // While a backend is held (LISTEN/NOTIFY, an open transaction, session
+        // state) it can speak unprompted: NotificationResponse, ParameterStatus,
+        // NoticeResponse. Waiting only on the client would leave those messages
+        // stuck in the backend socket until the client happened to send something.
+        //
+        // `next_client_cycle` is safe to cancel here: whatever it already read
+        // stays in `client_read_mut`, and the next iteration re-parses it.
+        let idle_event = match held_backend.as_mut() {
+            Some(backend) => {
+                async_backend_frames.clear();
+                tokio::select! {
+                    biased;
+                    cycle = next_client_cycle(
+                        &mut client,
+                        session_buffers.client_read_mut(),
+                        cycle_timeout,
+                        idle_timeout_kind,
+                        qos.max_client_buffer_bytes,
+                    ) => IdleEvent::Client(cycle?),
+                    read = backend
+                        .backend_mut()
+                        .stream_mut()
+                        .read_buf(&mut async_backend_frames) => IdleEvent::Backend(read),
+                }
+            }
+            None => IdleEvent::Client(
+                next_client_cycle(
+                    &mut client,
+                    session_buffers.client_read_mut(),
+                    cycle_timeout,
+                    idle_timeout_kind,
+                    qos.max_client_buffer_bytes,
+                )
+                .await?,
+            ),
+        };
+
+        let cycle = match idle_event {
+            IdleEvent::Client(Some(cycle)) => cycle,
+            IdleEvent::Client(None) => continue,
+            IdleEvent::Backend(Ok(0)) => {
+                // The held backend went away while idle; drop it so the next
+                // request checks out a fresh one instead of using a dead socket.
+                tracing::debug!("held backend closed while client was idle");
+                discard_held_backend(&cancel_registry, client_key, &mut held_backend).await;
+                continue;
+            }
+            IdleEvent::Backend(Ok(_)) => {
+                // Complete frames from the backend; forward verbatim.
+                client
+                    .write_all(&async_backend_frames)
+                    .await
+                    .context("write asynchronous backend message to client")?;
+                continue;
+            }
+            IdleEvent::Backend(Err(error)) => {
+                tracing::debug!(error = %error, "held backend read failed while client was idle");
+                discard_held_backend(&cancel_registry, client_key, &mut held_backend).await;
+                continue;
+            }
         };
         session_buffers.observe_client_read();
         session_buffers.trim_empty_buffers();
