@@ -2813,9 +2813,9 @@ fn parse_runtime_engine(value: &str) -> Result<RuntimeEngine, String> {
         "tokio_default" => Ok(RuntimeEngine::TokioDefault),
         "tokio_current_thread" => Ok(RuntimeEngine::TokioCurrentThread),
         "thread_per_core" => Ok(RuntimeEngine::ThreadPerCore),
-        "io_uring" | "experimental_io_uring" => Ok(RuntimeEngine::IoUring),
+        "io_uring" => Ok(RuntimeEngine::IoUring),
         _ => Err(format!(
-            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, io_uring, experimental_io_uring"
+            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, io_uring"
         )),
     }
 }
@@ -3214,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn io_uring_and_legacy_alias_parse_without_experimental_config_gate() {
+    fn io_uring_parses_without_experimental_config_gate() {
         let config = toml::from_str::<Config>(
             r#"
             [runtime.engine]
@@ -3227,18 +3227,6 @@ mod tests {
             pg_kinetic_core::runtime::RuntimeEngine::IoUring
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
-
-        let alias = toml::from_str::<Config>(
-            r#"
-            [runtime.engine]
-            runtime_engine = "experimental_io_uring"
-            "#,
-        )
-        .expect("legacy io_uring alias parses");
-        assert_eq!(
-            alias.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::IoUring
-        );
 
         let error = toml::from_str::<Config>(
             r#"

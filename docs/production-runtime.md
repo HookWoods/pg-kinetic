@@ -65,10 +65,9 @@ runtime_engine = "thread_per_core"
 | `tokio_current_thread` | stable option |
 | `io_uring` | stable Linux option; requires the `io-uring` cargo feature |
 
-`io_uring` uses monoio for the accept and transport layer while reusing the
+[`io_uring`](./configuration.md#configuration-reference) uses monoio for the accept and transport layer while reusing the
 shared pg-kinetic session, authentication, routing, pooling, timeout, cleanup,
-and recovery logic. The legacy `experimental_io_uring` value is accepted as a
-one-release compatibility alias and resolves to `io_uring`.
+and recovery logic.
 
 ## Preflight
 
