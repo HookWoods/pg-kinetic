@@ -253,17 +253,34 @@ async fn handle_shared_pool_checkout_error<C>(
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
 {
+    // Checkout rejection is the failure operators are most likely to be paged
+    // for, and it was previously visible only as a counter.
     let (message, close) = match error {
         crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::QueueFull,
-        ) => ("backend checkout queue is full", false),
+        ) => {
+            tracing::warn!(reason = "queue_full", "backend checkout rejected");
+            ("backend checkout queue is full", false)
+        }
         crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Timeout,
-        ) => ("backend checkout timed out", false),
+        ) => {
+            tracing::warn!(reason = "timeout", "backend checkout rejected");
+            ("backend checkout timed out", false)
+        }
         crate::pool::PoolError::Backpressure(
             pg_kinetic_core::backpressure::BackpressureError::Closed,
-        ) => ("", true),
-        crate::pool::PoolError::Connect(error) => return Err(error),
+        ) => {
+            tracing::debug!(
+                reason = "closed",
+                "backend checkout rejected during shutdown"
+            );
+            ("", true)
+        }
+        crate::pool::PoolError::Connect(error) => {
+            tracing::warn!(error = %error, "backend connection failed during checkout");
+            return Err(error);
+        }
     };
     if close {
         return Ok(false);
@@ -340,10 +357,16 @@ where
     }
 }
 
+/// Same per-connection span as the pooled path, so io_uring deployments produce
+/// correlatable logs too.
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[tracing::instrument(
+    skip_all,
+    fields(session_id = context.session_id, client_addr = %client_addr)
+)]
 pub(crate) async fn handle_client_session<C, B, O, P>(
     mut client: C,
-    _client_addr: SocketAddr,
+    client_addr: SocketAddr,
     context: SharedClientSessionContext<B, O, P>,
 ) -> anyhow::Result<()>
 where
@@ -857,6 +880,13 @@ pub(super) struct ClientSessionContext {
     pub(super) auth_query_service: Arc<AuthQueryService>,
 }
 
+/// One span per connection, not per query: it costs a single span creation on
+/// accept and is what makes the individual log lines emitted deeper in the stack
+/// (auth outcome, checkout failure, drain decision) attributable to a client.
+#[tracing::instrument(
+    skip_all,
+    fields(session_id = context.session_id, client_addr = %client_addr)
+)]
 pub(super) async fn handle_client(
     mut client: ClientConnection,
     client_addr: SocketAddr,

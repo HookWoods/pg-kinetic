@@ -98,6 +98,12 @@ pub(super) async fn checkout_backend(
                 )
             });
             timer.finish(MetricOutcome::Rejected);
+            tracing::warn!(
+                route = %request.route.metric_label(),
+                mode = checkout_mode_label(request.mode),
+                reason = "queue_full",
+                "backend checkout rejected"
+            );
             return Err(CheckoutFailure::Overload("backend checkout queue is full"));
         }
         Err(crate::pool::PoolError::Backpressure(
@@ -111,6 +117,12 @@ pub(super) async fn checkout_backend(
                 )
             });
             timer.finish(MetricOutcome::Timeout);
+            tracing::warn!(
+                route = %request.route.metric_label(),
+                mode = checkout_mode_label(request.mode),
+                reason = "timeout",
+                "backend checkout rejected"
+            );
             return Err(CheckoutFailure::Overload("backend checkout timed out"));
         }
         Err(crate::pool::PoolError::Backpressure(

@@ -1984,7 +1984,6 @@ impl ObservabilityConfig {
             0.0
         }
     }
-
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]

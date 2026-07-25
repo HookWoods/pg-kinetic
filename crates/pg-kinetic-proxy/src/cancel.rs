@@ -149,9 +149,13 @@ impl CancelRegistry {
     }
 
     pub async fn forward_cancel(&self, key: (i32, i32)) -> anyhow::Result<()> {
+        // Only the process id is logged. The secret key authenticates the cancel
+        // request and must never reach the logs.
         let Some(lease) = self.acquire_forwarding(key) else {
+            tracing::info!(process_id = key.0, "cancel request had no matching session");
             return Ok(());
         };
+        tracing::info!(process_id = key.0, "forwarding cancel request to backend");
         forward_cancel(lease.target()).await
     }
 

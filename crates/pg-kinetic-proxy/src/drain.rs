@@ -105,6 +105,11 @@ impl DrainController {
             .expect("drain started timestamp lock") = Some(started_at);
         *self.drain_deadline.lock().expect("drain deadline lock") = Some(deadline);
         self.notify.notify_waiters();
+        tracing::info!(
+            timeout_secs = timeout.as_secs(),
+            active_clients = self.active_clients(),
+            "drain started"
+        );
         true
     }
 
@@ -112,6 +117,10 @@ impl DrainController {
         self.state
             .store(Self::state_to_u8(DrainState::Drained), Ordering::Release);
         self.notify.notify_waiters();
+        tracing::info!(
+            active_clients = self.active_clients(),
+            "drain finished; no longer serving clients"
+        );
     }
 
     #[must_use]

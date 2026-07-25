@@ -99,6 +99,9 @@ pub async fn connect_backend_tls(
     TlsConnector::from(client_config)
         .connect(server_name, stream)
         .await
+        .inspect_err(|error| {
+            tracing::warn!(error = %error, "backend TLS handshake failed");
+        })
         .context("complete backend TLS handshake")
 }
 
@@ -109,6 +112,11 @@ pub async fn accept_client_tls(
     TlsAcceptor::from(Arc::clone(server_config))
         .accept(stream)
         .await
+        .inspect_err(|error| {
+            // A failing client handshake used to close the connection silently,
+            // which is indistinguishable from a client that simply went away.
+            tracing::warn!(error = %error, "client TLS handshake failed");
+        })
         .context("complete client TLS handshake")
 }
 

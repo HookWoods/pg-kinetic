@@ -36,7 +36,7 @@ use pg_kinetic_proxy::regression::{
 use pg_kinetic_proxy::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
 use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
 
 #[cfg(feature = "allocator-mimalloc")]
 #[global_allocator]
@@ -328,17 +328,40 @@ struct PolicyPreviewFileConfig {
     sharding: pg_kinetic::config::ShardingConfig,
 }
 
+/// Parses a `log_level` value into a filter.
+///
+/// A bare token is required to be a real level. `EnvFilter` would otherwise
+/// accept a typo like `inof` as a *target* name, which parses fine and then
+/// silently discards almost every log line — the exact misconfiguration this
+/// setting is supposed to make obvious. Anything containing `=` or `,` is treated
+/// as a full directive and left to `EnvFilter` to judge.
+fn parse_log_filter(directive: &str) -> anyhow::Result<EnvFilter> {
+    let directive = directive.trim();
+    if directive.contains('=') || directive.contains(',') {
+        return EnvFilter::builder()
+            .parse(directive)
+            .context("parse log filter directive");
+    }
+
+    let level = directive.parse::<LevelFilter>().map_err(|_| {
+        anyhow::anyhow!(
+            "expected trace, debug, info, warn, error, or off, \
+             or a filter directive such as 'pg_kinetic=debug,warn'"
+        )
+    })?;
+    Ok(EnvFilter::new(level.to_string()))
+}
+
 /// Installs the global tracing subscriber from config.
 ///
 /// `RUST_LOG` wins when set, so an operator can raise the level on a running
-/// deployment without editing the config file. An unparseable `log_level` is a
-/// hard error: falling back silently would leave the wrong level in place with
-/// nothing to indicate why.
+/// deployment without editing the config file. An invalid `log_level` is a hard
+/// error: falling back silently would leave the wrong level in place with nothing
+/// to indicate why.
 fn init_logging(observability: &pg_kinetic::config::ObservabilityConfig) -> anyhow::Result<()> {
     let filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
-        Err(_) => EnvFilter::builder()
-            .parse(&observability.log_level)
+        Err(_) => parse_log_filter(&observability.log_level)
             .with_context(|| format!("invalid log_level '{}'", observability.log_level))?,
     };
 
@@ -1132,4 +1155,38 @@ fn parse_compatibility_language(value: &str) -> Result<CompatibilityLanguage, St
 
 fn parse_compatibility_target(value: &str) -> Result<CompatibilityTarget, String> {
     value.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_log_filter;
+
+    #[test]
+    fn log_filter_accepts_levels_and_directives() {
+        for directive in ["info", "  warn  ", "OFF", "trace"] {
+            assert!(
+                parse_log_filter(directive).is_ok(),
+                "expected {directive:?} to parse"
+            );
+        }
+        assert!(parse_log_filter("pg_kinetic=debug,warn").is_ok());
+        assert!(parse_log_filter("pg_kinetic_proxy::pool=trace").is_ok());
+    }
+
+    #[test]
+    fn log_filter_rejects_a_bare_token_that_is_not_a_level() {
+        // EnvFilter would accept these as target names and then silently discard
+        // almost every log line, which is the failure this guard exists to catch.
+        for directive in ["inof", "verbose", "not a level"] {
+            assert!(
+                parse_log_filter(directive).is_err(),
+                "expected {directive:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn log_filter_rejects_a_malformed_directive() {
+        assert!(parse_log_filter("pg_kinetic=bogus").is_err());
+    }
 }
