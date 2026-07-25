@@ -1,15 +1,15 @@
 use std::{fs, path::PathBuf, process::Command};
 
-use pg_kinetic_core::benchmark::{
+use pg_kinetic_core::lab::benchmark::{
     BenchmarkComparison, BenchmarkDriver, BenchmarkScenario, BenchmarkTarget,
     BenchmarkValidationError, BenchmarkWorkloadKind,
 };
-use pg_kinetic_proxy::benchmark::{
+use pg_kinetic_lab::benchmark::{
     benchmark_target_is_required, benchmark_target_label, validate_benchmark_scenario,
     validate_benchmark_targets_with, BenchmarkTargetAvailability, BenchmarkTargetOutcome,
     BenchmarkTargetReportOutcome,
 };
-use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunOutcome, ProfileRunner, ProfileTool};
+use pg_kinetic_lab::profile::{ProfileRunConfig, ProfileRunOutcome, ProfileRunner, ProfileTool};
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_pg-kinetic")

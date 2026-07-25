@@ -4,8 +4,8 @@ use std::sync::{
 };
 
 use bytes::{BufMut, BytesMut};
-use pg_kinetic::proxy_runtime::io_runtime::StartupEncryptionRequest;
-use pg_kinetic::proxy_runtime::io_runtime::{
+use pg_kinetic::proxy_runtime::engine::io_runtime::StartupEncryptionRequest;
+use pg_kinetic::proxy_runtime::engine::io_runtime::{
     parse_frontend_cycle_frames, take_frontend_cycle_bytes, take_startup_packet_bytes,
     try_enter_backend_capacity, try_enter_client_capacity, FrontendCycleRead, FrontendCycleShape,
     StartupPacketRead,

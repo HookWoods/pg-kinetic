@@ -1147,6 +1147,7 @@ dependencies = [
  "metrics",
  "mimalloc",
  "pg-kinetic-core",
+ "pg-kinetic-lab",
  "pg-kinetic-proxy",
  "pg-kinetic-wire",
  "pretty_assertions",
@@ -1172,10 +1173,23 @@ dependencies = [
  "hmac",
  "pg-kinetic-wire",
  "pretty_assertions",
+ "rustix",
  "sha2",
  "subtle",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "pg-kinetic-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pg-kinetic-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml",
 ]
 
 [[package]]

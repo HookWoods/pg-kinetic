@@ -9,8 +9,8 @@ use pg_kinetic::{
     proxy::Proxy,
     wire::protocol::ProtocolVersion,
 };
-use pg_kinetic_proxy::backend::Backend;
-use pg_kinetic_proxy::tls::{load_backend_client_config, load_server_config};
+use pg_kinetic_proxy::net::tls::{load_backend_client_config, load_server_config};
+use pg_kinetic_proxy::pool::backend::Backend;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

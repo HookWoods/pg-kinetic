@@ -13,15 +13,15 @@ use pg_kinetic::{
         TlsConfig,
     },
     core::{
-        mirror::{
+        protocol::sql::SqlCommand,
+        traffic::mirror::{
             MirrorDecision, MirrorMode, MirrorOutcome, MirrorReason, MirrorSafetyGate,
             MirrorSample, MirrorTarget,
         },
-        route::{QueryClass as RouteQueryClass, RouteKey},
-        sql::SqlCommand,
+        traffic::route::{QueryClass as RouteQueryClass, RouteKey},
     },
     proxy_runtime::{
-        mirror::{
+        ops::mirror::{
             MirrorDispatchConfig, MirrorDispatcher, MirrorOutcomeRecorder, MirrorSampler,
             MirrorTask, MirrorTaskStatus,
         },

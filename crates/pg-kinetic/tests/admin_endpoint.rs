@@ -16,9 +16,12 @@ use pg_kinetic::{
         ConnectionConfig, DrainConfig, HealthConfig, ObservabilityConfig, PerformanceConfig,
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
-    core::{observability::MetricOutcome, prepare::PreparedStatementSnapshot, session::PinReason},
+    core::{
+        observability::MetricOutcome, protocol::prepare::PreparedStatementSnapshot,
+        protocol::session::PinReason,
+    },
     proxy::Proxy,
-    proxy_runtime::snapshot::{
+    proxy_runtime::observe::snapshot::{
         ClientSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot, PressureSnapshot,
         RouteSnapshot, ServerSnapshot, SnapshotStore,
     },

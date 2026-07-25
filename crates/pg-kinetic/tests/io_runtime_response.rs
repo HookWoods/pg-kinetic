@@ -1,5 +1,5 @@
 use bytes::{BufMut, BytesMut};
-use pg_kinetic::proxy_runtime::io_runtime::{
+use pg_kinetic::proxy_runtime::engine::io_runtime::{
     drain_backend_response_bytes, BackendBytesDrainEvent, BackendResponseDrain, ResponseDrainEvent,
 };
 use pg_kinetic::wire::{

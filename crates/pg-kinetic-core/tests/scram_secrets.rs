@@ -1,4 +1,6 @@
-use pg_kinetic_core::secrets::{Md5Secret, ScramVerifier, SecretError, UserSecret, UserStore};
+use pg_kinetic_core::security::secrets::{
+    Md5Secret, ScramVerifier, SecretError, UserSecret, UserStore,
+};
 
 #[test]
 fn parses_postgres_style_scram_verifier_strings() {
@@ -63,7 +65,7 @@ fn user_lookup_can_be_case_insensitive_when_configured() {
 
 #[test]
 fn generates_nonce_using_url_safe_text() {
-    let nonce = pg_kinetic_core::secrets::generate_nonce().expect("nonce");
+    let nonce = pg_kinetic_core::security::secrets::generate_nonce().expect("nonce");
     assert!(!nonce.is_empty());
     assert!(!nonce.contains('='));
 }

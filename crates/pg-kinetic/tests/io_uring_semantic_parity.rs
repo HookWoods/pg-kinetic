@@ -17,11 +17,11 @@ use std::{
 use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{BackendTlsMode, ClientTlsMode, Config, ReadRoutingConfig, RouteConfig, TlsConfig},
-    core::runtime::RuntimeEngine,
-    proxy_runtime::io_uring,
+    core::cluster::runtime::RuntimeEngine,
+    proxy_runtime::engine::io_uring,
 };
-use pg_kinetic_core::routing::ReadRoutingMode;
-use pg_kinetic_proxy::tls::{load_backend_client_config, load_server_config};
+use pg_kinetic_core::traffic::routing::ReadRoutingMode;
+use pg_kinetic_proxy::net::tls::{load_backend_client_config, load_server_config};
 use tokio_rustls::rustls::{
     pki_types::ServerName, ClientConnection, ServerConnection, StreamOwned,
 };

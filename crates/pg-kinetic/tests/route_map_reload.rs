@@ -1,22 +1,22 @@
 use pg_kinetic::{
     core::{
-        prepare::PreparedCatalog,
-        routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-        session::TransactionState,
-        sharding::{
+        protocol::prepare::PreparedCatalog,
+        protocol::session::TransactionState,
+        protocol::virtual_session::ReadAfterWriteState,
+        traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+        traffic::sharding::{
             MultiShardPolicy, ShardDrainPolicy, ShardId, ShardLifecycleState,
             ShardMigrationSafetyReport, ShardRebalancePlan, ShardRoute, ShardRouteMap,
             ShardRouteReason, ShardScope, ShardStrategy, ShardTarget,
         },
-        virtual_session::ReadAfterWriteState,
     },
     proxy_runtime::{
-        routing::{ReadRoutingPlanner, RouteHealthSnapshot},
-        sharding::{
+        observe::snapshot::{ShardLifecycleSnapshot, SnapshotStore},
+        routing::sharding::{
             RouteMapReloadErrorCode, RouteMapReloadResult, ShardRouteMapStore, ShardRoutingContext,
             ShardRoutingPlanner,
         },
-        snapshot::{ShardLifecycleSnapshot, SnapshotStore},
+        routing::{ReadRoutingPlanner, RouteHealthSnapshot},
     },
     route::{QueryClass, RouteKey},
 };
@@ -39,7 +39,7 @@ fn route(shard_id_value: &str) -> ShardRoute {
     ShardRoute::new(
         ShardTarget::new(
             route_key(),
-            pg_kinetic::core::routing::BackendRole::Primary,
+            pg_kinetic::core::traffic::routing::BackendRole::Primary,
             shard_id(shard_id_value),
         ),
         ShardRouteReason::HashMatch,
@@ -92,7 +92,7 @@ fn migration_report() -> ShardMigrationSafetyReport {
         vec![11, 17],
         vec![String::from("stmt_a"), String::from("stmt_b")],
         vec![88],
-        Some(pg_kinetic_core::lsn::PgLsn::new(42)),
+        Some(pg_kinetic_core::cluster::lsn::PgLsn::new(42)),
     )
 }
 
@@ -290,7 +290,7 @@ fn removed_shard_with_active_sessions_enters_draining_state_with_explicit_overri
             .safety_report()
             .expect("migration safety report")
             .last_required_lsn(),
-        Some(pg_kinetic_core::lsn::PgLsn::new(42))
+        Some(pg_kinetic_core::cluster::lsn::PgLsn::new(42))
     );
 }
 

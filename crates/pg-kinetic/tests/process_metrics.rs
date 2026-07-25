@@ -1,8 +1,8 @@
-use pg_kinetic::core::performance::{
+use pg_kinetic::core::observability::performance::{
     DerivedPerformanceMetric, PerformanceMetric, ProcessMetricKind, ProcessMetricSample,
     ProcessMetricValue,
 };
-use pg_kinetic_proxy::benchmark::collect_process_metrics;
+use pg_kinetic_core::observability::process::collect_process_metrics;
 use serde_json::Value;
 
 #[test]

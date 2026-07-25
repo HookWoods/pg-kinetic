@@ -1,8 +1,10 @@
 use pg_kinetic_core::{
-    routing::{BackendRole, RoutingReason},
-    session::{ClientEvent, ReadRoutingTransactionState, SessionState, TransactionAccessMode},
-    sql::classify,
-    virtual_session::{PinReason, VirtualSession},
+    protocol::session::{
+        ClientEvent, ReadRoutingTransactionState, SessionState, TransactionAccessMode,
+    },
+    protocol::sql::classify,
+    protocol::virtual_session::{PinReason, VirtualSession},
+    traffic::routing::{BackendRole, RoutingReason},
 };
 
 fn assert_read_routing_state(
@@ -39,7 +41,7 @@ fn begin_and_start_transaction_read_only_mark_transaction_replica_eligible() {
         );
         assert_eq!(
             state.pin_reason(),
-            Some(pg_kinetic_core::session::PinReason::OpenTransaction)
+            Some(pg_kinetic_core::protocol::session::PinReason::OpenTransaction)
         );
     }
 }

@@ -1,3 +1,6 @@
+pub mod backend;
+pub mod backend_query;
+
 use std::marker::PhantomData;
 use std::{
     collections::{HashMap, VecDeque},
@@ -14,16 +17,16 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
-    backend::Backend,
     config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
-    metrics::{self, RouteMetricHandles},
-    snapshot::{PoolLifecycleSnapshot, PoolSnapshot, SnapshotStore},
+    observe::metrics::{self, RouteMetricHandles},
+    observe::snapshot::{PoolLifecycleSnapshot, PoolSnapshot, SnapshotStore},
+    pool::backend::Backend,
 };
 use pg_kinetic_core::{
-    backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
-    route::{PoolKey, RouteKey},
-    routing::BackendRole,
-    sharding::ShardId,
+    traffic::backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
+    traffic::route::{PoolKey, RouteKey},
+    traffic::routing::BackendRole,
+    traffic::sharding::ShardId,
 };
 
 #[derive(Debug)]
@@ -41,7 +44,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct BackendPoolCore<T, C, R = crate::io_runtime::TokioTimeout>
+pub(crate) struct BackendPoolCore<T, C, R = crate::engine::io_runtime::TokioTimeout>
 where
     T: PoolBackendTransport,
     C: PoolBackendConnector<T>,
@@ -1431,7 +1434,7 @@ impl<T, C, R> BackendPoolCore<T, C, R>
 where
     T: PoolBackendTransport,
     C: PoolBackendConnector<T>,
-    R: crate::io_runtime::TimeoutRuntime + Send + Sync + 'static,
+    R: crate::engine::io_runtime::TimeoutRuntime + Send + Sync + 'static,
 {
     pub fn attach_snapshot_store(&self, snapshot_store: SnapshotStore) {
         self.snapshot_store
@@ -1838,7 +1841,7 @@ where
 }
 
 #[cfg(test)]
-impl<T, C> BackendPoolCore<T, C, crate::io_runtime::TokioTimeout>
+impl<T, C> BackendPoolCore<T, C, crate::engine::io_runtime::TokioTimeout>
 where
     T: PoolBackendTransport,
     C: PoolBackendConnector<T>,
@@ -2070,7 +2073,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pg_kinetic_core::route::QueryClass;
+    use pg_kinetic_core::traffic::route::QueryClass;
     use std::{
         net::SocketAddr,
         sync::{

@@ -8,31 +8,33 @@ pub(super) async fn next_client_cycle<C>(
     max_client_buffer_bytes: usize,
 ) -> anyhow::Result<Option<ClientCycle>>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     loop {
-        match crate::io_runtime::take_frontend_cycle_bytes(client_buffer, max_client_buffer_bytes)?
-        {
-            crate::io_runtime::FrontendCycleRead::Complete { bytes, .. } => {
+        match crate::engine::io_runtime::take_frontend_cycle_bytes(
+            client_buffer,
+            max_client_buffer_bytes,
+        )? {
+            crate::engine::io_runtime::FrontendCycleRead::Complete { bytes, .. } => {
                 return Ok(Some(ClientCycle::Frames(
-                    crate::io_runtime::parse_frontend_cycle_frames(bytes)?,
+                    crate::engine::io_runtime::parse_frontend_cycle_frames(bytes)?,
                 )));
             }
-            crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+            crate::engine::io_runtime::FrontendCycleRead::Terminate { .. } => {
                 return Ok(Some(ClientCycle::Terminate));
             }
-            crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+            crate::engine::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
                 return Ok(Some(ClientCycle::BufferLimitExceeded));
             }
-            crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+            crate::engine::io_runtime::FrontendCycleRead::NeedMoreBytes => {
                 if client_buffer.len() >= max_client_buffer_bytes {
                     return Ok(Some(ClientCycle::BufferLimitExceeded));
                 }
 
                 match idle_timeout {
-                    Some(duration) => match crate::io_runtime::tokio_timeout(
+                    Some(duration) => match crate::engine::io_runtime::tokio_timeout(
                         duration,
-                        crate::io_runtime::read_from(client, client_buffer),
+                        crate::engine::io_runtime::read_from(client, client_buffer),
                     )
                     .await
                     {
@@ -47,7 +49,7 @@ where
                         Err(_) => return Ok(Some(ClientCycle::IdleTimeout(idle_timeout_kind))),
                     },
                     None => {
-                        if crate::io_runtime::read_from(client, client_buffer)
+                        if crate::engine::io_runtime::read_from(client, client_buffer)
                             .await
                             .context("read client")?
                             == 0
@@ -104,7 +106,7 @@ where
             let mut response = BytesMut::with_capacity(error.len() + 6);
             response.extend_from_slice(&error);
             response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
-            crate::io_runtime::write_all_to(client, &response)
+            crate::engine::io_runtime::write_all_to(client, &response)
                 .await
                 .context("write startup timeout response")?;
             Ok(StartupOrCancel::Finished)
@@ -121,7 +123,7 @@ pub(crate) enum StartupOrCancel {
     Finished,
 }
 
-pub(crate) trait ClientTlsIo: crate::io_runtime::RuntimeByteStream {
+pub(crate) trait ClientTlsIo: crate::engine::io_runtime::RuntimeByteStream {
     fn is_tls(&self) -> bool;
 
     fn has_peer_certificates(&self) -> bool;
@@ -153,8 +155,11 @@ impl ClientTlsIo for ClientConnection {
         buffer: &mut BytesMut,
         idle_timeout: Duration,
     ) -> Result<std::io::Result<usize>, ()> {
-        crate::io_runtime::tokio_timeout(idle_timeout, crate::io_runtime::read_from(self, buffer))
-            .await
+        crate::engine::io_runtime::tokio_timeout(
+            idle_timeout,
+            crate::engine::io_runtime::read_from(self, buffer),
+        )
+        .await
     }
 
     async fn start_tls(
@@ -292,14 +297,15 @@ where
         crate::config::ClientTlsMode::Require | crate::config::ClientTlsMode::VerifyClient
     );
     loop {
-        match crate::io_runtime::take_startup_packet_bytes(buffer, max_client_buffer_bytes)? {
-            crate::io_runtime::StartupPacketRead::Packet(packet) => {
+        match crate::engine::io_runtime::take_startup_packet_bytes(buffer, max_client_buffer_bytes)?
+        {
+            crate::engine::io_runtime::StartupPacketRead::Packet(packet) => {
                 if client_tls_required && !client.is_tls() {
                     anyhow::bail!("client TLS is required");
                 }
                 return Ok(StartupRead::Packet(packet));
             }
-            crate::io_runtime::StartupPacketRead::Cancel {
+            crate::engine::io_runtime::StartupPacketRead::Cancel {
                 process_id,
                 secret_key,
                 ..
@@ -309,8 +315,8 @@ where
                     secret_key,
                 });
             }
-            crate::io_runtime::StartupPacketRead::EncryptionRequest(
-                crate::io_runtime::StartupEncryptionRequest::Ssl,
+            crate::engine::io_runtime::StartupPacketRead::EncryptionRequest(
+                crate::engine::io_runtime::StartupEncryptionRequest::Ssl,
             ) => {
                 match client_tls_mode {
                     crate::config::ClientTlsMode::Disable => {
@@ -319,7 +325,7 @@ where
                     crate::config::ClientTlsMode::Allow
                     | crate::config::ClientTlsMode::Require
                     | crate::config::ClientTlsMode::VerifyClient => {
-                        crate::io_runtime::write_all_to(client, b"S")
+                        crate::engine::io_runtime::write_all_to(client, b"S")
                             .await
                             .context("accept startup encryption request")?;
                         let server_config = client_tls_server_config
@@ -355,16 +361,16 @@ where
                 }
                 continue;
             }
-            crate::io_runtime::StartupPacketRead::EncryptionRequest(
-                crate::io_runtime::StartupEncryptionRequest::Gss,
+            crate::engine::io_runtime::StartupPacketRead::EncryptionRequest(
+                crate::engine::io_runtime::StartupEncryptionRequest::Gss,
             ) => {
                 reject_startup_encryption_request(client).await?;
                 continue;
             }
-            crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
+            crate::engine::io_runtime::StartupPacketRead::BufferLimitExceeded => {
                 return Ok(StartupRead::BufferLimitExceeded);
             }
-            crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
+            crate::engine::io_runtime::StartupPacketRead::NeedMoreBytes => {
                 if buffer.len() >= max_client_buffer_bytes {
                     return Ok(StartupRead::BufferLimitExceeded);
                 }
@@ -387,9 +393,9 @@ where
 
 pub(super) async fn reject_startup_encryption_request<C>(client: &mut C) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
-    crate::io_runtime::write_all_to(client, b"N")
+    crate::engine::io_runtime::write_all_to(client, b"N")
         .await
         .context("reject startup encryption request")
 }

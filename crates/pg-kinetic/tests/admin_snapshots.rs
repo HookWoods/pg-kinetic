@@ -4,10 +4,10 @@ use pg_kinetic::{
     config::Config,
     config::TlsConfig,
     core::observability::MetricOutcome,
-    core::prepare::PreparedStatementSnapshot,
-    core::session::PinReason,
+    core::protocol::prepare::PreparedStatementSnapshot,
+    core::protocol::session::PinReason,
     pool::BackendPool,
-    proxy_runtime::snapshot::{
+    proxy_runtime::observe::snapshot::{
         BackpressureSnapshot, ClientSnapshot, LimitsSnapshot, PinningSnapshot, PoolSnapshot,
         PreparedSnapshot, RecoverySnapshot, RouteSnapshot, ServerSnapshot, SettingsSnapshot,
         SnapshotStore,

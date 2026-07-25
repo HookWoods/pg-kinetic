@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs,
     net::SocketAddr,
@@ -8,7 +9,7 @@ use std::{
 
 use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
-    proxy_runtime::reload::{
+    proxy_runtime::ops::reload::{
         load_auth_users, load_backend_credential_provider, load_client_tls_server_config,
         load_effective_config, reload_once, reload_once_with_pools_and_credentials,
         validate_runtime_assets, BackendCredentialCache, ReloadDecision,
@@ -25,12 +26,18 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
+    // The timestamp alone is not unique: tests in this binary run in parallel and
+    // the clock is coarse enough that two calls sharing a prefix can land on the
+    // same value, so one test silently overwrites another's config file. The
+    // counter makes the name unique regardless of clock resolution.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "pg-kinetic-{prefix}-{}-{timestamp}{suffix}",
+        "pg-kinetic-{prefix}-{}-{timestamp}-{sequence}{suffix}",
         std::process::id()
     ))
 }

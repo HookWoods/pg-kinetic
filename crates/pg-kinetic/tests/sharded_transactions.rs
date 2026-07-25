@@ -1,8 +1,10 @@
 use pg_kinetic::{
-    core::routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode, RoutingReason},
-    core::session::{TransactionShardDecision, TransactionShardState},
-    core::sharding::{MultiShardPolicy, ShardId},
-    core::virtual_session::VirtualSession,
+    core::protocol::session::{TransactionShardDecision, TransactionShardState},
+    core::protocol::virtual_session::VirtualSession,
+    core::traffic::routing::{
+        BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode, RoutingReason,
+    },
+    core::traffic::sharding::{MultiShardPolicy, ShardId},
     virtual_session::PinReason,
 };
 use pg_kinetic_proxy::routing::{
@@ -168,8 +170,8 @@ fn read_only_transactions_can_use_replicas_inside_the_selected_shard() {
         &routing_planner(),
         RoutingContext::new(
             "select 1",
-            pg_kinetic::core::session::TransactionState::Idle,
-            pg_kinetic::core::virtual_session::ReadAfterWriteState::Disabled,
+            pg_kinetic::core::protocol::session::TransactionState::Idle,
+            pg_kinetic::core::protocol::virtual_session::ReadAfterWriteState::Disabled,
             &healthy_replica(),
         ),
     );

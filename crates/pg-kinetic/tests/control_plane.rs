@@ -2,13 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use pg_kinetic::{
     core::{
-        control::{
+        cluster::control::{
             ClusterViewGeneration, ControlEvent, ControlEventKind, NodeHeartbeat,
             NodeLifecycleSummary, NodeStatus, PeerHealth, PeerState,
         },
-        runtime::{NodeId, ReadinessState, RuntimeLifecycleState},
+        cluster::runtime::{NodeId, ReadinessState, RuntimeLifecycleState},
     },
-    proxy_runtime::control::{
+    proxy_runtime::ops::control::{
         ClusterViewStore, HeartbeatObserver, HeartbeatPublisher, LocalControlEventSink,
         NodeRegistry,
     },

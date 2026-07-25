@@ -332,7 +332,7 @@ pub(super) async fn reject_client_during_drain(
     )
     .await?;
     drain_timer.finish(MetricOutcome::Rejected);
-    crate::io_runtime::shutdown(client)
+    crate::engine::io_runtime::shutdown(client)
         .await
         .context("shutdown draining client")
 }

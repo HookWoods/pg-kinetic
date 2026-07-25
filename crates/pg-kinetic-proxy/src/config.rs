@@ -6,23 +6,25 @@ use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
-    adaptive::{AdaptiveMode, TunableKnob},
-    cleanup::PoolMode as CorePoolMode,
+    cluster::adaptive::{AdaptiveMode, TunableKnob},
+    cluster::cleanup::PoolMode as CorePoolMode,
+    cluster::recovery::RecoveryMode,
+    cluster::runtime::{NodeId, RuntimeEngine},
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
-    mirror::MirrorMode,
-    policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
-    recovery::RecoveryMode,
-    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-    runtime::{NodeId, RuntimeEngine},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
         ClientTlsMode as CoreClientTlsMode,
     },
-    sharding::ShardId,
+    traffic::mirror::MirrorMode,
+    traffic::policy::{
+        PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId,
+    },
+    traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    traffic::sharding::ShardId,
 };
 
 #[cfg(feature = "policy-wasm")]
-use crate::policy_wasm::WasmPolicyEvaluator;
+use crate::routing::policy_wasm::WasmPolicyEvaluator;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -369,7 +371,7 @@ pub struct MirrorSamplingConfig {
 impl MirrorSamplingConfig {
     #[must_use]
     pub fn sample_rate(&self) -> f64 {
-        pg_kinetic_core::mirror::MirrorSample::new(self.mirror_sample_rate).rate()
+        pg_kinetic_core::traffic::mirror::MirrorSample::new(self.mirror_sample_rate).rate()
     }
 }
 
@@ -826,14 +828,14 @@ impl AdaptiveConfig {
 
     pub fn evaluate(
         &self,
-        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+        recommendation: &pg_kinetic_core::cluster::adaptive::AdaptiveRecommendation,
     ) -> Result<
-        pg_kinetic_core::adaptive::AdaptiveOutcome,
-        pg_kinetic_core::adaptive::AdaptiveApplyError,
+        pg_kinetic_core::cluster::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::cluster::adaptive::AdaptiveApplyError,
     > {
         if recommendation.confidence() < self.adaptive_min_confidence {
-            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                pg_kinetic_core::adaptive::AdaptiveGuardrail::ConfidenceFloor,
+            return Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::ConfidenceFloor,
                 format!(
                     "adaptive recommendation confidence {:.3} is below the minimum {:.3}",
                     recommendation.confidence(),
@@ -845,7 +847,7 @@ impl AdaptiveConfig {
         if self.adaptive_mode.is_apply() {
             self.apply.evaluate(recommendation, &self.guardrail)
         } else {
-            Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Recommended)
+            Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Recommended)
         }
     }
 }
@@ -914,19 +916,19 @@ impl AdaptiveApplyConfig {
 
     pub fn evaluate(
         &self,
-        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+        recommendation: &pg_kinetic_core::cluster::adaptive::AdaptiveRecommendation,
         guardrail: &AdaptiveGuardrailConfig,
     ) -> Result<
-        pg_kinetic_core::adaptive::AdaptiveOutcome,
-        pg_kinetic_core::adaptive::AdaptiveApplyError,
+        pg_kinetic_core::cluster::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::cluster::adaptive::AdaptiveApplyError,
     > {
         if !self.adaptive_apply_enabled {
-            return Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Skipped);
+            return Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Skipped);
         }
 
         if !self.allows(recommendation.knob()) {
-            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                pg_kinetic_core::adaptive::AdaptiveGuardrail::Allowlist,
+            return Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::Allowlist,
                 format!(
                     "adaptive knob '{}' is not on the apply allowlist",
                     recommendation.knob()
@@ -935,25 +937,25 @@ impl AdaptiveApplyConfig {
         }
 
         match recommendation.safety_bound() {
-            pg_kinetic_core::adaptive::TuningBound::Unbounded => {
-                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                    pg_kinetic_core::adaptive::AdaptiveGuardrail::UnboundedChange,
+            pg_kinetic_core::cluster::adaptive::TuningBound::Unbounded => {
+                Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::UnboundedChange,
                     "adaptive apply rejected an unbounded change",
                 ))
             }
-            pg_kinetic_core::adaptive::TuningBound::Percent(change_percent)
+            pg_kinetic_core::cluster::adaptive::TuningBound::Percent(change_percent)
                 if change_percent > guardrail.adaptive_max_change_percent =>
             {
-                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                    pg_kinetic_core::adaptive::AdaptiveGuardrail::MaxChangePercent,
+                Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::MaxChangePercent,
                     format!(
                         "adaptive change percent {change_percent} exceeds the configured limit {}",
                         guardrail.adaptive_max_change_percent
                     ),
                 ))
             }
-            pg_kinetic_core::adaptive::TuningBound::Percent(_) => {
-                Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Applied)
+            pg_kinetic_core::cluster::adaptive::TuningBound::Percent(_) => {
+                Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Applied)
             }
         }
     }
@@ -982,8 +984,8 @@ impl AdaptiveGuardrailConfig {
     }
 
     #[must_use]
-    pub const fn safety_bound(&self) -> pg_kinetic_core::adaptive::TuningBound {
-        pg_kinetic_core::adaptive::TuningBound::percent(self.adaptive_max_change_percent)
+    pub const fn safety_bound(&self) -> pg_kinetic_core::cluster::adaptive::TuningBound {
+        pg_kinetic_core::cluster::adaptive::TuningBound::percent(self.adaptive_max_change_percent)
     }
 }
 
@@ -2940,7 +2942,7 @@ mod tests {
         PoolMode, PressureConfig, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig,
         SocketConfig,
     };
-    use crate::snapshot::SettingsSnapshot;
+    use crate::observe::snapshot::SettingsSnapshot;
     use clap::Parser;
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -2969,7 +2971,7 @@ mod tests {
         assert!(!config.runtime.node.node_id.as_str().is_empty());
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::ThreadPerCore
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
         assert_eq!(config.runtime.engine.runtime_shards, None);
@@ -2994,7 +2996,7 @@ mod tests {
         assert_eq!(config.performance.pool_mode, PoolMode::Transaction);
         assert_eq!(
             config.performance.recovery_mode,
-            pg_kinetic_core::recovery::RecoveryMode::Recover
+            pg_kinetic_core::cluster::recovery::RecoveryMode::Recover
         );
         assert_eq!(
             config.performance.recovery_timeout(),
@@ -3166,7 +3168,7 @@ mod tests {
         assert_eq!(config.runtime.node.node_id.as_str(), "proxy-a");
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::TokioCurrentThread
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::TokioCurrentThread
         );
         assert!(config.runtime.production.control_plane_enabled);
         assert!(config.runtime.production.mirroring_enabled);
@@ -3248,7 +3250,7 @@ mod tests {
         .expect("stable io_uring runtime parses");
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::IoUring
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::IoUring
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
 
@@ -3276,7 +3278,7 @@ mod tests {
 
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::ThreadPerCore
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
         assert_eq!(config.runtime.engine.runtime_shards, Some(2));
@@ -3517,7 +3519,7 @@ mod tests {
         assert_eq!(config.performance.pool_mode, PoolMode::Session);
         assert_eq!(
             config.performance.recovery_mode,
-            pg_kinetic_core::recovery::RecoveryMode::Drop
+            pg_kinetic_core::cluster::recovery::RecoveryMode::Drop
         );
         assert_eq!(
             config.performance.recovery_timeout(),

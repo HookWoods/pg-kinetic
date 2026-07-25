@@ -1,6 +1,6 @@
 use pg_kinetic_core::{
-    routing::{QueryClass, RoutingHint},
-    sql_classify::analyze_sql,
+    protocol::sql_classify::analyze_sql,
+    traffic::routing::{QueryClass, RoutingHint},
 };
 
 #[test]

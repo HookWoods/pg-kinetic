@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
-use pg_kinetic::core::performance::PerformanceScoreOutcome;
-use pg_kinetic_proxy::regression::{redact_sensitive_text, score_benchmark_reports};
+use pg_kinetic::core::observability::performance::PerformanceScoreOutcome;
+use pg_kinetic_lab::regression::{redact_sensitive_text, score_benchmark_reports};
 use serde_json::Value;
 
 fn workspace_path(path: &str) -> PathBuf {

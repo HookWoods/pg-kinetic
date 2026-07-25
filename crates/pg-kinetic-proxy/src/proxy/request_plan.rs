@@ -92,7 +92,7 @@ impl<'a> RequestPlan<'a> {
         }
     }
 
-    fn from_prepared(statement: &pg_kinetic_core::prepare::PreparedStatement) -> Self {
+    fn from_prepared(statement: &pg_kinetic_core::protocol::prepare::PreparedStatement) -> Self {
         Self {
             sql: Cow::Owned(statement.query.clone()),
             command: statement.command().clone(),
@@ -189,7 +189,7 @@ pub(super) fn mirror_sql_command_for_request_plan(
 #[cfg(test)]
 mod sql_plan_cache_tests {
     use super::*;
-    use pg_kinetic_core::routing::{QueryClass as RoutingQueryClass, RoutingHint};
+    use pg_kinetic_core::traffic::routing::{QueryClass as RoutingQueryClass, RoutingHint};
 
     #[test]
     fn cached_sql_plan_upgrades_to_full_analysis_only_when_needed() {

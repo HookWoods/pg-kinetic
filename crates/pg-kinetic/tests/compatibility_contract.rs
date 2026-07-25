@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use pg_kinetic::core::compatibility::CompatibilityCase;
+use pg_kinetic::core::lab::compatibility::CompatibilityCase;
 use serde_json::Value;
 
 fn workspace_path(path: &str) -> PathBuf {

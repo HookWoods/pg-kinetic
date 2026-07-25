@@ -3,11 +3,11 @@ use pg_kinetic::{
     config::{
         AuthMode, BackendTlsMode, ClientTlsMode, Config, PoolConfig, ReadRoutingConfig, RouteConfig,
     },
-    core::runtime::RuntimeEngine,
-    proxy_runtime::io_uring,
+    core::cluster::runtime::RuntimeEngine,
+    proxy_runtime::engine::io_uring,
     wire::protocol::ProtocolVersion,
 };
-use pg_kinetic_core::routing::ReadRoutingMode;
+use pg_kinetic_core::traffic::routing::ReadRoutingMode;
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();

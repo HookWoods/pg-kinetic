@@ -94,21 +94,21 @@ where
 }
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-impl<B, O> crate::io_runtime::RuntimeByteStream for LeaseRuntimeBackend<'_, B, O>
+impl<B, O> crate::engine::io_runtime::RuntimeByteStream for LeaseRuntimeBackend<'_, B, O>
 where
-    B: crate::pool::PoolBackendTransport + crate::io_runtime::RuntimeByteStream,
+    B: crate::pool::PoolBackendTransport + crate::engine::io_runtime::RuntimeByteStream,
     O: crate::pool::BackendLeaseOwner<B>,
 {
     async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
-        crate::io_runtime::read_from(self.lease.backend_mut(), dst).await
+        crate::engine::io_runtime::read_from(self.lease.backend_mut(), dst).await
     }
 
     async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        crate::io_runtime::write_all_to(self.lease.backend_mut(), bytes).await
+        crate::engine::io_runtime::write_all_to(self.lease.backend_mut(), bytes).await
     }
 
     async fn shutdown_stream(&mut self) -> std::io::Result<()> {
-        crate::io_runtime::shutdown(self.lease.backend_mut()).await
+        crate::engine::io_runtime::shutdown(self.lease.backend_mut()).await
     }
 }
 
@@ -116,7 +116,7 @@ where
 struct DiscardRuntimeStream;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-impl crate::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
+impl crate::engine::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
     async fn read_into(&mut self, _dst: &mut BytesMut) -> std::io::Result<usize> {
         Ok(0)
     }
@@ -187,13 +187,13 @@ async fn write_shared_error_response<C>(
     message: &str,
 ) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     let error = build_error_response(sqlstate, message);
     let mut response = BytesMut::with_capacity(error.len() + 6);
     response.extend_from_slice(&error);
     response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
-    crate::io_runtime::write_all_to(client, &response)
+    crate::engine::io_runtime::write_all_to(client, &response)
         .await
         .context("write shared error response")
 }
@@ -201,7 +201,7 @@ where
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     write_shared_error_response(client, SqlState::QueryCanceled.as_str(), "query timed out").await
 }
@@ -212,7 +212,7 @@ async fn write_shared_idle_timeout_response<C>(
     kind: IdleTimeoutKind,
 ) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     metrics_crate::counter!(
         MetricName::TimeoutTotal.as_str(),
@@ -237,7 +237,7 @@ where
                 SqlState::OperatorIntervention.as_str(),
                 "idle transaction timed out",
             );
-            crate::io_runtime::write_all_to(client, &error)
+            crate::engine::io_runtime::write_all_to(client, &error)
                 .await
                 .context("write shared idle transaction timeout response")
         }
@@ -251,25 +251,25 @@ async fn handle_shared_pool_checkout_error<C>(
     overload_error_code: &str,
 ) -> anyhow::Result<bool>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     // Checkout rejection is the failure operators are most likely to be paged
     // for, and it was previously visible only as a counter.
     let (message, close) = match error {
         crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::QueueFull,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::QueueFull,
         ) => {
             tracing::warn!(reason = "queue_full", "backend checkout rejected");
             ("backend checkout queue is full", false)
         }
         crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Timeout,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Timeout,
         ) => {
             tracing::warn!(reason = "timeout", "backend checkout rejected");
             ("backend checkout timed out", false)
         }
         crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Closed,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Closed,
         ) => {
             tracing::debug!(
                 reason = "closed",
@@ -296,16 +296,16 @@ async fn probe_shared_read_after_write_requirement<S>(
     max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<PgLsn>
 where
-    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+    S: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     let probe = probe_shared_read_after_write_requirement_without_timeout(
         backend,
         max_backend_buffer_bytes,
     );
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    let result = crate::io_runtime::monoio_timeout(probe_timeout, probe).await;
+    let result = crate::engine::io_runtime::monoio_timeout(probe_timeout, probe).await;
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    let result = crate::io_runtime::tokio_timeout(probe_timeout, probe).await;
+    let result = crate::engine::io_runtime::tokio_timeout(probe_timeout, probe).await;
 
     result.map_err(|_| anyhow::anyhow!("read-after-write probe timed out"))?
 }
@@ -316,10 +316,10 @@ async fn probe_shared_read_after_write_requirement_without_timeout<S>(
     max_backend_buffer_bytes: usize,
 ) -> anyhow::Result<PgLsn>
 where
-    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+    S: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
     let frame = simple_query_frame("SELECT pg_current_wal_lsn()");
-    crate::io_runtime::write_all_to(backend, &encode_frontend_frame(&frame))
+    crate::engine::io_runtime::write_all_to(backend, &encode_frontend_frame(&frame))
         .await
         .context("write read-after-write probe")?;
 
@@ -330,7 +330,7 @@ where
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
-        let read = crate::io_runtime::read_from(backend, &mut backend_buffer)
+        let read = crate::engine::io_runtime::read_from(backend, &mut backend_buffer)
             .await
             .context("read read-after-write probe response")?;
         if read == 0 {
@@ -370,9 +370,9 @@ pub(crate) async fn handle_client_session<C, B, O, P>(
     context: SharedClientSessionContext<B, O, P>,
 ) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream,
+    C: crate::engine::io_runtime::RuntimeByteStream,
     B: crate::pool::PoolBackendTransport
-        + crate::io_runtime::RuntimeByteStream
+        + crate::engine::io_runtime::RuntimeByteStream
         + BackendStartupMetadata,
     O: crate::pool::BackendLeaseOwner<B>,
     P: SharedBackendPool<B, O>,
@@ -497,7 +497,7 @@ where
         } else {
             Some(idle_timeout)
         };
-        let cycle = match crate::io_runtime::take_frontend_cycle_bytes(
+        let cycle = match crate::engine::io_runtime::take_frontend_cycle_bytes(
             &mut client_buffer,
             max_client_buffer_bytes,
         ) {
@@ -508,8 +508,8 @@ where
             }
         };
         match cycle {
-            crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
-                let frames = match crate::io_runtime::parse_frontend_cycle_frames(bytes) {
+            crate::engine::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
+                let frames = match crate::engine::io_runtime::parse_frontend_cycle_frames(bytes) {
                     Ok(frames) => frames,
                     Err(error) => {
                         cleanup_held_shared_backend(
@@ -665,7 +665,7 @@ where
                         replay_bytes.extend_from_slice(&encode_frontend_frame(frame));
                     }
                     let replay_shape =
-                        crate::io_runtime::FrontendCycleShape::from_frames(&replay_frames);
+                        crate::engine::io_runtime::FrontendCycleShape::from_frames(&replay_frames);
                     let mut replay_backend_buffer = BytesMut::with_capacity(16 * 1024);
                     let mut discard_client = DiscardRuntimeStream;
                     let mut replay_backend = LeaseRuntimeBackend {
@@ -731,12 +731,13 @@ where
                     max_backend_buffer_bytes,
                 );
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-                let result = crate::io_runtime::monoio_timeout(query_timeout, forward).await;
+                let result =
+                    crate::engine::io_runtime::monoio_timeout(query_timeout, forward).await;
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-                let result = crate::io_runtime::tokio_timeout(query_timeout, forward).await;
+                let result = crate::engine::io_runtime::tokio_timeout(query_timeout, forward).await;
                 match result {
                     Ok(Ok(outcome)) => match outcome {
-                        crate::io_runtime::BackendForwardOutcome::Ready(status) => {
+                        crate::engine::io_runtime::BackendForwardOutcome::Ready(status) => {
                             if should_probe_read_after_write(
                                 committed_write_transaction,
                                 read_after_write_protection_enabled,
@@ -765,7 +766,7 @@ where
                                 .await;
                             }
                         }
-                        crate::io_runtime::BackendForwardOutcome::Flushed => {
+                        crate::engine::io_runtime::BackendForwardOutcome::Flushed => {
                             drop(runtime_backend);
                             held_backend = Some(backend);
                         }
@@ -790,27 +791,31 @@ where
                     }
                 }
             }
-            crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+            crate::engine::io_runtime::FrontendCycleRead::Terminate { .. } => {
                 cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
                 return Ok(());
             }
-            crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+            crate::engine::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
                 cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
                 return Err(anyhow::anyhow!(
                     "client request exceeded configured buffer limit"
                 ));
             }
-            crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+            crate::engine::io_runtime::FrontendCycleRead::NeedMoreBytes => {
                 let read = match cycle_timeout {
                     Some(timeout) => {
-                        crate::io_runtime::read_from_timeout(
+                        crate::engine::io_runtime::read_from_timeout(
                             &mut client,
                             &mut client_buffer,
                             timeout,
                         )
                         .await
                     }
-                    None => Ok(crate::io_runtime::read_from(&mut client, &mut client_buffer).await),
+                    None => Ok(crate::engine::io_runtime::read_from(
+                        &mut client,
+                        &mut client_buffer,
+                    )
+                    .await),
                 };
                 match read {
                     Ok(Ok(0)) => {

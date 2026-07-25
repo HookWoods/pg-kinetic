@@ -2,12 +2,12 @@ use pg_kinetic::{
     core::{
         admin::{parse_admin_command, AdminCommand, AdminView},
         observability::metric_catalog,
-        performance::{
+        observability::performance::{
             PerformanceBudget, PerformanceMetric, PerformanceRegressionThreshold,
             ProfileCaptureStatus,
         },
     },
-    proxy_runtime::snapshot::{PerformanceSnapshot, SnapshotStore},
+    proxy_runtime::observe::snapshot::{PerformanceSnapshot, SnapshotStore},
 };
 
 #[test]

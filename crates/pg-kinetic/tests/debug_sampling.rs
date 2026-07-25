@@ -2,12 +2,12 @@ use std::net::SocketAddr;
 
 use pg_kinetic::{
     core::{
+        cluster::recovery::{RecoveryAction, RecoveryTrigger},
         observability::{MetricOutcome, ProtocolPhase},
-        recovery::{RecoveryAction, RecoveryTrigger},
-        route::{QueryClass, RouteKey},
-        virtual_session::PinReason,
+        protocol::virtual_session::PinReason,
+        traffic::route::{QueryClass, RouteKey},
     },
-    proxy_runtime::telemetry::{redact_debug_value, DebugSample, DebugSampler},
+    proxy_runtime::observe::telemetry::{redact_debug_value, DebugSample, DebugSampler},
 };
 
 fn test_route_key() -> RouteKey {

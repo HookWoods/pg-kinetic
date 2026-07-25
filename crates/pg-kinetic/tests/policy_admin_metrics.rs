@@ -18,19 +18,19 @@ use pg_kinetic::{
         PolicyConfig, QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     core::{
-        lsn::FreshnessStatus,
-        policy::{
+        cluster::lsn::FreshnessStatus,
+        protocol::session::TransactionAccessMode,
+        traffic::policy::{
             PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyHookPoint,
             PolicyId, PolicyMode, PolicyOutcome, PolicyVersion,
         },
-        routing::BackendRole,
-        routing::QueryClass,
-        session::TransactionAccessMode,
+        traffic::routing::BackendRole,
+        traffic::routing::QueryClass,
     },
     proxy::Proxy,
     proxy_runtime::{
-        policy::{preview_policy, PolicyRuntime, PolicyStore},
-        snapshot::{PolicyReloadSnapshot, PolicyStatusSnapshot, SnapshotStore},
+        observe::snapshot::{PolicyReloadSnapshot, PolicyStatusSnapshot, SnapshotStore},
+        routing::policy::{preview_policy, PolicyRuntime, PolicyStore},
     },
     wire::{
         backend::{parse_backend_frame, BackendFrame, ReadyStatus},
@@ -67,7 +67,7 @@ async fn show_policies_exposes_status_reload_details_and_bounded_history() {
         policy_generation_id: 7,
         success: false,
         error_code: Some(
-            pg_kinetic::proxy_runtime::policy::PolicyReloadErrorCode::RouteReferenceMissing,
+            pg_kinetic::proxy_runtime::routing::policy::PolicyReloadErrorCode::RouteReferenceMissing,
         ),
         error: Some(String::from(
             "route override target 'route-9' does not reference an existing route",
@@ -285,8 +285,10 @@ fn policy_metrics_use_bounded_labels() {
                 policy_id: PolicyId::new("route-fallback").expect("policy id"),
                 hook_point: PolicyHookPoint::BeforeRouting,
                 action: InlinePolicyActionConfig::RouteOverride {
-                    target_id: pg_kinetic::core::policy::PolicyRouteTargetId::new("missing-route")
-                        .expect("target id"),
+                    target_id: pg_kinetic::core::traffic::policy::PolicyRouteTargetId::new(
+                        "missing-route",
+                    )
+                    .expect("target id"),
                 },
             }],
             ..PolicyConfig::default()
@@ -509,8 +511,8 @@ fn test_config(
     }
 }
 
-fn sample_policy_input() -> pg_kinetic::proxy_runtime::policy::PolicyEvalInput {
-    pg_kinetic::proxy_runtime::policy::PolicyEvalInput {
+fn sample_policy_input() -> pg_kinetic::proxy_runtime::routing::policy::PolicyEvalInput {
+    pg_kinetic::proxy_runtime::routing::policy::PolicyEvalInput {
         database: Arc::from("billing"),
         user: Arc::from("reporter"),
         application_name: Some(Arc::from("dashboard")),
@@ -535,7 +537,7 @@ fn policy_event(
     kind: PolicyAuditKind,
     policy_version: u64,
     outcome: PolicyOutcome,
-    input: &pg_kinetic::proxy_runtime::policy::PolicyEvalInput,
+    input: &pg_kinetic::proxy_runtime::routing::policy::PolicyEvalInput,
 ) -> PolicyAuditEvent {
     let decision = PolicyDecision::new(
         PolicyId::new("route-fallback").expect("policy id"),

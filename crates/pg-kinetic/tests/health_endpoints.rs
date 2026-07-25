@@ -7,7 +7,7 @@ use pg_kinetic::{
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     proxy::Proxy,
-    proxy_runtime::drain::DrainController,
+    proxy_runtime::ops::drain::DrainController,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

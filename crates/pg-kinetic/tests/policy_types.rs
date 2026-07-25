@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pg_kinetic::core::policy::{
+use pg_kinetic::core::traffic::policy::{
     PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyContext, PolicyContextField,
     PolicyDecision, PolicyDecisionReason, PolicyEffect, PolicyHookPoint, PolicyId, PolicyMode,
     PolicyOutcome, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,

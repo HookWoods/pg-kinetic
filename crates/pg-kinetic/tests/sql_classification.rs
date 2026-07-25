@@ -1,9 +1,9 @@
 use pg_kinetic_core::{
-    routing::{QueryClass, RoutingHint},
-    sql_classify::{
+    protocol::sql_classify::{
         classify_sql, contains_data_modifying_cte, extract_routing_hint, has_multiple_statements,
         strip_leading_comments_and_whitespace,
     },
+    traffic::routing::{QueryClass, RoutingHint},
 };
 
 #[test]

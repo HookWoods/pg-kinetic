@@ -1,5 +1,5 @@
-use pg_kinetic_core::runtime::{RuntimeEngine, RuntimeEngineStatus};
-use pg_kinetic_proxy::runtime_engine::{
+use pg_kinetic_core::cluster::runtime::{RuntimeEngine, RuntimeEngineStatus};
+use pg_kinetic_proxy::engine::runtime_engine::{
     RuntimeEngineCapabilities, RuntimeEngineExperiment, RuntimeEngineSelectionError,
     RuntimeEngineSelector,
 };

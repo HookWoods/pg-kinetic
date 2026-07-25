@@ -88,7 +88,7 @@ pub(super) async fn checkout_backend(
     let mut backend = match backend_result {
         Ok(backend) => backend,
         Err(crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::QueueFull,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::QueueFull,
         )) => {
             telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::overload_rejected(
@@ -107,7 +107,7 @@ pub(super) async fn checkout_backend(
             return Err(CheckoutFailure::Overload("backend checkout queue is full"));
         }
         Err(crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Timeout,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Timeout,
         )) => {
             telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::overload_rejected(
@@ -126,7 +126,7 @@ pub(super) async fn checkout_backend(
             return Err(CheckoutFailure::Overload("backend checkout timed out"));
         }
         Err(crate::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Closed,
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Closed,
         )) => {
             telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::backend_checkout(

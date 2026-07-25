@@ -6,7 +6,7 @@ use pg_kinetic::{
         InlinePolicyActionConfig, PolicyAuditConfig, PolicyConfig, PolicyFileConfig,
         PolicyWasmConfig,
     },
-    proxy_runtime::snapshot::SettingsSnapshot,
+    proxy_runtime::observe::snapshot::SettingsSnapshot,
 };
 use serde::Deserialize;
 

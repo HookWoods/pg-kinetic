@@ -9,12 +9,12 @@ use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{SocketConfig, TlsConfig},
     core::{
-        ha::{EndpointHealth, EndpointRoleState, ReplicaLagState},
-        lsn::PgLsn,
-        routing::BackendRole,
+        cluster::ha::{EndpointHealth, EndpointRoleState, ReplicaLagState},
+        cluster::lsn::PgLsn,
+        traffic::routing::BackendRole,
     },
-    proxy_runtime::health::EndpointHealthProbe,
-    proxy_runtime::snapshot::SnapshotStore,
+    proxy_runtime::observe::health::EndpointHealthProbe,
+    proxy_runtime::observe::snapshot::SnapshotStore,
     wire::{frame::parse_frontend_frame, message::parse_simple_query},
 };
 use tokio::{

@@ -7,20 +7,20 @@ use std::{
 use pg_kinetic::config::{
     InlinePolicyActionConfig, InlinePolicyConfig, PolicyConfig, PolicyWasmConfig,
 };
-use pg_kinetic::core::policy::{
+use pg_kinetic::core::traffic::policy::{
     PolicyAction, PolicyFailureMode, PolicyHookPoint, PolicyId, PolicyPluginError,
 };
-use pg_kinetic::proxy_runtime::policy::PolicyRuntime;
+use pg_kinetic::proxy_runtime::routing::policy::PolicyRuntime;
 
 #[cfg(feature = "policy-wasm")]
 use pg_kinetic::{
     core::{
-        lsn::FreshnessStatus,
-        policy::{PolicyMode, PolicyVersion},
-        routing::{BackendRole, QueryClass},
-        session::TransactionAccessMode,
+        cluster::lsn::FreshnessStatus,
+        protocol::session::TransactionAccessMode,
+        traffic::policy::{PolicyMode, PolicyVersion},
+        traffic::routing::{BackendRole, QueryClass},
     },
-    proxy_runtime::policy::PolicyEvalInput,
+    proxy_runtime::routing::policy::PolicyEvalInput,
 };
 
 #[cfg(feature = "policy-wasm")]
@@ -90,9 +90,9 @@ fn wasm_policy_support_is_disabled_by_default() {
 #[test]
 fn policy_failure_mode_defaults_follow_policy_mode() {
     let enforce_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
-        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce);
+        .with_policy_mode(pg_kinetic::core::traffic::policy::PolicyMode::Enforce);
     let dry_run_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
-        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::DryRun);
+        .with_policy_mode(pg_kinetic::core::traffic::policy::PolicyMode::DryRun);
 
     assert_eq!(
         enforce_runtime.policy_failure_mode(),
@@ -111,7 +111,7 @@ fn policy_failure_mode_maps_timeout_and_engine_errors_to_configured_fallbacks() 
     let engine_error = PolicyPluginError::output_validation_failed("policy engine exploded");
 
     let fail_closed_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
-        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce);
+        .with_policy_mode(pg_kinetic::core::traffic::policy::PolicyMode::Enforce);
     assert_eq!(
         fail_closed_runtime.policy_failure_action_for_error(&timeout_error),
         Some(PolicyAction::deny())
@@ -122,7 +122,7 @@ fn policy_failure_mode_maps_timeout_and_engine_errors_to_configured_fallbacks() 
     );
 
     let fail_open_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
-        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::Enforce)
+        .with_policy_mode(pg_kinetic::core::traffic::policy::PolicyMode::Enforce)
         .with_policy_failure_mode(PolicyFailureMode::FailOpen);
     assert_eq!(
         fail_open_runtime.policy_failure_action_for_error(&timeout_error),
@@ -134,7 +134,7 @@ fn policy_failure_mode_maps_timeout_and_engine_errors_to_configured_fallbacks() 
     );
 
     let disable_policy_runtime = PolicyRuntime::new(Duration::from_millis(10), 8_192)
-        .with_policy_mode(pg_kinetic::core::policy::PolicyMode::DryRun)
+        .with_policy_mode(pg_kinetic::core::traffic::policy::PolicyMode::DryRun)
         .with_policy_failure_mode(PolicyFailureMode::DisablePolicy);
     assert_eq!(
         disable_policy_runtime.policy_failure_action_for_error(&timeout_error),
@@ -318,11 +318,11 @@ fn deny_action_from_wasm_is_enforced_in_enforce_mode() {
         .expect("deny policy evaluates");
     assert!(matches!(
         decision.action,
-        pg_kinetic::core::policy::PolicyAction::Deny { .. }
+        pg_kinetic::core::traffic::policy::PolicyAction::Deny { .. }
     ));
     assert_eq!(
         decision.outcome,
-        pg_kinetic::core::policy::PolicyOutcome::Applied
+        pg_kinetic::core::traffic::policy::PolicyOutcome::Applied
     );
 }
 
@@ -351,11 +351,11 @@ fn deny_action_from_wasm_is_dry_run_only_in_dry_run_mode() {
         .expect("deny policy evaluates");
     assert!(matches!(
         decision.action,
-        pg_kinetic::core::policy::PolicyAction::Deny { .. }
+        pg_kinetic::core::traffic::policy::PolicyAction::Deny { .. }
     ));
     assert_eq!(
         decision.outcome,
-        pg_kinetic::core::policy::PolicyOutcome::DryRun
+        pg_kinetic::core::traffic::policy::PolicyOutcome::DryRun
     );
 }
 
@@ -379,7 +379,7 @@ fn wasm_policy_cannot_access_filesystem_network_secrets_or_raw_sql_text() {
         .with_policy_wasm_enabled(true);
     let rule = wasm_rule(module_path);
 
-    let evaluator = pg_kinetic::proxy_runtime::policy_wasm::WasmPolicyEvaluator::load(
+    let evaluator = pg_kinetic::proxy_runtime::routing::policy_wasm::WasmPolicyEvaluator::load(
         match &rule.action {
             InlinePolicyActionConfig::Wasm { module_path } => module_path,
             _ => unreachable!("rule is always wasm"),

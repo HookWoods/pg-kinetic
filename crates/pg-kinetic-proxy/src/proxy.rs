@@ -27,63 +27,64 @@ use crate::routing::{
     RoutingContext, RoutingReason, RoutingTarget,
 };
 use crate::{
-    adaptive::AdaptiveController,
-    admin, auth,
-    backend_query::AuthQueryService,
-    buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, SessionBufferSet},
-    cancel,
+    auth, cancel,
     config::{Config, PoolConfig, RouteConfig},
-    drain::DrainController,
-    health,
-    lifecycle::{
+    net::buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, SessionBufferSet},
+    net::limits,
+    net::pressure::PressureController,
+    net::socket,
+    net::tls,
+    observe::health,
+    observe::metrics,
+    observe::snapshot::{
+        ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
+        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot,
+        RuntimeShardSnapshot, SettingsSnapshot, SnapshotStore,
+    },
+    observe::telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
+    ops::adaptive::AdaptiveController,
+    ops::admin,
+    ops::drain::DrainController,
+    ops::lifecycle::{
         wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator, ShutdownOutcome,
     },
-    limits, metrics,
-    mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
-    pause::PauseController,
+    ops::mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
+    ops::pause::PauseController,
+    ops::reload,
+    pool::backend_query::AuthQueryService,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
         ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePoolRetirementTargets,
         RoutePools,
     },
-    pressure::PressureController,
-    reload,
-    snapshot::{
-        ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
-        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot,
-        RuntimeShardSnapshot, SettingsSnapshot, SnapshotStore,
-    },
-    socket,
-    telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
-    tls,
 };
-use pg_kinetic_core::routing::{
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use pg_kinetic_core::security::secrets::UserStore;
+use pg_kinetic_core::traffic::routing::{
     BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode,
     RoutingReason as CoreRoutingReason,
 };
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-use pg_kinetic_core::secrets::UserStore;
 use pg_kinetic_core::{
-    cleanup::{cleanup_action, CleanupAction},
+    cluster::cleanup::{cleanup_action, CleanupAction},
+    cluster::lsn::{FreshnessStatus, PgLsn},
+    cluster::recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
+    cluster::runtime::{RuntimeLifecycleState, ShutdownReason},
     constants::{MetricName, PreparedEvent},
-    lsn::{FreshnessStatus, PgLsn},
     observability::{MetricOutcome, ProtocolPhase},
-    pin::PinnedBackend,
-    policy::{
+    protocol::pin::PinnedBackend,
+    protocol::prepare::{InvalidationScope, PreparedCatalog},
+    protocol::session::PinReason as SessionPinReason,
+    protocol::session::TransactionState,
+    protocol::sql::{classify, SetScope, SqlCommand},
+    protocol::sql_classify::{analyze_sql, SqlAnalysis},
+    protocol::virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
+    traffic::policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyMode,
         POLICY_DENY_SQLSTATE,
     },
-    prepare::{InvalidationScope, PreparedCatalog},
-    recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
-    route::{PoolKey, QueryClass, RouteKey},
-    runtime::{RuntimeLifecycleState, ShutdownReason},
-    session::PinReason as SessionPinReason,
-    session::TransactionState,
-    shard_extract::{extract_shard_hint, ShardHint},
-    sharding::{MultiShardPolicy, ShardId},
-    sql::{classify, SetScope, SqlCommand},
-    sql_classify::{analyze_sql, SqlAnalysis},
-    virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
+    traffic::route::{PoolKey, QueryClass, RouteKey},
+    traffic::shard_extract::{extract_shard_hint, ShardHint},
+    traffic::sharding::{MultiShardPolicy, ShardId},
 };
 use pg_kinetic_wire::{
     backend::{
@@ -106,7 +107,7 @@ use pg_kinetic_wire::{
 };
 use std::borrow::Cow;
 
-use crate::policy::{PolicyEvalInput, PolicyRuntime};
+use crate::routing::policy::{PolicyEvalInput, PolicyRuntime};
 
 mod backend_startup;
 mod buffer_limit;
@@ -1707,8 +1708,8 @@ mod tests {
         BackendEndpointConfig, FreshnessConfig, HaConfig, ReadRoutingConfig, RouteConfig,
     };
     use pg_kinetic_core::{
-        route::{QueryClass, RouteKey},
-        routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+        traffic::route::{QueryClass, RouteKey},
+        traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     };
 
     fn auth_payload(code: i32) -> [u8; 4] {

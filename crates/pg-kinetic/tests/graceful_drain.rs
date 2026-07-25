@@ -8,7 +8,7 @@ use pg_kinetic::{
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     proxy::Proxy,
-    proxy_runtime::drain::{DrainController, DrainOutcome},
+    proxy_runtime::ops::drain::{DrainController, DrainOutcome},
     wire::{
         backend::{parse_backend_frame, BackendFrame, ReadyStatus},
         protocol::ProtocolVersion,

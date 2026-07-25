@@ -3,17 +3,19 @@ use std::{sync::Arc, time::Duration};
 use pg_kinetic::config::{
     AdaptiveApplyConfig, AdaptiveConfig, AdaptiveGuardrailConfig, Config, ProductionConfig,
 };
-use pg_kinetic::core::mirror::{MirrorDecision, MirrorMode, MirrorReason, MirrorSafetyGate};
+use pg_kinetic::core::traffic::mirror::{
+    MirrorDecision, MirrorMode, MirrorReason, MirrorSafetyGate,
+};
 use pg_kinetic::proxy_runtime::{
-    adaptive::{
+    observe::snapshot::{BackpressureSnapshot, LimitsSnapshot, PoolSnapshot, SnapshotStore},
+    ops::adaptive::{
         AdaptiveApplyEngine, AdaptiveController, AdaptiveRecommendationEngine,
         AdaptiveSignalCollector, AdaptiveSignalSnapshot, AdaptiveTuningSnapshot,
     },
-    mirror::{MirrorObservation, MirrorOutcomeRecorder, MirrorTaskStatus, MirrorTelemetry},
-    snapshot::{BackpressureSnapshot, LimitsSnapshot, PoolSnapshot, SnapshotStore},
+    ops::mirror::{MirrorObservation, MirrorOutcomeRecorder, MirrorTaskStatus, MirrorTelemetry},
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
-use pg_kinetic_core::adaptive::{
+use pg_kinetic_core::cluster::adaptive::{
     AdaptiveAction, AdaptiveGuardrail, AdaptiveMode, AdaptiveOutcome, AdaptiveRecommendation,
     AdaptiveSignal, TunableKnob, TuningBound,
 };

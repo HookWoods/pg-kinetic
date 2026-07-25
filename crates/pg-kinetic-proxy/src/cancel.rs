@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Context;
 use bytes::{BufMut, BytesMut};
-use pg_kinetic_core::secrets;
+use pg_kinetic_core::security::secrets;
 use pg_kinetic_wire::protocol::CANCEL_REQUEST_CODE;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;

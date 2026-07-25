@@ -1,11 +1,22 @@
+//! Read-routing decisions, plus the shard and policy layers that feed them.
+//!
+//! `sharding` and `policy` live here so their paths no longer collide with the
+//! models of the same name in `pg-kinetic-core`: `crate::routing::policy` is the
+//! runtime evaluator, `pg_kinetic_core::traffic::policy` is the rule model it evaluates.
+
+pub mod policy;
+#[cfg(feature = "policy-wasm")]
+pub mod policy_wasm;
+pub mod sharding;
+
 use pg_kinetic_core::{
-    lsn::PgLsn,
-    policy::PolicyAction,
-    routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
-    session::TransactionState,
-    sharding::{ShardRouteDecision, ShardRouteReason},
-    sql_classify::{analyze_sql, SqlAnalysis},
-    virtual_session::ReadAfterWriteState,
+    cluster::lsn::PgLsn,
+    protocol::session::TransactionState,
+    protocol::sql_classify::{analyze_sql, SqlAnalysis},
+    protocol::virtual_session::ReadAfterWriteState,
+    traffic::policy::PolicyAction,
+    traffic::routing::{FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingHint},
+    traffic::sharding::{ShardRouteDecision, ShardRouteReason},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,10 +261,10 @@ impl RoutingTarget {
     }
 
     #[must_use]
-    pub const fn target_role(&self) -> Option<pg_kinetic_core::routing::BackendRole> {
+    pub const fn target_role(&self) -> Option<pg_kinetic_core::traffic::routing::BackendRole> {
         match self {
-            Self::Primary { .. } => Some(pg_kinetic_core::routing::BackendRole::Primary),
-            Self::Replica { .. } => Some(pg_kinetic_core::routing::BackendRole::Replica),
+            Self::Primary { .. } => Some(pg_kinetic_core::traffic::routing::BackendRole::Primary),
+            Self::Replica { .. } => Some(pg_kinetic_core::traffic::routing::BackendRole::Replica),
             Self::Wait { .. } | Self::Reject { .. } => None,
         }
     }
@@ -597,51 +608,55 @@ pub fn bridge_shard_route_decision(
     decision: &ShardRouteDecision,
     sql: &str,
     planner: &ReadRoutingPlanner,
-) -> pg_kinetic_core::routing::RoutingDecision {
+) -> pg_kinetic_core::traffic::routing::RoutingDecision {
     let analysis = analyze_sql(sql);
     let query_class = analysis.query_class();
     let routing_hint = analysis.routing_hint();
     let target_role = decision
         .route()
         .map(|route| route.target().backend_role())
-        .unwrap_or(pg_kinetic_core::routing::BackendRole::Unknown);
+        .unwrap_or(pg_kinetic_core::traffic::routing::BackendRole::Unknown);
 
     let reason = match decision.reason() {
         ShardRouteReason::AdminOverride => match target_role {
-            pg_kinetic_core::routing::BackendRole::Primary => {
-                pg_kinetic_core::routing::RoutingReason::ReadOnlyQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Primary => {
+                pg_kinetic_core::traffic::routing::RoutingReason::ReadOnlyQuery
             }
-            pg_kinetic_core::routing::BackendRole::Replica => {
-                pg_kinetic_core::routing::RoutingReason::ReadCandidateQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Replica => {
+                pg_kinetic_core::traffic::routing::RoutingReason::ReadCandidateQuery
             }
-            pg_kinetic_core::routing::BackendRole::Unknown => {
-                pg_kinetic_core::routing::RoutingReason::UnknownQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Unknown => {
+                pg_kinetic_core::traffic::routing::RoutingReason::UnknownQuery
             }
         },
         ShardRouteReason::HashMatch
         | ShardRouteReason::RangeMatch
         | ShardRouteReason::ListMatch => match target_role {
-            pg_kinetic_core::routing::BackendRole::Primary => {
-                pg_kinetic_core::routing::RoutingReason::ReadOnlyQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Primary => {
+                pg_kinetic_core::traffic::routing::RoutingReason::ReadOnlyQuery
             }
-            pg_kinetic_core::routing::BackendRole::Replica => {
-                pg_kinetic_core::routing::RoutingReason::ReadCandidateQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Replica => {
+                pg_kinetic_core::traffic::routing::RoutingReason::ReadCandidateQuery
             }
-            pg_kinetic_core::routing::BackendRole::Unknown => {
-                pg_kinetic_core::routing::RoutingReason::UnknownQuery
+            pg_kinetic_core::traffic::routing::BackendRole::Unknown => {
+                pg_kinetic_core::traffic::routing::RoutingReason::UnknownQuery
             }
         },
         ShardRouteReason::MultiShardRejected | ShardRouteReason::ValidationFailed => {
-            pg_kinetic_core::routing::RoutingReason::FallbackReject
+            pg_kinetic_core::traffic::routing::RoutingReason::FallbackReject
         }
         ShardRouteReason::NoMatch => match planner.fallback_policy() {
-            FallbackPolicy::Primary => pg_kinetic_core::routing::RoutingReason::FallbackPrimary,
-            FallbackPolicy::Reject => pg_kinetic_core::routing::RoutingReason::FallbackReject,
-            FallbackPolicy::Wait => pg_kinetic_core::routing::RoutingReason::FallbackWait,
+            FallbackPolicy::Primary => {
+                pg_kinetic_core::traffic::routing::RoutingReason::FallbackPrimary
+            }
+            FallbackPolicy::Reject => {
+                pg_kinetic_core::traffic::routing::RoutingReason::FallbackReject
+            }
+            FallbackPolicy::Wait => pg_kinetic_core::traffic::routing::RoutingReason::FallbackWait,
         },
     };
 
-    pg_kinetic_core::routing::RoutingDecision::new(
+    pg_kinetic_core::traffic::routing::RoutingDecision::new(
         target_role,
         query_class,
         routing_hint,

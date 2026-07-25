@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use pg_kinetic_core::lsn::{FreshnessRequirement, FreshnessStatus, PgLsn, ReplicaReplayState};
+use pg_kinetic_core::cluster::lsn::{
+    FreshnessRequirement, FreshnessStatus, PgLsn, ReplicaReplayState,
+};
 
 #[test]
 fn parses_valid_postgres_lsn_strings() {

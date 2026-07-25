@@ -1,26 +1,26 @@
 use pg_kinetic_core::{
-    route::{QueryClass, RouteKey},
-    routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-    session::TransactionState,
-    sharding::{
+    protocol::session::TransactionState,
+    protocol::virtual_session::ReadAfterWriteState,
+    traffic::route::{QueryClass, RouteKey},
+    traffic::routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    traffic::sharding::{
         MultiShardPolicy, RouteDefinition, RouteMapValidationInput, ShardId, ShardRoute,
         ShardRouteDecision, ShardRouteMap, ShardRouteReason, ShardScope, ShardStrategy,
         ShardTarget, ShardedTableDefinition,
     },
-    virtual_session::ReadAfterWriteState,
 };
 use pg_kinetic_proxy::{
     pool::{
         BackendPoolRef, CheckoutMode, ReplicaSelectionStrategy, ReplicaSelector,
         ShardPoolCheckoutTarget, ShardPoolKey, ShardPools, ShardedPoolRegistry,
     },
+    routing::sharding::{
+        apply_multi_shard_policy, choose_sharded_routing_target, plan_sharded_route,
+        ShardRouteMapStore, ShardRoutingContext, ShardRoutingPlanner,
+    },
     routing::{
         bridge_shard_route_decision, choose_routing_target, ReadRoutingPlanner, ReplicaCandidate,
         RouteHealthSnapshot, RoutingContext, RoutingReason, RoutingTarget,
-    },
-    sharding::{
-        apply_multi_shard_policy, choose_sharded_routing_target, plan_sharded_route,
-        ShardRouteMapStore, ShardRoutingContext, ShardRoutingPlanner,
     },
 };
 
@@ -362,7 +362,7 @@ fn shard_route_decision_bridges_to_read_routing_decision() {
 
     assert_eq!(
         routing_decision.target_role,
-        pg_kinetic_core::routing::BackendRole::Primary
+        pg_kinetic_core::traffic::routing::BackendRole::Primary
     );
     assert_eq!(routing_decision.fallback_policy, FallbackPolicy::Primary);
 }
@@ -562,7 +562,7 @@ async fn unknown_shard_id_is_rejected_before_backend_checkout() {
     assert!(matches!(
         result,
         Err(pg_kinetic_proxy::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Closed
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Closed
         ))
     ));
     assert_eq!(

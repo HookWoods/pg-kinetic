@@ -1,49 +1,20 @@
-pub mod adaptive;
-pub mod admin;
 pub mod auth;
-pub mod backend;
-pub mod backend_query;
-pub mod benchmark;
-pub mod buffers;
 pub mod cancel;
-pub mod compatibility;
 pub mod config;
-pub mod control;
-pub mod drain;
-pub mod health;
-pub mod io_runtime;
-pub mod io_uring;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub mod io_uring_transport;
-pub mod lifecycle;
-pub mod limits;
-pub mod metrics;
-pub mod mirror;
-pub mod pause;
-pub mod policy;
-#[cfg(feature = "policy-wasm")]
-pub mod policy_wasm;
+pub mod engine;
+pub mod net;
+pub mod observe;
+pub mod ops;
 pub mod pool;
-pub mod preflight;
-pub mod pressure;
-pub mod profile;
 pub mod proxy;
-pub mod regression;
-pub mod reload;
 pub mod routing;
-pub mod runtime_engine;
-pub mod sharding;
-pub mod snapshot;
-pub mod socket;
-pub mod telemetry;
-pub mod tls;
 
-pub use health::{EndpointHealthProbe, EndpointHealthSnapshot};
-pub use reload::ReloadDecision;
+pub use observe::health::{EndpointHealthProbe, EndpointHealthSnapshot};
+pub use ops::reload::ReloadDecision;
 
 pub async fn run(config: config::Config) -> anyhow::Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
-    metrics::install(metrics::MetricsConfig {
+    observe::metrics::install(observe::metrics::MetricsConfig {
         listen_addr: config.observability.metrics_addr,
     })?;
     proxy::Proxy::new(config).run().await
@@ -51,12 +22,12 @@ pub async fn run(config: config::Config) -> anyhow::Result<()> {
 
 pub fn run_thread_per_core(config: config::Config) -> anyhow::Result<()> {
     config.validate().map_err(anyhow::Error::msg)?;
-    metrics::install(metrics::MetricsConfig {
+    observe::metrics::install(observe::metrics::MetricsConfig {
         listen_addr: config.observability.metrics_addr,
     })?;
     proxy::Proxy::new(config).run_thread_per_core()
 }
 
 pub fn run_io_uring(config: config::Config) -> anyhow::Result<()> {
-    io_uring::run(config)
+    engine::io_uring::run(config)
 }

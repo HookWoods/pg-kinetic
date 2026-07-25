@@ -3,16 +3,16 @@ use std::time::Duration;
 use pg_kinetic::{
     config::PolicyConfig,
     core::{
-        lsn::{FreshnessStatus, PgLsn},
-        policy::{
+        cluster::lsn::{FreshnessStatus, PgLsn},
+        protocol::session::TransactionState,
+        protocol::virtual_session::ReadAfterWriteState,
+        traffic::policy::{
             PolicyAction, PolicyContext, PolicyContextField, PolicyHookPoint, PolicyId, PolicyMode,
             PolicyOutcome, PolicyPluginAccessRequest, PolicyPluginAction, PolicyPluginInput,
             PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
         },
-        route::{QueryClass, RouteKey},
-        routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-        session::TransactionState,
-        virtual_session::ReadAfterWriteState,
+        traffic::route::{QueryClass, RouteKey},
+        traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     },
     proxy::{
         apply_policy_after_routing_target, apply_policy_before_checkout_target,
@@ -20,14 +20,14 @@ use pg_kinetic::{
         checkout_postgres_error_for_target, route_checkout_snapshot_for_target,
     },
     proxy_runtime::{
-        policy::PolicyPluginHostLimits,
+        routing::policy::PolicyPluginHostLimits,
+        routing::sharding::{
+            apply_policy_action_to_sharded_routing_target, ShardRouteMapStore, ShardRoutingContext,
+            ShardRoutingPlanner,
+        },
         routing::{
             choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,
             RoutingContext, RoutingReason, RoutingTarget,
-        },
-        sharding::{
-            apply_policy_action_to_sharded_routing_target, ShardRouteMapStore, ShardRoutingContext,
-            ShardRoutingPlanner,
         },
     },
 };
@@ -359,8 +359,10 @@ fn policy_actions_do_not_bypass_pinning_or_recovery_safety() {
 
 #[test]
 fn plugin_host_limits_enforce_bytes_duration_and_private_access() {
-    let runtime =
-        pg_kinetic::proxy_runtime::policy::PolicyRuntime::new(Duration::from_millis(5), 16);
+    let runtime = pg_kinetic::proxy_runtime::routing::policy::PolicyRuntime::new(
+        Duration::from_millis(5),
+        16,
+    );
     let limits = runtime.plugin_host_limits();
 
     assert_eq!(limits.max_input_bytes(), 16);

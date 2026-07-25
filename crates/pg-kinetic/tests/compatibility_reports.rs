@@ -3,8 +3,8 @@ use std::{
     path::PathBuf,
 };
 
-use pg_kinetic::core::compatibility::{CompatibilityLanguage, CompatibilityTarget};
-use pg_kinetic_proxy::compatibility::{
+use pg_kinetic::core::lab::compatibility::{CompatibilityLanguage, CompatibilityTarget};
+use pg_kinetic_lab::compatibility::{
     CompatibilityRunConfig, CompatibilityRunner, CompatibilitySuiteSelector,
 };
 

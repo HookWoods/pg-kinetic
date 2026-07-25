@@ -8,33 +8,37 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pg_kinetic::config::{Config, LogFormat};
-use pg_kinetic::core::benchmark::{BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError};
+use pg_kinetic::core::lab::benchmark::{
+    BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError,
+};
 use pg_kinetic::core::{
-    compatibility::{CompatibilityLanguage, CompatibilityTarget},
-    lsn::FreshnessStatus,
-    policy::PolicyAction,
-    regression::{RegressionCategory, RegressionPlatform},
-    routing::QueryClass as RoutingQueryClass,
-    runtime::RuntimeEngine,
-    session::TransactionAccessMode,
+    cluster::lsn::FreshnessStatus,
+    cluster::runtime::RuntimeEngine,
+    lab::compatibility::{CompatibilityLanguage, CompatibilityTarget},
+    lab::regression::{RegressionCategory, RegressionPlatform},
+    protocol::session::TransactionAccessMode,
+    traffic::policy::PolicyAction,
+    traffic::routing::QueryClass as RoutingQueryClass,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
-use pg_kinetic_proxy::benchmark::{
+use pg_kinetic_lab::benchmark::{
     compare_benchmark_reports, prepare_benchmark_results, validate_benchmark_scenario,
     BenchmarkReportOutcome, BenchmarkRunReport,
 };
-use pg_kinetic_proxy::compatibility::{
+use pg_kinetic_lab::compatibility::{
     CompatibilityRunConfig, CompatibilityRunner, CompatibilitySuiteSelector,
 };
-use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
-use pg_kinetic_proxy::preflight::PreflightRunner;
-use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
-use pg_kinetic_proxy::regression::{
+use pg_kinetic_lab::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
+use pg_kinetic_lab::regression::{
     load_regression_manifest, redact_sensitive_text, score_benchmark_reports, write_ignored_output,
     RegressionRunner, RegressionSelection,
 };
-use pg_kinetic_proxy::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
-use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
+use pg_kinetic_proxy::engine::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
+use pg_kinetic_proxy::ops::preflight::PreflightRunner;
+use pg_kinetic_proxy::routing::policy::{
+    preview_policy, PolicyPreviewError, PolicyPreviewEvaluation,
+};
+use pg_kinetic_proxy::routing::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
 use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
 
@@ -394,7 +398,7 @@ fn main() -> anyhow::Result<()> {
     // Merge the config file onto the CLI base exactly the way SIGHUP reload does,
     // so command-line flags survive startup and the running config does not change
     // on the first reload.
-    let config = pg_kinetic_proxy::reload::load_effective_config(&config)
+    let config = pg_kinetic_proxy::ops::reload::load_effective_config(&config)
         .context("load effective startup config")?;
     init_logging(&config.observability)?;
     config.validate().map_err(anyhow::Error::msg)?;
@@ -883,7 +887,7 @@ fn build_policy_preview_input(
     route: &str,
     shard: &str,
     query_class: RoutingQueryClass,
-) -> pg_kinetic_proxy::policy::PolicyEvalInput {
+) -> pg_kinetic_proxy::routing::policy::PolicyEvalInput {
     let backend_role = query_class.target_role();
     let transaction_mode = match query_class {
         RoutingQueryClass::ReadOnly | RoutingQueryClass::ReadCandidate => {
@@ -892,7 +896,7 @@ fn build_policy_preview_input(
         _ => TransactionAccessMode::ReadWrite,
     };
 
-    pg_kinetic_proxy::policy::PolicyEvalInput {
+    pg_kinetic_proxy::routing::policy::PolicyEvalInput {
         database: Arc::from(database),
         user: Arc::from(user),
         application_name: application_name.map(Arc::from),
@@ -1015,7 +1019,9 @@ fn preview_route_label(database: &str, user: &str, application_name: Option<&str
     RouteKey::new(database, user, application_name, None, QueryClass::Default).metric_label()
 }
 
-fn render_preview_success(summary: &pg_kinetic_proxy::sharding::RoutePreviewSummary) -> String {
+fn render_preview_success(
+    summary: &pg_kinetic_proxy::routing::sharding::RoutePreviewSummary,
+) -> String {
     format!(
         "{{\"ok\":true,\"route\":{},\"shard_id\":{},\"backend_role\":{},\"reason\":{},\"shard_reason\":{}}}",
         json_string(&summary.route),
@@ -1055,7 +1061,7 @@ fn render_benchmark_error(path: &Path, error: &BenchmarkValidationError) -> Stri
 fn render_benchmark_report_error(
     baseline: &Path,
     current: &Path,
-    error: &pg_kinetic_proxy::benchmark::BenchmarkReportError,
+    error: &pg_kinetic_lab::benchmark::BenchmarkReportError,
 ) -> String {
     format!(
         "{{\"ok\":false,\"baseline\":{},\"current\":{},\"error\":{{\"code\":\"benchmark_report_failed\",\"message\":{}}}}}",

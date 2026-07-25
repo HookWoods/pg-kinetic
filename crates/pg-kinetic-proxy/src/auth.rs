@@ -11,11 +11,13 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::{
-    backend_query::AuthQueryService,
     config::{AuthConfig, AuthFailureMessageMode, AuthMode},
-    io_runtime::{read_from, write_all_to, RuntimeByteStream},
+    engine::io_runtime::{read_from, write_all_to, RuntimeByteStream},
+    pool::backend_query::AuthQueryService,
 };
-use pg_kinetic_core::secrets::{generate_nonce, Md5Secret, ScramVerifier, UserSecret, UserStore};
+use pg_kinetic_core::security::secrets::{
+    generate_nonce, Md5Secret, ScramVerifier, UserSecret, UserStore,
+};
 use pg_kinetic_wire::{
     auth::{
         authentication_md5_password, authentication_ok, authentication_sasl_continue,
@@ -1011,7 +1013,7 @@ mod tests {
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use bytes::BytesMut;
-    use pg_kinetic_core::secrets::{UserSecret, UserStore};
+    use pg_kinetic_core::security::secrets::{UserSecret, UserStore};
 
     use super::{authenticate_client, BackendAuthSession, BackendCredentials, ClientAuthOutcome};
 
@@ -1021,7 +1023,7 @@ mod tests {
         writes: Vec<BytesMut>,
     }
 
-    impl crate::io_runtime::RuntimeByteStream for MemoryClient {
+    impl crate::engine::io_runtime::RuntimeByteStream for MemoryClient {
         async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
             let Some(next) = self.reads.pop_front() else {
                 return Ok(0);

@@ -3,8 +3,8 @@ use pg_kinetic::{
     session::PreparedShardSummary,
     wire::sqlstate::SqlState,
 };
-use pg_kinetic_core::routing::{QueryClass, RoutingHint};
-use pg_kinetic_core::{sql::classify, sql_classify::analyze_sql};
+use pg_kinetic_core::traffic::routing::{QueryClass, RoutingHint};
+use pg_kinetic_core::{protocol::sql::classify, protocol::sql_classify::analyze_sql};
 
 #[test]
 fn stores_named_statement_with_internal_name() {

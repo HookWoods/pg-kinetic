@@ -14,7 +14,7 @@ pub(crate) trait BackendStartupMetadata {
     fn set_key_data(&mut self, process_id: i32, secret_key: i32);
 }
 
-impl BackendStartupMetadata for crate::backend::Backend {
+impl BackendStartupMetadata for crate::pool::backend::Backend {
     fn is_tls(&self) -> bool {
         self.is_tls()
     }
@@ -41,7 +41,7 @@ impl BackendStartupMetadata for crate::backend::Backend {
 }
 
 struct PooledBackendStartup<'a> {
-    backend: &'a mut crate::backend::Backend,
+    backend: &'a mut crate::pool::backend::Backend,
 }
 
 impl BackendStartupMetadata for PooledBackendStartup<'_> {
@@ -70,17 +70,17 @@ impl BackendStartupMetadata for PooledBackendStartup<'_> {
     }
 }
 
-impl crate::io_runtime::RuntimeByteStream for PooledBackendStartup<'_> {
+impl crate::engine::io_runtime::RuntimeByteStream for PooledBackendStartup<'_> {
     async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
-        crate::io_runtime::read_from(self.backend.stream_mut(), dst).await
+        crate::engine::io_runtime::read_from(self.backend.stream_mut(), dst).await
     }
 
     async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        crate::io_runtime::write_all_to(self.backend.stream_mut(), bytes).await
+        crate::engine::io_runtime::write_all_to(self.backend.stream_mut(), bytes).await
     }
 
     async fn shutdown_stream(&mut self) -> std::io::Result<()> {
-        crate::io_runtime::shutdown(self.backend.stream_mut()).await
+        crate::engine::io_runtime::shutdown(self.backend.stream_mut()).await
     }
 }
 
@@ -159,8 +159,8 @@ pub(crate) async fn proxy_startup_streams<C, B>(
     client_key: Option<(i32, i32)>,
 ) -> anyhow::Result<()>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
-    B: crate::io_runtime::RuntimeByteStream + BackendStartupMetadata,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
+    B: crate::engine::io_runtime::RuntimeByteStream + BackendStartupMetadata,
 {
     if !requires_startup {
         let client_key =
@@ -170,13 +170,13 @@ where
             backend.parameter_status(),
             client_key,
         );
-        crate::io_runtime::write_all_to(client, &startup_response)
+        crate::engine::io_runtime::write_all_to(client, &startup_response)
             .await
             .context("write synthetic startup response")?;
         return Ok(());
     }
 
-    crate::io_runtime::write_all_to(backend, startup_packet)
+    crate::engine::io_runtime::write_all_to(backend, startup_packet)
         .await
         .context("forward startup")?;
     buffers.client_read_mut().clear();
@@ -191,7 +191,7 @@ where
             return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
         }
 
-        crate::io_runtime::read_from(backend, buffers.backend_read_mut())
+        crate::engine::io_runtime::read_from(backend, buffers.backend_read_mut())
             .await
             .context("read startup response")?;
         buffers.observe_backend_read();
@@ -206,7 +206,7 @@ where
                     if let Some(response) =
                         backend_auth.respond(&frame.payload, backend.is_tls())?
                     {
-                        crate::io_runtime::write_all_to(backend, &response)
+                        crate::engine::io_runtime::write_all_to(backend, &response)
                             .await
                             .context("respond to backend authentication request")?;
                     }
@@ -214,15 +214,18 @@ where
                 }
                 if code == 0 {
                     if forward_backend_auth_requests_to_client {
-                        crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
-                            .await
-                            .context("forward startup response")?;
+                        crate::engine::io_runtime::write_all_to(
+                            client,
+                            &encode_backend_frame(&frame),
+                        )
+                        .await
+                        .context("forward startup response")?;
                     }
                     continue;
                 }
 
                 if forward_backend_auth_requests_to_client {
-                    crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
+                    crate::engine::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
                         .await
                         .context("forward startup response")?;
 
@@ -232,15 +235,16 @@ where
                         }
 
                         buffers.client_read_mut().clear();
-                        let read = crate::io_runtime::read_from(client, buffers.client_read_mut())
-                            .await
-                            .context("read startup auth response")?;
+                        let read =
+                            crate::engine::io_runtime::read_from(client, buffers.client_read_mut())
+                                .await
+                                .context("read startup auth response")?;
                         anyhow::ensure!(read > 0, "client disconnected during startup auth");
                         buffers.observe_client_read();
                         if buffers.client_read_mut().len() > max_client_buffer_bytes {
                             return Err(buffer_limit_exceeded(BufferBudgetKind::Client));
                         }
-                        crate::io_runtime::write_all_to(backend, buffers.client_read_mut())
+                        crate::engine::io_runtime::write_all_to(backend, buffers.client_read_mut())
                             .await
                             .context("forward startup auth response")?;
                         buffers.client_read_mut().clear();
@@ -254,7 +258,7 @@ where
                 capture_backend_parameter_status(backend, &frame);
                 if capture_backend_key_data(backend, &frame) {
                     if let Some(client_key) = client_key {
-                        crate::io_runtime::write_all_to(
+                        crate::engine::io_runtime::write_all_to(
                             client,
                             &encode_backend_key_data(client_key.0, client_key.1),
                         )
@@ -266,7 +270,7 @@ where
                 }
                 if frame.ready_status().is_some() && !sent_backend_key_data {
                     if let Some(client_key) = client_key {
-                        crate::io_runtime::write_all_to(
+                        crate::engine::io_runtime::write_all_to(
                             client,
                             &encode_backend_key_data(client_key.0, client_key.1),
                         )
@@ -275,7 +279,7 @@ where
                         sent_backend_key_data = true;
                     }
                 }
-                crate::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
+                crate::engine::io_runtime::write_all_to(client, &encode_backend_frame(&frame))
                     .await
                     .context("forward startup response")?;
             }
@@ -312,13 +316,13 @@ pub(crate) async fn bootstrap_backend_streams<B>(
     backend_credentials: Option<&auth::BackendCredentials>,
 ) -> anyhow::Result<()>
 where
-    B: crate::io_runtime::RuntimeByteStream + BackendStartupMetadata,
+    B: crate::engine::io_runtime::RuntimeByteStream + BackendStartupMetadata,
 {
     if !requires_startup {
         return Ok(());
     }
 
-    crate::io_runtime::write_all_to(backend, startup_packet)
+    crate::engine::io_runtime::write_all_to(backend, startup_packet)
         .await
         .context("forward backend startup")?;
 
@@ -328,7 +332,7 @@ where
         .map(auth::BackendAuthSession::new)
         .transpose()?;
     loop {
-        crate::io_runtime::read_from(backend, &mut backend_buffer)
+        crate::engine::io_runtime::read_from(backend, &mut backend_buffer)
             .await
             .context("read backend startup response")?;
 
@@ -339,7 +343,7 @@ where
                     if let Some(response) =
                         backend_auth.respond(&frame.payload, backend.is_tls())?
                     {
-                        crate::io_runtime::write_all_to(backend, &response)
+                        crate::engine::io_runtime::write_all_to(backend, &response)
                             .await
                             .context("respond to backend bootstrap authentication request")?;
                     }
@@ -451,7 +455,7 @@ mod tests {
     use std::{collections::VecDeque, io};
 
     use super::*;
-    use crate::io_runtime::RuntimeByteStream;
+    use crate::engine::io_runtime::RuntimeByteStream;
 
     #[tokio::test]
     async fn startup_stream_helper_forwards_backend_ready_without_pooled_backend() {

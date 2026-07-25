@@ -1,11 +1,11 @@
-use pg_kinetic_core::runtime::{
+use pg_kinetic_core::cluster::runtime::{
     LifecycleTransition, LifecycleTransitionError, NodeId, ReadinessState, RuntimeEngine,
     RuntimeEngineStatus, RuntimeLifecycleState, ShutdownReason,
 };
 use pg_kinetic_proxy::{
     config::LifecycleConfig,
-    drain::{DrainController, DrainOutcome},
-    lifecycle::{
+    ops::drain::{DrainController, DrainOutcome},
+    ops::lifecycle::{
         KubernetesLifecycle, LifecycleController, PreStopDrainOutcome, ProbeStatus,
         ShutdownCoordinator,
     },

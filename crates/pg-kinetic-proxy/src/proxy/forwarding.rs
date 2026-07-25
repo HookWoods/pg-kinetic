@@ -15,8 +15,8 @@ pub(super) fn plan_frontend_cycle(
     simple_query_commands: &[SqlCommand],
     buffers: &mut SessionBufferSet,
     phase_recorder: &dyn telemetry::PhaseTimingRecorder,
-) -> anyhow::Result<crate::io_runtime::PlannedFrontendCycle> {
-    let cycle_shape = crate::io_runtime::FrontendCycleShape::from_frames(frames);
+) -> anyhow::Result<crate::engine::io_runtime::PlannedFrontendCycle> {
+    let cycle_shape = crate::engine::io_runtime::FrontendCycleShape::from_frames(frames);
     let needs_sync = cycle_shape.needs_sync();
     let mut simple_query_commands = simple_query_commands.iter();
     let mut injected_parse_completes = 0_usize;
@@ -55,7 +55,7 @@ pub(super) fn plan_frontend_cycle(
         buffers.append_frontend_frame(plan.frame.tag, &plan.frame.payload);
     }
 
-    Ok(crate::io_runtime::PlannedFrontendCycle {
+    Ok(crate::engine::io_runtime::PlannedFrontendCycle {
         backend_bytes: BytesMut::from(buffers.backend_write()),
         injected_parse_completes,
         needs_sync,
@@ -82,9 +82,9 @@ pub(super) async fn forward_message_cycle(
         phase_recorder,
     )?;
     let needs_sync = planned.needs_sync;
-    let cycle_shape = crate::io_runtime::FrontendCycleShape::from_frames(frames);
+    let cycle_shape = crate::engine::io_runtime::FrontendCycleShape::from_frames(frames);
     let expected_ready_count = cycle_shape.expected_ready_count();
-    let mut progress = crate::io_runtime::BackendCycleProgress {
+    let mut progress = crate::engine::io_runtime::BackendCycleProgress {
         injected_parse_completes: planned.injected_parse_completes,
         ..Default::default()
     };
@@ -213,8 +213,8 @@ pub(super) async fn forward_message_cycle(
 }
 
 fn flush_cycle_complete(
-    shape: crate::io_runtime::FrontendCycleShape,
-    progress: crate::io_runtime::BackendCycleProgress,
+    shape: crate::engine::io_runtime::FrontendCycleShape,
+    progress: crate::engine::io_runtime::BackendCycleProgress,
 ) -> bool {
     progress.saw_error || progress.completion_count >= shape.expected_completion_count()
 }
@@ -227,21 +227,21 @@ pub(crate) async fn forward_runtime_cycle<C, B>(
     client: &mut C,
     backend: &mut B,
     cycle: &[u8],
-    shape: crate::io_runtime::FrontendCycleShape,
+    shape: crate::engine::io_runtime::FrontendCycleShape,
     injected_parse_completes: usize,
     backend_buffer: &mut BytesMut,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<crate::io_runtime::BackendForwardOutcome>
+) -> anyhow::Result<crate::engine::io_runtime::BackendForwardOutcome>
 where
-    C: crate::io_runtime::RuntimeByteStream + ?Sized,
-    B: crate::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
+    B: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
 {
-    crate::io_runtime::write_all_to(backend, cycle)
+    crate::engine::io_runtime::write_all_to(backend, cycle)
         .await
         .context("write frontend cycle to backend")?;
     let mut response_drain =
-        crate::io_runtime::BackendResponseDrain::for_cycle(shape, injected_parse_completes);
-    crate::io_runtime::forward_backend_until_cycle_complete(
+        crate::engine::io_runtime::BackendResponseDrain::for_cycle(shape, injected_parse_completes);
+    crate::engine::io_runtime::forward_backend_until_cycle_complete(
         backend,
         client,
         backend_buffer,
@@ -268,7 +268,7 @@ mod generic_tests {
         writes: Vec<BytesMut>,
     }
 
-    impl crate::io_runtime::RuntimeByteStream for MemoryBackendStream {
+    impl crate::engine::io_runtime::RuntimeByteStream for MemoryBackendStream {
         async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
             let Some(next) = self.reads.pop_front() else {
                 return Ok(0);
@@ -312,7 +312,7 @@ mod generic_tests {
         assert_eq!(backend.id(), 1);
     }
 
-    fn cycle_shape(tags: &[FrontendTag]) -> crate::io_runtime::FrontendCycleShape {
+    fn cycle_shape(tags: &[FrontendTag]) -> crate::engine::io_runtime::FrontendCycleShape {
         let frames = tags
             .iter()
             .map(|tag| FrontendFrame {
@@ -320,7 +320,7 @@ mod generic_tests {
                 payload: Bytes::new(),
             })
             .collect::<Vec<_>>();
-        crate::io_runtime::FrontendCycleShape::from_frames(&frames)
+        crate::engine::io_runtime::FrontendCycleShape::from_frames(&frames)
     }
 
     /// Guards the stop condition the pooled (non-runtime) forwarding loop uses for
@@ -335,7 +335,7 @@ mod generic_tests {
         assert_eq!(shape.expected_completion_count(), 2);
         assert!(!shape.expects_ready());
 
-        let mut progress = crate::io_runtime::BackendCycleProgress::default();
+        let mut progress = crate::engine::io_runtime::BackendCycleProgress::default();
         assert!(!flush_cycle_complete(shape, progress));
 
         // ParseComplete only: the Describe reply is still outstanding.
@@ -348,7 +348,7 @@ mod generic_tests {
 
         // An ErrorResponse ends the cycle even with replies outstanding, because
         // the backend discards the rest of it until it sees a Sync.
-        let errored = crate::io_runtime::BackendCycleProgress {
+        let errored = crate::engine::io_runtime::BackendCycleProgress {
             saw_error: true,
             ..Default::default()
         };
@@ -456,7 +456,7 @@ mod generic_tests {
 
         assert!(matches!(
             outcome,
-            crate::io_runtime::BackendForwardOutcome::Flushed
+            crate::engine::io_runtime::BackendForwardOutcome::Flushed
         ));
         assert_eq!(
             backend.writes,
@@ -506,7 +506,7 @@ mod generic_tests {
 
         assert!(matches!(
             outcome,
-            crate::io_runtime::BackendForwardOutcome::Flushed
+            crate::engine::io_runtime::BackendForwardOutcome::Flushed
         ));
     }
 
@@ -538,7 +538,7 @@ mod generic_tests {
 
         assert!(matches!(
             outcome,
-            crate::io_runtime::BackendForwardOutcome::Flushed
+            crate::engine::io_runtime::BackendForwardOutcome::Flushed
         ));
         assert!(client.writes.is_empty());
     }
@@ -548,12 +548,12 @@ pub(super) fn classify_backend_frames(
     backend_id: u64,
     state: &mut ForwardCycleState<'_>,
     backend_buffer: &mut BytesMut,
-    shape: crate::io_runtime::FrontendCycleShape,
-    progress: &mut crate::io_runtime::BackendCycleProgress,
+    shape: crate::engine::io_runtime::FrontendCycleShape,
+    progress: &mut crate::engine::io_runtime::BackendCycleProgress,
     forwarded_frames: &mut Vec<([u8; 5], Bytes)>,
 ) -> anyhow::Result<Option<ReadyStatus>> {
     progress.response_started = state.progress.response_started;
-    let mut drain = crate::io_runtime::BackendResponseDrain::resume(shape, *progress);
+    let mut drain = crate::engine::io_runtime::BackendResponseDrain::resume(shape, *progress);
     let event = drain.drain_with(backend_buffer, forwarded_frames, |frame| {
         state.progress.response_started = true;
         if let Some(sqlstate) = frame.sqlstate() {
@@ -575,9 +575,9 @@ pub(super) fn classify_backend_frames(
     })?;
     *progress = drain.progress();
     Ok(match event {
-        crate::io_runtime::ResponseDrainEvent::Frames { ready, .. } => ready,
-        crate::io_runtime::ResponseDrainEvent::BufferLimitExceeded
-        | crate::io_runtime::ResponseDrainEvent::NeedMoreBytes => None,
+        crate::engine::io_runtime::ResponseDrainEvent::Frames { ready, .. } => ready,
+        crate::engine::io_runtime::ResponseDrainEvent::BufferLimitExceeded
+        | crate::engine::io_runtime::ResponseDrainEvent::NeedMoreBytes => None,
     })
 }
 
@@ -790,7 +790,7 @@ pub(super) fn update_transaction_shard_state_from_sql(session: &mut VirtualSessi
     );
     if matches!(
         decision,
-        pg_kinetic_core::session::TransactionShardDecision::Rejected
+        pg_kinetic_core::protocol::session::TransactionShardDecision::Rejected
     ) {
         session.mark_transaction_cross_shard_violation();
     }
@@ -872,8 +872,9 @@ mod tests {
             payload: Bytes::new(),
         };
 
-        let simple_shape = crate::io_runtime::FrontendCycleShape::from_frames(&simple_frames);
-        let sync_shape = crate::io_runtime::FrontendCycleShape::from_frames(&[sync_frame]);
+        let simple_shape =
+            crate::engine::io_runtime::FrontendCycleShape::from_frames(&simple_frames);
+        let sync_shape = crate::engine::io_runtime::FrontendCycleShape::from_frames(&[sync_frame]);
 
         assert_eq!(simple_shape.expected_ready_count(), 3);
         assert!(!simple_shape.needs_sync());

@@ -8,7 +8,7 @@ use pg_kinetic::{
         RouteConfig,
     },
     proxy::Proxy,
-    proxy_runtime::snapshot::{RouteCheckoutSnapshot, SnapshotStore},
+    proxy_runtime::observe::snapshot::{RouteCheckoutSnapshot, SnapshotStore},
     wire::{
         frame::parse_frontend_frame,
         message::{parse_bind_statement_name, parse_parse_message, parse_simple_query},
@@ -16,10 +16,10 @@ use pg_kinetic::{
     },
 };
 use pg_kinetic_core::{
-    lsn::PgLsn,
-    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-    session::TransactionState,
-    virtual_session::ReadAfterWriteState,
+    cluster::lsn::PgLsn,
+    protocol::session::TransactionState,
+    protocol::virtual_session::ReadAfterWriteState,
+    traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
 };
 use pg_kinetic_proxy::routing::{
     choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,

@@ -197,7 +197,7 @@ impl ClientConnection {
     }
 }
 
-impl crate::io_runtime::RuntimeByteStream for ClientConnection {
+impl crate::engine::io_runtime::RuntimeByteStream for ClientConnection {
     async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
         self.read_buf(dst).await
     }

@@ -15,7 +15,7 @@ use pg_kinetic::{
     proxy::Proxy,
     wire::protocol::{FrontendTag, ProtocolVersion},
 };
-use pg_kinetic_proxy::buffers::{
+use pg_kinetic_proxy::net::buffers::{
     BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, ProxyBufferStats,
 };
 use pretty_assertions::assert_eq;

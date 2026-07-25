@@ -13,7 +13,9 @@ use std::{
 };
 
 use bytes::{BufMut, BytesMut};
-use pg_kinetic::{config::Config, core::runtime::RuntimeEngine, proxy_runtime::io_uring};
+use pg_kinetic::{
+    config::Config, core::cluster::runtime::RuntimeEngine, proxy_runtime::engine::io_uring,
+};
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();

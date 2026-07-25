@@ -1,4 +1,4 @@
-use pg_kinetic::core::performance::{
+use pg_kinetic::core::observability::performance::{
     BenchmarkTarget, PerformanceBudget, PerformanceBudgetOutcome, PerformanceBudgetSet,
     PerformanceMetric, PerformanceRegressionThreshold,
 };
