@@ -712,32 +712,46 @@ where
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 let result = crate::io_runtime::tokio_timeout(query_timeout, forward).await;
                 match result {
-                    Ok(Ok(status)) => {
-                        if should_probe_read_after_write(
-                            committed_write_transaction,
-                            read_after_write_protection_enabled,
-                            status,
-                        ) {
-                            let freshness_outcome = probe_shared_read_after_write_requirement(
-                                &mut runtime_backend,
-                                read_after_write_timeout,
-                                max_backend_buffer_bytes,
-                            )
-                            .await;
-                            apply_read_after_write_probe_result(&mut session, freshness_outcome);
+                    Ok(Ok(outcome)) => match outcome {
+                        ForwardOutcome::Ready(status) => {
+                            if should_probe_read_after_write(
+                                committed_write_transaction,
+                                read_after_write_protection_enabled,
+                                status,
+                            ) {
+                                let freshness_outcome = probe_shared_read_after_write_requirement(
+                                    &mut runtime_backend,
+                                    read_after_write_timeout,
+                                    max_backend_buffer_bytes,
+                                )
+                                .await;
+                                apply_read_after_write_probe_result(
+                                    &mut session,
+                                    freshness_outcome,
+                                );
+                            }
+                            drop(runtime_backend);
+                            if session.pin_reason().is_some() {
+                                held_backend = Some(backend);
+                            } else {
+                                release_backend_with_cancel_unbind(
+                                    &cancel_registry,
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
+                            }
                         }
-                        drop(runtime_backend);
-                        if session.pin_reason().is_some() {
+                        ForwardOutcome::Flushed => {
+                            drop(runtime_backend);
                             held_backend = Some(backend);
-                        } else {
-                            release_backend_with_cancel_unbind(
-                                &cancel_registry,
-                                client_key,
-                                backend,
-                            )
-                            .await;
                         }
-                    }
+                        ForwardOutcome::ClientDisconnectedAfterReady(_)
+                        | ForwardOutcome::AbandonedResponse { .. }
+                        | ForwardOutcome::BufferLimitExceeded => {
+                            unreachable!("runtime forwarding only returns ready or flushed");
+                        }
+                    },
                     Ok(Err(error)) => {
                         drop(runtime_backend);
                         discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
@@ -1497,6 +1511,10 @@ async fn handle_forward_result(
                 .await?;
                 return Ok(FrameCycleOutcome::Finish);
             }
+        }
+        Ok(Ok(ForwardOutcome::Flushed)) => {
+            *held_backend = Some(backend);
+            return Ok(FrameCycleOutcome::Continue);
         }
         Ok(Ok(ForwardOutcome::AbandonedResponse { needs_sync })) => {
             let reused = recover_backend(

@@ -82,8 +82,8 @@ pub(super) async fn forward_message_cycle(
         phase_recorder,
     )?;
     let needs_sync = planned.needs_sync;
-    let expected_ready_count =
-        crate::io_runtime::FrontendCycleShape::from_frames(frames).expected_ready_count();
+    let cycle_shape = crate::io_runtime::FrontendCycleShape::from_frames(frames);
+    let expected_ready_count = cycle_shape.expected_ready_count();
     let mut injected_parse_completes = planned.injected_parse_completes;
     let mut ready_count = 0_usize;
 
@@ -160,8 +160,9 @@ pub(super) async fn forward_message_cycle(
             &mut forwarded_frames,
         )?;
         *buffers.backend_read_mut() = backend_read;
+        let has_forwarded_frames = !forwarded_frames.is_empty();
 
-        if !forwarded_frames.is_empty() {
+        if has_forwarded_frames {
             let mut client_write = Vec::with_capacity(forwarded_frames.len() * 2);
             for (header, payload) in &forwarded_frames {
                 client_write.push(IoSlice::new(header));
@@ -187,6 +188,12 @@ pub(super) async fn forward_message_cycle(
             rows_timer.finish(MetricOutcome::Ok);
             return Ok(ForwardOutcome::Ready(status));
         }
+
+        if !cycle_shape.expects_ready() && has_forwarded_frames {
+            buffers.trim_empty_buffers();
+            rows_timer.finish(MetricOutcome::Ok);
+            return Ok(ForwardOutcome::Flushed);
+        }
     }
 }
 
@@ -199,7 +206,7 @@ pub(crate) async fn forward_runtime_cycle<C, B>(
     injected_parse_completes: usize,
     backend_buffer: &mut BytesMut,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<ReadyStatus>
+) -> anyhow::Result<ForwardOutcome>
 where
     C: crate::io_runtime::RuntimeByteStream + ?Sized,
     B: crate::io_runtime::RuntimeByteStream + ?Sized,
@@ -211,7 +218,7 @@ where
         expected_ready_count,
         injected_parse_completes,
     );
-    crate::io_runtime::forward_backend_until_ready(
+    match crate::io_runtime::forward_backend_until_cycle_complete(
         backend,
         client,
         backend_buffer,
@@ -221,7 +228,13 @@ where
         "write backend response",
         "backend closed during response",
     )
-    .await
+    .await?
+    {
+        crate::io_runtime::BackendForwardOutcome::Ready(status) => {
+            Ok(ForwardOutcome::Ready(status))
+        }
+        crate::io_runtime::BackendForwardOutcome::Flushed => Ok(ForwardOutcome::Flushed),
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +327,42 @@ mod generic_tests {
         assert_eq!(
             client.writes,
             vec![BytesMut::from(&b"Z\x00\x00\x00\x05I"[..])]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_returns_after_flush_response_without_ready() {
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::from([BytesMut::from(&b"1\x00\x00\x00\x04"[..])]),
+            writes: Vec::new(),
+        };
+
+        let outcome = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"H\x00\x00\x00\x04",
+            0,
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect("flush forwarding returns after available backend frames");
+
+        assert!(matches!(outcome, ForwardOutcome::Flushed));
+        assert_eq!(
+            backend.writes,
+            vec![BytesMut::from(&b"H\x00\x00\x00\x04"[..])]
+        );
+        assert_eq!(
+            client.writes,
+            vec![BytesMut::from(&b"1\x00\x00\x00\x04"[..])]
         );
     }
 }
@@ -485,6 +534,7 @@ impl PreparedForwardPlan {
 pub(super) enum ForwardOutcome {
     Ready(ReadyStatus),
     ClientDisconnectedAfterReady(ReadyStatus),
+    Flushed,
     AbandonedResponse { needs_sync: bool },
     BufferLimitExceeded,
 }
@@ -622,6 +672,7 @@ pub(super) fn update_virtual_session_from_frame(
         FrontendTag::Describe,
         FrontendTag::Execute,
         FrontendTag::Close,
+        FrontendTag::Flush,
         FrontendTag::Sync,
     ]
     .iter()

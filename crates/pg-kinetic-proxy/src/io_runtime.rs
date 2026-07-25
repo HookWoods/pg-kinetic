@@ -194,12 +194,23 @@ impl FrontendCycleShape {
             .iter()
             .filter(|frame| frame.tag == u8::from(FrontendTag::Query))
             .count();
+        let simple_query_cycle = query_count == frames.len();
         let needs_sync = frames
             .iter()
             .any(|frame| frame.tag != u8::from(FrontendTag::Query));
+        let expected_ready_count = if simple_query_cycle {
+            query_count.max(1)
+        } else if frames
+            .last()
+            .is_some_and(|frame| frame.tag == u8::from(FrontendTag::Sync))
+        {
+            1
+        } else {
+            0
+        };
 
         Self {
-            expected_ready_count: query_count.max(1),
+            expected_ready_count,
             needs_sync,
         }
     }
@@ -221,6 +232,11 @@ impl FrontendCycleShape {
     #[must_use]
     pub const fn expected_ready_count(self) -> usize {
         self.expected_ready_count
+    }
+
+    #[must_use]
+    pub const fn expects_ready(self) -> bool {
+        self.expected_ready_count > 0
     }
 
     #[must_use]
@@ -263,7 +279,7 @@ pub fn take_frontend_cycle_bytes(
             cycle_len += next_len;
         }
     } else {
-        while !buffer[..cycle_len].ends_with_sync_frame()? {
+        while !buffer[..cycle_len].ends_with_extended_cycle_boundary()? {
             let Some(next_len) = complete_frontend_frame_len(&buffer[cycle_len..])? else {
                 return Ok(FrontendCycleRead::NeedMoreBytes);
             };
@@ -341,17 +357,18 @@ fn complete_frontend_frame_len(bytes: &[u8]) -> anyhow::Result<Option<usize>> {
 }
 
 trait FrontendCycleBytes {
-    fn ends_with_sync_frame(&self) -> anyhow::Result<bool>;
+    fn ends_with_extended_cycle_boundary(&self) -> anyhow::Result<bool>;
 }
 
 impl FrontendCycleBytes for [u8] {
-    fn ends_with_sync_frame(&self) -> anyhow::Result<bool> {
+    fn ends_with_extended_cycle_boundary(&self) -> anyhow::Result<bool> {
         let mut scan = BytesMut::from(self);
-        let mut last_is_sync = false;
+        let mut boundary = false;
         while let Some(frame) = parse_frontend_frame(&mut scan)? {
-            last_is_sync = frame.tag == u8::from(FrontendTag::Sync);
+            boundary = frame.tag == u8::from(FrontendTag::Sync)
+                || frame.tag == u8::from(FrontendTag::Flush);
         }
-        Ok(last_is_sync && scan.is_empty())
+        Ok(boundary && scan.is_empty())
     }
 }
 
@@ -431,6 +448,11 @@ impl BackendResponseDrain {
         self.injected_parse_completes
     }
 
+    #[must_use]
+    pub const fn expects_ready(&self) -> bool {
+        self.expected_ready_count > 0
+    }
+
     pub fn drain(
         &mut self,
         backend_buffer: &mut BytesMut,
@@ -494,6 +516,12 @@ impl BackendResponseDrain {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BackendForwardOutcome {
+    Ready(ReadyStatus),
+    Flushed,
+}
+
 pub fn drain_backend_response_bytes(
     backend_buffer: &mut BytesMut,
     drain: &mut BackendResponseDrain,
@@ -537,6 +565,39 @@ where
     B: RuntimeByteStream + ?Sized,
     C: RuntimeByteStream + ?Sized,
 {
+    match forward_backend_until_cycle_complete(
+        backend,
+        client,
+        backend_buffer,
+        drain,
+        max_backend_buffer_bytes,
+        read_context,
+        write_context,
+        closed_message,
+    )
+    .await?
+    {
+        BackendForwardOutcome::Ready(status) => Ok(status),
+        BackendForwardOutcome::Flushed => {
+            anyhow::bail!("backend flushed response without ReadyForQuery")
+        }
+    }
+}
+
+pub(crate) async fn forward_backend_until_cycle_complete<B, C>(
+    backend: &mut B,
+    client: &mut C,
+    backend_buffer: &mut BytesMut,
+    drain: &mut BackendResponseDrain,
+    max_backend_buffer_bytes: usize,
+    read_context: &'static str,
+    write_context: &'static str,
+    closed_message: &'static str,
+) -> anyhow::Result<BackendForwardOutcome>
+where
+    B: RuntimeByteStream + ?Sized,
+    C: RuntimeByteStream + ?Sized,
+{
     loop {
         let read = read_from(backend, backend_buffer)
             .await
@@ -552,8 +613,11 @@ where
                         .await
                         .with_context(|| write_context)?;
                 }
-                if ready.is_some() {
-                    return Ok(ready.expect("ready status is present"));
+                if let Some(status) = ready {
+                    return Ok(BackendForwardOutcome::Ready(status));
+                }
+                if !drain.expects_ready() && !bytes.is_empty() {
+                    return Ok(BackendForwardOutcome::Flushed);
                 }
             }
             BackendBytesDrainEvent::BufferLimitExceeded => {

@@ -20,6 +20,7 @@ pub enum FrontendTag {
     Describe,
     Execute,
     Close,
+    Flush,
     Sync,
     Terminate,
 }
@@ -33,6 +34,7 @@ impl From<FrontendTag> for u8 {
             FrontendTag::Describe => b'D',
             FrontendTag::Execute => b'E',
             FrontendTag::Close => b'C',
+            FrontendTag::Flush => b'H',
             FrontendTag::Sync => b'S',
             FrontendTag::Terminate => b'X',
         }

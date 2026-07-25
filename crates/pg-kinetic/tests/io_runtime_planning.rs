@@ -59,6 +59,48 @@ fn frontend_cycle_shape_requires_sync_for_extended_protocol_frames() {
 }
 
 #[test]
+fn frontend_cycle_shape_allows_flush_without_ready() {
+    let frames = vec![
+        frontend_frame(FrontendTag::Parse, b""),
+        frontend_frame(FrontendTag::Describe, b"S\0"),
+        frontend_frame(FrontendTag::Flush, b""),
+    ];
+
+    let shape = FrontendCycleShape::from_frames(&frames);
+
+    assert_eq!(shape.expected_ready_count(), 0);
+    assert!(!shape.expects_ready());
+    assert!(shape.needs_sync());
+}
+
+#[test]
+fn frontend_cycle_bytes_take_flush_boundary_before_sync_tail() {
+    let mut bytes = BytesMut::new();
+    let parse = encoded_frontend_frame(FrontendTag::Parse, b"statement\0select 1\0\0");
+    let describe = encoded_frontend_frame(FrontendTag::Describe, b"Sstatement\0");
+    let flush = encoded_frontend_frame(FrontendTag::Flush, b"");
+    let sync = encoded_frontend_frame(FrontendTag::Sync, b"");
+    bytes.extend_from_slice(&parse);
+    bytes.extend_from_slice(&describe);
+    bytes.extend_from_slice(&flush);
+    bytes.extend_from_slice(&sync);
+
+    let outcome = take_frontend_cycle_bytes(&mut bytes, 1024).expect("cycle read");
+
+    let FrontendCycleRead::Complete {
+        bytes: complete,
+        shape,
+    } = outcome
+    else {
+        panic!("expected flush-delimited cycle");
+    };
+    assert_eq!(complete.len(), parse.len() + describe.len() + flush.len());
+    assert_eq!(shape.expected_ready_count(), 0);
+    assert!(!shape.expects_ready());
+    assert_eq!(bytes.len(), sync.len());
+}
+
+#[test]
 fn frontend_cycle_shape_from_wire_bytes_counts_complete_simple_queries() {
     let mut bytes = BytesMut::new();
     bytes.extend_from_slice(&encoded_frontend_frame(FrontendTag::Query, b"select 1\0"));

@@ -346,6 +346,7 @@ fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    let config = load_startup_config(config)?;
     let selector = RuntimeEngineSelector::new(config.runtime.engine.runtime_engine)
         .with_experiment(RuntimeEngineExperiment::new(
             config.runtime.engine.experimental_runtime_enabled,
@@ -945,6 +946,20 @@ fn load_policy_preview_config(
             format!("parse {}: {error}", path.display()),
         )
     })
+}
+
+fn load_startup_config(config: Config) -> anyhow::Result<Config> {
+    let Some(config_file) = config.reload.config_file.clone() else {
+        return Ok(config);
+    };
+
+    let contents = fs::read_to_string(&config_file)
+        .with_context(|| format!("read config file {}", config_file.display()))?;
+    let mut loaded = toml::from_str::<Config>(&contents)
+        .with_context(|| format!("parse config file {}", config_file.display()))?;
+    loaded.reload.config_file = Some(config_file);
+    loaded.validate().map_err(anyhow::Error::msg)?;
+    Ok(loaded)
 }
 
 fn preview_route_label(database: &str, user: &str, application_name: Option<&str>) -> String {
