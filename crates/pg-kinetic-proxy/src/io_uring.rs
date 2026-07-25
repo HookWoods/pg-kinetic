@@ -31,6 +31,7 @@ mod linux {
         let runtime_state = Arc::new(proxy.initialize_runtime_state()?);
         let config = runtime_state.effective_config().clone();
         validate_supported_config(&config)?;
+        let client_tls_server_config = crate::reload::load_client_tls_server_config(&config)?;
         let shard_count = config
             .runtime
             .engine
@@ -52,6 +53,7 @@ mod linux {
             let client_slots = Arc::clone(&client_slots);
             let backend_slots = Arc::clone(&backend_slots);
             let runtime_state = Arc::clone(&runtime_state);
+            let client_tls_server_config = client_tls_server_config.clone();
             let lifecycle = lifecycle.clone();
             let startup_tx = startup_tx.clone();
             let listen_addr = config.connection.listen_addr;
@@ -77,6 +79,7 @@ mod linux {
                         shard_id,
                         listen_addr,
                         runtime_state,
+                        client_tls_server_config,
                         stop,
                         start_accepting,
                         buffer_pool,
@@ -119,7 +122,7 @@ mod linux {
             listen_addr = %config.connection.listen_addr,
             backend_addr = %runtime_state.default_primary_backend_addr(),
             shards = shard_count,
-            "experimental io_uring plaintext pass-through runtime listening"
+            "io_uring runtime listening"
         );
 
         wait_for_shutdown_blocking()?;
@@ -175,6 +178,7 @@ mod linux {
         shard_id: usize,
         listen_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
+        client_tls_server_config: Option<Arc<rustls::ServerConfig>>,
         stop: Arc<AtomicBool>,
         start_accepting: Arc<AtomicBool>,
         buffer_pool: crate::buffers::ProxyBufferPool,
@@ -197,6 +201,13 @@ mod linux {
             }
         };
         let _ = startup_tx.send(Ok(shard_id));
+        let backend_pool_selector =
+            Arc::new(crate::io_uring_transport::MonoioBackendPoolSelector::new(
+                runtime_state.default_primary_backend_addr(),
+                runtime_state.effective_config().tls.clone(),
+                runtime_state.effective_config().socket.clone(),
+                backend_slots,
+            ));
 
         wait_for_start_gate(&start_accepting, &stop).await;
         while !stop.load(Ordering::Acquire) && drain.is_accepting() {
@@ -213,15 +224,17 @@ mod linux {
                 continue;
             };
             let buffer_pool = buffer_pool.clone();
-            let backend_slots = Arc::clone(&backend_slots);
+            let backend_pool_selector = Arc::clone(&backend_pool_selector);
             let runtime_state = Arc::clone(&runtime_state);
+            let client_tls_server_config = client_tls_server_config.clone();
             monoio::spawn(async move {
                 if let Err(error) = proxy_connection(
                     client,
                     client_addr,
                     runtime_state,
+                    client_tls_server_config,
                     buffer_pool,
-                    backend_slots,
+                    backend_pool_selector,
                     max_client_buffer_bytes,
                     max_backend_buffer_bytes,
                 )
@@ -262,132 +275,101 @@ mod linux {
         client: TcpStream,
         client_addr: SocketAddr,
         runtime_state: Arc<crate::proxy::ProxyRuntimeState>,
+        client_tls_server_config: Option<Arc<rustls::ServerConfig>>,
         buffer_pool: crate::buffers::ProxyBufferPool,
-        backend_slots: Arc<tokio::sync::Semaphore>,
+        backend_pool_selector: Arc<crate::io_uring_transport::MonoioBackendPoolSelector>,
         max_client_buffer_bytes: usize,
         max_backend_buffer_bytes: usize,
     ) -> anyhow::Result<()> {
         let mut client = crate::io_uring_transport::MonoioTransport::new(client);
         let mut client_buffer = BytesMut::with_capacity(16 * 1024);
-        let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
-
-        let startup_packet = loop {
-            match crate::io_runtime::take_startup_packet_bytes(
-                &mut client_buffer,
-                max_client_buffer_bytes,
-            )? {
-                crate::io_runtime::StartupPacketRead::Packet(bytes) => break bytes,
-                crate::io_runtime::StartupPacketRead::Cancel { bytes, .. } => {
-                    let backend_addr = runtime_state.default_primary_backend_addr();
-                    let Ok(backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned()
-                    else {
-                        anyhow::bail!("backend capacity exceeded");
-                    };
-                    let backend = TcpStream::connect_addr(backend_addr)
-                        .await
-                        .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-                    let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
-                    crate::io_runtime::write_all_to(&mut backend, &bytes)
-                        .await
-                        .context("forward cancel request")?;
-                    let _ = crate::io_runtime::shutdown(&mut backend).await;
-                    drop(backend_capacity_guard);
-                    return Ok(());
-                }
-                crate::io_runtime::StartupPacketRead::EncryptionRequest(_) => {
-                    crate::io_runtime::write_all_to(&mut client, b"N")
-                        .await
-                        .context("reject startup encryption request")?;
-                }
-                crate::io_runtime::StartupPacketRead::BufferLimitExceeded => {
-                    anyhow::bail!("client startup packet exceeded configured buffer limit");
-                }
-                crate::io_runtime::StartupPacketRead::NeedMoreBytes => {
-                    let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
-                        .await
-                        .context("read startup")?;
-                    if read == 0 {
-                        return Ok(());
-                    }
-                }
-            }
-        };
-        let startup_plan = runtime_state
-            .startup_backend_plan(&startup_packet, client_addr, None)
-            .context("resolve startup backend")?;
-        let backend_addr = startup_plan.primary_backend_addr();
-
-        let Ok(_backend_capacity_guard) = Arc::clone(&backend_slots).try_acquire_owned() else {
-            anyhow::bail!("backend capacity exceeded");
-        };
-        let backend = TcpStream::connect_addr(backend_addr)
-            .await
-            .with_context(|| format!("connect io_uring backend {backend_addr}"))?;
-        let mut backend = crate::io_uring_transport::MonoioBackend::new(
-            backend_addr,
-            crate::io_uring_transport::MonoioTransport::new(backend),
-        );
-        let mut buffers = buffer_pool.acquire();
-        crate::proxy::proxy_startup_streams(
+        let effective_config = runtime_state.effective_config();
+        let phase_recorder = crate::telemetry::phase_timing_recorder(false);
+        let startup_packet = match crate::proxy::handle_startup_or_cancel(
             &mut client,
-            &mut backend,
-            true,
-            &startup_plan.backend_startup_packet,
+            &mut client_buffer,
+            effective_config.tls.client_tls_mode,
+            client_tls_server_config.as_ref(),
+            effective_config.qos.idle_client_timeout(),
+            max_client_buffer_bytes,
+            phase_recorder.as_ref(),
+        )
+        .await?
+        {
+            crate::proxy::StartupOrCancel::Startup(bytes) => bytes,
+            crate::proxy::StartupOrCancel::Cancel {
+                process_id,
+                secret_key,
+                ..
+            } => {
+                let Some(lease) = runtime_state
+                    .cancel_registry()
+                    .acquire_forwarding((process_id, secret_key))
+                else {
+                    return Ok(());
+                };
+                let target = lease.target();
+                let backend = TcpStream::connect_addr(target.backend_addr)
+                    .await
+                    .with_context(|| format!("connect io_uring backend {}", target.backend_addr))?;
+                let mut backend = crate::io_uring_transport::MonoioTransport::new(backend);
+                let packet =
+                    crate::cancel::encode_cancel_request(target.process_id, target.secret_key);
+                crate::io_runtime::write_all_to(&mut backend, &packet)
+                    .await
+                    .context("forward cancel request")?;
+                let _ = crate::io_runtime::shutdown(&mut backend).await;
+                return Ok(());
+            }
+            crate::proxy::StartupOrCancel::Finished => return Ok(()),
+        };
+        let backend_credentials = runtime_state.backend_credentials();
+        let startup_plan = runtime_state
+            .startup_backend_plan(
+                &startup_packet,
+                client_addr,
+                backend_credentials
+                    .as_deref()
+                    .map(crate::auth::BackendCredentials::username),
+            )
+            .context("resolve startup backend")?;
+        let route_policy = startup_plan.route_policy;
+        let context = crate::proxy::SharedClientSessionContext {
+            pool: backend_pool_selector,
+            route: startup_plan.session_route,
+            route_user: startup_plan.route_user,
+            route_application_name: startup_plan.route_application_name,
+            backend_startup_packet: startup_plan.backend_startup_packet,
+            buffer_pool,
             max_client_buffer_bytes,
             max_backend_buffer_bytes,
-            true,
-            false,
-            None,
-            buffers.buffers_mut(),
-            None,
-        )
-        .await?;
-
-        loop {
-            let (client_cycle, expected_ready_count) = loop {
-                match crate::io_runtime::take_frontend_cycle_bytes(
-                    &mut client_buffer,
-                    max_client_buffer_bytes,
-                )? {
-                    crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
-                        break (bytes, shape.expected_ready_count());
-                    }
-                    crate::io_runtime::FrontendCycleRead::Terminate { bytes } => {
-                        let _ = crate::io_runtime::write_all_to(&mut backend, &bytes).await;
-                        let _ = crate::io_runtime::shutdown(&mut backend).await;
-                        return Ok(());
-                    }
-                    crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
-                        anyhow::bail!("client request exceeded configured buffer limit");
-                    }
-                    crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
-                        let read = crate::io_runtime::read_from(&mut client, &mut client_buffer)
-                            .await
-                            .context("read client query")?;
-                        if read == 0 {
-                            let _ = crate::io_runtime::shutdown(&mut backend).await;
-                            return Ok(());
-                        }
-                    }
-                }
-            };
-            crate::io_runtime::write_all_to(&mut backend, &client_cycle)
-                .await
-                .context("write query")?;
-            let mut response_drain =
-                crate::io_runtime::BackendResponseDrain::new(expected_ready_count, 0);
-            crate::io_runtime::forward_backend_until_ready(
-                &mut backend,
-                &mut client,
-                &mut backend_buffer,
-                &mut response_drain,
-                max_backend_buffer_bytes,
-                "read backend response",
-                "write backend response",
-                "backend closed during response",
-            )
-            .await?;
-        }
+            query_timeout: effective_config.qos.query_timeout(),
+            idle_client_timeout: effective_config.qos.idle_client_timeout(),
+            idle_transaction_timeout: effective_config.qos.idle_transaction_timeout(),
+            overload_error_code: effective_config.qos.overload_error_code.clone(),
+            auth: effective_config.auth.clone(),
+            auth_users: crate::reload::load_auth_users(effective_config)?,
+            auth_query_service: runtime_state.auth_query_service(),
+            backend_credentials,
+            cancel_registry: runtime_state.cancel_registry(),
+            route_pools: startup_plan.route_pools,
+            route_read_routing_mode: route_policy.routing_planner.read_routing_mode(),
+            route_fallback_policy: route_policy.routing_planner.fallback_policy(),
+            read_after_write_timeout: route_policy.read_after_write_timeout,
+            read_after_write_protection_enabled: route_policy.read_after_write_protection_enabled,
+            routing_planner: route_policy.routing_planner,
+            snapshot_store: runtime_state.snapshot_store(),
+            phase_recorder: crate::telemetry::phase_timing_recorder(false),
+            session_id: crate::proxy::next_session_id(),
+            _backend: std::marker::PhantomData,
+        };
+        crate::proxy::handle_client_session::<
+            _,
+            crate::io_uring_transport::MonoioBackend,
+            Arc<crate::io_uring_transport::MonoioBackendPool>,
+            Arc<crate::io_uring_transport::MonoioBackendPoolSelector>,
+        >(client, client_addr, context)
+        .await
     }
 
     fn bind_reuseport_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
@@ -421,9 +403,7 @@ mod linux {
     use super::*;
 
     pub fn run(_config: Config) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "experimental_io_uring requires Linux and the pg-kinetic io-uring cargo feature"
-        )
+        anyhow::bail!("io_uring requires Linux and the pg-kinetic io-uring cargo feature")
     }
 }
 
@@ -437,6 +417,24 @@ pub fn run(config: Config) -> anyhow::Result<()> {
 
 pub fn validate_supported_config_for_test(config: &Config) -> anyhow::Result<()> {
     validate_supported_config(config)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoUringSessionLifecycleSummary {
+    pub client_transport: &'static str,
+    pub backend_checkout: &'static str,
+    pub session_lifecycle: &'static str,
+}
+
+pub fn session_lifecycle_summary_for_test(
+    config: Config,
+) -> anyhow::Result<IoUringSessionLifecycleSummary> {
+    validate_supported_config(&config)?;
+    Ok(IoUringSessionLifecycleSummary {
+        client_transport: "monoio",
+        backend_checkout: "shared_pool",
+        session_lifecycle: "shared_proxy",
+    })
 }
 
 pub fn direct_backend_addr_for_test(config: &Config) -> anyhow::Result<SocketAddr> {
@@ -486,56 +484,36 @@ pub fn shared_capacity_limits_for_test(config: Config) -> anyhow::Result<(usize,
 }
 
 fn validate_supported_config(config: &Config) -> anyhow::Result<()> {
-    use crate::config::{AuthMode, BackendTlsMode, ClientTlsMode};
-
-    if config.tls.client_tls_mode != ClientTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires client_tls_mode=disable");
-    }
-    if config.tls.backend_tls_mode != BackendTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires backend_tls_mode=disable");
-    }
-    if config.auth.auth_mode != AuthMode::PassThrough {
-        anyhow::bail!("experimental_io_uring currently requires auth_mode=pass_through");
-    }
-    direct_backend_addr(config)?;
+    let _ = config;
     Ok(())
 }
 
 fn direct_backend_addr(config: &Config) -> anyhow::Result<SocketAddr> {
-    use crate::config::{BackendTlsMode, FreshnessConfig, HaConfig, ReadRoutingConfig};
-
-    if !config.pools.is_empty() {
-        anyhow::bail!(
-            "experimental_io_uring currently rejects pool configs until shared pool checkout exists"
-        );
-    }
+    use crate::config::{FreshnessConfig, HaConfig, ReadRoutingConfig};
 
     let routes = config.effective_routes();
     let [route] = routes.as_slice() else {
-        anyhow::bail!("experimental_io_uring currently requires a single primary route");
+        anyhow::bail!("io_uring direct backend helper currently requires a single primary route");
     };
     if !route.replicas.is_empty() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects replicas until route selection exists"
+            "io_uring direct backend helper rejects replicas; use shared route selection"
         );
     }
     if route.read_routing != ReadRoutingConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects read routing until route selection exists"
+            "io_uring direct backend helper rejects read routing; use shared route selection"
         );
     }
     if route.freshness != FreshnessConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects freshness policy until route selection exists"
+            "io_uring direct backend helper rejects freshness policy; use shared route selection"
         );
     }
     if route.ha != HaConfig::default() {
         anyhow::bail!(
-            "experimental_io_uring currently rejects route HA until route selection exists"
+            "io_uring direct backend helper rejects route HA; use shared route selection"
         );
-    }
-    if route.primary.tls_mode != BackendTlsMode::Disable {
-        anyhow::bail!("experimental_io_uring currently requires route primary tls_mode=disable");
     }
     Ok(route.primary.address)
 }
@@ -555,23 +533,19 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_managed_auth() {
+    fn supported_config_accepts_managed_auth() {
         let mut config = Config::default();
         config.auth.auth_mode = AuthMode::Trust;
 
-        let error = validate_supported_config(&config).expect_err("managed auth is rejected");
-
-        assert!(error.to_string().contains("auth_mode=pass_through"));
+        validate_supported_config(&config).expect("managed auth uses shared auth path");
     }
 
     #[test]
-    fn supported_config_rejects_tls() {
+    fn supported_config_accepts_tls() {
         let mut config = Config::default();
         config.tls.client_tls_mode = ClientTlsMode::VerifyClient;
 
-        let error = validate_supported_config(&config).expect_err("client TLS is rejected");
-
-        assert!(error.to_string().contains("client_tls_mode=disable"));
+        validate_supported_config(&config).expect("client TLS uses shared startup path");
     }
 
     #[test]
@@ -587,20 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn supported_config_rejects_multiple_route_configurations() {
+    fn direct_backend_addr_rejects_multiple_route_configurations() {
         let mut config = Config::default();
         config.routes = vec![
             RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr")),
             RouteConfig::from_backend_addr("127.0.0.1:6545".parse().expect("route addr")),
         ];
 
-        let error = validate_supported_config(&config).expect_err("multiple routes are rejected");
+        let error =
+            direct_backend_addr(&config).expect_err("direct route helper rejects multiple routes");
 
         assert!(error.to_string().contains("single primary route"));
     }
 
     #[test]
-    fn supported_config_rejects_pool_configuration() {
+    fn supported_config_accepts_pool_configuration() {
         let mut config = Config::default();
         config.pools = vec![PoolConfig {
             database: "app".to_string(),
@@ -609,13 +584,11 @@ mod tests {
             max_backends: None,
         }];
 
-        let error = validate_supported_config(&config).expect_err("pools are rejected");
-
-        assert!(error.to_string().contains("pool configs"));
+        validate_supported_config(&config).expect("pool configuration is supported");
     }
 
     #[test]
-    fn supported_config_rejects_read_routing() {
+    fn direct_backend_addr_rejects_read_routing() {
         let mut config = Config::default();
         let mut route =
             RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
@@ -625,7 +598,8 @@ mod tests {
         };
         config.routes = vec![route];
 
-        let error = validate_supported_config(&config).expect_err("read routing is rejected");
+        let error =
+            direct_backend_addr(&config).expect_err("direct route helper rejects read routing");
 
         assert!(error.to_string().contains("read routing"));
     }

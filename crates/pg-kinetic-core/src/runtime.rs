@@ -211,7 +211,7 @@ pub enum RuntimeEngine {
     TokioCurrentThread,
     #[default]
     ThreadPerCore,
-    ExperimentalIoUring,
+    IoUring,
 }
 
 impl RuntimeEngine {
@@ -221,17 +221,16 @@ impl RuntimeEngine {
             Self::TokioDefault => "tokio_default",
             Self::TokioCurrentThread => "tokio_current_thread",
             Self::ThreadPerCore => "thread_per_core",
-            Self::ExperimentalIoUring => "experimental_io_uring",
+            Self::IoUring => "io_uring",
         }
     }
 
     #[must_use]
     pub const fn status(self) -> RuntimeEngineStatus {
         match self {
-            Self::TokioDefault | Self::TokioCurrentThread | Self::ThreadPerCore => {
+            Self::TokioDefault | Self::TokioCurrentThread | Self::ThreadPerCore | Self::IoUring => {
                 RuntimeEngineStatus::Stable
             }
-            Self::ExperimentalIoUring => RuntimeEngineStatus::Experimental,
         }
     }
 

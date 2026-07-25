@@ -3,11 +3,41 @@ use super::*;
 pub(crate) trait BackendStartupMetadata {
     fn is_tls(&self) -> bool;
 
+    fn addr(&self) -> std::net::SocketAddr;
+
+    fn key_data(&self) -> Option<(i32, i32)>;
+
     fn parameter_status(&self) -> &[(String, String)];
 
     fn push_parameter_status(&mut self, name: String, value: String);
 
     fn set_key_data(&mut self, process_id: i32, secret_key: i32);
+}
+
+impl BackendStartupMetadata for crate::backend::Backend {
+    fn is_tls(&self) -> bool {
+        self.is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.key_data()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.set_key_data(process_id, secret_key);
+    }
 }
 
 struct PooledBackendStartup<'a> {
@@ -17,6 +47,14 @@ struct PooledBackendStartup<'a> {
 impl BackendStartupMetadata for PooledBackendStartup<'_> {
     fn is_tls(&self) -> bool {
         self.backend.is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.backend.addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.backend.key_data()
     }
 
     fn parameter_status(&self) -> &[(String, String)] {
@@ -49,6 +87,14 @@ impl crate::io_runtime::RuntimeByteStream for PooledBackendStartup<'_> {
 impl BackendStartupMetadata for PooledBackend {
     fn is_tls(&self) -> bool {
         self.backend().is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.backend().addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.backend().key_data()
     }
 
     fn parameter_status(&self) -> &[(String, String)] {
@@ -246,14 +292,33 @@ pub(super) async fn bootstrap_backend(
     startup_packet: &[u8],
     backend_credentials: Option<&auth::BackendCredentials>,
 ) -> anyhow::Result<()> {
-    if !backend.requires_startup() {
+    let requires_startup = backend.requires_startup();
+    let mut startup_backend = PooledBackendStartup {
+        backend: backend.backend_mut(),
+    };
+    bootstrap_backend_streams(
+        &mut startup_backend,
+        requires_startup,
+        startup_packet,
+        backend_credentials,
+    )
+    .await
+}
+
+pub(crate) async fn bootstrap_backend_streams<B>(
+    backend: &mut B,
+    requires_startup: bool,
+    startup_packet: &[u8],
+    backend_credentials: Option<&auth::BackendCredentials>,
+) -> anyhow::Result<()>
+where
+    B: crate::io_runtime::RuntimeByteStream + BackendStartupMetadata,
+{
+    if !requires_startup {
         return Ok(());
     }
 
-    backend
-        .backend_mut()
-        .stream_mut()
-        .write_all(startup_packet)
+    crate::io_runtime::write_all_to(backend, startup_packet)
         .await
         .context("forward backend startup")?;
 
@@ -263,10 +328,7 @@ pub(super) async fn bootstrap_backend(
         .map(auth::BackendAuthSession::new)
         .transpose()?;
     loop {
-        backend
-            .backend_mut()
-            .stream_mut()
-            .read_buf(&mut backend_buffer)
+        crate::io_runtime::read_from(backend, &mut backend_buffer)
             .await
             .context("read backend startup response")?;
 
@@ -275,12 +337,9 @@ pub(super) async fn bootstrap_backend(
                 let code = auth_request_code(&frame.payload)?;
                 if let Some(backend_auth) = backend_auth.as_mut() {
                     if let Some(response) =
-                        backend_auth.respond(&frame.payload, backend.backend_mut().is_tls())?
+                        backend_auth.respond(&frame.payload, backend.is_tls())?
                     {
-                        backend
-                            .backend_mut()
-                            .stream_mut()
-                            .write_all(&response)
+                        crate::io_runtime::write_all_to(backend, &response)
                             .await
                             .context("respond to backend bootstrap authentication request")?;
                     }
@@ -428,6 +487,37 @@ mod tests {
         assert!(client.written.ends_with(&ready_for_query_idle()));
     }
 
+    #[tokio::test]
+    async fn startup_stream_helper_synthesizes_ready_for_reused_backend() {
+        let startup_packet = BytesMut::from(&b"startup"[..]);
+        let mut client = MemoryStream::default();
+        let mut backend = MemoryStream::default();
+        let pool = ProxyBufferPool::new(
+            BufferReusePolicy::default(),
+            OversizedBufferPolicy::default(),
+        );
+        let mut lease = pool.acquire();
+
+        proxy_startup_streams(
+            &mut client,
+            &mut backend,
+            false,
+            &startup_packet,
+            1024,
+            1024,
+            true,
+            true,
+            None,
+            lease.buffers_mut(),
+            Some((12, 34)),
+        )
+        .await
+        .expect("reused backend startup succeeds");
+
+        assert!(backend.written.is_empty());
+        assert_eq!(client.written, synthetic_startup_ready(true, &[], (12, 34)));
+    }
+
     #[derive(Default)]
     struct MemoryStream {
         reads: VecDeque<BytesMut>,
@@ -450,6 +540,14 @@ mod tests {
     impl BackendStartupMetadata for MemoryStream {
         fn is_tls(&self) -> bool {
             false
+        }
+
+        fn addr(&self) -> std::net::SocketAddr {
+            "127.0.0.1:5432".parse().expect("test address")
+        }
+
+        fn key_data(&self) -> Option<(i32, i32)> {
+            self.key_data
         }
 
         fn parameter_status(&self) -> &[(String, String)] {

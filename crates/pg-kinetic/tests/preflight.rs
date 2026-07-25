@@ -134,8 +134,7 @@ fn preflight_reports_unavailable_runtime_engine() {
             "127.0.0.1:5432",
             r#"
 [runtime.engine]
-runtime_engine = "experimental_io_uring"
-experimental_runtime_enabled = true
+runtime_engine = "io_uring"
 "#,
         ),
     );

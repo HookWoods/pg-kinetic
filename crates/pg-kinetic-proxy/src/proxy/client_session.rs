@@ -1,5 +1,836 @@
 use super::*;
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) trait SharedBackendPool<B, O>: Clone + std::fmt::Debug
+where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    async fn checkout_shared(
+        &self,
+        route: RouteKey,
+        route_pools: &RoutePools,
+    ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
+
+    async fn checkout_shared_target(
+        &self,
+        route: RouteKey,
+        route_pools: &RoutePools,
+        target: &RoutingTarget,
+    ) -> Result<crate::pool::PooledBackendLease<B, O>, crate::pool::PoolError>;
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) struct SharedClientSessionContext<B, O, P> {
+    pub(crate) pool: P,
+    pub(crate) route: RouteKey,
+    pub(crate) route_user: String,
+    pub(crate) route_application_name: Option<String>,
+    pub(crate) backend_startup_packet: BytesMut,
+    pub(crate) buffer_pool: ProxyBufferPool,
+    pub(crate) max_client_buffer_bytes: usize,
+    pub(crate) max_backend_buffer_bytes: usize,
+    pub(crate) query_timeout: Duration,
+    pub(crate) idle_client_timeout: Duration,
+    pub(crate) idle_transaction_timeout: Duration,
+    pub(crate) overload_error_code: String,
+    pub(crate) auth: crate::config::AuthConfig,
+    pub(crate) auth_users: Option<Arc<UserStore>>,
+    pub(crate) auth_query_service: Arc<AuthQueryService>,
+    pub(crate) backend_credentials: Option<Arc<auth::BackendCredentials>>,
+    pub(crate) cancel_registry: Arc<cancel::CancelRegistry>,
+    pub(crate) route_pools: Arc<RoutePools>,
+    pub(crate) routing_planner: ReadRoutingPlanner,
+    pub(crate) route_read_routing_mode: ReadRoutingMode,
+    pub(crate) route_fallback_policy: FallbackPolicy,
+    pub(crate) read_after_write_timeout: Duration,
+    pub(crate) read_after_write_protection_enabled: bool,
+    pub(crate) snapshot_store: SnapshotStore,
+    pub(crate) phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
+    pub(crate) session_id: u64,
+    pub(crate) _backend: std::marker::PhantomData<(B, O)>,
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct LeaseRuntimeBackend<'a, B, O>
+where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    lease: &'a mut crate::pool::PooledBackendLease<B, O>,
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl<B, O> BackendStartupMetadata for LeaseRuntimeBackend<'_, B, O>
+where
+    B: crate::pool::PoolBackendTransport + BackendStartupMetadata,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    fn is_tls(&self) -> bool {
+        self.lease.backend().is_tls()
+    }
+
+    fn addr(&self) -> std::net::SocketAddr {
+        self.lease.backend().addr()
+    }
+
+    fn key_data(&self) -> Option<(i32, i32)> {
+        self.lease.backend().key_data()
+    }
+
+    fn parameter_status(&self) -> &[(String, String)] {
+        self.lease.backend().parameter_status()
+    }
+
+    fn push_parameter_status(&mut self, name: String, value: String) {
+        self.lease.backend_mut().push_parameter_status(name, value);
+    }
+
+    fn set_key_data(&mut self, process_id: i32, secret_key: i32) {
+        self.lease
+            .backend_mut()
+            .set_key_data(process_id, secret_key);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl<B, O> crate::io_runtime::RuntimeByteStream for LeaseRuntimeBackend<'_, B, O>
+where
+    B: crate::pool::PoolBackendTransport + crate::io_runtime::RuntimeByteStream,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        crate::io_runtime::read_from(self.lease.backend_mut(), dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        crate::io_runtime::write_all_to(self.lease.backend_mut(), bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        crate::io_runtime::shutdown(self.lease.backend_mut()).await
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+struct DiscardRuntimeStream;
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl crate::io_runtime::RuntimeByteStream for DiscardRuntimeStream {
+    async fn read_into(&mut self, _dst: &mut BytesMut) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    async fn write_all_bytes(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+fn should_reuse_held_backend(session: &VirtualSession, held_backend_id: Option<u64>) -> bool {
+    session.pin_reason().is_some() && held_backend_id.is_some()
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn cleanup_held_shared_backend<B, O>(
+    cancel_registry: &cancel::CancelRegistry,
+    client_key: (i32, i32),
+    held_backend: &mut Option<crate::pool::PooledBackendLease<B, O>>,
+) where
+    B: crate::pool::PoolBackendTransport,
+    O: crate::pool::BackendLeaseOwner<B>,
+{
+    if let Some(held_backend) = held_backend.take() {
+        release_backend_with_cancel_unbind(cancel_registry, client_key, held_backend).await;
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+fn should_replay_shared_session(
+    session: &VirtualSession,
+    previous_backend_id: Option<u64>,
+    backend_id: u64,
+) -> bool {
+    session.has_replayable_settings() && previous_backend_id != Some(backend_id)
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+fn should_probe_read_after_write(
+    committed_write_transaction: bool,
+    read_after_write_protection_enabled: bool,
+    status: ReadyStatus,
+) -> bool {
+    committed_write_transaction
+        && read_after_write_protection_enabled
+        && status == ReadyStatus::Idle
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+fn apply_read_after_write_probe_result(
+    session: &mut VirtualSession,
+    result: anyhow::Result<PgLsn>,
+) {
+    match result {
+        Ok(lsn) => session.set_read_after_write_required(lsn),
+        Err(_) => session.set_read_after_write_unknown(),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn write_shared_error_response<C>(
+    client: &mut C,
+    sqlstate: &str,
+    message: &str,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let error = build_error_response(sqlstate, message);
+    let mut response = BytesMut::with_capacity(error.len() + 6);
+    response.extend_from_slice(&error);
+    response.extend_from_slice(&ready_for_query(ReadyStatus::Idle));
+    crate::io_runtime::write_all_to(client, &response)
+        .await
+        .context("write shared error response")
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn write_shared_query_timeout_response<C>(client: &mut C) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    write_shared_error_response(client, SqlState::QueryCanceled.as_str(), "query timed out").await
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn write_shared_idle_timeout_response<C>(
+    client: &mut C,
+    kind: IdleTimeoutKind,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    metrics_crate::counter!(
+        MetricName::TimeoutTotal.as_str(),
+        "kind" => match kind {
+            IdleTimeoutKind::Client => "idle_client",
+            IdleTimeoutKind::Transaction => "idle_transaction",
+        }
+    )
+    .increment(1);
+
+    match kind {
+        IdleTimeoutKind::Client => {
+            write_shared_error_response(
+                client,
+                SqlState::OperatorIntervention.as_str(),
+                "idle client timed out",
+            )
+            .await
+        }
+        IdleTimeoutKind::Transaction => {
+            let error = build_error_response(
+                SqlState::OperatorIntervention.as_str(),
+                "idle transaction timed out",
+            );
+            crate::io_runtime::write_all_to(client, &error)
+                .await
+                .context("write shared idle transaction timeout response")
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn handle_shared_pool_checkout_error<C>(
+    client: &mut C,
+    error: crate::pool::PoolError,
+    overload_error_code: &str,
+) -> anyhow::Result<bool>
+where
+    C: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let (message, close) = match error {
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::QueueFull,
+        ) => ("backend checkout queue is full", false),
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Timeout,
+        ) => ("backend checkout timed out", false),
+        crate::pool::PoolError::Backpressure(
+            pg_kinetic_core::backpressure::BackpressureError::Closed,
+        ) => ("", true),
+        crate::pool::PoolError::Connect(error) => return Err(error),
+    };
+    if close {
+        return Ok(false);
+    }
+    write_shared_error_response(client, overload_error_code, message).await?;
+    Ok(true)
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn probe_shared_read_after_write_requirement<S>(
+    backend: &mut S,
+    probe_timeout: Duration,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<PgLsn>
+where
+    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let probe = probe_shared_read_after_write_requirement_without_timeout(
+        backend,
+        max_backend_buffer_bytes,
+    );
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    let result = crate::io_runtime::monoio_timeout(probe_timeout, probe).await;
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    let result = crate::io_runtime::tokio_timeout(probe_timeout, probe).await;
+
+    result.map_err(|_| anyhow::anyhow!("read-after-write probe timed out"))?
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn probe_shared_read_after_write_requirement_without_timeout<S>(
+    backend: &mut S,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<PgLsn>
+where
+    S: crate::io_runtime::RuntimeByteStream + ?Sized,
+{
+    let frame = simple_query_frame("SELECT pg_current_wal_lsn()");
+    crate::io_runtime::write_all_to(backend, &encode_frontend_frame(&frame))
+        .await
+        .context("write read-after-write probe")?;
+
+    let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut probe_lsn = None;
+    loop {
+        if backend_buffer.len() >= max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
+        let read = crate::io_runtime::read_from(backend, &mut backend_buffer)
+            .await
+            .context("read read-after-write probe response")?;
+        if read == 0 {
+            anyhow::bail!("backend disconnected during read-after-write probe");
+        }
+        if backend_buffer.len() > max_backend_buffer_bytes {
+            return Err(buffer_limit_exceeded(BufferBudgetKind::Backend));
+        }
+
+        while let Some(frame) = parse_backend_frame(&mut backend_buffer)? {
+            match frame.tag {
+                tag if tag == u8::from(BackendTag::DataRow) && probe_lsn.is_none() => {
+                    probe_lsn = parse_read_after_write_lsn(&frame.payload)?;
+                }
+                tag if tag == u8::from(BackendTag::ErrorResponse) => {
+                    anyhow::bail!("backend returned error during read-after-write probe");
+                }
+                tag if tag == u8::from(BackendTag::ReadyForQuery) => {
+                    return probe_lsn.context("read-after-write probe returned no LSN");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) async fn handle_client_session<C, B, O, P>(
+    mut client: C,
+    _client_addr: SocketAddr,
+    context: SharedClientSessionContext<B, O, P>,
+) -> anyhow::Result<()>
+where
+    C: crate::io_runtime::RuntimeByteStream,
+    B: crate::pool::PoolBackendTransport
+        + crate::io_runtime::RuntimeByteStream
+        + BackendStartupMetadata,
+    O: crate::pool::BackendLeaseOwner<B>,
+    P: SharedBackendPool<B, O>,
+{
+    let SharedClientSessionContext {
+        pool,
+        route,
+        route_user,
+        mut route_application_name,
+        backend_startup_packet,
+        buffer_pool,
+        max_client_buffer_bytes,
+        max_backend_buffer_bytes,
+        query_timeout,
+        idle_client_timeout,
+        idle_transaction_timeout,
+        overload_error_code,
+        auth,
+        auth_users,
+        auth_query_service,
+        backend_credentials,
+        cancel_registry,
+        route_pools,
+        routing_planner,
+        route_read_routing_mode,
+        route_fallback_policy,
+        read_after_write_timeout,
+        read_after_write_protection_enabled,
+        snapshot_store,
+        phase_recorder,
+        session_id,
+        _backend: _,
+    } = context;
+    let client_key = cancel_registry.issue_client_key()?;
+    let _cancel_session = CancelSessionGuard::new(Arc::clone(&cancel_registry), client_key);
+    let mut client_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut backend_buffer = BytesMut::with_capacity(16 * 1024);
+    let mut buffers = buffer_pool.acquire();
+    if !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough) {
+        let users = auth_users
+            .as_deref()
+            .context("auth user store unavailable")?;
+        match auth::authenticate_client(
+            &mut client,
+            &route_user,
+            &auth,
+            users,
+            Some(auth_query_service.as_ref()),
+            max_client_buffer_bytes,
+            max_backend_buffer_bytes,
+        )
+        .await
+        .with_context(|| format!("authenticate client {}", route_user))?
+        {
+            auth::ClientAuthOutcome::PassThrough | auth::ClientAuthOutcome::Authenticated => {}
+            auth::ClientAuthOutcome::Rejected => return Ok(()),
+        }
+    }
+    let mut startup_proxied = true;
+    let mut previous_backend_id = match pool.checkout_shared(route.clone(), &route_pools).await {
+        Ok(mut startup_backend_lease) => {
+            let requires_startup = startup_backend_lease.requires_startup();
+            let mut startup_backend = LeaseRuntimeBackend {
+                lease: &mut startup_backend_lease,
+            };
+            if let Err(error) = crate::proxy::proxy_startup_streams(
+                &mut client,
+                &mut startup_backend,
+                requires_startup,
+                &backend_startup_packet,
+                max_client_buffer_bytes,
+                max_backend_buffer_bytes,
+                true,
+                true,
+                backend_credentials.as_deref(),
+                buffers.buffers_mut(),
+                Some(client_key),
+            )
+            .await
+            {
+                drop(startup_backend);
+                startup_backend_lease.discard();
+                return Err(error).context("shared backend startup");
+            }
+            drop(startup_backend);
+            bind_cancel_target_for_backend(&cancel_registry, client_key, &startup_backend_lease);
+            let previous_backend_id = Some(startup_backend_lease.backend_id());
+            release_backend_with_cancel_unbind(&cancel_registry, client_key, startup_backend_lease)
+                .await;
+            previous_backend_id
+        }
+        Err(error) => {
+            if handle_shared_pool_checkout_error(&mut client, error, &overload_error_code).await? {
+                startup_proxied = !matches!(auth.auth_mode, crate::config::AuthMode::PassThrough);
+                None
+            } else {
+                return Ok(());
+            }
+        }
+    };
+
+    let mut session = VirtualSession::default();
+    let mut prepared = PreparedCatalog::new(session_id);
+    let prepared_snapshot_handle = snapshot_store.prepared_handle();
+    let mut sql_plan_cache = SqlPlanCache::new(SQL_PLAN_CACHE_CAPACITY);
+    let mut held_backend: Option<crate::pool::PooledBackendLease<B, O>> = None;
+    let mut wait_for_client_activity_after_timeout = false;
+
+    loop {
+        let idle_timeout_kind = if session.pin_reason().is_some() {
+            IdleTimeoutKind::Transaction
+        } else {
+            IdleTimeoutKind::Client
+        };
+        let idle_timeout = if idle_timeout_kind == IdleTimeoutKind::Transaction {
+            idle_transaction_timeout
+        } else {
+            idle_client_timeout
+        };
+        let cycle_timeout = if wait_for_client_activity_after_timeout {
+            None
+        } else {
+            Some(idle_timeout)
+        };
+        let cycle = match crate::io_runtime::take_frontend_cycle_bytes(
+            &mut client_buffer,
+            max_client_buffer_bytes,
+        ) {
+            Ok(cycle) => cycle,
+            Err(error) => {
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
+                return Err(error).context("read frontend cycle");
+            }
+        };
+        match cycle {
+            crate::io_runtime::FrontendCycleRead::Complete { bytes, shape } => {
+                let frames = match crate::io_runtime::parse_frontend_cycle_frames(bytes) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error).context("parse frontend cycle");
+                    }
+                };
+                if frames.is_empty() {
+                    continue;
+                }
+                wait_for_client_activity_after_timeout = false;
+                let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
+                let request_plans = match request_plans_for_frames(
+                    &prepared,
+                    &frames,
+                    full_routing_analysis,
+                    &mut sql_plan_cache,
+                )
+                .context("build request plan before monoio backend checkout")
+                {
+                    Ok(request_plans) => request_plans,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                let committed_write_transaction = match update_transaction_state_from_request_plans(
+                    &mut session,
+                    &request_plans,
+                    full_routing_analysis,
+                )
+                .context("update transaction state before monoio backend checkout")
+                {
+                    Ok(committed_write_transaction) => committed_write_transaction,
+                    Err(error) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                let selection = ReadRoutingSelection {
+                    planner: &routing_planner,
+                    route_pools: &route_pools,
+                    snapshot_store: &snapshot_store,
+                    read_routing_mode: route_read_routing_mode,
+                    fallback_policy: route_fallback_policy,
+                    session: &session,
+                    request_plan: request_plans.first(),
+                };
+                let target = if full_routing_analysis {
+                    select_checkout_target(&selection)
+                } else {
+                    RoutingTarget::Primary {
+                        reason: RoutingReason::Off,
+                    }
+                };
+                if matches!(
+                    target,
+                    RoutingTarget::Wait { .. } | RoutingTarget::Reject { .. }
+                ) {
+                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "monoio cycle routing produced unsupported target: {target:?}"
+                    ));
+                }
+                let reuse_held_backend = should_reuse_held_backend(
+                    &session,
+                    held_backend.as_ref().map(|backend| backend.backend_id()),
+                );
+                if !reuse_held_backend {
+                    cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend)
+                        .await;
+                }
+                let mut backend = if reuse_held_backend {
+                    held_backend
+                        .take()
+                        .expect("held backend exists when reuse is selected")
+                } else {
+                    match pool
+                        .checkout_shared_target(route.clone(), &route_pools, &target)
+                        .await
+                    {
+                        Ok(backend) => backend,
+                        Err(error) => {
+                            if handle_shared_pool_checkout_error(
+                                &mut client,
+                                error,
+                                &overload_error_code,
+                            )
+                            .await?
+                            {
+                                continue;
+                            }
+                            return Ok(());
+                        }
+                    }
+                };
+                let requires_startup = backend.requires_startup();
+                let mut startup_backend = LeaseRuntimeBackend {
+                    lease: &mut backend,
+                };
+                let startup_result = if startup_proxied {
+                    crate::proxy::bootstrap_backend_streams(
+                        &mut startup_backend,
+                        requires_startup,
+                        &backend_startup_packet,
+                        backend_credentials.as_deref(),
+                    )
+                    .await
+                } else {
+                    crate::proxy::proxy_startup_streams(
+                        &mut client,
+                        &mut startup_backend,
+                        requires_startup,
+                        &backend_startup_packet,
+                        max_client_buffer_bytes,
+                        max_backend_buffer_bytes,
+                        true,
+                        true,
+                        backend_credentials.as_deref(),
+                        buffers.buffers_mut(),
+                        Some(client_key),
+                    )
+                    .await
+                };
+                if let Err(error) = startup_result {
+                    drop(startup_backend);
+                    discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
+                    return Err(error).context("monoio cycle backend startup");
+                }
+                drop(startup_backend);
+                startup_proxied = true;
+                bind_cancel_target_for_backend(&cancel_registry, client_key, &backend);
+                let backend_id = backend.backend_id();
+                if should_replay_shared_session(&session, previous_backend_id, backend_id) {
+                    let replay_frames = replay_frames(&session);
+                    let mut replay_bytes = BytesMut::new();
+                    for frame in &replay_frames {
+                        replay_bytes.extend_from_slice(&encode_frontend_frame(frame));
+                    }
+                    let replay_shape =
+                        crate::io_runtime::FrontendCycleShape::from_frames(&replay_frames);
+                    let mut replay_backend_buffer = BytesMut::with_capacity(16 * 1024);
+                    let mut discard_client = DiscardRuntimeStream;
+                    let mut replay_backend = LeaseRuntimeBackend {
+                        lease: &mut backend,
+                    };
+                    let replay_result = forward_runtime_cycle(
+                        &mut discard_client,
+                        &mut replay_backend,
+                        &replay_bytes,
+                        replay_shape.expected_ready_count(),
+                        0,
+                        &mut replay_backend_buffer,
+                        max_backend_buffer_bytes,
+                    )
+                    .await;
+                    drop(replay_backend);
+                    if let Err(error) = replay_result {
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        return Err(error).context("monoio virtual session replay");
+                    }
+                }
+                previous_backend_id = Some(backend_id);
+                let simple_query_commands: Vec<SqlCommand> = request_plans
+                    .iter()
+                    .filter(|plan| plan.updates_session_state)
+                    .map(|plan| plan.command.clone())
+                    .collect();
+                let mut progress = QueryProgress::default();
+                let mut forward_state = ForwardCycleState {
+                    session: &mut session,
+                    prepared: &mut prepared,
+                    prepared_snapshot_handle: prepared_snapshot_handle.clone(),
+                    route_application_name: &mut route_application_name,
+                    progress: &mut progress,
+                };
+                let planned = match plan_frontend_cycle(
+                    backend.backend_id(),
+                    &mut forward_state,
+                    &frames,
+                    &simple_query_commands,
+                    buffers.buffers_mut(),
+                    phase_recorder.as_ref(),
+                ) {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        drop(forward_state);
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        return Err(error).context("plan monoio cycle");
+                    }
+                };
+                let mut runtime_backend = LeaseRuntimeBackend {
+                    lease: &mut backend,
+                };
+                let forward = forward_runtime_cycle(
+                    &mut client,
+                    &mut runtime_backend,
+                    &planned.backend_bytes,
+                    shape.expected_ready_count(),
+                    planned.injected_parse_completes,
+                    &mut backend_buffer,
+                    max_backend_buffer_bytes,
+                );
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                let result = crate::io_runtime::monoio_timeout(query_timeout, forward).await;
+                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                let result = crate::io_runtime::tokio_timeout(query_timeout, forward).await;
+                match result {
+                    Ok(Ok(status)) => {
+                        if should_probe_read_after_write(
+                            committed_write_transaction,
+                            read_after_write_protection_enabled,
+                            status,
+                        ) {
+                            let freshness_outcome = probe_shared_read_after_write_requirement(
+                                &mut runtime_backend,
+                                read_after_write_timeout,
+                                max_backend_buffer_bytes,
+                            )
+                            .await;
+                            apply_read_after_write_probe_result(&mut session, freshness_outcome);
+                        }
+                        drop(runtime_backend);
+                        if session.pin_reason().is_some() {
+                            held_backend = Some(backend);
+                        } else {
+                            release_backend_with_cancel_unbind(
+                                &cancel_registry,
+                                client_key,
+                                backend,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        drop(runtime_backend);
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        drop(runtime_backend);
+                        metrics_crate::counter!(
+                            MetricName::TimeoutTotal.as_str(),
+                            "kind" => "query"
+                        )
+                        .increment(1);
+                        session.mark_unknown_protocol_state();
+                        discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
+                            .await;
+                        write_shared_query_timeout_response(&mut client).await?;
+                    }
+                }
+            }
+            crate::io_runtime::FrontendCycleRead::Terminate { .. } => {
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
+                return Ok(());
+            }
+            crate::io_runtime::FrontendCycleRead::BufferLimitExceeded => {
+                cleanup_held_shared_backend(&cancel_registry, client_key, &mut held_backend).await;
+                return Err(anyhow::anyhow!(
+                    "client request exceeded configured buffer limit"
+                ));
+            }
+            crate::io_runtime::FrontendCycleRead::NeedMoreBytes => {
+                let read = match cycle_timeout {
+                    Some(timeout) => {
+                        crate::io_runtime::read_from_timeout(
+                            &mut client,
+                            &mut client_buffer,
+                            timeout,
+                        )
+                        .await
+                    }
+                    None => Ok(crate::io_runtime::read_from(&mut client, &mut client_buffer).await),
+                };
+                match read {
+                    Ok(Ok(0)) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        cleanup_held_shared_backend(
+                            &cancel_registry,
+                            client_key,
+                            &mut held_backend,
+                        )
+                        .await;
+                        return Err(error).context("read frontend data");
+                    }
+                    Err(_) => {
+                        if idle_timeout_kind == IdleTimeoutKind::Transaction {
+                            if let Some(backend) = held_backend.take() {
+                                discard_backend_with_cancel_unbind(
+                                    &cancel_registry,
+                                    client_key,
+                                    backend,
+                                )
+                                .await;
+                            }
+                        } else {
+                            cleanup_held_shared_backend(
+                                &cancel_registry,
+                                client_key,
+                                &mut held_backend,
+                            )
+                            .await;
+                        }
+                        client_buffer.clear();
+                        write_shared_idle_timeout_response(&mut client, idle_timeout_kind).await?;
+                        if idle_timeout_kind == IdleTimeoutKind::Transaction {
+                            return Ok(());
+                        }
+                        wait_for_client_activity_after_timeout = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct ClientSessionContext {
     pub(super) route_pool_selector: RoutePoolSelector,
     pub(super) config: Config,
@@ -25,7 +856,7 @@ pub(super) async fn handle_client(
     let ClientSessionContext {
         route_pool_selector,
         config,
-        routing_planner,
+        routing_planner: _global_routing_planner,
         session_id,
         snapshot_store,
         client_snapshot_handle,
@@ -80,6 +911,7 @@ pub(super) async fn handle_client(
         route_fallback_policy,
         read_after_write_timeout,
         read_after_write_protection_enabled,
+        routing_planner,
         prepared_snapshot_handle,
         recovery_snapshot_handle,
         mut route_application_name,
@@ -973,6 +1805,7 @@ pub(super) struct SessionStartupState {
     pub(super) route_fallback_policy: FallbackPolicy,
     pub(super) read_after_write_timeout: Duration,
     pub(super) read_after_write_protection_enabled: bool,
+    pub(super) routing_planner: ReadRoutingPlanner,
     pub(super) prepared_snapshot_handle: PreparedSnapshotHandle,
     pub(super) recovery_snapshot_handle: RecoverySnapshotHandle,
     pub(super) route_application_name: Option<String>,
@@ -991,20 +1824,6 @@ pub(super) async fn complete_client_startup(
     let auth = request.config.auth.clone();
     let performance = request.config.performance.clone();
     let qos = request.config.qos.clone();
-    let route_config = request
-        .config
-        .effective_routes()
-        .into_iter()
-        .next()
-        .context("missing effective route config")?;
-    let route_read_routing_mode = route_config.read_routing.read_routing_mode;
-    let route_fallback_policy = route_config.read_routing.fallback_policy;
-    let read_after_write_timeout =
-        Duration::from_millis(route_config.freshness.read_after_write_timeout_ms);
-    let read_after_write_protection_enabled = matches!(
-        route_config.freshness.freshness_policy,
-        FreshnessPolicy::SessionWriteLsn | FreshnessPolicy::SessionWriteLsnAndMaxLag
-    );
     let prepared_snapshot_handle = request.snapshot_store.prepared_handle();
     let recovery_snapshot_handle = request.snapshot_store.recovery_handle();
 
@@ -1097,6 +1916,12 @@ pub(super) async fn complete_client_startup(
     let route_application_name = startup_plan.route_application_name.clone();
     let session_route = startup_plan.session_route.clone();
     let route_pools = Arc::clone(&startup_plan.route_pools);
+    let route_policy = startup_plan.route_policy;
+    let route_read_routing_mode = route_policy.routing_planner.read_routing_mode();
+    let route_fallback_policy = route_policy.routing_planner.fallback_policy();
+    let read_after_write_timeout = route_policy.read_after_write_timeout;
+    let read_after_write_protection_enabled = route_policy.read_after_write_protection_enabled;
+    let routing_planner = route_policy.routing_planner;
     let backend_startup_packet = startup_plan.backend_startup_packet.clone();
 
     update_client_snapshot(
@@ -1269,6 +2094,7 @@ pub(super) async fn complete_client_startup(
         route_fallback_policy,
         read_after_write_timeout,
         read_after_write_protection_enabled,
+        routing_planner,
         prepared_snapshot_handle,
         recovery_snapshot_handle,
         route_application_name,
@@ -1318,4 +2144,73 @@ pub(super) async fn finalize_held_backend_on_disconnect(
         request.debug_sampler,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_session_replays_replayable_settings_on_backend_change() {
+        let mut session = VirtualSession::default();
+        session.apply_sql(classify("set application_name = 'api'"));
+
+        assert!(should_replay_shared_session(&session, Some(1), 2));
+        assert!(!should_replay_shared_session(&session, Some(2), 2));
+    }
+
+    #[test]
+    fn shared_session_does_not_replay_without_replayable_settings() {
+        let session = VirtualSession::default();
+
+        assert!(!should_replay_shared_session(&session, Some(1), 2));
+    }
+
+    #[test]
+    fn unpinned_session_releases_held_backend_before_retargeting() {
+        let mut session = VirtualSession::default();
+        session.apply_sql(classify("begin"));
+        assert!(should_reuse_held_backend(&session, Some(7)));
+
+        session.apply_sql(classify("commit"));
+
+        assert!(!should_reuse_held_backend(&session, Some(7)));
+    }
+
+    #[test]
+    fn shared_freshness_probe_updates_session_state() {
+        let mut session = VirtualSession::default();
+
+        assert!(should_probe_read_after_write(true, true, ReadyStatus::Idle));
+        apply_read_after_write_probe_result(&mut session, Ok(PgLsn::new(42)));
+        assert_eq!(
+            session.read_after_write_state(),
+            ReadAfterWriteState::Required(PgLsn::new(42))
+        );
+
+        apply_read_after_write_probe_result(&mut session, Err(anyhow::anyhow!("probe failed")));
+        assert_eq!(
+            session.read_after_write_state(),
+            ReadAfterWriteState::Unknown
+        );
+    }
+
+    #[test]
+    fn shared_freshness_probe_requires_committed_idle_protected_cycle() {
+        assert!(!should_probe_read_after_write(
+            false,
+            true,
+            ReadyStatus::Idle
+        ));
+        assert!(!should_probe_read_after_write(
+            true,
+            false,
+            ReadyStatus::Idle
+        ));
+        assert!(!should_probe_read_after_write(
+            true,
+            true,
+            ReadyStatus::InTransaction
+        ));
+    }
 }

@@ -24,7 +24,7 @@ use pg_kinetic_core::{
 #[cfg(feature = "policy-wasm")]
 use crate::policy_wasm::WasmPolicyEvaluator;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum ClientTlsMode {
@@ -57,7 +57,7 @@ impl From<ClientTlsMode> for CoreClientTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum BackendTlsMode {
@@ -995,7 +995,7 @@ impl Default for AdaptiveGuardrailConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ConnectionConfig {
     #[arg(long, env = "PG_KINETIC_LISTEN_ADDR", default_value = "127.0.0.1:6543")]
@@ -1690,7 +1690,7 @@ pub struct PolicyWasmConfig {
     pub policy_wasm_enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct CapacityConfig {
     #[arg(long, env = "PG_KINETIC_MAX_CLIENTS", default_value_t = 10_000)]
@@ -1962,7 +1962,7 @@ impl ObservabilityConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct TlsConfig {
     #[arg(
@@ -2248,7 +2248,7 @@ impl Default for HealthConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct SocketConfig {
     #[arg(long, env = "PG_KINETIC_TCP_NODELAY", default_value_t = true)]
@@ -2813,9 +2813,9 @@ fn parse_runtime_engine(value: &str) -> Result<RuntimeEngine, String> {
         "tokio_default" => Ok(RuntimeEngine::TokioDefault),
         "tokio_current_thread" => Ok(RuntimeEngine::TokioCurrentThread),
         "thread_per_core" => Ok(RuntimeEngine::ThreadPerCore),
-        "experimental_io_uring" => Ok(RuntimeEngine::ExperimentalIoUring),
+        "io_uring" | "experimental_io_uring" => Ok(RuntimeEngine::IoUring),
         _ => Err(format!(
-            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, experimental_io_uring"
+            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, io_uring, experimental_io_uring"
         )),
     }
 }
@@ -3214,15 +3214,31 @@ mod tests {
     }
 
     #[test]
-    fn experimental_runtime_engines_require_explicit_config_gate() {
-        let error = toml::from_str::<Config>(
+    fn io_uring_and_legacy_alias_parse_without_experimental_config_gate() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "io_uring"
+            "#,
+        )
+        .expect("stable io_uring runtime parses");
+        assert_eq!(
+            config.runtime.engine.runtime_engine,
+            pg_kinetic_core::runtime::RuntimeEngine::IoUring
+        );
+        assert!(!config.runtime.engine.experimental_runtime_enabled);
+
+        let alias = toml::from_str::<Config>(
             r#"
             [runtime.engine]
             runtime_engine = "experimental_io_uring"
             "#,
         )
-        .expect_err("ungated experimental runtime is rejected");
-        assert!(error.to_string().contains("experimental_runtime_enabled"));
+        .expect("legacy io_uring alias parses");
+        assert_eq!(
+            alias.runtime.engine.runtime_engine,
+            pg_kinetic_core::runtime::RuntimeEngine::IoUring
+        );
 
         let error = toml::from_str::<Config>(
             r#"

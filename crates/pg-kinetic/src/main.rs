@@ -367,7 +367,7 @@ fn main() -> anyhow::Result<()> {
             .context("pg-kinetic runtime failed"),
         RuntimeEngine::ThreadPerCore => pg_kinetic::run_thread_per_core(config)
             .context("pg-kinetic thread-per-core runtime failed"),
-        RuntimeEngine::ExperimentalIoUring => {
+        RuntimeEngine::IoUring => {
             pg_kinetic::run_io_uring(config).context("pg-kinetic io_uring runtime failed")
         }
     }

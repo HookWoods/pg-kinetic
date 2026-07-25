@@ -55,8 +55,9 @@ The following behavior is stable for production use:
 The default runtime engine is `thread_per_core`. Operators can switch back to
 the Tokio runtime with `runtime_engine = "tokio_default"` or
 `PG_KINETIC_RUNTIME_ENGINE=tokio_default` without rebuilding the binary.
-`experimental_io_uring` remains opt-in and is not part of the default release
-path.
+Linux builds compiled with the `io-uring` cargo feature can select the stable
+`io_uring` runtime. `experimental_io_uring` is accepted as a compatibility
+alias for one release and resolves to `io_uring`.
 
 ## Authentication Contract
 

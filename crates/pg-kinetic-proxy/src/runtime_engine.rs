@@ -118,14 +118,14 @@ impl RuntimeEngineCapabilities {
 
     #[must_use]
     pub const fn platform_supported(self) -> bool {
-        !matches!(self.engine, RuntimeEngine::ExperimentalIoUring) || cfg!(target_os = "linux")
+        !matches!(self.engine, RuntimeEngine::IoUring) || cfg!(target_os = "linux")
     }
 
     #[must_use]
     pub const fn feature_supported(self) -> bool {
         match self.engine {
             RuntimeEngine::ThreadPerCore => true,
-            RuntimeEngine::ExperimentalIoUring => cfg!(feature = "io-uring"),
+            RuntimeEngine::IoUring => cfg!(feature = "io-uring"),
             RuntimeEngine::TokioDefault | RuntimeEngine::TokioCurrentThread => true,
         }
     }

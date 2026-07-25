@@ -1,8 +1,8 @@
-use std::io;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::{future::Future, io, time::Duration};
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -49,6 +49,15 @@ pub enum StartupPacketRead {
 pub(crate) trait RuntimeByteStream {
     async fn read_into(&mut self, dst: &mut BytesMut) -> io::Result<usize>;
 
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    async fn read_into_timeout(
+        &mut self,
+        dst: &mut BytesMut,
+        duration: Duration,
+    ) -> Result<io::Result<usize>, ()> {
+        monoio_timeout(duration, self.read_into(dst)).await
+    }
+
     async fn write_all_bytes(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     async fn shutdown_stream(&mut self) -> io::Result<()>;
@@ -68,8 +77,58 @@ pub(crate) async fn write_all_to<S: RuntimeByteStream + ?Sized>(
     stream.write_all_bytes(bytes).await
 }
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) async fn read_from_timeout<S: RuntimeByteStream + ?Sized>(
+    stream: &mut S,
+    dst: &mut BytesMut,
+    duration: Duration,
+) -> Result<io::Result<usize>, ()> {
+    stream.read_into_timeout(dst, duration).await
+}
+
 pub(crate) async fn shutdown<S: RuntimeByteStream + ?Sized>(stream: &mut S) -> io::Result<()> {
     stream.shutdown_stream().await
+}
+
+pub(crate) trait TimeoutRuntime {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TokioTimeout;
+
+impl TimeoutRuntime for TokioTimeout {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+        tokio::time::timeout(duration, future).await.map_err(|_| ())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MonoioTimeout;
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+impl TimeoutRuntime for MonoioTimeout {
+    async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, ()> {
+        monoio::time::timeout(duration, future)
+            .await
+            .map_err(|_| ())
+    }
+}
+
+pub(crate) async fn tokio_timeout<F: Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, ()> {
+    TokioTimeout::timeout(duration, future).await
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) async fn monoio_timeout<F: Future>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, ()> {
+    MonoioTimeout::timeout(duration, future).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,7 +532,7 @@ pub(crate) async fn forward_backend_until_ready<B, C>(
     read_context: &'static str,
     write_context: &'static str,
     closed_message: &'static str,
-) -> anyhow::Result<()>
+) -> anyhow::Result<ReadyStatus>
 where
     B: RuntimeByteStream + ?Sized,
     C: RuntimeByteStream + ?Sized,
@@ -494,7 +553,7 @@ where
                         .with_context(|| write_context)?;
                 }
                 if ready.is_some() {
-                    return Ok(());
+                    return Ok(ready.expect("ready status is present"));
                 }
             }
             BackendBytesDrainEvent::BufferLimitExceeded => {

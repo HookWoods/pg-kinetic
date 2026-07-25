@@ -11,8 +11,7 @@ use pg_kinetic_core::routing::ReadRoutingMode;
 
 fn io_uring_config() -> Config {
     let mut config = Config::default();
-    config.runtime.engine.runtime_engine = RuntimeEngine::ExperimentalIoUring;
-    config.runtime.engine.experimental_runtime_enabled = true;
+    config.runtime.engine.runtime_engine = RuntimeEngine::IoUring;
     config
 }
 
@@ -86,67 +85,55 @@ fn io_uring_prepares_proxy_capacity_slots_from_shared_runtime_state() {
 }
 
 #[test]
-fn io_uring_rejects_client_tls_until_semantic_runtime_exists() {
+fn io_uring_accepts_client_tls_in_stable_config_boundary() {
     let mut config = io_uring_config();
     config.tls.client_tls_mode = ClientTlsMode::Require;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("client TLS is not supported yet");
-
-    assert!(error.to_string().contains("client_tls_mode=disable"));
+    io_uring::validate_supported_config_for_test(&config).expect("client TLS is stable");
 }
 
 #[test]
-fn io_uring_rejects_backend_tls_until_semantic_runtime_exists() {
+fn io_uring_accepts_backend_tls_in_stable_config_boundary() {
     let mut config = io_uring_config();
     config.tls.backend_tls_mode = BackendTlsMode::Require;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("backend TLS is not supported yet");
-
-    assert!(error.to_string().contains("backend_tls_mode=disable"));
+    io_uring::validate_supported_config_for_test(&config).expect("backend TLS is stable");
 }
 
 #[test]
-fn io_uring_rejects_auth_modes_until_auth_path_exists() {
+fn io_uring_accepts_auth_modes_through_shared_session_lifecycle() {
     let mut config = io_uring_config();
     config.auth.auth_mode = AuthMode::Trust;
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("auth modes are not supported yet");
-
-    assert!(error.to_string().contains("auth_mode=pass_through"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("auth modes use shared session lifecycle");
 }
 
 #[test]
-fn io_uring_rejects_multiple_routes_until_route_selection_exists() {
+fn io_uring_accepts_multiple_routes_through_shared_route_selection() {
     let mut config = io_uring_config();
     config.routes = vec![
         RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr")),
         RouteConfig::from_backend_addr("127.0.0.1:6545".parse().expect("route addr")),
     ];
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("route selection is not supported yet");
-
-    assert!(error.to_string().contains("single primary route"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("multiple routes use shared route selection");
 }
 
 #[test]
-fn io_uring_rejects_replicas_until_pooling_path_exists() {
+fn io_uring_accepts_replicas_through_shared_route_selection() {
     let mut config = io_uring_config();
     let mut route = RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
     route.replicas.push(Default::default());
     config.routes = vec![route];
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("replica routing is not supported yet");
-
-    assert!(error.to_string().contains("replicas"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("replicas use shared route selection");
 }
 
 #[test]
-fn io_uring_rejects_read_routing_until_route_selection_exists() {
+fn io_uring_accepts_read_routing_through_shared_planner() {
     let mut config = io_uring_config();
     let mut route = RouteConfig::from_backend_addr("127.0.0.1:6544".parse().expect("route addr"));
     route.read_routing = ReadRoutingConfig {
@@ -155,26 +142,22 @@ fn io_uring_rejects_read_routing_until_route_selection_exists() {
     };
     config.routes = vec![route];
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("read routing is not supported yet");
-
-    assert!(error.to_string().contains("read routing"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("read routing uses shared planner");
 }
 
 #[test]
-fn io_uring_rejects_pool_configs_until_pool_checkout_exists() {
+fn io_uring_accepts_pool_configs_through_shared_checkout() {
     let mut config = io_uring_config();
     config.pools = vec![PoolConfig {
         database: "app".to_string(),
         user: "app".to_string(),
         backend_addr: "127.0.0.1:6544".parse().expect("pool addr"),
-        max_backends: None,
+        max_backends: Some(2),
     }];
 
-    let error = io_uring::validate_supported_config_for_test(&config)
-        .expect_err("pool checkout is not supported yet");
-
-    assert!(error.to_string().contains("pool configs"));
+    io_uring::validate_supported_config_for_test(&config)
+        .expect("pool configs use shared checkout");
 }
 
 fn startup_packet(user: &str, database: &str) -> BytesMut {
