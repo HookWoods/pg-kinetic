@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use pg_kinetic::config::Config;
+use pg_kinetic::config::{Config, LogFormat};
 use pg_kinetic::core::benchmark::{BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError};
 use pg_kinetic::core::{
     compatibility::{CompatibilityLanguage, CompatibilityTarget},
@@ -328,22 +328,44 @@ struct PolicyPreviewFileConfig {
     sharding: pg_kinetic::config::ShardingConfig,
 }
 
-fn main() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+/// Installs the global tracing subscriber from config.
+///
+/// `RUST_LOG` wins when set, so an operator can raise the level on a running
+/// deployment without editing the config file. An unparseable `log_level` is a
+/// hard error: falling back silently would leave the wrong level in place with
+/// nothing to indicate why.
+fn init_logging(observability: &pg_kinetic::config::ObservabilityConfig) -> anyhow::Result<()> {
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::builder()
+            .parse(&observability.log_level)
+            .with_context(|| format!("invalid log_level '{}'", observability.log_level))?,
+    };
 
+    match observability.log_format {
+        LogFormat::Json => fmt().json().with_env_filter(filter).init(),
+        LogFormat::Text => fmt().with_env_filter(filter).init(),
+    }
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli { config, command } = cli;
 
-    match command {
-        Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
-        Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
-        Some(Command::Benchmark(args)) => return run_benchmark(config, args),
-        Some(Command::Compat(args)) => return run_compat(args),
-        Some(Command::Regression(args)) => return run_regression(args),
-        Some(Command::Profile(args)) => return run_profile(config, args),
-        Some(Command::Preflight(args)) => return run_preflight(config, args),
-        None => {}
+    if let Some(command) = command {
+        // Subcommands are offline tooling: log from the CLI values only, without
+        // loading the server config file they may not even use.
+        init_logging(&config.observability)?;
+        return match command {
+            Command::RoutePreview(args) => run_route_preview(config, args),
+            Command::PolicyPreview(args) => run_policy_preview(config, args),
+            Command::Benchmark(args) => run_benchmark(config, args),
+            Command::Compat(args) => run_compat(args),
+            Command::Regression(args) => run_regression(args),
+            Command::Profile(args) => run_profile(config, args),
+            Command::Preflight(args) => run_preflight(config, args),
+        };
     }
 
     // Merge the config file onto the CLI base exactly the way SIGHUP reload does,
@@ -351,12 +373,25 @@ fn main() -> anyhow::Result<()> {
     // on the first reload.
     let config = pg_kinetic_proxy::reload::load_effective_config(&config)
         .context("load effective startup config")?;
+    init_logging(&config.observability)?;
     config.validate().map_err(anyhow::Error::msg)?;
     let selector = RuntimeEngineSelector::new(config.runtime.engine.runtime_engine)
         .with_experiment(RuntimeEngineExperiment::new(
             config.runtime.engine.experimental_runtime_enabled,
         ));
     selector.validate().context("validate runtime engine")?;
+
+    // One line that answers "what is actually running?" without shell access.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        runtime_engine = %config.runtime.engine.runtime_engine,
+        pool_mode = ?config.performance.pool_mode,
+        listen_addr = %config.connection.listen_addr,
+        config_file = ?config.reload.config_file,
+        client_tls_mode = ?config.tls.client_tls_mode,
+        auth_mode = ?config.auth.auth_mode,
+        "starting pg-kinetic"
+    );
 
     match selector.engine() {
         RuntimeEngine::TokioDefault => tokio::runtime::Builder::new_multi_thread()

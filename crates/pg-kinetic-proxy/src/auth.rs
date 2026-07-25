@@ -448,7 +448,7 @@ pub(crate) async fn authenticate_client<C>(
 where
     C: RuntimeByteStream + ?Sized,
 {
-    match auth.auth_mode {
+    let result = match auth.auth_mode {
         AuthMode::PassThrough => Ok(ClientAuthOutcome::PassThrough),
         AuthMode::Trust => authenticate_trust(client, username, auth, users).await,
         AuthMode::ScramSha256 => {
@@ -475,7 +475,37 @@ where
             )
             .await
         }
+    };
+
+    // Authentication outcomes were invisible in the logs: a rejected login
+    // produced metrics but nothing an operator could read. Logged here so both
+    // call sites are covered; the connection span supplies the peer address and
+    // session id. Never log the secret, salt, nonce, or client response.
+    match &result {
+        Ok(ClientAuthOutcome::PassThrough) => tracing::debug!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client auth passed through to backend"
+        ),
+        Ok(ClientAuthOutcome::Authenticated) => tracing::info!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client authenticated"
+        ),
+        Ok(ClientAuthOutcome::Rejected) => tracing::warn!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client authentication rejected"
+        ),
+        Err(error) => tracing::warn!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            error = %error,
+            "client authentication failed"
+        ),
     }
+
+    result
 }
 
 async fn authenticate_trust<C>(

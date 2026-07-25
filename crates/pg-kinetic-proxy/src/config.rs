@@ -1895,11 +1895,33 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
+
+    /// Tracing filter directive, e.g. `info` or `pg_kinetic=debug,warn`.
+    /// `RUST_LOG` takes precedence when set.
+    #[arg(long, env = "PG_KINETIC_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    pub log_format: LogFormat,
 
     #[arg(
         long,
@@ -1933,6 +1955,8 @@ impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             metrics_addr: None,
+            log_level: String::from("info"),
+            log_format: LogFormat::Text,
             debug_trace_sampling_rate: 0.0,
             phase_timing_sample_rate: 0.0,
             otel_enabled: false,
@@ -1960,6 +1984,7 @@ impl ObservabilityConfig {
             0.0
         }
     }
+
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
