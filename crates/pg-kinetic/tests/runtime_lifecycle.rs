@@ -1,11 +1,11 @@
-use pg_kinetic_core::runtime::{
+use pg_kinetic_core::cluster::runtime::{
     LifecycleTransition, LifecycleTransitionError, NodeId, ReadinessState, RuntimeEngine,
     RuntimeEngineStatus, RuntimeLifecycleState, ShutdownReason,
 };
 use pg_kinetic_proxy::{
     config::LifecycleConfig,
-    drain::{DrainController, DrainOutcome},
-    lifecycle::{
+    ops::drain::{DrainController, DrainOutcome},
+    ops::lifecycle::{
         KubernetesLifecycle, LifecycleController, PreStopDrainOutcome, ProbeStatus,
         ShutdownCoordinator,
     },
@@ -72,11 +72,11 @@ fn thread_per_core_is_a_stable_runtime_engine() {
 }
 
 #[test]
-fn experimental_runtime_engine_is_explicitly_labeled() {
-    let engine = RuntimeEngine::ExperimentalIoUring;
-    assert!(engine.is_experimental());
-    assert_eq!(engine.status(), RuntimeEngineStatus::Experimental);
-    assert!(engine.as_str().starts_with("experimental_"));
+fn io_uring_is_a_stable_runtime_engine() {
+    let engine = RuntimeEngine::IoUring;
+    assert!(!engine.is_experimental());
+    assert_eq!(engine.status(), RuntimeEngineStatus::Stable);
+    assert_eq!(engine.as_str(), "io_uring");
 
     assert!(!RuntimeEngine::TokioCurrentThread.is_experimental());
 }

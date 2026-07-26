@@ -11,11 +11,13 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::{
-    backend_query::AuthQueryService,
     config::{AuthConfig, AuthFailureMessageMode, AuthMode},
-    proxy::ClientConnection,
+    engine::io_runtime::{read_from, write_all_to, RuntimeByteStream},
+    pool::backend_query::AuthQueryService,
 };
-use pg_kinetic_core::secrets::{generate_nonce, Md5Secret, ScramVerifier, UserSecret, UserStore};
+use pg_kinetic_core::security::secrets::{
+    generate_nonce, Md5Secret, ScramVerifier, UserSecret, UserStore,
+};
 use pg_kinetic_wire::{
     auth::{
         authentication_md5_password, authentication_ok, authentication_sasl_continue,
@@ -436,16 +438,19 @@ pub fn load_user_store(path: Option<&Path>) -> anyhow::Result<UserStore> {
     Ok(store)
 }
 
-pub(crate) async fn authenticate_client(
-    client: &mut ClientConnection,
+pub(crate) async fn authenticate_client<C>(
+    client: &mut C,
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
     auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<ClientAuthOutcome> {
-    match auth.auth_mode {
+) -> anyhow::Result<ClientAuthOutcome>
+where
+    C: RuntimeByteStream + ?Sized,
+{
+    let result = match auth.auth_mode {
         AuthMode::PassThrough => Ok(ClientAuthOutcome::PassThrough),
         AuthMode::Trust => authenticate_trust(client, username, auth, users).await,
         AuthMode::ScramSha256 => {
@@ -472,20 +477,52 @@ pub(crate) async fn authenticate_client(
             )
             .await
         }
+    };
+
+    // Authentication outcomes were invisible in the logs: a rejected login
+    // produced metrics but nothing an operator could read. Logged here so both
+    // call sites are covered; the connection span supplies the peer address and
+    // session id. Never log the secret, salt, nonce, or client response.
+    match &result {
+        Ok(ClientAuthOutcome::PassThrough) => tracing::debug!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client auth passed through to backend"
+        ),
+        Ok(ClientAuthOutcome::Authenticated) => tracing::info!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client authenticated"
+        ),
+        Ok(ClientAuthOutcome::Rejected) => tracing::warn!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            "client authentication rejected"
+        ),
+        Err(error) => tracing::warn!(
+            user = %username,
+            auth_mode = ?auth.auth_mode,
+            error = %error,
+            "client authentication failed"
+        ),
     }
+
+    result
 }
 
-async fn authenticate_trust(
-    client: &mut ClientConnection,
+async fn authenticate_trust<C>(
+    client: &mut C,
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
-) -> anyhow::Result<ClientAuthOutcome> {
+) -> anyhow::Result<ClientAuthOutcome>
+where
+    C: RuntimeByteStream + ?Sized,
+{
     match users.get(username) {
         Some(UserSecret::Trust) => {
             let ok = authentication_ok();
-            client
-                .write_all(&ok)
+            write_all_to(client, &ok)
                 .await
                 .context("write trust authentication ok")?;
             Ok(ClientAuthOutcome::Authenticated)
@@ -513,15 +550,18 @@ async fn authenticate_trust(
     }
 }
 
-async fn authenticate_scram(
-    client: &mut ClientConnection,
+async fn authenticate_scram<C>(
+    client: &mut C,
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
     auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<ClientAuthOutcome> {
+) -> anyhow::Result<ClientAuthOutcome>
+where
+    C: RuntimeByteStream + ?Sized,
+{
     let secret = match resolve_user_secret(
         username,
         auth,
@@ -555,8 +595,7 @@ async fn authenticate_scram(
     };
 
     let sasl_request = authentication_sasl_scram_sha_256();
-    client
-        .write_all(&sasl_request)
+    write_all_to(client, &sasl_request)
         .await
         .context("write SCRAM authentication request")?;
 
@@ -584,8 +623,7 @@ async fn authenticate_scram(
         verifier.iterations,
     );
     let server_first_message = authentication_sasl_continue(server_first.as_bytes());
-    client
-        .write_all(&server_first_message)
+    write_all_to(client, &server_first_message)
         .await
         .context("write SCRAM server-first message")?;
 
@@ -621,28 +659,29 @@ async fn authenticate_scram(
     let server_signature = scram_server_signature(&verifier, auth_message.as_bytes());
     let server_final = format!("v={}", STANDARD.encode(server_signature));
     let server_final_message = authentication_sasl_final(server_final.as_bytes());
-    client
-        .write_all(&server_final_message)
+    write_all_to(client, &server_final_message)
         .await
         .context("write SCRAM server-final message")?;
     let ok = authentication_ok();
-    client
-        .write_all(&ok)
+    write_all_to(client, &ok)
         .await
         .context("write SCRAM authentication ok")?;
 
     Ok(ClientAuthOutcome::Authenticated)
 }
 
-async fn authenticate_md5(
-    client: &mut ClientConnection,
+async fn authenticate_md5<C>(
+    client: &mut C,
     username: &str,
     auth: &AuthConfig,
     users: &UserStore,
     auth_query: Option<&AuthQueryService>,
     max_client_buffer_bytes: usize,
     max_backend_buffer_bytes: usize,
-) -> anyhow::Result<ClientAuthOutcome> {
+) -> anyhow::Result<ClientAuthOutcome>
+where
+    C: RuntimeByteStream + ?Sized,
+{
     let secret = match resolve_user_secret(
         username,
         auth,
@@ -677,8 +716,7 @@ async fn authenticate_md5(
 
     let mut salt = [0_u8; 4];
     getrandom::fill(&mut salt).context("generate MD5 authentication salt")?;
-    client
-        .write_all(&authentication_md5_password(salt))
+    write_all_to(client, &authentication_md5_password(salt))
         .await
         .context("write MD5 authentication request")?;
 
@@ -699,8 +737,7 @@ async fn authenticate_md5(
 
     let expected = expected_md5_client_hash(&secret, salt);
     if bool::from(expected.as_bytes().ct_eq(response)) {
-        client
-            .write_all(&authentication_ok())
+        write_all_to(client, &authentication_ok())
             .await
             .context("write MD5 authentication ok")?;
         Ok(ClientAuthOutcome::Authenticated)
@@ -740,12 +777,15 @@ async fn resolve_user_secret(
         .await
 }
 
-async fn reject_authentication(
-    client: &mut ClientConnection,
+async fn reject_authentication<C>(
+    client: &mut C,
     mode: AuthFailureMessageMode,
     username: &str,
     reason: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    C: RuntimeByteStream + ?Sized,
+{
     let message = match mode {
         AuthFailureMessageMode::Generic => String::from("password authentication failed"),
         AuthFailureMessageMode::Detailed => {
@@ -753,16 +793,18 @@ async fn reject_authentication(
         }
     };
     let error = build_error_response(AUTH_FAILURE_SQLSTATE, &message);
-    client
-        .write_all(&error)
+    write_all_to(client, &error)
         .await
         .context("write auth failure response")
 }
 
-async fn read_authentication_frame(
-    client: &mut ClientConnection,
+async fn read_authentication_frame<C>(
+    client: &mut C,
     max_client_buffer_bytes: usize,
-) -> anyhow::Result<FrontendFrame> {
+) -> anyhow::Result<FrontendFrame>
+where
+    C: RuntimeByteStream + ?Sized,
+{
     let mut buffer = BytesMut::with_capacity(512);
     loop {
         if let Some(frame) = parse_frontend_frame(&mut buffer)? {
@@ -773,8 +815,7 @@ async fn read_authentication_frame(
             bail!("client authentication message exceeded buffer limit");
         }
 
-        let read = client
-            .read_buf(&mut buffer)
+        let read = read_from(client, &mut buffer)
             .await
             .context("read client authentication frame")?;
         anyhow::ensure!(read > 0, "client disconnected during authentication");
@@ -968,9 +1009,39 @@ fn scram_unescape(value: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::collections::VecDeque;
 
-    use super::{BackendAuthSession, BackendCredentials};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use bytes::BytesMut;
+    use pg_kinetic_core::security::secrets::{UserSecret, UserStore};
+
+    use super::{authenticate_client, BackendAuthSession, BackendCredentials, ClientAuthOutcome};
+
+    #[derive(Debug, Default)]
+    struct MemoryClient {
+        reads: VecDeque<BytesMut>,
+        writes: Vec<BytesMut>,
+    }
+
+    impl crate::engine::io_runtime::RuntimeByteStream for MemoryClient {
+        async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+            let Some(next) = self.reads.pop_front() else {
+                return Ok(0);
+            };
+            let read = next.len();
+            dst.extend_from_slice(&next);
+            Ok(read)
+        }
+
+        async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.writes.push(BytesMut::from(bytes));
+            Ok(())
+        }
+
+        async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn credentials() -> BackendCredentials {
         BackendCredentials {
@@ -978,6 +1049,22 @@ mod tests {
             password: String::from("pool-password"),
             provider: None,
         }
+    }
+
+    #[tokio::test]
+    async fn client_auth_accepts_generic_runtime_byte_stream() {
+        let mut users = UserStore::new();
+        users.insert("app", UserSecret::Trust);
+        let mut auth = crate::config::AuthConfig::default();
+        auth.auth_mode = crate::config::AuthMode::Trust;
+        let mut client = MemoryClient::default();
+
+        let outcome = authenticate_client(&mut client, "app", &auth, &users, None, 1024, 1024)
+            .await
+            .expect("generic client auth");
+
+        assert_eq!(outcome, ClientAuthOutcome::Authenticated);
+        assert_eq!(client.writes.len(), 1);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::{
 
 use pg_kinetic::{
     core::observability::{MetricOutcome, ProtocolPhase},
-    proxy_runtime::telemetry::{PhaseTimingRecorder, SampledPhaseTimingRecorder},
+    proxy_runtime::observe::telemetry::{PhaseTimingRecorder, SampledPhaseTimingRecorder},
 };
 
 #[derive(Default)]

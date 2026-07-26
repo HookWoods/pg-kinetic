@@ -15,7 +15,7 @@ use pg_kinetic::{
     proxy::Proxy,
     wire::protocol::{FrontendTag, ProtocolVersion},
 };
-use pg_kinetic_proxy::buffers::{
+use pg_kinetic_proxy::net::buffers::{
     BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, ProxyBufferStats,
 };
 use pretty_assertions::assert_eq;
@@ -157,6 +157,7 @@ fn oversized_session_buffers_are_trimmed_before_reuse() {
         BufferReusePolicy {
             initial_capacity: 64,
             max_cached_sessions: 1,
+            max_cached_bytes: 512,
         },
         OversizedBufferPolicy {
             max_retained_capacity: 128,
@@ -184,6 +185,7 @@ fn buffer_stats_track_copies_and_growth() {
         BufferReusePolicy {
             initial_capacity: 8,
             max_cached_sessions: 1,
+            max_cached_bytes: 512,
         },
         OversizedBufferPolicy::default(),
     );
@@ -196,6 +198,39 @@ fn buffer_stats_track_copies_and_growth() {
     assert_eq!(stats.copied_bytes, 64);
     assert_eq!(stats.allocations, 1);
     assert!(stats.allocation_bytes >= 69);
+}
+
+#[test]
+fn buffer_pool_releases_sessions_over_byte_budget() {
+    let pool = ProxyBufferPool::new(
+        BufferReusePolicy {
+            initial_capacity: 64,
+            max_cached_sessions: 8,
+            max_cached_bytes: 128,
+        },
+        OversizedBufferPolicy {
+            max_retained_capacity: 128,
+        },
+    );
+
+    {
+        let mut first = pool.acquire();
+        first.buffers_mut().append_backend_frame(b'D', &[0; 64]);
+    }
+    let first_cached_bytes = pool.stats().cached_session_bytes;
+    assert!(first_cached_bytes > 0);
+    assert!(first_cached_bytes <= 128);
+
+    let mut second = pool.acquire();
+    second.buffers_mut().append_backend_frame(b'D', &[0; 64]);
+    let mut third = pool.acquire();
+    third.buffers_mut().append_backend_frame(b'D', &[0; 64]);
+    drop(second);
+    drop(third);
+
+    let stats = pool.stats();
+    assert!(stats.cached_session_bytes <= first_cached_bytes);
+    assert!(stats.cached_sessions_released >= 1);
 }
 
 #[tokio::test]

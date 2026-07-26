@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs,
     net::TcpListener,
@@ -6,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use pg_kinetic_proxy::preflight::{PreflightCheck, PreflightRunner};
+use pg_kinetic_proxy::ops::preflight::{PreflightCheck, PreflightRunner};
 
 const SCRAM_VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHlzYWx0$RdRL9M4hIQ6KSGRy8YdcY/rWTt9c53a35goFQzcrGXw=:lNY6toUrz5jlkvLtdJbAj5bXIomZuncUbgsZq5rYF5M=";
 
@@ -23,11 +24,18 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn temp_path(name: &str) -> PathBuf {
+    // See reload_config.rs: the timestamp alone is not unique across the parallel
+    // tests in this binary, so a same-named file can be overwritten mid-test.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock drift")
         .as_nanos();
-    std::env::temp_dir().join(format!("pg-kinetic-preflight-{name}-{unique}.toml"))
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "pg-kinetic-preflight-{name}-{}-{unique}-{sequence}.toml",
+        std::process::id()
+    ))
 }
 
 fn toml_path(path: &Path) -> String {
@@ -134,8 +142,7 @@ fn preflight_reports_unavailable_runtime_engine() {
             "127.0.0.1:5432",
             r#"
 [runtime.engine]
-runtime_engine = "experimental_io_uring"
-experimental_runtime_enabled = true
+runtime_engine = "io_uring"
 "#,
         ),
     );
@@ -394,17 +401,16 @@ target.isolated = false
 
     assert!(!report.warnings().is_empty());
     assert!(!report.errors().is_empty());
-    assert!(
-        report
-            .warnings()
-            .iter()
-            .all(|finding| finding.severity
-                == pg_kinetic_proxy::preflight::PreflightSeverity::Warning)
-    );
+    assert!(report
+        .warnings()
+        .iter()
+        .all(|finding| finding.severity
+            == pg_kinetic_proxy::ops::preflight::PreflightSeverity::Warning));
     assert!(report
         .errors()
         .iter()
-        .all(|finding| finding.severity == pg_kinetic_proxy::preflight::PreflightSeverity::Error));
+        .all(|finding| finding.severity
+            == pg_kinetic_proxy::ops::preflight::PreflightSeverity::Error));
     let json = report.render_json();
     assert!(json.contains("\"warnings\""));
     assert!(json.contains("\"errors\""));

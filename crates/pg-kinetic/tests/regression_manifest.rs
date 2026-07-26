@@ -1,12 +1,10 @@
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
-use pg_kinetic::core::regression::{
+use pg_kinetic::core::lab::regression::{
     RegressionArtifactPolicy, RegressionCase, RegressionCaseSpec, RegressionCategory,
     RegressionManifest, RegressionOutcome, RegressionPlatform,
 };
-use pg_kinetic_proxy::regression::{
-    load_regression_manifest, RegressionRunner, RegressionSelection,
-};
+use pg_kinetic_lab::regression::{load_regression_manifest, RegressionRunner, RegressionSelection};
 
 fn workspace_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

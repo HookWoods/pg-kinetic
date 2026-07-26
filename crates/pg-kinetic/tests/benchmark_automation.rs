@@ -1,9 +1,9 @@
 use std::{fs, path::PathBuf, process::Command};
 
-use pg_kinetic_core::benchmark::{
+use pg_kinetic_core::lab::benchmark::{
     BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult, BenchmarkTarget,
 };
-use pg_kinetic_proxy::benchmark::validate_benchmark_scenario;
+use pg_kinetic_lab::benchmark::validate_benchmark_scenario;
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_pg-kinetic")

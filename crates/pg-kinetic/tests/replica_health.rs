@@ -9,12 +9,12 @@ use bytes::{BufMut, BytesMut};
 use pg_kinetic::{
     config::{SocketConfig, TlsConfig},
     core::{
-        ha::{EndpointHealth, EndpointRoleState, ReplicaLagState},
-        lsn::PgLsn,
-        routing::BackendRole,
+        cluster::ha::{EndpointHealth, EndpointRoleState, ReplicaLagState},
+        cluster::lsn::PgLsn,
+        traffic::routing::BackendRole,
     },
-    proxy_runtime::health::EndpointHealthProbe,
-    proxy_runtime::snapshot::SnapshotStore,
+    proxy_runtime::observe::health::EndpointHealthProbe,
+    proxy_runtime::observe::snapshot::SnapshotStore,
     wire::{frame::parse_frontend_frame, message::parse_simple_query},
 };
 use tokio::{
@@ -218,7 +218,7 @@ enum ProbePlan {
 }
 
 fn probe(addr: SocketAddr, expected_role: BackendRole) -> Arc<EndpointHealthProbe> {
-    probe_with_timeout(addr, expected_role, Duration::from_millis(75))
+    probe_with_timeout(addr, expected_role, Duration::from_secs(1))
 }
 
 fn probe_with_timeout(

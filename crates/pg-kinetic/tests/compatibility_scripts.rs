@@ -3,8 +3,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use pg_kinetic::core::compatibility::{CompatibilityLanguage, CompatibilityTarget};
-use pg_kinetic_proxy::compatibility::{
+use pg_kinetic::core::lab::compatibility::{CompatibilityLanguage, CompatibilityTarget};
+use pg_kinetic_lab::compatibility::{
     CompatibilityRunConfig, CompatibilityRunner, CompatibilitySuiteSelector,
 };
 
@@ -952,7 +952,7 @@ fn public_docs_and_ci_link_the_compatibility_workflow() {
     assert!(workflow.contains("--target direct-postgres --smoke"));
     assert!(workflow.contains("--target pg-kinetic --smoke"));
     assert!(workflow.contains(
-        "docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic"
+        "docker compose -f bench/compose.yml up --detach --wait --build pg-direct pg-kinetic"
     ));
     assert!(workflow.contains("--category framework"));
     assert!(workflow.contains("npm --prefix docs-site run build"));

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs,
     net::SocketAddr,
@@ -8,7 +9,7 @@ use std::{
 
 use pg_kinetic::{
     config::{AuthMode, BackendTlsMode, ClientTlsMode, Config, ConnectionConfig},
-    proxy_runtime::reload::{
+    proxy_runtime::ops::reload::{
         load_auth_users, load_backend_credential_provider, load_client_tls_server_config,
         load_effective_config, reload_once, reload_once_with_pools_and_credentials,
         validate_runtime_assets, BackendCredentialCache, ReloadDecision,
@@ -25,12 +26,18 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
+    // The timestamp alone is not unique: tests in this binary run in parallel and
+    // the clock is coarse enough that two calls sharing a prefix can land on the
+    // same value, so one test silently overwrites another's config file. The
+    // counter makes the name unique regardless of clock resolution.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "pg-kinetic-{prefix}-{}-{timestamp}{suffix}",
+        "pg-kinetic-{prefix}-{}-{timestamp}-{sequence}{suffix}",
         std::process::id()
     ))
 }
@@ -588,4 +595,50 @@ async fn invalid_reload_keeps_previous_config_active() {
     assert!(error.to_string().contains("parse config file"));
 
     assert_eq!(active_config.read().await.qos.query_timeout_ms, 2_222);
+}
+
+#[test]
+fn clap_defaults_match_config_default() {
+    use clap::Parser;
+
+    // `merge_file_config` decides a CLI value was supplied explicitly by comparing
+    // it against `Config::default()`. If clap's default for a field disagrees with
+    // the `Default` impl, an unspecified flag looks explicit and silently
+    // overrides the config file — which is how a `runtime_engine` set in a file
+    // was being ignored at startup.
+    let parsed = Config::parse_from(["pg-kinetic"]);
+
+    assert_eq!(
+        parsed,
+        Config::default(),
+        "clap defaults and Config::default() must agree, or the config file loses \
+         to flags the operator never passed"
+    );
+}
+
+#[tokio::test]
+async fn startup_config_keeps_restart_only_file_values() {
+    let config_file = write_temp_file(
+        "startup-runtime",
+        ".toml",
+        r#"
+[connection]
+listen_addr = "127.0.0.1:6551"
+backend_addr = "127.0.0.1:5432"
+
+[runtime.engine]
+runtime_engine = "tokio_current_thread"
+"#,
+    );
+
+    let mut base = Config::default();
+    base.reload.config_file = Some(config_file.clone());
+
+    let effective = load_effective_config(&base).expect("load effective config");
+
+    assert_eq!(
+        effective.runtime.engine.runtime_engine,
+        pg_kinetic::core::cluster::runtime::RuntimeEngine::TokioCurrentThread
+    );
+    let _ = fs::remove_file(config_file);
 }

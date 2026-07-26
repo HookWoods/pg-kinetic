@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use pg_kinetic::{
     config::PolicyConfig,
-    core::policy::PolicyMode,
+    core::traffic::policy::PolicyMode,
     proxy_runtime::{
-        policy::{PolicyReloadErrorCode, PolicyStore},
-        reload::{record_policy_reload, reload_policy_once},
-        snapshot::SnapshotStore,
+        observe::snapshot::SnapshotStore,
+        ops::reload::{record_policy_reload, reload_policy_once},
+        routing::policy::{PolicyReloadErrorCode, PolicyStore},
     },
 };
 use serde::Deserialize;
@@ -321,7 +321,7 @@ target_id = "route-1"
 #[test]
 fn record_policy_reload_can_persist_a_snapshot_directly() {
     let snapshot_store = SnapshotStore::new();
-    let result = pg_kinetic::proxy_runtime::policy::PolicyReloadResult {
+    let result = pg_kinetic::proxy_runtime::routing::policy::PolicyReloadResult {
         success: true,
         policy_generation_id: 7,
         error_code: None,

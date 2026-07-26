@@ -264,6 +264,20 @@ fn metric_catalog_is_complete_and_stable() {
             "Adaptive apply outcomes by mode, target, and outcome.",
         ),
         (
+            "pg_kinetic_pressure_cpu",
+            MetricKind::Gauge,
+            "pct",
+            &[][..],
+            "Linux PSI CPU some avg10 percentage.",
+        ),
+        (
+            "pg_kinetic_pressure_mem",
+            MetricKind::Gauge,
+            "pct",
+            &[][..],
+            "Linux PSI memory some avg10 percentage.",
+        ),
+        (
             "pg_kinetic_benchmark_runs_total",
             MetricKind::Counter,
             "1",

@@ -2,22 +2,24 @@ use std::{sync::Arc, time::Duration};
 
 use pg_kinetic::{
     core::{
-        policy::{
+        protocol::session::TransactionAccessMode,
+        protocol::virtual_session::ReadAfterWriteState,
+        traffic::policy::{
             PolicyAction, PolicyAuditKind, PolicyDecision, PolicyHookPoint, PolicyId, PolicyMode,
             PolicyOutcome, PolicyRouteTargetId, PolicyVersion,
         },
-        routing::{BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass as CoreQueryClass},
-        session::TransactionAccessMode,
-        virtual_session::ReadAfterWriteState,
+        traffic::routing::{
+            BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass as CoreQueryClass,
+        },
     },
     proxy::{apply_policy_action_to_routing_target_with_mode, policy_audit_event_from_decision},
     proxy_runtime::{
-        policy::{PolicyEvalInput, PolicyRuntime},
+        observe::snapshot::SnapshotStore,
+        routing::policy::{PolicyEvalInput, PolicyRuntime},
         routing::{
             choose_routing_target, ReadRoutingPlanner, ReplicaCandidate, RouteHealthSnapshot,
             RoutingContext,
         },
-        snapshot::SnapshotStore,
     },
 };
 
@@ -225,7 +227,7 @@ fn sample_runtime(sample_rate: f64) -> PolicyRuntime {
 
 fn sample_planner() -> ReadRoutingPlanner {
     ReadRoutingPlanner::new(
-        pg_kinetic::core::routing::ReadRoutingMode::PreferReplica,
+        pg_kinetic::core::traffic::routing::ReadRoutingMode::PreferReplica,
         FallbackPolicy::Primary,
         FreshnessPolicy::SessionWriteLsnAndMaxLag,
         1_000,
@@ -236,7 +238,7 @@ fn sample_routing_context<'a>() -> RoutingContext<'a> {
     let health = sample_health();
     RoutingContext::new(
         "SELECT 1",
-        pg_kinetic::core::session::TransactionState::Idle,
+        pg_kinetic::core::protocol::session::TransactionState::Idle,
         ReadAfterWriteState::Required(sample_lsn()),
         Box::leak(Box::new(health)),
     )
@@ -253,11 +255,11 @@ fn sample_health() -> RouteHealthSnapshot {
 }
 
 fn sample_policy_input() -> PolicyEvalInput {
-    let routing_decision = pg_kinetic::core::routing::RoutingDecision::new(
+    let routing_decision = pg_kinetic::core::traffic::routing::RoutingDecision::new(
         BackendRole::Replica,
         CoreQueryClass::ReadOnly,
-        pg_kinetic::core::routing::RoutingHint::StrictFresh,
-        pg_kinetic::core::routing::RoutingReason::ReadOnlyQuery,
+        pg_kinetic::core::traffic::routing::RoutingHint::StrictFresh,
+        pg_kinetic::core::traffic::routing::RoutingReason::ReadOnlyQuery,
         FallbackPolicy::Primary,
         FreshnessPolicy::SessionWriteLsn,
     );
@@ -271,7 +273,7 @@ fn sample_policy_input() -> PolicyEvalInput {
         backend_role: BackendRole::Replica,
         query_class: CoreQueryClass::ReadOnly,
         transaction_mode: TransactionAccessMode::ReadOnly,
-        freshness_state: pg_kinetic::core::lsn::FreshnessStatus::Waiting,
+        freshness_state: pg_kinetic::core::cluster::lsn::FreshnessStatus::Waiting,
         routing_decision: Some(routing_decision),
         shard_route_decision: None,
         password: Some(Arc::from("swordfish")),
@@ -299,6 +301,6 @@ fn sample_decision(
     )
 }
 
-fn sample_lsn() -> pg_kinetic::core::lsn::PgLsn {
+fn sample_lsn() -> pg_kinetic::core::cluster::lsn::PgLsn {
     "0/16B6C50".parse().expect("lsn")
 }

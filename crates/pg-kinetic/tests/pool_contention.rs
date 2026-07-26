@@ -10,23 +10,23 @@ use std::{
 
 use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 use pg_kinetic_core::{
-    route::{QueryClass, RouteKey},
-    routing::BackendRole,
-    sharding::{
+    traffic::route::{QueryClass, RouteKey},
+    traffic::routing::BackendRole,
+    traffic::sharding::{
         MultiShardPolicy, ShardId, ShardRoute, ShardRouteMap, ShardRouteReason, ShardScope,
         ShardStrategy, ShardTarget,
     },
 };
 use pg_kinetic_proxy::{
     config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
+    observe::snapshot::SnapshotStore,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode, PoolError, ReplicaSelectionStrategy,
         ReplicaSelector, RoutePoolRegistry, RoutePools, ShardPoolCheckoutTarget, ShardPoolKey,
         ShardPools, ShardedPoolRegistry,
     },
+    routing::sharding::ShardRouteMapStore,
     routing::{RoutingReason, RoutingTarget},
-    sharding::ShardRouteMapStore,
-    snapshot::SnapshotStore,
 };
 use tokio::sync::Semaphore;
 
@@ -346,7 +346,7 @@ async fn shared_global_backend_cap_prevents_cross_pool_overallocation() {
         .expect_err("second pool waits behind the global backend cap");
     assert!(matches!(
         blocked,
-        PoolError::Backpressure(pg_kinetic_core::backpressure::BackpressureError::Timeout)
+        PoolError::Backpressure(pg_kinetic_core::traffic::backpressure::BackpressureError::Timeout)
     ));
     assert_eq!(accepted.load(Ordering::Acquire), 1);
 
@@ -365,7 +365,7 @@ fn route_metric_handles_reuse_registry_entries() {
     recorder.clear();
 
     let route = route_key();
-    let handles = pg_kinetic_proxy::metrics::RouteMetricHandles::resolve(&route);
+    let handles = pg_kinetic_proxy::observe::metrics::RouteMetricHandles::resolve(&route);
     handles.route_wait_ok.record(1.0);
     handles.route_wait_ok.record(2.0);
 
@@ -404,7 +404,7 @@ async fn reusable_checkout_times_out_without_opening_another_connection() {
     assert!(matches!(
         error,
         pg_kinetic_proxy::pool::PoolError::Backpressure(
-            pg_kinetic_core::backpressure::BackpressureError::Timeout
+            pg_kinetic_core::traffic::backpressure::BackpressureError::Timeout
         )
     ));
     assert!(started.elapsed() < Duration::from_millis(250));

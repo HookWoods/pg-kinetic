@@ -1,0 +1,17 @@
+[package]
+name = "pg-kinetic-lab"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+anyhow = "1"
+pg-kinetic-core = { path = "../pg-kinetic-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "1.1"
+
+[lints]
+workspace = true

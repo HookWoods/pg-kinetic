@@ -15,18 +15,16 @@ use pg_kinetic::{
         CapacityConfig, Config, ConnectionConfig, ObservabilityConfig, PerformanceConfig, QosConfig,
     },
     core::{
-        performance::{
+        observability::performance::{
             DerivedPerformanceMetric, ProcessMetricKind, ProcessMetricSample, ProcessMetricValue,
         },
-        session::SessionState,
+        protocol::session::SessionState,
     },
     proxy::Proxy,
     wire::protocol::ProtocolVersion,
 };
-use pg_kinetic_proxy::{
-    benchmark::validate_benchmark_scenario,
-    buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool},
-};
+use pg_kinetic_lab::benchmark::validate_benchmark_scenario;
+use pg_kinetic_proxy::net::buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -38,8 +36,8 @@ struct TestProxy {
     address: SocketAddr,
     _buffer_pool: ProxyBufferPool,
     backend_accepts: Arc<AtomicUsize>,
-    snapshots: pg_kinetic_proxy::snapshot::SnapshotStore,
-    drain: Arc<pg_kinetic_proxy::drain::DrainController>,
+    snapshots: pg_kinetic_proxy::observe::snapshot::SnapshotStore,
+    drain: Arc<pg_kinetic_proxy::ops::drain::DrainController>,
     proxy_task: JoinHandle<()>,
     backend_task: JoinHandle<()>,
 }
@@ -71,6 +69,7 @@ fn test_buffer_pool() -> ProxyBufferPool {
         BufferReusePolicy {
             initial_capacity: 64,
             max_cached_sessions: 64,
+            max_cached_bytes: 8 * 1024,
         },
         OversizedBufferPolicy {
             max_retained_capacity: 128,

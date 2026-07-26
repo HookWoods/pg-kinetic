@@ -1,11 +1,11 @@
 use pg_kinetic::core::{
-    recovery::{RecoveryAction, RecoveryTrigger},
-    route::{QueryClass, RouteKey},
+    cluster::recovery::{RecoveryAction, RecoveryTrigger},
     security::AuthMode,
+    traffic::route::{QueryClass, RouteKey},
 };
 use pg_kinetic::{
     config::Config,
-    proxy_runtime::telemetry::{
+    proxy_runtime::observe::telemetry::{
         auth_span, build_otel_tracer_provider, checkout_span, close_span, query_span,
         recovery_span, rows_span, startup_span,
     },

@@ -75,5 +75,5 @@ try {
   process.exitCode = 1;
 } finally {
   if (kysely) await kysely.destroy();
-  await pool.end();
+  else await pool.end();
 }

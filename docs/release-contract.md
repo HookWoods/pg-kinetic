@@ -55,8 +55,8 @@ The following behavior is stable for production use:
 The default runtime engine is `thread_per_core`. Operators can switch back to
 the Tokio runtime with `runtime_engine = "tokio_default"` or
 `PG_KINETIC_RUNTIME_ENGINE=tokio_default` without rebuilding the binary.
-`experimental_io_uring` remains opt-in and is not part of the default release
-path.
+Linux builds compiled with the `io-uring` cargo feature can select the stable
+[`io_uring`](./production-runtime.md#runtime-engine-selection) runtime.
 
 ## Authentication Contract
 
@@ -132,10 +132,11 @@ the compatibility workflow because those jobs install language-specific
 toolchains and client libraries.
 
 ```bash
-docker compose -f bench/compose.yml up --detach --wait --build postgres pg-kinetic
+docker compose -f bench/compose.yml up --detach --wait --build pg-direct pg-kinetic
 cargo fmt --check
 cargo test --workspace --locked
-cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T pg-direct psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
+cat compat/common/schema.sql compat/common/seed.sql | docker compose -f bench/compose.yml exec -T pg-kinetic-db psql -v ON_ERROR_STOP=1 -U postgres -d pgkinetic
 cargo run -p xtask -- compat --language rust --target direct-postgres --smoke
 cargo run -p xtask -- compat --language rust --target pg-kinetic --smoke
 docker compose -f bench/compose.yml down --volumes

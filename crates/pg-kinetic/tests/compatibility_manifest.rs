@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
-use pg_kinetic::core::compatibility::{
+use pg_kinetic::core::lab::compatibility::{
     CompatibilityArtifactPolicy, CompatibilityLanguage, CompatibilityLibrary, CompatibilitySuite,
     CompatibilitySuiteSpec, CompatibilityTarget,
 };

@@ -2,7 +2,7 @@ use pg_kinetic::config::{
     MultiShardPolicyConfig, RouteMapPriority, ShardScopeConfig, ShardStrategyConfig,
     ShardTargetConfig, ShardingConfig,
 };
-use pg_kinetic_core::sharding::{
+use pg_kinetic_core::traffic::sharding::{
     ordered_route_indices, validate_route_map, RouteDefinition, RouteMapValidationErrorCode,
     RouteMapValidationInput, ShardKey, ShardRuleDefinition, ShardedTableDefinition,
 };

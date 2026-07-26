@@ -17,27 +17,29 @@ use pg_kinetic::{
         PerformanceConfig, QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     core::{
-        adaptive::{
+        cluster::adaptive::{
             AdaptiveAction, AdaptiveMode, AdaptiveOutcome, AdaptiveSignal, TunableKnob, TuningBound,
         },
-        benchmark::{
+        cluster::control::PeerHealth,
+        cluster::runtime::{
+            NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason,
+        },
+        lab::benchmark::{
             BenchmarkComparison, BenchmarkDriver, BenchmarkMetric, BenchmarkResult,
             BenchmarkScenario, BenchmarkTarget,
         },
-        control::PeerHealth,
-        mirror::MirrorMode,
-        performance::{
+        observability::performance::{
             BenchmarkTarget as PerformanceBenchmarkTarget, PerformanceBudget,
             PerformanceBudgetOutcome, PerformanceMetric, PerformanceRegressionResult,
             PerformanceRegressionThreshold, ProcessMetricCollectionStatus, ProcessMetricKind,
             ProcessMetricSample, ProcessMetricValue, ProfileCaptureStatus,
         },
-        runtime::{NodeId, ReadinessState, RuntimeEngine, RuntimeLifecycleState, ShutdownReason},
+        traffic::mirror::MirrorMode,
     },
     proxy::Proxy,
     proxy_runtime::{
-        metrics as proxy_metrics,
-        snapshot::{
+        observe::metrics as proxy_metrics,
+        observe::snapshot::{
             AdaptiveOutcomeSnapshot, AdaptiveRecommendationSnapshot, BenchmarkRunSnapshot,
             MirrorSummarySnapshot, NodeSummaryRole, NodeSummarySnapshot, PerformanceSnapshot,
             RuntimeSnapshot, SnapshotStore,

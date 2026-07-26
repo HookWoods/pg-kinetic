@@ -6,7 +6,7 @@ use std::{
 use pg_kinetic::{
     config::ObservabilityConfig,
     core::observability::{metric_catalog, LabelPolicy},
-    proxy_runtime::telemetry::{
+    proxy_runtime::observe::telemetry::{
         build_otel_tracer_provider, emit_debug_sample_with, sampled_phase_timing_recorder,
         shared_phase_timing_recorder, DebugSample, DebugSampler, PhaseTimer,
     },

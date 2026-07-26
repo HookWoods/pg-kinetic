@@ -7,36 +7,44 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use pg_kinetic::config::Config;
-use pg_kinetic::core::benchmark::{BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError};
+use pg_kinetic::config::{Config, LogFormat};
+use pg_kinetic::core::lab::benchmark::{
+    BenchmarkScenario, BenchmarkTarget, BenchmarkValidationError,
+};
 use pg_kinetic::core::{
-    compatibility::{CompatibilityLanguage, CompatibilityTarget},
-    lsn::FreshnessStatus,
-    policy::PolicyAction,
-    regression::{RegressionCategory, RegressionPlatform},
-    routing::QueryClass as RoutingQueryClass,
-    runtime::RuntimeEngine,
-    session::TransactionAccessMode,
+    cluster::lsn::FreshnessStatus,
+    cluster::runtime::RuntimeEngine,
+    lab::compatibility::{CompatibilityLanguage, CompatibilityTarget},
+    lab::regression::{RegressionCategory, RegressionPlatform},
+    protocol::session::TransactionAccessMode,
+    traffic::policy::PolicyAction,
+    traffic::routing::QueryClass as RoutingQueryClass,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
-use pg_kinetic_proxy::benchmark::{
+use pg_kinetic_lab::benchmark::{
     compare_benchmark_reports, prepare_benchmark_results, validate_benchmark_scenario,
     BenchmarkReportOutcome, BenchmarkRunReport,
 };
-use pg_kinetic_proxy::compatibility::{
+use pg_kinetic_lab::compatibility::{
     CompatibilityRunConfig, CompatibilityRunner, CompatibilitySuiteSelector,
 };
-use pg_kinetic_proxy::policy::{preview_policy, PolicyPreviewError, PolicyPreviewEvaluation};
-use pg_kinetic_proxy::preflight::PreflightRunner;
-use pg_kinetic_proxy::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
-use pg_kinetic_proxy::regression::{
+use pg_kinetic_lab::profile::{ProfileRunConfig, ProfileRunner, ProfileTool};
+use pg_kinetic_lab::regression::{
     load_regression_manifest, redact_sensitive_text, score_benchmark_reports, write_ignored_output,
     RegressionRunner, RegressionSelection,
 };
-use pg_kinetic_proxy::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
-use pg_kinetic_proxy::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
+use pg_kinetic_proxy::engine::runtime_engine::{RuntimeEngineExperiment, RuntimeEngineSelector};
+use pg_kinetic_proxy::ops::preflight::PreflightRunner;
+use pg_kinetic_proxy::routing::policy::{
+    preview_policy, PolicyPreviewError, PolicyPreviewEvaluation,
+};
+use pg_kinetic_proxy::routing::sharding::{preview_route, RoutePreviewError, RoutePreviewRequest};
 use serde::Deserialize;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
+
+#[cfg(feature = "allocator-mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "pg-kinetic", about = "Low-overhead PostgreSQL wire proxy")]
@@ -324,29 +332,93 @@ struct PolicyPreviewFileConfig {
     sharding: pg_kinetic::config::ShardingConfig,
 }
 
-fn main() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+/// Parses a `log_level` value into a filter.
+///
+/// A bare token is required to be a real level. `EnvFilter` would otherwise
+/// accept a typo like `inof` as a *target* name, which parses fine and then
+/// silently discards almost every log line — the exact misconfiguration this
+/// setting is supposed to make obvious. Anything containing `=` or `,` is treated
+/// as a full directive and left to `EnvFilter` to judge.
+fn parse_log_filter(directive: &str) -> anyhow::Result<EnvFilter> {
+    let directive = directive.trim();
+    if directive.contains('=') || directive.contains(',') {
+        return EnvFilter::builder()
+            .parse(directive)
+            .context("parse log filter directive");
+    }
 
+    let level = directive.parse::<LevelFilter>().map_err(|_| {
+        anyhow::anyhow!(
+            "expected trace, debug, info, warn, error, or off, \
+             or a filter directive such as 'pg_kinetic=debug,warn'"
+        )
+    })?;
+    Ok(EnvFilter::new(level.to_string()))
+}
+
+/// Installs the global tracing subscriber from config.
+///
+/// `RUST_LOG` wins when set, so an operator can raise the level on a running
+/// deployment without editing the config file. An invalid `log_level` is a hard
+/// error: falling back silently would leave the wrong level in place with nothing
+/// to indicate why.
+fn init_logging(observability: &pg_kinetic::config::ObservabilityConfig) -> anyhow::Result<()> {
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => parse_log_filter(&observability.log_level)
+            .with_context(|| format!("invalid log_level '{}'", observability.log_level))?,
+    };
+
+    match observability.log_format {
+        LogFormat::Json => fmt().json().with_env_filter(filter).init(),
+        LogFormat::Text => fmt().with_env_filter(filter).init(),
+    }
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Cli { config, command } = cli;
 
-    match command {
-        Some(Command::RoutePreview(args)) => return run_route_preview(config, args),
-        Some(Command::PolicyPreview(args)) => return run_policy_preview(config, args),
-        Some(Command::Benchmark(args)) => return run_benchmark(config, args),
-        Some(Command::Compat(args)) => return run_compat(args),
-        Some(Command::Regression(args)) => return run_regression(args),
-        Some(Command::Profile(args)) => return run_profile(config, args),
-        Some(Command::Preflight(args)) => return run_preflight(config, args),
-        None => {}
+    if let Some(command) = command {
+        // Subcommands are offline tooling: log from the CLI values only, without
+        // loading the server config file they may not even use.
+        init_logging(&config.observability)?;
+        return match command {
+            Command::RoutePreview(args) => run_route_preview(config, args),
+            Command::PolicyPreview(args) => run_policy_preview(config, args),
+            Command::Benchmark(args) => run_benchmark(config, args),
+            Command::Compat(args) => run_compat(args),
+            Command::Regression(args) => run_regression(args),
+            Command::Profile(args) => run_profile(config, args),
+            Command::Preflight(args) => run_preflight(config, args),
+        };
     }
 
+    // Merge the config file onto the CLI base exactly the way SIGHUP reload does,
+    // so command-line flags survive startup and the running config does not change
+    // on the first reload.
+    let config = pg_kinetic_proxy::ops::reload::load_effective_config(&config)
+        .context("load effective startup config")?;
+    init_logging(&config.observability)?;
+    config.validate().map_err(anyhow::Error::msg)?;
     let selector = RuntimeEngineSelector::new(config.runtime.engine.runtime_engine)
         .with_experiment(RuntimeEngineExperiment::new(
             config.runtime.engine.experimental_runtime_enabled,
         ));
     selector.validate().context("validate runtime engine")?;
+
+    // One line that answers "what is actually running?" without shell access.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        runtime_engine = %config.runtime.engine.runtime_engine,
+        pool_mode = ?config.performance.pool_mode,
+        listen_addr = %config.connection.listen_addr,
+        config_file = ?config.reload.config_file,
+        client_tls_mode = ?config.tls.client_tls_mode,
+        auth_mode = ?config.auth.auth_mode,
+        "starting pg-kinetic"
+    );
 
     match selector.engine() {
         RuntimeEngine::TokioDefault => tokio::runtime::Builder::new_multi_thread()
@@ -363,7 +435,7 @@ fn main() -> anyhow::Result<()> {
             .context("pg-kinetic runtime failed"),
         RuntimeEngine::ThreadPerCore => pg_kinetic::run_thread_per_core(config)
             .context("pg-kinetic thread-per-core runtime failed"),
-        RuntimeEngine::ExperimentalIoUring => {
+        RuntimeEngine::IoUring => {
             pg_kinetic::run_io_uring(config).context("pg-kinetic io_uring runtime failed")
         }
     }
@@ -815,7 +887,7 @@ fn build_policy_preview_input(
     route: &str,
     shard: &str,
     query_class: RoutingQueryClass,
-) -> pg_kinetic_proxy::policy::PolicyEvalInput {
+) -> pg_kinetic_proxy::routing::policy::PolicyEvalInput {
     let backend_role = query_class.target_role();
     let transaction_mode = match query_class {
         RoutingQueryClass::ReadOnly | RoutingQueryClass::ReadCandidate => {
@@ -824,7 +896,7 @@ fn build_policy_preview_input(
         _ => TransactionAccessMode::ReadWrite,
     };
 
-    pg_kinetic_proxy::policy::PolicyEvalInput {
+    pg_kinetic_proxy::routing::policy::PolicyEvalInput {
         database: Arc::from(database),
         user: Arc::from(user),
         application_name: application_name.map(Arc::from),
@@ -947,7 +1019,9 @@ fn preview_route_label(database: &str, user: &str, application_name: Option<&str
     RouteKey::new(database, user, application_name, None, QueryClass::Default).metric_label()
 }
 
-fn render_preview_success(summary: &pg_kinetic_proxy::sharding::RoutePreviewSummary) -> String {
+fn render_preview_success(
+    summary: &pg_kinetic_proxy::routing::sharding::RoutePreviewSummary,
+) -> String {
     format!(
         "{{\"ok\":true,\"route\":{},\"shard_id\":{},\"backend_role\":{},\"reason\":{},\"shard_reason\":{}}}",
         json_string(&summary.route),
@@ -987,7 +1061,7 @@ fn render_benchmark_error(path: &Path, error: &BenchmarkValidationError) -> Stri
 fn render_benchmark_report_error(
     baseline: &Path,
     current: &Path,
-    error: &pg_kinetic_proxy::benchmark::BenchmarkReportError,
+    error: &pg_kinetic_lab::benchmark::BenchmarkReportError,
 ) -> String {
     format!(
         "{{\"ok\":false,\"baseline\":{},\"current\":{},\"error\":{{\"code\":\"benchmark_report_failed\",\"message\":{}}}}}",
@@ -1087,4 +1161,38 @@ fn parse_compatibility_language(value: &str) -> Result<CompatibilityLanguage, St
 
 fn parse_compatibility_target(value: &str) -> Result<CompatibilityTarget, String> {
     value.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_log_filter;
+
+    #[test]
+    fn log_filter_accepts_levels_and_directives() {
+        for directive in ["info", "  warn  ", "OFF", "trace"] {
+            assert!(
+                parse_log_filter(directive).is_ok(),
+                "expected {directive:?} to parse"
+            );
+        }
+        assert!(parse_log_filter("pg_kinetic=debug,warn").is_ok());
+        assert!(parse_log_filter("pg_kinetic_proxy::pool=trace").is_ok());
+    }
+
+    #[test]
+    fn log_filter_rejects_a_bare_token_that_is_not_a_level() {
+        // EnvFilter would accept these as target names and then silently discard
+        // almost every log line, which is the failure this guard exists to catch.
+        for directive in ["inof", "verbose", "not a level"] {
+            assert!(
+                parse_log_filter(directive).is_err(),
+                "expected {directive:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn log_filter_rejects_a_malformed_directive() {
+        assert!(parse_log_filter("pg_kinetic=bogus").is_err());
+    }
 }

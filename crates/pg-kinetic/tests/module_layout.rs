@@ -29,7 +29,7 @@ fn compatibility_reexports_remain_available() {
     let _ = std::mem::size_of::<VirtualSession>();
     let _ = std::mem::size_of::<ReadyStatus>();
     let _ = std::mem::size_of::<FrontendFrame>();
-    let _ = std::mem::size_of::<core::recovery::RecoveryAction>();
+    let _ = std::mem::size_of::<core::cluster::recovery::RecoveryAction>();
     let _ = std::mem::size_of::<proxy_runtime::pool::PoolError>();
     let _ = std::mem::size_of::<wire::backend::ReadyStatus>();
 }

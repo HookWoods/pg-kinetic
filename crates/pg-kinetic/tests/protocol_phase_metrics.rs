@@ -6,7 +6,7 @@ use std::{
 use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 use pg_kinetic::{
     core::observability::{MetricOutcome, ProtocolPhase},
-    proxy_runtime::telemetry::{self, PhaseTimer, PhaseTimingRecorder},
+    proxy_runtime::observe::telemetry::{self, PhaseTimer, PhaseTimingRecorder},
 };
 
 #[test]

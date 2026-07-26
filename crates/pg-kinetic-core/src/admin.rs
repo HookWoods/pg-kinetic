@@ -21,6 +21,7 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
         ["show", "nodes"] => AdminCommand::Show(AdminView::Nodes),
         ["show", "mirroring"] => AdminCommand::Show(AdminView::Mirroring),
         ["show", "adaptive"] => AdminCommand::Show(AdminView::Adaptive),
+        ["show", "pressure"] => AdminCommand::Show(AdminView::Pressure),
         ["show", "benchmarks"] => AdminCommand::Show(AdminView::Benchmarks),
         ["show", "performance"] => AdminCommand::Show(AdminView::Performance),
         ["show", "prepared"] => AdminCommand::Show(AdminView::Prepared),
@@ -69,6 +70,7 @@ pub enum AdminView {
     Nodes,
     Mirroring,
     Adaptive,
+    Pressure,
     Benchmarks,
     Performance,
     Prepared,
@@ -98,6 +100,7 @@ impl AdminView {
             Self::Nodes => "nodes",
             Self::Mirroring => "mirroring",
             Self::Adaptive => "adaptive",
+            Self::Pressure => "pressure",
             Self::Benchmarks => "benchmarks",
             Self::Performance => "performance",
             Self::Prepared => "prepared",
@@ -188,27 +191,6 @@ pub struct AdminTable {
     rows: Vec<AdminRow>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_admin_command, AdminCommand, AdminView};
-
-    #[test]
-    fn parses_runtime_shards_view_without_changing_runtime_view() {
-        assert_eq!(
-            parse_admin_command("SHOW RUNTIME").view(),
-            Some(AdminView::Runtime)
-        );
-        assert_eq!(
-            parse_admin_command("SHOW RUNTIME SHARDS").view(),
-            Some(AdminView::RuntimeShards)
-        );
-        assert!(matches!(
-            parse_admin_command("SHOW RUNTIME POOLS"),
-            AdminCommand::Unknown(_)
-        ));
-    }
-}
-
 impl AdminTable {
     #[must_use]
     pub fn new(view: AdminView, columns: Vec<AdminColumn>, rows: Vec<AdminRow>) -> Self {
@@ -232,5 +214,26 @@ impl AdminTable {
     #[must_use]
     pub fn rows(&self) -> &[AdminRow] {
         &self.rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_admin_command, AdminCommand, AdminView};
+
+    #[test]
+    fn parses_runtime_shards_view_without_changing_runtime_view() {
+        assert_eq!(
+            parse_admin_command("SHOW RUNTIME").view(),
+            Some(AdminView::Runtime)
+        );
+        assert_eq!(
+            parse_admin_command("SHOW RUNTIME SHARDS").view(),
+            Some(AdminView::RuntimeShards)
+        );
+        assert!(matches!(
+            parse_admin_command("SHOW RUNTIME POOLS"),
+            AdminCommand::Unknown(_)
+        ));
     }
 }

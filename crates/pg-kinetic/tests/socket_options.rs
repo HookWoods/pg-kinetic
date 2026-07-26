@@ -1,6 +1,6 @@
 use pg_kinetic::{
     config::SocketConfig,
-    proxy_runtime::socket::{apply_socket_options, SocketOptionOutcome, SocketOptions},
+    proxy_runtime::net::socket::{apply_socket_options, SocketOptionOutcome, SocketOptions},
 };
 use tokio::net::{TcpListener, TcpStream};
 

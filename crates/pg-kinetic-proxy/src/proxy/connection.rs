@@ -197,6 +197,20 @@ impl ClientConnection {
     }
 }
 
+impl crate::engine::io_runtime::RuntimeByteStream for ClientConnection {
+    async fn read_into(&mut self, dst: &mut BytesMut) -> std::io::Result<usize> {
+        self.read_buf(dst).await
+    }
+
+    async fn write_all_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes).await
+    }
+
+    async fn shutdown_stream(&mut self) -> std::io::Result<()> {
+        self.shutdown().await
+    }
+}
+
 pub(super) fn skip_empty_vectored_slices(
     slices: &[IoSlice<'_>],
     slice_index: &mut usize,

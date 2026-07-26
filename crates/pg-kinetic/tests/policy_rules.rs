@@ -1,27 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
 use pg_kinetic::core::{
-    lsn::FreshnessStatus,
-    policy::{
+    cluster::lsn::FreshnessStatus,
+    protocol::session::TransactionAccessMode,
+    traffic::policy::{
         PolicyAction, PolicyAuditKind, PolicyContext, PolicyDecision, PolicyDecisionReason,
         PolicyHookPoint, PolicyId, PolicyOutcome, PolicyPluginAbiVersion,
         PolicyPluginAccessRequest, PolicyPluginAction, PolicyPluginError, PolicyPluginInput,
         PolicyPluginOutput, PolicyRouteTargetId, PolicyShardTargetId, PolicyVersion,
     },
-    policy_rule::{
+    traffic::policy_rule::{
         PolicyRule, PolicyRuleAction, PolicyRuleContext, PolicyRuleMatch, PolicyRuleSet,
     },
-    route::{QueryClass as RouteQueryClass, RouteKey},
-    routing::{
+    traffic::route::{QueryClass as RouteQueryClass, RouteKey},
+    traffic::routing::{
         BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass, RoutingDecision, RoutingHint,
         RoutingReason,
     },
-    session::TransactionAccessMode,
-    sharding::{
+    traffic::sharding::{
         MultiShardPolicy, ShardId, ShardRoute, ShardRouteDecision, ShardRouteReason, ShardTarget,
     },
 };
-use pg_kinetic::proxy_runtime::policy::{PolicyEvalInput, PolicyRuntime};
+use pg_kinetic::proxy_runtime::routing::policy::{PolicyEvalInput, PolicyRuntime};
 
 #[test]
 fn rule_matches_supported_policy_fields() {

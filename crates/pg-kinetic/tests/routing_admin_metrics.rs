@@ -18,21 +18,21 @@ use pg_kinetic::{
         PerformanceConfig, QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
     core::{
-        ha::{
+        cluster::ha::{
             EndpointHealth, EndpointRoleState, HealthProbeOutcome, ReplicaLagState,
             RoleProbeOutcome,
         },
-        lsn::{FreshnessStatus, PgLsn},
-        routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+        cluster::lsn::{FreshnessStatus, PgLsn},
+        traffic::routing::{BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
     },
     proxy::Proxy,
     proxy_runtime::{
-        metrics as proxy_metrics,
-        routing::{ReplicaCandidate, RoutingReason, RoutingTarget},
-        snapshot::{
+        observe::metrics as proxy_metrics,
+        observe::snapshot::{
             BackpressureSnapshot, ClientSnapshot, ReplicaHealthSnapshot, RouteCheckoutSnapshot,
             RoutePolicySnapshot, RouteSnapshot, ServerSnapshot, SnapshotStore,
         },
+        routing::{ReplicaCandidate, RoutingReason, RoutingTarget},
     },
     route::{QueryClass, RouteKey},
     wire::{

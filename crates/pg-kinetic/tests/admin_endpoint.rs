@@ -16,11 +16,14 @@ use pg_kinetic::{
         ConnectionConfig, DrainConfig, HealthConfig, ObservabilityConfig, PerformanceConfig,
         QosConfig, ReloadConfig, SocketConfig, TlsConfig,
     },
-    core::{observability::MetricOutcome, prepare::PreparedStatementSnapshot, session::PinReason},
+    core::{
+        observability::MetricOutcome, protocol::prepare::PreparedStatementSnapshot,
+        protocol::session::PinReason,
+    },
     proxy::Proxy,
-    proxy_runtime::snapshot::{
-        ClientSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot, RouteSnapshot,
-        ServerSnapshot, SnapshotStore,
+    proxy_runtime::observe::snapshot::{
+        ClientSnapshot, PinningSnapshot, PoolSnapshot, PreparedSnapshot, PressureSnapshot,
+        RouteSnapshot, ServerSnapshot, SnapshotStore,
     },
     recovery::{RecoveryAction, RecoveryTrigger},
     route::{QueryClass, RouteKey},
@@ -327,6 +330,16 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
     backpressure_handle.increment_rejected(route_key.clone());
     backpressure_handle.increment_timed_out(route_key.clone());
     backpressure_handle.increment_canceled(route_key.clone());
+    snapshot_store.set_pressure_snapshot(PressureSnapshot {
+        enabled: true,
+        cpu_some_avg10: Some(12.5),
+        mem_some_avg10: Some(7.25),
+        cpu_high_pct: 10.0,
+        mem_high_pct: 6.0,
+        pressured: true,
+        route_in_flight_limit: 4,
+        configured_route_in_flight: 16,
+    });
 
     snapshot_store.set_route_snapshot(RouteSnapshot {
         route_key: route_key.clone(),
@@ -387,6 +400,24 @@ async fn show_prepared_pinning_recovery_backpressure_and_routes_return_stable_co
             "canceled",
         ],
         &[vec![route_key_text, "3", "2", "1", "1", "1"]],
+    );
+
+    let pressure_frames = admin_query(admin_addr, "SHOW PRESSURE").await;
+    assert_admin_table_response(
+        &pressure_frames,
+        &[
+            "enabled",
+            "cpu_some_avg10",
+            "mem_some_avg10",
+            "cpu_high_pct",
+            "mem_high_pct",
+            "pressured",
+            "route_in_flight_limit",
+            "configured_route_in_flight",
+        ],
+        &[vec![
+            "true", "12.500", "7.250", "10.000", "6.000", "true", "4", "16",
+        ]],
     );
 
     let routes_frames = admin_query(admin_addr, "SHOW ROUTES").await;

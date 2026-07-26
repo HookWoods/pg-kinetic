@@ -92,7 +92,7 @@ impl<'a> RequestPlan<'a> {
         }
     }
 
-    fn from_prepared(statement: &pg_kinetic_core::prepare::PreparedStatement) -> Self {
+    fn from_prepared(statement: &pg_kinetic_core::protocol::prepare::PreparedStatement) -> Self {
         Self {
             sql: Cow::Owned(statement.query.clone()),
             command: statement.command().clone(),
@@ -150,9 +150,9 @@ pub(super) fn request_plans_for_frames<'frames>(
                 .ok()
                 .flatten()
                 .and_then(|describe_target| match describe_target {
-                    DescribeTarget::Statement(statement_name) => prepared
-                        .get_for_current_route_map(&statement_name)
-                        .map(|statement| statement),
+                    DescribeTarget::Statement(statement_name) => {
+                        prepared.get_for_current_route_map(&statement_name)
+                    }
                     _ => None,
                 })
         {
@@ -163,10 +163,33 @@ pub(super) fn request_plans_for_frames<'frames>(
     Ok(plans)
 }
 
+pub(super) fn safe_request_to_replay(
+    frames: &[FrontendFrame],
+    plans: &[RequestPlan<'_>],
+    session: &VirtualSession,
+) -> bool {
+    !frames.is_empty()
+        && frames
+            .iter()
+            .all(|frame| frame.tag == u8::from(FrontendTag::Query))
+        && plans.len() == 1
+        && plans[0].analysis().query_class().routes_to_replica()
+        && session.pin_reason().is_none()
+        && !session.has_replayable_settings()
+}
+
+pub(super) fn mirror_sql_command_for_request_plan(
+    request_plan: Option<&RequestPlan<'_>>,
+) -> SqlCommand {
+    request_plan
+        .map(|plan| plan.command.clone())
+        .unwrap_or(SqlCommand::Query)
+}
+
 #[cfg(test)]
 mod sql_plan_cache_tests {
     use super::*;
-    use pg_kinetic_core::routing::{QueryClass as RoutingQueryClass, RoutingHint};
+    use pg_kinetic_core::traffic::routing::{QueryClass as RoutingQueryClass, RoutingHint};
 
     #[test]
     fn cached_sql_plan_upgrades_to_full_analysis_only_when_needed() {
@@ -211,27 +234,4 @@ mod sql_plan_cache_tests {
         assert!(cache.plans.contains_key(&b"select 2"[..]));
         assert!(cache.plans.contains_key(&b"select 3"[..]));
     }
-}
-
-pub(super) fn safe_request_to_replay(
-    frames: &[FrontendFrame],
-    plans: &[RequestPlan<'_>],
-    session: &VirtualSession,
-) -> bool {
-    !frames.is_empty()
-        && frames
-            .iter()
-            .all(|frame| frame.tag == u8::from(FrontendTag::Query))
-        && plans.len() == 1
-        && plans[0].analysis().query_class().routes_to_replica()
-        && session.pin_reason().is_none()
-        && !session.has_replayable_settings()
-}
-
-pub(super) fn mirror_sql_command_for_request_plan(
-    request_plan: Option<&RequestPlan<'_>>,
-) -> SqlCommand {
-    request_plan
-        .map(|plan| plan.command.clone())
-        .unwrap_or(SqlCommand::Query)
 }

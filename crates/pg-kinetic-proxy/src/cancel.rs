@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Context;
 use bytes::{BufMut, BytesMut};
-use pg_kinetic_core::secrets;
+use pg_kinetic_core::security::secrets;
 use pg_kinetic_wire::protocol::CANCEL_REQUEST_CODE;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
@@ -34,12 +34,18 @@ struct CancelBinding {
     forwarding_done: Notify,
 }
 
-struct CancelLease {
+pub(crate) struct CancelForwardingLease {
     binding: Arc<CancelBinding>,
     target: CancelTarget,
 }
 
-impl Drop for CancelLease {
+impl CancelForwardingLease {
+    pub(crate) fn target(&self) -> CancelTarget {
+        self.target
+    }
+}
+
+impl Drop for CancelForwardingLease {
     fn drop(&mut self) {
         self.binding.forwarding.store(false, Ordering::Release);
         self.binding.forwarding_done.notify_waiters();
@@ -112,7 +118,7 @@ impl CancelRegistry {
             })
     }
 
-    async fn acquire(&self, key: (i32, i32)) -> Option<CancelLease> {
+    pub(crate) fn acquire_forwarding(&self, key: (i32, i32)) -> Option<CancelForwardingLease> {
         let binding = self
             .entries
             .read()
@@ -133,7 +139,7 @@ impl CancelRegistry {
             .as_ref()
             .copied();
         match target {
-            Some(target) => Some(CancelLease { binding, target }),
+            Some(target) => Some(CancelForwardingLease { binding, target }),
             None => {
                 binding.forwarding.store(false, Ordering::Release);
                 binding.forwarding_done.notify_waiters();
@@ -143,10 +149,14 @@ impl CancelRegistry {
     }
 
     pub async fn forward_cancel(&self, key: (i32, i32)) -> anyhow::Result<()> {
-        let Some(lease) = self.acquire(key).await else {
+        // Only the process id is logged. The secret key authenticates the cancel
+        // request and must never reach the logs.
+        let Some(lease) = self.acquire_forwarding(key) else {
+            tracing::info!(process_id = key.0, "cancel request had no matching session");
             return Ok(());
         };
-        forward_cancel(lease.target).await
+        tracing::info!(process_id = key.0, "forwarding cancel request to backend");
+        forward_cancel(lease.target()).await
     }
 
     pub fn remove_session(&self, key: (i32, i32)) {
@@ -161,11 +171,7 @@ pub async fn forward_cancel(target: CancelTarget) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(target.backend_addr)
         .await
         .with_context(|| format!("connect backend {} for cancel", target.backend_addr))?;
-    let mut packet = BytesMut::with_capacity(16);
-    packet.put_i32(16);
-    packet.put_i32(CANCEL_REQUEST_CODE);
-    packet.put_i32(target.process_id);
-    packet.put_i32(target.secret_key);
+    let packet = encode_cancel_request(target.process_id, target.secret_key);
     stream
         .write_all(&packet)
         .await
@@ -173,8 +179,19 @@ pub async fn forward_cancel(target: CancelTarget) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn encode_cancel_request(process_id: i32, secret_key: i32) -> BytesMut {
+    let mut packet = BytesMut::with_capacity(16);
+    packet.put_i32(16);
+    packet.put_i32(CANCEL_REQUEST_CODE);
+    packet.put_i32(process_id);
+    packet.put_i32(secret_key);
+    packet
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[tokio::test]
@@ -195,5 +212,45 @@ mod tests {
         registry.remove_session(key);
         registry.bind(key, target);
         assert_eq!(registry.lookup(key), None);
+    }
+
+    #[tokio::test]
+    async fn unbind_waits_for_forwarding_lease() {
+        let registry = Arc::new(CancelRegistry::default());
+        let key = registry.issue_client_key().expect("client key");
+        registry.bind(
+            key,
+            CancelTarget {
+                backend_addr: "127.0.0.1:5432".parse().expect("addr"),
+                process_id: 7,
+                secret_key: 9,
+            },
+        );
+        let lease = registry.acquire_forwarding(key).expect("forwarding lease");
+
+        let unbind_registry = Arc::clone(&registry);
+        let mut unbind = tokio::spawn(async move {
+            unbind_registry.unbind(key).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut unbind)
+            .await
+            .is_err());
+
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(1), unbind)
+            .await
+            .expect("unbind completes after lease drop")
+            .expect("unbind task completes");
+        assert_eq!(registry.lookup(key), None);
+    }
+
+    #[test]
+    fn cancel_packet_uses_target_credentials() {
+        let packet = encode_cancel_request(7, 9);
+        assert_eq!(
+            &packet[..],
+            &[0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9,]
+        );
     }
 }

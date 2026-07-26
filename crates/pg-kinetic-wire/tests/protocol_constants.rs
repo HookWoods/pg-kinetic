@@ -8,6 +8,7 @@ fn protocol_constants_match_postgres_wire_values() {
     assert_eq!(ProtocolVersion::V3.to_i32(), 196_608);
     assert_eq!(u8::from(FrontendTag::Query), b'Q');
     assert_eq!(u8::from(FrontendTag::Parse), b'P');
+    assert_eq!(u8::from(FrontendTag::Flush), b'H');
     assert_eq!(u8::from(FrontendTag::Sync), b'S');
     assert_eq!(u8::from(BackendTag::ErrorResponse), b'E');
     assert_eq!(u8::from(BackendTag::ReadyForQuery), b'Z');

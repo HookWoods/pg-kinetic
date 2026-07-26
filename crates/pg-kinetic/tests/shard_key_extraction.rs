@@ -1,6 +1,8 @@
 use pg_kinetic_core::{
-    shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
-    sharding::{RouteDefinition, RouteMapValidationInput, ShardKey, ShardedTableDefinition},
+    traffic::shard_extract::{extract_shard_hint, extract_shard_key, ShardExtraction, ShardHint},
+    traffic::sharding::{
+        RouteDefinition, RouteMapValidationInput, ShardKey, ShardedTableDefinition,
+    },
 };
 use pretty_assertions::assert_eq;
 use std::sync::Arc;

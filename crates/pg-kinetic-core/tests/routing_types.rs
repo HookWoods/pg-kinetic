@@ -1,4 +1,4 @@
-use pg_kinetic_core::routing::{
+use pg_kinetic_core::traffic::routing::{
     BackendRole, FallbackPolicy, FreshnessPolicy, QueryClass, ReadRoutingMode, RoutingDecision,
     RoutingHint, RoutingReason,
 };

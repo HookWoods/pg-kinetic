@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -27,68 +27,71 @@ use crate::routing::{
     RoutingContext, RoutingReason, RoutingTarget,
 };
 use crate::{
-    adaptive::AdaptiveController,
-    admin, auth,
-    backend_query::AuthQueryService,
-    buffers::{ProxyBufferPool, SessionBufferSet},
-    cancel,
+    auth, cancel,
     config::{Config, PoolConfig, RouteConfig},
-    drain::DrainController,
-    health,
-    lifecycle::{
+    net::buffers::{BufferReusePolicy, OversizedBufferPolicy, ProxyBufferPool, SessionBufferSet},
+    net::limits,
+    net::pressure::PressureController,
+    net::socket,
+    net::tls,
+    observe::health,
+    observe::metrics,
+    observe::snapshot::{
+        ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
+        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot,
+        RuntimeShardSnapshot, SettingsSnapshot, SnapshotStore,
+    },
+    observe::telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
+    ops::adaptive::AdaptiveController,
+    ops::admin,
+    ops::drain::DrainController,
+    ops::lifecycle::{
         wait_for_shutdown_signal, LifecycleController, ShutdownCoordinator, ShutdownOutcome,
     },
-    metrics,
-    mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
-    pause::PauseController,
+    ops::mirror::{MirrorDispatcher, MirrorOutcomeRecorder, MirrorTask},
+    ops::pause::PauseController,
+    ops::reload,
+    pool::backend_query::AuthQueryService,
     pool::{
         BackendPool, BackendPoolRef, CheckoutMode as PoolCheckoutMode, PooledBackend,
         ReplicaSelectionStrategy, ReplicaSelector, RoutePoolRegistry, RoutePoolRetirementTargets,
         RoutePools,
     },
-    reload,
-    snapshot::{
-        ClientSnapshot, ClientSnapshotHandle, LimitsSnapshot, PinningSnapshot,
-        PreparedSnapshotHandle, RecoverySnapshotHandle, RouteCheckoutSnapshot,
-        RuntimeShardSnapshot, SettingsSnapshot, SnapshotStore,
-    },
-    socket,
-    telemetry::{self, DebugSample, DebugSampler, PhaseTimer},
-    tls,
 };
-use pg_kinetic_core::routing::{
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use pg_kinetic_core::security::secrets::UserStore;
+use pg_kinetic_core::traffic::routing::{
     BackendRole, FallbackPolicy, FreshnessPolicy, ReadRoutingMode,
     RoutingReason as CoreRoutingReason,
 };
 use pg_kinetic_core::{
-    cleanup::{cleanup_action, CleanupAction},
+    cluster::cleanup::{cleanup_action, CleanupAction},
+    cluster::lsn::{FreshnessStatus, PgLsn},
+    cluster::recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
+    cluster::runtime::{RuntimeLifecycleState, ShutdownReason},
     constants::{MetricName, PreparedEvent},
-    lsn::{FreshnessStatus, PgLsn},
     observability::{MetricOutcome, ProtocolPhase},
-    pin::PinnedBackend,
-    policy::{
+    protocol::pin::PinnedBackend,
+    protocol::prepare::{InvalidationScope, PreparedCatalog},
+    protocol::session::PinReason as SessionPinReason,
+    protocol::session::TransactionState,
+    protocol::sql::{classify, SetScope, SqlCommand},
+    protocol::sql_classify::{analyze_sql, SqlAnalysis},
+    protocol::virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
+    traffic::policy::{
         PolicyAction, PolicyAuditEvent, PolicyAuditKind, PolicyDecision, PolicyMode,
         POLICY_DENY_SQLSTATE,
     },
-    prepare::{InvalidationScope, PreparedCatalog},
-    recovery::{recovery_action, RecoveryAction, RecoveryTrigger},
-    route::{QueryClass, RouteKey},
-    runtime::{RuntimeLifecycleState, ShutdownReason},
-    session::PinReason as SessionPinReason,
-    session::TransactionState,
-    shard_extract::{extract_shard_hint, ShardHint},
-    sharding::{MultiShardPolicy, ShardId},
-    sql::{classify, SetScope, SqlCommand},
-    sql_classify::{analyze_sql, SqlAnalysis},
-    virtual_session::{PinReason, ReadAfterWriteState, VirtualSession},
+    traffic::route::{PoolKey, QueryClass, RouteKey},
+    traffic::shard_extract::{extract_shard_hint, ShardHint},
+    traffic::sharding::{MultiShardPolicy, ShardId},
 };
 use pg_kinetic_wire::{
     backend::{
         build_error_response, encode_backend_key_data, encode_parameter_status,
         parse_backend_frame, parse_parameter_status, BackendFrame, ReadyStatus,
     },
-    error::WireError,
-    frame::{parse_frontend_frame, FrontendFrame},
+    frame::FrontendFrame,
     message::{
         parse_bind_statement_name, parse_close_target, parse_describe_target, parse_parse_message,
         parse_simple_query, CloseTarget, DescribeTarget,
@@ -104,7 +107,7 @@ use pg_kinetic_wire::{
 };
 use std::borrow::Cow;
 
-use crate::policy::{PolicyEvalInput, PolicyRuntime};
+use crate::routing::policy::{PolicyEvalInput, PolicyRuntime};
 
 mod backend_startup;
 mod buffer_limit;
@@ -117,7 +120,10 @@ mod recovery;
 mod request_plan;
 mod session_snapshot;
 
+pub(crate) use backend_startup::BackendStartupMetadata;
 use backend_startup::*;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) use backend_startup::{bootstrap_backend_streams, proxy_startup_streams};
 use buffer_limit::*;
 use checkout::*;
 pub use checkout::{
@@ -126,13 +132,21 @@ pub use checkout::{
     checkout_postgres_error_for_target, policy_audit_event_from_decision,
     route_checkout_snapshot_for_target,
 };
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use client_io::bind_cancel_target_for_backend;
 use client_io::{
     bind_cancel_target, discard_backend_with_cancel_unbind, next_client_cycle,
     read_startup_packet_with_buffer, release_backend_with_cancel_unbind, CancelSessionGuard,
     ClientCycle, IdleTimeoutKind, QueryProgress,
 };
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) use client_io::{handle_startup_or_cancel, ClientTlsIo, StartupOrCancel};
 pub(crate) use client_io::{read_startup_packet, StartupRead};
 use client_session::{handle_client, ClientSessionContext};
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) use client_session::{
+    handle_client_session, SharedBackendPool, SharedClientSessionContext,
+};
 pub(crate) use connection::ClientConnection;
 use connection::{backend_failure, BackendFailure};
 pub use connection::{retry_disposition, BackendFailureKind, RetryDisposition};
@@ -142,6 +156,11 @@ use request_plan::*;
 use session_snapshot::*;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
 const CANNOT_CONNECT_NOW_SQLSTATE: &str = "57P03";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 const INVALID_CATALOG_NAME_SQLSTATE: &str = "3D000";
@@ -166,6 +185,7 @@ struct ControlPlaneHandles {
     _admin_handle: Option<JoinHandle<()>>,
     _reload_handle: Option<JoinHandle<()>>,
     _adaptive_handle: Option<JoinHandle<()>>,
+    _pressure_handle: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct ShardContext {
@@ -192,7 +212,8 @@ pub(crate) struct ShardContext {
     pub runtime_shard_observability: bool,
 }
 
-struct ProxyRuntimeState {
+#[cfg_attr(not(all(target_os = "linux", feature = "io-uring")), allow(dead_code))]
+pub(crate) struct ProxyRuntimeState {
     effective_config: Config,
     phase_metrics_enabled: bool,
     phase_timing_sample_rate: f64,
@@ -207,30 +228,95 @@ struct ProxyRuntimeState {
     mirror_dispatcher: Arc<MirrorDispatcher>,
     route_pool_selector: RoutePoolSelector,
     control_route_pools: Arc<RoutePools>,
+    snapshot_store: SnapshotStore,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
     routing_planner: ReadRoutingPlanner,
     auth_query_service: Arc<AuthQueryService>,
+    cancel_registry: Arc<cancel::CancelRegistry>,
+}
+
+pub(crate) struct StartupBackendPlan {
+    pub(crate) route_database: String,
+    pub(crate) route_user: String,
+    pub(crate) route_application_name: Option<String>,
+    pub(crate) session_route: RouteKey,
+    pub(crate) route_pools: Arc<RoutePools>,
+    pub(crate) route_policy: RoutePolicy,
+    pub(crate) backend_startup_packet: BytesMut,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoutePolicy {
+    pub(crate) routing_planner: ReadRoutingPlanner,
+    pub(crate) read_after_write_timeout: Duration,
+    pub(crate) read_after_write_protection_enabled: bool,
+}
+
+impl RoutePolicy {
+    fn from_route_config(route_config: &RouteConfig) -> Self {
+        Self {
+            routing_planner: ReadRoutingPlanner::new(
+                route_config.read_routing.read_routing_mode,
+                route_config.read_routing.fallback_policy,
+                route_config.freshness.freshness_policy,
+                route_config.freshness.max_replica_lag_ms,
+            ),
+            read_after_write_timeout: Duration::from_millis(
+                route_config.freshness.read_after_write_timeout_ms,
+            ),
+            read_after_write_protection_enabled: matches!(
+                route_config.freshness.freshness_policy,
+                FreshnessPolicy::SessionWriteLsn | FreshnessPolicy::SessionWriteLsnAndMaxLag
+            ),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StartupBackendPlanError {
+    #[error("database \"{database}\" for user \"{user}\" is not configured on this proxy")]
+    UnknownRoute { database: String, user: String },
+
+    #[error(transparent)]
+    Invalid(#[from] anyhow::Error),
+}
+
+impl StartupBackendPlan {
+    #[must_use]
+    pub(crate) fn primary_backend_addr(&self) -> SocketAddr {
+        self.route_pools.primary().backend_addr()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RoutePoolSelector {
     default_pools: Option<Arc<RoutePools>>,
+    default_policy: Option<RoutePolicy>,
     registry: Arc<RoutePoolRegistry>,
+    policies: Arc<HashMap<PoolKey, RoutePolicy>>,
 }
 
 impl RoutePoolSelector {
     #[must_use]
-    fn default(default_pools: Arc<RoutePools>) -> Self {
+    fn default(default_pools: Arc<RoutePools>, default_policy: RoutePolicy) -> Self {
         Self {
             default_pools: Some(default_pools),
+            default_policy: Some(default_policy),
             registry: Arc::new(RoutePoolRegistry::new()),
+            policies: Arc::new(HashMap::new()),
         }
     }
 
     #[must_use]
-    fn configured(registry: Arc<RoutePoolRegistry>) -> Self {
+    fn configured(
+        registry: Arc<RoutePoolRegistry>,
+        policies: HashMap<PoolKey, RoutePolicy>,
+    ) -> Self {
         Self {
             default_pools: None,
+            default_policy: None,
             registry,
+            policies: Arc::new(policies),
         }
     }
 
@@ -240,6 +326,14 @@ impl RoutePoolSelector {
             .route_pools(route)
             .map(Arc::new)
             .or_else(|| self.default_pools.as_ref().map(Arc::clone))
+    }
+
+    #[must_use]
+    fn policy(&self, route: &RouteKey) -> Option<RoutePolicy> {
+        self.policies
+            .get(&route.selection_key())
+            .copied()
+            .or(self.default_policy)
     }
 
     #[must_use]
@@ -253,6 +347,100 @@ impl RoutePoolSelector {
         } else {
             targets.register_registry(Arc::clone(&self.registry));
         }
+    }
+
+    fn startup_backend_plan(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+        backend_user: Option<&str>,
+    ) -> Result<StartupBackendPlan, StartupBackendPlanError> {
+        let (route_database, route_user, route_application_name) =
+            startup_route_key(startup_packet)?;
+        let session_route = route_key(
+            &route_database,
+            &route_user,
+            route_application_name.as_deref(),
+            client_addr,
+        );
+        let Some(route_pools) = self.resolve(&session_route) else {
+            return Err(StartupBackendPlanError::UnknownRoute {
+                database: route_database,
+                user: route_user,
+            });
+        };
+        let route_policy = self
+            .policy(&session_route)
+            .context("missing policy for selected route")?;
+        let backend_startup_packet = rewrite_backend_startup_user(startup_packet, backend_user)?;
+
+        Ok(StartupBackendPlan {
+            route_database,
+            route_user,
+            route_application_name,
+            session_route,
+            route_pools,
+            route_policy,
+            backend_startup_packet,
+        })
+    }
+}
+
+impl ProxyRuntimeState {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn effective_config(&self) -> &Config {
+        &self.effective_config
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn default_primary_backend_addr(&self) -> SocketAddr {
+        self.control_route_pools.primary().backend_addr()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn backend_credentials(&self) -> Option<Arc<auth::BackendCredentials>> {
+        self.backend_credentials.load()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn auth_query_service(&self) -> Arc<AuthQueryService> {
+        Arc::clone(&self.auth_query_service)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn snapshot_store(&self) -> SnapshotStore {
+        self.snapshot_store.clone()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn cancel_registry(&self) -> Arc<cancel::CancelRegistry> {
+        Arc::clone(&self.cancel_registry)
+    }
+
+    pub(crate) fn startup_primary_backend_addr(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+    ) -> anyhow::Result<SocketAddr> {
+        Ok(self
+            .startup_backend_plan(startup_packet, client_addr, None)?
+            .primary_backend_addr())
+    }
+
+    pub(crate) fn startup_backend_plan(
+        &self,
+        startup_packet: &[u8],
+        client_addr: SocketAddr,
+        backend_user: Option<&str>,
+    ) -> anyhow::Result<StartupBackendPlan> {
+        Ok(self.route_pool_selector.startup_backend_plan(
+            startup_packet,
+            client_addr,
+            backend_user,
+        )?)
     }
 }
 
@@ -272,7 +460,7 @@ impl Proxy {
 
         Self {
             config,
-            buffer_pool: ProxyBufferPool::default(),
+            buffer_pool: default_buffer_pool(),
             client_slots,
             backend_slots,
             lifecycle,
@@ -304,8 +492,36 @@ impl Proxy {
         self.snapshot_store.clone()
     }
 
+    #[must_use]
+    pub(crate) fn available_client_slots(&self) -> usize {
+        self.client_slots.available_permits()
+    }
+
+    #[must_use]
+    pub(crate) fn available_backend_slots(&self) -> usize {
+        self.backend_slots.available_permits()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn buffer_pool(&self) -> ProxyBufferPool {
+        self.buffer_pool.clone()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn client_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.client_slots)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub(crate) fn backend_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.backend_slots)
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
-        let state = self.initialize_runtime_state().await?;
+        let state = self.initialize_runtime_state()?;
 
         let listener = TcpListener::bind(state.effective_config.connection.listen_addr)
             .await
@@ -325,11 +541,13 @@ impl Proxy {
             state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
+            Arc::clone(&state.pressure_route_in_flight_limit),
             &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
+            self.buffer_pool.clone(),
             state.mirror_outcome_recorder.clone(),
         )
         .await?;
@@ -413,10 +631,25 @@ impl Proxy {
     }
 
     async fn run_thread_per_core_inner(self) -> anyhow::Result<()> {
-        let state = self.initialize_runtime_state().await?;
+        let state = self.initialize_runtime_state()?;
         let listen_addr =
             resolve_runtime_listen_addr(state.effective_config.connection.listen_addr)?;
-        let shard_count = resolve_runtime_shard_count(&state.effective_config)?;
+        let resource_limits = limits::detect_cgroup_limits();
+        let shard_count = resolve_runtime_shard_count(&state.effective_config, resource_limits)?;
+        if state
+            .effective_config
+            .runtime
+            .engine
+            .runtime_shards
+            .is_none()
+        {
+            tracing::info!(
+                cpu_quota = ?resource_limits.cpu_quota,
+                mem_limit_bytes = ?resource_limits.mem_limit_bytes,
+                shards = shard_count,
+                "resolved implicit thread-per-core runtime sizing"
+            );
+        }
         let core_assignments = runtime_shard_core_assignments(shard_count);
         let (shutdown_completion_tx, shutdown_completion_rx) = watch::channel(None);
         let (startup_tx, startup_rx) = std::sync::mpsc::channel();
@@ -432,6 +665,7 @@ impl Proxy {
                 &state.default_route_config,
                 self.snapshot_store.clone(),
                 Arc::clone(&self.backend_slots),
+                Arc::clone(&state.pressure_route_in_flight_limit),
             );
             route_pool_selector.register_retirement_target(&state.route_pool_retirement_targets);
             let active_config = Arc::clone(&state.active_config);
@@ -571,11 +805,13 @@ impl Proxy {
             state.route_pool_retirement_targets.clone(),
             Arc::clone(&state.control_route_pools),
             Arc::clone(state.route_pool_selector.registry()),
+            Arc::clone(&state.pressure_route_in_flight_limit),
             &state.control_route_config,
             Arc::clone(&drain),
             Arc::clone(&self.pause),
             self.lifecycle.clone(),
             self.snapshot_store.clone(),
+            self.buffer_pool.clone(),
             state.mirror_outcome_recorder.clone(),
         )
         .await?;
@@ -663,7 +899,7 @@ impl Proxy {
         }
     }
 
-    async fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
+    pub(crate) fn initialize_runtime_state(&self) -> anyhow::Result<ProxyRuntimeState> {
         let effective_config = reload::load_effective_config(&self.config)?;
         effective_config.validate().map_err(anyhow::Error::msg)?;
         reload::validate_runtime_assets(&effective_config)?;
@@ -709,11 +945,14 @@ impl Proxy {
             effective_config.socket.clone(),
             mirror_outcome_recorder.clone(),
         ));
+        let pressure_route_in_flight_limit =
+            Arc::new(AtomicUsize::new(effective_config.qos.max_route_in_flight));
         let (route_pool_selector, control_route_pools) = build_route_pool_selector(
             &effective_config,
             &route_config,
             self.snapshot_store.clone(),
             Arc::clone(&self.backend_slots),
+            Arc::clone(&pressure_route_in_flight_limit),
         );
         let route_pool_retirement_targets = RoutePoolRetirementTargets::new();
         route_pool_selector.register_retirement_target(&route_pool_retirement_targets);
@@ -740,10 +979,33 @@ impl Proxy {
             mirror_dispatcher,
             route_pool_selector,
             control_route_pools,
+            snapshot_store: self.snapshot_store.clone(),
+            pressure_route_in_flight_limit,
             routing_planner,
             auth_query_service,
+            cancel_registry: Arc::clone(&self.cancel_registry),
         })
     }
+}
+
+fn default_buffer_pool() -> ProxyBufferPool {
+    let resource_limits = limits::detect_cgroup_limits();
+    let mut reuse_policy = BufferReusePolicy::default();
+    reuse_policy.max_cached_bytes = buffer_cache_budget(reuse_policy, resource_limits);
+    ProxyBufferPool::new(reuse_policy, OversizedBufferPolicy::default())
+}
+
+fn buffer_cache_budget(
+    reuse_policy: BufferReusePolicy,
+    resource_limits: limits::ResourceLimits,
+) -> usize {
+    resource_limits
+        .mem_limit_bytes
+        .map_or(reuse_policy.max_cached_bytes, |mem_limit_bytes| {
+            (mem_limit_bytes as usize / 100)
+                .max(reuse_policy.initial_capacity)
+                .min(reuse_policy.max_cached_bytes)
+        })
 }
 
 fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
@@ -756,14 +1018,16 @@ fn resolve_runtime_listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
     listener.local_addr().context("read reserved listener addr")
 }
 
-fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
+fn resolve_runtime_shard_count(
+    config: &Config,
+    resource_limits: limits::ResourceLimits,
+) -> anyhow::Result<usize> {
     let shard_count = match config.runtime.engine.runtime_shards {
         Some(shards) => shards,
-        None => core_affinity::get_core_ids()
-            .map(|cores| cores.len())
-            .filter(|cores| *cores > 0)
-            .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
-            .unwrap_or(1),
+        None => {
+            let host_parallelism = host_parallelism();
+            cgroup_shard_cap(resource_limits.cpu_quota, host_parallelism)
+        }
     };
 
     if shard_count == 0 {
@@ -771,6 +1035,23 @@ fn resolve_runtime_shard_count(config: &Config) -> anyhow::Result<usize> {
     }
 
     Ok(shard_count)
+}
+
+fn host_parallelism() -> usize {
+    core_affinity::get_core_ids()
+        .map(|cores| cores.len())
+        .filter(|cores| *cores > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+}
+
+fn cgroup_shard_cap(cpu_quota: Option<f64>, host_parallelism: usize) -> usize {
+    let host_parallelism = host_parallelism.max(1);
+    let Some(cpu_quota) = cpu_quota.filter(|quota| quota.is_finite() && *quota > 0.0) else {
+        return host_parallelism;
+    };
+
+    host_parallelism.min(cpu_quota.ceil().max(1.0) as usize)
 }
 
 fn runtime_shard_core_assignments(shard_count: usize) -> Vec<Option<core_affinity::CoreId>> {
@@ -802,11 +1083,13 @@ async fn run_control_plane(
     route_pool_retirement_targets: RoutePoolRetirementTargets,
     route_pools: Arc<RoutePools>,
     route_pool_registry: Arc<RoutePoolRegistry>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
     route_config: &RouteConfig,
     drain: Arc<DrainController>,
     pause: Arc<PauseController>,
     lifecycle: LifecycleController,
     snapshot_store: SnapshotStore,
+    buffer_pool: ProxyBufferPool,
     mirror_outcome_recorder: MirrorOutcomeRecorder,
 ) -> anyhow::Result<ControlPlaneHandles> {
     let health_handle = if let Some(health_addr) = effective_config.health.health_addr {
@@ -870,9 +1153,23 @@ async fn run_control_plane(
 
     let adaptive_handle = if effective_config.runtime.production.adaptive_enabled {
         let controller = AdaptiveController::new(
-            snapshot_store,
+            snapshot_store.clone(),
             mirror_outcome_recorder,
             Arc::clone(&active_config),
+        );
+        Some(tokio::spawn(async move {
+            controller.run().await;
+        }))
+    } else {
+        None
+    };
+
+    let pressure_handle = if effective_config.runtime.production.pressure.enabled {
+        let controller = PressureController::new(
+            Arc::clone(&active_config),
+            snapshot_store,
+            pressure_route_in_flight_limit,
+            buffer_pool,
         );
         Some(tokio::spawn(async move {
             controller.run().await;
@@ -886,6 +1183,7 @@ async fn run_control_plane(
         _admin_handle: admin_handle,
         _reload_handle: reload_handle,
         _adaptive_handle: adaptive_handle,
+        _pressure_handle: pressure_handle,
     })
 }
 
@@ -1230,6 +1528,7 @@ fn build_route_pools(
     snapshot_store: SnapshotStore,
     global_backend_slots: Option<Arc<Semaphore>>,
     global_backend_available: Option<Arc<tokio::sync::Notify>>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> RoutePools {
     let mut lifecycle = config.pool_lifecycle.clone();
     lifecycle.max_size = lifecycle.max_size.min(config.capacity.max_backends);
@@ -1244,7 +1543,7 @@ fn build_route_pools(
         lifecycle,
     );
 
-    let primary_pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
+    let primary_pool = BackendPool::new_with_socket_lifecycle_global_limit_notify_and_route_limit(
         route_config.primary.address,
         pool_args.0.clone(),
         pool_args.1.clone(),
@@ -1256,6 +1555,7 @@ fn build_route_pools(
         pool_args.7.clone(),
         global_backend_slots.clone(),
         global_backend_available.clone(),
+        Some(Arc::clone(&pressure_route_in_flight_limit)),
     );
     let primary = BackendPoolRef::primary(primary_pool);
     primary.attach_snapshot_store(snapshot_store.clone());
@@ -1265,7 +1565,7 @@ fn build_route_pools(
         .iter()
         .enumerate()
         .map(|(index, replica)| {
-            let pool = BackendPool::new_with_socket_lifecycle_and_global_limit_and_notify(
+            let pool = BackendPool::new_with_socket_lifecycle_global_limit_notify_and_route_limit(
                 replica.address,
                 pool_args.0.clone(),
                 pool_args.1.clone(),
@@ -1277,6 +1577,7 @@ fn build_route_pools(
                 pool_args.7.clone(),
                 global_backend_slots.clone(),
                 global_backend_available.clone(),
+                Some(Arc::clone(&pressure_route_in_flight_limit)),
             );
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
         })
@@ -1301,6 +1602,7 @@ fn build_route_pool_selector(
     default_route_config: &RouteConfig,
     snapshot_store: SnapshotStore,
     global_backend_slots: Arc<Semaphore>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> (RoutePoolSelector, Arc<RoutePools>) {
     if config.pools.is_empty() {
         let default_pools = Arc::new(build_route_pools(
@@ -1309,14 +1611,19 @@ fn build_route_pool_selector(
             snapshot_store,
             Some(global_backend_slots),
             None,
+            pressure_route_in_flight_limit,
         ));
         return (
-            RoutePoolSelector::default(Arc::clone(&default_pools)),
+            RoutePoolSelector::default(
+                Arc::clone(&default_pools),
+                RoutePolicy::from_route_config(default_route_config),
+            ),
             default_pools,
         );
     }
 
     let registry = Arc::new(RoutePoolRegistry::new());
+    let mut policies = HashMap::with_capacity(config.pools.len());
     let global_backend_available = Arc::new(tokio::sync::Notify::new());
     let mut control_route_pools = None;
     for pool_config in &config.pools {
@@ -1327,21 +1634,34 @@ fn build_route_pool_selector(
             None,
             QueryClass::Default,
         );
+        let route_config = RouteConfig::from_backend_addr(pool_config.backend_addr);
         let pools = build_route_pools_for_pool(
             config,
             pool_config,
             snapshot_store.clone(),
             Arc::clone(&global_backend_slots),
             Some(Arc::clone(&global_backend_available)),
+            Arc::clone(&pressure_route_in_flight_limit),
         );
         if control_route_pools.is_none() {
             control_route_pools = Some(Arc::new(pools.clone()));
         }
         registry.insert(route, pools);
+        policies.insert(
+            RouteKey::new(
+                pool_config.database.as_str(),
+                pool_config.user.as_str(),
+                None,
+                None,
+                QueryClass::Default,
+            )
+            .selection_key(),
+            RoutePolicy::from_route_config(&route_config),
+        );
     }
 
     (
-        RoutePoolSelector::configured(registry),
+        RoutePoolSelector::configured(registry, policies),
         control_route_pools.expect("non-empty pools has a control pool"),
     )
 }
@@ -1352,6 +1672,7 @@ fn build_route_pools_for_pool(
     snapshot_store: SnapshotStore,
     global_backend_slots: Arc<Semaphore>,
     global_backend_available: Option<Arc<tokio::sync::Notify>>,
+    pressure_route_in_flight_limit: Arc<AtomicUsize>,
 ) -> RoutePools {
     let mut scoped_config = config.clone();
     if let Some(max_backends) = pool_config.max_backends {
@@ -1365,14 +1686,31 @@ fn build_route_pools_for_pool(
         snapshot_store,
         Some(global_backend_slots),
         global_backend_available,
+        pressure_route_in_flight_limit,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::IoSlice;
+    use std::{
+        io::IoSlice,
+        sync::{atomic::AtomicUsize, Arc},
+        time::Duration,
+    };
 
-    use super::{auth_request_expects_client_response, connection::skip_empty_vectored_slices};
+    use super::{
+        auth_request_expects_client_response, build_route_pools, cgroup_shard_cap,
+        connection::skip_empty_vectored_slices, limits, resolve_runtime_shard_count,
+        BufferReusePolicy, Config, RoutePolicy, RoutePoolRegistry, RoutePoolSelector,
+        SnapshotStore,
+    };
+    use crate::config::{
+        BackendEndpointConfig, FreshnessConfig, HaConfig, ReadRoutingConfig, RouteConfig,
+    };
+    use pg_kinetic_core::{
+        traffic::route::{QueryClass, RouteKey},
+        traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    };
 
     fn auth_payload(code: i32) -> [u8; 4] {
         code.to_be_bytes()
@@ -1388,6 +1726,163 @@ mod tests {
     fn sasl_final_and_ok_do_not_expect_client_responses() {
         assert!(!auth_request_expects_client_response(&auth_payload(12)).unwrap());
         assert!(!auth_request_expects_client_response(&auth_payload(0)).unwrap());
+    }
+
+    #[test]
+    fn startup_plan_carries_policy_by_selected_route() {
+        let first_route = RouteKey::new("tenant", "alice", None, None, QueryClass::Default);
+        let second_route = RouteKey::new("tenant", "bob", None, None, QueryClass::Default);
+        let first_route_config = RouteConfig {
+            primary: BackendEndpointConfig::default(),
+            replicas: Vec::new(),
+            read_routing: ReadRoutingConfig {
+                read_routing_mode: ReadRoutingMode::PreferReplica,
+                fallback_policy: FallbackPolicy::Primary,
+            },
+            freshness: FreshnessConfig {
+                freshness_policy: FreshnessPolicy::None,
+                max_replica_lag_ms: 11,
+                read_after_write_timeout_ms: 125,
+            },
+            ha: HaConfig::default(),
+        };
+        let second_route_config = RouteConfig {
+            primary: BackendEndpointConfig {
+                address: "127.0.0.1:6544".parse().expect("valid backend address"),
+                ..BackendEndpointConfig::default()
+            },
+            replicas: Vec::new(),
+            read_routing: ReadRoutingConfig {
+                read_routing_mode: ReadRoutingMode::RequireReplica,
+                fallback_policy: FallbackPolicy::Reject,
+            },
+            freshness: FreshnessConfig {
+                freshness_policy: FreshnessPolicy::SessionWriteLsnAndMaxLag,
+                max_replica_lag_ms: 42,
+                read_after_write_timeout_ms: 750,
+            },
+            ha: HaConfig::default(),
+        };
+        let config = Config::default();
+        let snapshot_store = SnapshotStore::new();
+        let pressure_route_in_flight_limit = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(RoutePoolRegistry::new());
+        registry.insert(
+            first_route.clone(),
+            build_route_pools(
+                &config,
+                &first_route_config,
+                snapshot_store.clone(),
+                None,
+                None,
+                Arc::clone(&pressure_route_in_flight_limit),
+            ),
+        );
+        registry.insert(
+            second_route.clone(),
+            build_route_pools(
+                &config,
+                &second_route_config,
+                snapshot_store,
+                None,
+                None,
+                pressure_route_in_flight_limit,
+            ),
+        );
+        let selector = RoutePoolSelector::configured(
+            registry,
+            [
+                (
+                    first_route.selection_key(),
+                    RoutePolicy::from_route_config(&first_route_config),
+                ),
+                (
+                    second_route.selection_key(),
+                    RoutePolicy::from_route_config(&second_route_config),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let first_plan = selector
+            .startup_backend_plan(
+                &startup_packet("tenant", "alice"),
+                "127.0.0.1:7000".parse().expect("valid client address"),
+                None,
+            )
+            .expect("first startup plan");
+        assert_eq!(
+            first_plan.session_route.selection_key(),
+            first_route.selection_key()
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.read_routing_mode(),
+            ReadRoutingMode::PreferReplica
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.fallback_policy(),
+            FallbackPolicy::Primary
+        );
+        assert_eq!(
+            first_plan.route_policy.routing_planner.max_replica_lag_ms(),
+            11
+        );
+        assert_eq!(
+            first_plan.route_policy.read_after_write_timeout,
+            Duration::from_millis(125)
+        );
+        assert!(!first_plan.route_policy.read_after_write_protection_enabled);
+
+        let second_plan = selector
+            .startup_backend_plan(
+                &startup_packet("tenant", "bob"),
+                "127.0.0.1:7000".parse().expect("valid client address"),
+                None,
+            )
+            .expect("second startup plan");
+        assert_eq!(
+            second_plan.session_route.selection_key(),
+            second_route.selection_key()
+        );
+        assert_eq!(
+            second_plan.route_policy.routing_planner.read_routing_mode(),
+            ReadRoutingMode::RequireReplica
+        );
+        assert_eq!(
+            second_plan.route_policy.routing_planner.fallback_policy(),
+            FallbackPolicy::Reject
+        );
+        assert_eq!(
+            second_plan
+                .route_policy
+                .routing_planner
+                .max_replica_lag_ms(),
+            42
+        );
+        assert_eq!(
+            second_plan.route_policy.read_after_write_timeout,
+            Duration::from_millis(750)
+        );
+        assert!(second_plan.route_policy.read_after_write_protection_enabled);
+    }
+
+    fn startup_packet(database: &str, user: &str) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0, 0, 0, 0]);
+        packet.extend_from_slice(&196_608_i32.to_be_bytes());
+        packet.extend_from_slice(b"database");
+        packet.push(0);
+        packet.extend_from_slice(database.as_bytes());
+        packet.push(0);
+        packet.extend_from_slice(b"user");
+        packet.push(0);
+        packet.extend_from_slice(user.as_bytes());
+        packet.push(0);
+        packet.push(0);
+        let length = (packet.len() as i32).to_be_bytes();
+        packet[..4].copy_from_slice(&length);
+        packet
     }
 
     #[test]
@@ -1407,5 +1902,70 @@ mod tests {
 
         assert_eq!(slice_index, 2);
         assert_eq!(slice_offset, 0);
+    }
+
+    #[test]
+    fn cgroup_quota_caps_implicit_runtime_shards() {
+        assert_eq!(cgroup_shard_cap(Some(2.0), 16), 2);
+        assert_eq!(cgroup_shard_cap(Some(1.5), 16), 2);
+        assert_eq!(cgroup_shard_cap(Some(32.0), 16), 16);
+        assert_eq!(cgroup_shard_cap(None, 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(0.0), 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(f64::NAN), 16), 16);
+        assert_eq!(cgroup_shard_cap(Some(0.25), 16), 1);
+        assert_eq!(cgroup_shard_cap(Some(2.0), 0), 1);
+    }
+
+    #[test]
+    fn cgroup_memory_caps_cached_buffer_budget() {
+        let policy = BufferReusePolicy {
+            initial_capacity: 16 * 1024,
+            max_cached_sessions: 64,
+            max_cached_bytes: 4 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            super::buffer_cache_budget(
+                policy,
+                limits::ResourceLimits {
+                    cpu_quota: None,
+                    mem_limit_bytes: Some(128 * 1024 * 1024),
+                },
+            ),
+            128 * 1024 * 1024 / 100
+        );
+        assert_eq!(
+            super::buffer_cache_budget(
+                policy,
+                limits::ResourceLimits {
+                    cpu_quota: None,
+                    mem_limit_bytes: Some(512 * 1024),
+                },
+            ),
+            policy.initial_capacity
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_shards_are_not_cgroup_capped() {
+        let mut config = Config::default();
+        config.runtime.engine.runtime_shards = Some(4);
+
+        assert_eq!(
+            resolve_runtime_shard_count(&config, limits::ResourceLimits::default())
+                .expect("shards"),
+            4
+        );
+    }
+
+    #[test]
+    fn explicit_zero_runtime_shards_are_rejected() {
+        let mut config = Config::default();
+        config.runtime.engine.runtime_shards = Some(0);
+
+        let error = resolve_runtime_shard_count(&config, limits::ResourceLimits::default())
+            .expect_err("zero shards");
+
+        assert!(error.to_string().contains("runtime_shards"));
     }
 }

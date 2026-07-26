@@ -6,25 +6,27 @@ use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use pg_kinetic_core::{
-    adaptive::{AdaptiveMode, TunableKnob},
-    cleanup::PoolMode as CorePoolMode,
+    cluster::adaptive::{AdaptiveMode, TunableKnob},
+    cluster::cleanup::PoolMode as CorePoolMode,
+    cluster::recovery::RecoveryMode,
+    cluster::runtime::{NodeId, RuntimeEngine},
     constants::{BufferDefaults, QosDefaults, TimeoutDefaults},
-    mirror::MirrorMode,
-    policy::{PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId},
-    recovery::RecoveryMode,
-    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-    runtime::{NodeId, RuntimeEngine},
     security::{
         AuthMode as CoreAuthMode, BackendTlsMode as CoreBackendTlsMode,
         ClientTlsMode as CoreClientTlsMode,
     },
-    sharding::ShardId,
+    traffic::mirror::MirrorMode,
+    traffic::policy::{
+        PolicyHookPoint, PolicyId, PolicyMode, PolicyRouteTargetId, PolicyShardTargetId,
+    },
+    traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    traffic::sharding::ShardId,
 };
 
 #[cfg(feature = "policy-wasm")]
-use crate::policy_wasm::WasmPolicyEvaluator;
+use crate::routing::policy_wasm::WasmPolicyEvaluator;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum ClientTlsMode {
@@ -57,7 +59,7 @@ impl From<ClientTlsMode> for CoreClientTlsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum BackendTlsMode {
@@ -369,7 +371,7 @@ pub struct MirrorSamplingConfig {
 impl MirrorSamplingConfig {
     #[must_use]
     pub fn sample_rate(&self) -> f64 {
-        pg_kinetic_core::mirror::MirrorSample::new(self.mirror_sample_rate).rate()
+        pg_kinetic_core::traffic::mirror::MirrorSample::new(self.mirror_sample_rate).rate()
     }
 }
 
@@ -598,7 +600,11 @@ impl RuntimeEngineConfig {
 impl Default for RuntimeEngineConfig {
     fn default() -> Self {
         Self {
-            runtime_engine: RuntimeEngine::TokioDefault,
+            // Must match the clap/serde default. `merge_file_config` decides a CLI
+            // value was set explicitly by comparing it against `Config::default()`,
+            // so a disagreement here makes an unspecified flag look explicit and
+            // silently override the config file.
+            runtime_engine: default_runtime_engine(),
             experimental_runtime_enabled: false,
             runtime_shards: None,
         }
@@ -662,6 +668,88 @@ pub struct ProductionConfig {
     #[command(flatten)]
     #[serde(flatten)]
     pub adaptive: AdaptiveConfig,
+
+    #[command(flatten)]
+    pub pressure: PressureConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct PressureConfig {
+    #[arg(
+        long = "pressure-enabled",
+        env = "PG_KINETIC_PRESSURE_ENABLED",
+        default_value_t = false
+    )]
+    pub enabled: bool,
+
+    #[arg(
+        long = "pressure-cpu-high-pct",
+        env = "PG_KINETIC_PRESSURE_CPU_HIGH_PCT",
+        default_value_t = 20.0
+    )]
+    pub cpu_high_pct: f64,
+
+    #[arg(
+        long = "pressure-mem-high-pct",
+        env = "PG_KINETIC_PRESSURE_MEM_HIGH_PCT",
+        default_value_t = 10.0
+    )]
+    pub mem_high_pct: f64,
+
+    #[arg(
+        long = "pressure-min-in-flight-floor",
+        env = "PG_KINETIC_PRESSURE_MIN_IN_FLIGHT_FLOOR",
+        default_value_t = 1
+    )]
+    pub min_in_flight_floor: usize,
+
+    #[arg(
+        long = "pressure-window-ms",
+        env = "PG_KINETIC_PRESSURE_WINDOW_MS",
+        default_value_t = 5_000
+    )]
+    pub window_ms: u64,
+}
+
+impl PressureConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_pressure_threshold("pressure_cpu_high_pct", self.cpu_high_pct)?;
+        validate_pressure_threshold("pressure_mem_high_pct", self.mem_high_pct)?;
+        if self.min_in_flight_floor == 0 {
+            return Err(String::from(
+                "pressure_min_in_flight_floor must be greater than zero",
+            ));
+        }
+        if self.window_ms == 0 {
+            return Err(String::from("pressure_window_ms must be greater than zero"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn window(&self) -> Duration {
+        Duration::from_millis(self.window_ms)
+    }
+}
+
+impl Default for PressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cpu_high_pct: 20.0,
+            mem_high_pct: 10.0,
+            min_in_flight_floor: 1,
+            window_ms: 5_000,
+        }
+    }
+}
+
+fn validate_pressure_threshold(name: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(format!("{name} must be between 0.0 and 100.0"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
@@ -744,14 +832,14 @@ impl AdaptiveConfig {
 
     pub fn evaluate(
         &self,
-        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+        recommendation: &pg_kinetic_core::cluster::adaptive::AdaptiveRecommendation,
     ) -> Result<
-        pg_kinetic_core::adaptive::AdaptiveOutcome,
-        pg_kinetic_core::adaptive::AdaptiveApplyError,
+        pg_kinetic_core::cluster::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::cluster::adaptive::AdaptiveApplyError,
     > {
         if recommendation.confidence() < self.adaptive_min_confidence {
-            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                pg_kinetic_core::adaptive::AdaptiveGuardrail::ConfidenceFloor,
+            return Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::ConfidenceFloor,
                 format!(
                     "adaptive recommendation confidence {:.3} is below the minimum {:.3}",
                     recommendation.confidence(),
@@ -763,7 +851,7 @@ impl AdaptiveConfig {
         if self.adaptive_mode.is_apply() {
             self.apply.evaluate(recommendation, &self.guardrail)
         } else {
-            Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Recommended)
+            Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Recommended)
         }
     }
 }
@@ -832,19 +920,19 @@ impl AdaptiveApplyConfig {
 
     pub fn evaluate(
         &self,
-        recommendation: &pg_kinetic_core::adaptive::AdaptiveRecommendation,
+        recommendation: &pg_kinetic_core::cluster::adaptive::AdaptiveRecommendation,
         guardrail: &AdaptiveGuardrailConfig,
     ) -> Result<
-        pg_kinetic_core::adaptive::AdaptiveOutcome,
-        pg_kinetic_core::adaptive::AdaptiveApplyError,
+        pg_kinetic_core::cluster::adaptive::AdaptiveOutcome,
+        pg_kinetic_core::cluster::adaptive::AdaptiveApplyError,
     > {
         if !self.adaptive_apply_enabled {
-            return Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Skipped);
+            return Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Skipped);
         }
 
         if !self.allows(recommendation.knob()) {
-            return Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                pg_kinetic_core::adaptive::AdaptiveGuardrail::Allowlist,
+            return Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::Allowlist,
                 format!(
                     "adaptive knob '{}' is not on the apply allowlist",
                     recommendation.knob()
@@ -853,25 +941,25 @@ impl AdaptiveApplyConfig {
         }
 
         match recommendation.safety_bound() {
-            pg_kinetic_core::adaptive::TuningBound::Unbounded => {
-                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                    pg_kinetic_core::adaptive::AdaptiveGuardrail::UnboundedChange,
+            pg_kinetic_core::cluster::adaptive::TuningBound::Unbounded => {
+                Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::UnboundedChange,
                     "adaptive apply rejected an unbounded change",
                 ))
             }
-            pg_kinetic_core::adaptive::TuningBound::Percent(change_percent)
+            pg_kinetic_core::cluster::adaptive::TuningBound::Percent(change_percent)
                 if change_percent > guardrail.adaptive_max_change_percent =>
             {
-                Err(pg_kinetic_core::adaptive::AdaptiveApplyError::new(
-                    pg_kinetic_core::adaptive::AdaptiveGuardrail::MaxChangePercent,
+                Err(pg_kinetic_core::cluster::adaptive::AdaptiveApplyError::new(
+                    pg_kinetic_core::cluster::adaptive::AdaptiveGuardrail::MaxChangePercent,
                     format!(
                         "adaptive change percent {change_percent} exceeds the configured limit {}",
                         guardrail.adaptive_max_change_percent
                     ),
                 ))
             }
-            pg_kinetic_core::adaptive::TuningBound::Percent(_) => {
-                Ok(pg_kinetic_core::adaptive::AdaptiveOutcome::Applied)
+            pg_kinetic_core::cluster::adaptive::TuningBound::Percent(_) => {
+                Ok(pg_kinetic_core::cluster::adaptive::AdaptiveOutcome::Applied)
             }
         }
     }
@@ -900,8 +988,8 @@ impl AdaptiveGuardrailConfig {
     }
 
     #[must_use]
-    pub const fn safety_bound(&self) -> pg_kinetic_core::adaptive::TuningBound {
-        pg_kinetic_core::adaptive::TuningBound::percent(self.adaptive_max_change_percent)
+    pub const fn safety_bound(&self) -> pg_kinetic_core::cluster::adaptive::TuningBound {
+        pg_kinetic_core::cluster::adaptive::TuningBound::percent(self.adaptive_max_change_percent)
     }
 }
 
@@ -913,7 +1001,7 @@ impl Default for AdaptiveGuardrailConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ConnectionConfig {
     #[arg(long, env = "PG_KINETIC_LISTEN_ADDR", default_value = "127.0.0.1:6543")]
@@ -1608,7 +1696,7 @@ pub struct PolicyWasmConfig {
     pub policy_wasm_enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct CapacityConfig {
     #[arg(long, env = "PG_KINETIC_MAX_CLIENTS", default_value_t = 10_000)]
@@ -1734,7 +1822,7 @@ pub struct PerformanceConfig {
     pub backend_reset_query: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct AdminConfig {
     #[arg(long, env = "PG_KINETIC_ADMIN_ADDR")]
@@ -1755,6 +1843,21 @@ pub struct AdminConfig {
 
     #[arg(long, env = "PG_KINETIC_ADMIN_MAX_CLIENTS", default_value_t = 8)]
     pub admin_max_clients: usize,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        // Kept in step with the clap defaults above; see
+        // `clap_defaults_match_config_default`. A derived Default would give 0 here
+        // and make an unspecified flag override the config file.
+        Self {
+            admin_addr: None,
+            admin_require_tls: false,
+            admin_allowed_user: None,
+            admin_query_timeout_ms: 1_000,
+            admin_max_clients: 8,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
@@ -1813,11 +1916,33 @@ pub struct QosConfig {
     pub overload_error_code: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct ObservabilityConfig {
     #[arg(long, env = "PG_KINETIC_METRICS_ADDR")]
     pub metrics_addr: Option<SocketAddr>,
+
+    /// Tracing filter directive, e.g. `info` or `pg_kinetic=debug,warn`.
+    /// `RUST_LOG` takes precedence when set.
+    #[arg(long, env = "PG_KINETIC_LOG_LEVEL", default_value = "info")]
+    pub log_level: String,
+
+    #[arg(
+        long,
+        env = "PG_KINETIC_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    pub log_format: LogFormat,
 
     #[arg(
         long,
@@ -1851,6 +1976,8 @@ impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             metrics_addr: None,
+            log_level: String::from("info"),
+            log_format: LogFormat::Text,
             debug_trace_sampling_rate: 0.0,
             phase_timing_sample_rate: 0.0,
             otel_enabled: false,
@@ -1880,7 +2007,7 @@ impl ObservabilityConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct TlsConfig {
     #[arg(
@@ -2166,7 +2293,7 @@ impl Default for HealthConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Args, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Args, Serialize)]
 #[serde(default)]
 pub struct SocketConfig {
     #[arg(long, env = "PG_KINETIC_TCP_NODELAY", default_value_t = true)]
@@ -2248,6 +2375,14 @@ impl Config {
         config.runtime.engine.validate().map_err(|message| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
         })?;
+        config
+            .runtime
+            .production
+            .pressure
+            .validate()
+            .map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+            })?;
         Ok(config)
     }
 
@@ -2272,6 +2407,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.capacity.validate()?;
         self.auth.validate()?;
+        self.runtime.production.pressure.validate()?;
         self.validate_pool_configs()
     }
 
@@ -2722,9 +2858,9 @@ fn parse_runtime_engine(value: &str) -> Result<RuntimeEngine, String> {
         "tokio_default" => Ok(RuntimeEngine::TokioDefault),
         "tokio_current_thread" => Ok(RuntimeEngine::TokioCurrentThread),
         "thread_per_core" => Ok(RuntimeEngine::ThreadPerCore),
-        "experimental_io_uring" => Ok(RuntimeEngine::ExperimentalIoUring),
+        "io_uring" => Ok(RuntimeEngine::IoUring),
         _ => Err(format!(
-            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, experimental_io_uring"
+            "unsupported runtime engine '{value}', expected one of: tokio_default, tokio_current_thread, thread_per_core, io_uring"
         )),
     }
 }
@@ -2822,9 +2958,10 @@ mod tests {
     use super::{
         AuthFailureMessageMode, AuthMode, BackendEndpointConfig, BackendTlsMode, ClientTlsMode,
         Config, FallbackPolicy, FreshnessConfig, FreshnessPolicy, HaConfig, PoolLifecycleConfig,
-        PoolMode, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig, SocketConfig,
+        PoolMode, PressureConfig, ReadRoutingConfig, ReadRoutingMode, ReplicaConfig, RouteConfig,
+        SocketConfig,
     };
-    use crate::snapshot::SettingsSnapshot;
+    use crate::observe::snapshot::SettingsSnapshot;
     use clap::Parser;
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -2853,7 +2990,7 @@ mod tests {
         assert!(!config.runtime.node.node_id.as_str().is_empty());
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::ThreadPerCore
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
         assert_eq!(config.runtime.engine.runtime_shards, None);
@@ -2878,7 +3015,7 @@ mod tests {
         assert_eq!(config.performance.pool_mode, PoolMode::Transaction);
         assert_eq!(
             config.performance.recovery_mode,
-            pg_kinetic_core::recovery::RecoveryMode::Recover
+            pg_kinetic_core::cluster::recovery::RecoveryMode::Recover
         );
         assert_eq!(
             config.performance.recovery_timeout(),
@@ -3050,7 +3187,7 @@ mod tests {
         assert_eq!(config.runtime.node.node_id.as_str(), "proxy-a");
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::TokioCurrentThread
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::TokioCurrentThread
         );
         assert!(config.runtime.production.control_plane_enabled);
         assert!(config.runtime.production.mirroring_enabled);
@@ -3058,15 +3195,83 @@ mod tests {
     }
 
     #[test]
-    fn experimental_runtime_engines_require_explicit_config_gate() {
-        let error = toml::from_str::<Config>(
+    fn pressure_config_defaults_disabled_and_validates_thresholds() {
+        let pressure = PressureConfig::default();
+        assert!(!pressure.enabled);
+        assert_eq!(pressure.cpu_high_pct, 20.0);
+        assert_eq!(pressure.mem_high_pct, 10.0);
+        assert_eq!(pressure.min_in_flight_floor, 1);
+        pressure
+            .validate()
+            .expect("default pressure config is valid");
+
+        let mut invalid = pressure.clone();
+        invalid.cpu_high_pct = 101.0;
+        assert!(invalid.validate().expect_err("invalid cpu").contains("cpu"));
+
+        let mut invalid = pressure;
+        invalid.min_in_flight_floor = 0;
+        assert!(invalid
+            .validate()
+            .expect_err("invalid floor")
+            .contains("greater than zero"));
+    }
+
+    #[test]
+    fn pressure_config_parses_from_toml_and_cli() {
+        let config = toml::from_str::<Config>(
             r#"
-            [runtime.engine]
-            runtime_engine = "experimental_io_uring"
+            [runtime.production.pressure]
+            enabled = true
+            cpu_high_pct = 12.5
+            mem_high_pct = 8.0
+            min_in_flight_floor = 3
+            window_ms = 2500
             "#,
         )
-        .expect_err("ungated experimental runtime is rejected");
-        assert!(error.to_string().contains("experimental_runtime_enabled"));
+        .expect("pressure config parses");
+
+        assert!(config.runtime.production.pressure.enabled);
+        assert_eq!(config.runtime.production.pressure.cpu_high_pct, 12.5);
+        assert_eq!(config.runtime.production.pressure.mem_high_pct, 8.0);
+        assert_eq!(config.runtime.production.pressure.min_in_flight_floor, 3);
+        assert_eq!(config.runtime.production.pressure.window_ms, 2_500);
+
+        let config = Config::try_parse_from_args([
+            "pg-kinetic",
+            "--pressure-enabled",
+            "--pressure-cpu-high-pct",
+            "11.5",
+            "--pressure-mem-high-pct",
+            "9.5",
+            "--pressure-min-in-flight-floor",
+            "2",
+            "--pressure-window-ms",
+            "1000",
+        ])
+        .expect("pressure flags parse");
+
+        assert!(config.runtime.production.pressure.enabled);
+        assert_eq!(config.runtime.production.pressure.cpu_high_pct, 11.5);
+        assert_eq!(config.runtime.production.pressure.mem_high_pct, 9.5);
+        assert_eq!(config.runtime.production.pressure.min_in_flight_floor, 2);
+        assert_eq!(config.runtime.production.pressure.window_ms, 1_000);
+    }
+
+    #[test]
+    fn io_uring_parses_without_experimental_config_gate() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [runtime.engine]
+            runtime_engine = "io_uring"
+            "#,
+        )
+        .expect("stable io_uring runtime parses");
+        assert_eq!(
+            config.runtime.engine.runtime_engine,
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::IoUring
+        );
+        assert!(!config.runtime.engine.experimental_runtime_enabled);
 
         let error = toml::from_str::<Config>(
             r#"
@@ -3092,7 +3297,7 @@ mod tests {
 
         assert_eq!(
             config.runtime.engine.runtime_engine,
-            pg_kinetic_core::runtime::RuntimeEngine::ThreadPerCore
+            pg_kinetic_core::cluster::runtime::RuntimeEngine::ThreadPerCore
         );
         assert!(!config.runtime.engine.experimental_runtime_enabled);
         assert_eq!(config.runtime.engine.runtime_shards, Some(2));
@@ -3333,7 +3538,7 @@ mod tests {
         assert_eq!(config.performance.pool_mode, PoolMode::Session);
         assert_eq!(
             config.performance.recovery_mode,
-            pg_kinetic_core::recovery::RecoveryMode::Drop
+            pg_kinetic_core::cluster::recovery::RecoveryMode::Drop
         );
         assert_eq!(
             config.performance.recovery_timeout(),

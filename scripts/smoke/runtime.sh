@@ -25,8 +25,10 @@ if ! CARGO="$(resolve_command cargo)"; then
   exit 0
 fi
 if ! PYTHON="$(resolve_command python)"; then
-  skip "python is not available"
-  exit 0
+  if ! PYTHON="$(resolve_command python3)"; then
+    skip "python is not available"
+    exit 0
+  fi
 fi
 
 free_tcp_port() {

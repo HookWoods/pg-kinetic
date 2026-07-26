@@ -56,7 +56,6 @@ The HTTP health server does not implement `/drain`, so Kubernetes pre-stop HTTP 
 ```toml
 [runtime.engine]
 runtime_engine = "thread_per_core"
-experimental_runtime_enabled = false
 ```
 
 | Engine | Status |
@@ -64,15 +63,11 @@ experimental_runtime_enabled = false
 | `thread_per_core` | default and stable |
 | `tokio_default` | stable option |
 | `tokio_current_thread` | stable option |
-| `experimental_io_uring` | requires `experimental_runtime_enabled = true` |
+| `io_uring` | stable Linux option; requires the `io-uring` cargo feature |
 
-`experimental_io_uring` is a Linux-only plaintext pass-through experiment. It
-requires the `io-uring` cargo feature and currently rejects client TLS, backend
-TLS, and pg-kinetic-managed authentication modes. Use it only for isolated
-benchmarking against a trusted backend that performs its own PostgreSQL
-authentication. `thread_per_core`, `tokio_default`, and
-`tokio_current_thread` remain the runtime engines for the full
-pooled/authenticated proxy surface.
+[`io_uring`](./configuration.md#configuration-reference) uses monoio for the accept and transport layer while reusing the
+shared pg-kinetic session, authentication, routing, pooling, timeout, cleanup,
+and recovery logic.
 
 ## Preflight
 

@@ -14,7 +14,7 @@ use pg_kinetic::{
         RouteConfig,
     },
     proxy::Proxy,
-    proxy_runtime::snapshot::{ReplicaHealthSnapshot, SnapshotStore},
+    proxy_runtime::observe::snapshot::{ReplicaHealthSnapshot, SnapshotStore},
     wire::{
         admin::{build_admin_table_response, AdminWireColumn, AdminWireType},
         backend::parse_backend_frame,
@@ -24,12 +24,12 @@ use pg_kinetic::{
     },
 };
 use pg_kinetic_core::{
-    ha::{
+    cluster::ha::{
         EndpointHealth, EndpointRoleState, HealthProbeOutcome, ReplicaLagState, RoleProbeOutcome,
         SplitBrainWarning,
     },
-    lsn::PgLsn,
-    routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+    cluster::lsn::PgLsn,
+    traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -418,7 +418,7 @@ fn publish_replica_health(
     let mut snapshot = ReplicaHealthSnapshot::new(
         replica_id,
         replica_addr,
-        pg_kinetic_core::routing::BackendRole::Replica,
+        pg_kinetic_core::traffic::routing::BackendRole::Replica,
     );
     snapshot.health = HealthProbeOutcome::new(EndpointHealth::Healthy, false, 0);
     snapshot.role = RoleProbeOutcome::new(EndpointRoleState::Replica, None);
@@ -439,13 +439,13 @@ fn publish_replica_split_brain_health(
     replica_addr: SocketAddr,
     replay_lsn: PgLsn,
     lag_ms: u64,
-    expected_role: pg_kinetic_core::routing::BackendRole,
-    observed_role: pg_kinetic_core::routing::BackendRole,
+    expected_role: pg_kinetic_core::traffic::routing::BackendRole,
+    observed_role: pg_kinetic_core::traffic::routing::BackendRole,
 ) {
     let mut snapshot = ReplicaHealthSnapshot::new(
         replica_id,
         replica_addr,
-        pg_kinetic_core::routing::BackendRole::Replica,
+        pg_kinetic_core::traffic::routing::BackendRole::Replica,
     );
     snapshot.health = HealthProbeOutcome::new(EndpointHealth::Healthy, false, 0);
     snapshot.role = RoleProbeOutcome::new(
@@ -845,8 +845,8 @@ async fn split_brain_role_warning_follows_fallback_policy() {
         replica_addr,
         PgLsn::from_parts(0, 40),
         5,
-        pg_kinetic_core::routing::BackendRole::Replica,
-        pg_kinetic_core::routing::BackendRole::Primary,
+        pg_kinetic_core::traffic::routing::BackendRole::Replica,
+        pg_kinetic_core::traffic::routing::BackendRole::Primary,
     );
 
     let mut client = open_client(proxy_addr).await;

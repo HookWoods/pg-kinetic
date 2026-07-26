@@ -13,11 +13,12 @@ keywords:
 
 For evaluators who want a quick performance picture before reading the full benchmarking workflow.
 
-These charts use a reviewed live Linux VM run collected on July 23, 2026.
-They are not universal performance claims. They are a reproducible snapshot
-from one isolated environment: Docker on Linux, 16 CPUs, five 30-second rounds
-per target, one PostgreSQL instance per target, and pg-kinetic running with the
-`thread_per_core` runtime engine.
+These charts use reviewed live Linux VM runs. They are not universal
+performance claims. They are reproducible snapshots from isolated environments,
+with five 30-second rounds per target and one PostgreSQL instance per target.
+
+The latest result on this page is the July 24, 2026 `io_uring` simple-query
+run.
 
 The comparison uses capacity-matched benchmark settings: each PostgreSQL
 backend accepts up to 512 connections, pg-kinetic uses
@@ -25,7 +26,32 @@ backend accepts up to 512 connections, pg-kinetic uses
 and PgDog use `default_pool_size=512`. Detailed phase timing and debug trace
 sampling were disabled for the run.
 
-## Simple Query Throughput
+## Latest io_uring Simple Query
+
+Higher throughput is better. Lower latency is better.
+
+```mermaid
+xychart-beta
+  title "Simple query throughput at c=256, qps"
+  x-axis ["direct", "PgBouncer", "PgDog", "thread/core", "io_uring"]
+  y-axis "queries per second" 0 --> 120000
+  bar [111780, 28098, 24788, 57807, 65327]
+```
+
+| Target | c=64 median TPS | c=64 median ms | c=256 median TPS | c=256 median ms |
+| --- | ---: | ---: | ---: | ---: |
+| direct PostgreSQL | 105,358.8 | 0.607 | 111,780.2 | 2.290 |
+| PgBouncer | 31,614.1 | 2.024 | 28,097.9 | 9.111 |
+| PgDog | 25,787.2 | 2.482 | 24,787.7 | 10.328 |
+| pg-kinetic `thread_per_core` | 54,259.8 | 1.180 | 57,807.4 | 4.428 |
+| pg-kinetic `io_uring` | 59,969.5 | 1.067 | 65,327.0 | 3.919 |
+
+In this run, `io_uring` is about 10.5% faster than `thread_per_core` at c=64
+and about 13.0% faster at c=256. It is about 132.5% faster than PgBouncer and
+about 163.6% faster than PgDog at c=256. Direct PostgreSQL remains the
+throughput ceiling.
+
+## Prior thread_per_core Simple Query
 
 Higher is better.
 
@@ -44,7 +70,7 @@ xychart-beta
 | PgDog | 21,111.7 | 3.031 | 19,886.1 | 12.873 |
 | pg-kinetic | 32,808.2 | 1.951 | 38,099.2 | 6.719 |
 
-## Prepared Statement Throughput
+## Prior thread_per_core Prepared Statement
 
 Higher is better.
 
@@ -63,7 +89,7 @@ xychart-beta
 | PgDog | 20,957.4 | 3.054 | 20,353.6 | 12.578 |
 | pg-kinetic | 40,984.7 | 1.562 | 50,572.9 | 5.062 |
 
-## Tail Latency
+## Prior thread_per_core Tail Latency
 
 Lower is better.
 
@@ -84,20 +110,21 @@ Direct PostgreSQL is the ceiling for proxy overhead, not a drop-in comparison fo
 
 PgBouncer and PgDog are included as directional comparison targets because the benchmark stack starts one isolated PostgreSQL backend per target. These numbers do not claim broad feature parity or global superiority.
 
-In this snapshot, pg-kinetic is the fastest pooler target for both simple and
-prepared read-only workloads. At c=256 it is about 62% faster than PgBouncer on
-simple queries and about 129% faster on prepared statement reuse. Direct
-PostgreSQL remains the throughput ceiling and is about 31% ahead of pg-kinetic
-at c=256.
+In the July 24 `io_uring` snapshot, pg-kinetic is the fastest pooler target for
+the simple-query workload at both c=64 and c=256. In the July 23
+`thread_per_core` snapshot, pg-kinetic is the fastest pooler target for both
+simple and prepared read-only workloads. Direct PostgreSQL remains the
+throughput ceiling in both snapshots.
 
 Transaction-pool write-heavy results are intentionally excluded from the
 headline table. The current TPC-B style write workload is dominated by
 PostgreSQL commit and fsync behavior, so it is not a clean proxy-overhead
 comparison.
 
-## Commands Used
+## Prior thread_per_core Commands
 
-The run used the compose benchmark stack with the comparison profile:
+The July 23 `thread_per_core` run used the compose benchmark stack with the
+comparison profile:
 
 ```bash
 export PGPASSWORD=postgres
@@ -166,7 +193,12 @@ The checked-in baseline reports used by the regression score gate are:
 - `bench/baselines/transaction-pool.json`
 - `bench/baselines/prepared.json`
 
-The July 23, 2026 capacity-matched VM run was collected as raw benchmark output
-outside Git. Read [Benchmarking](./benchmarking.md) before updating these
-numbers. Do not replace checked-in baselines with dry-run output or a single
-local measurement.
+The July 23, 2026 capacity-matched VM run and the July 24, 2026 `io_uring` run
+were collected as raw benchmark output outside Git. Read
+[Benchmarking](./benchmarking.md) before updating these numbers. Do not replace
+checked-in baselines with dry-run output or a single local measurement.
+
+No reviewed `io_uring` flamegraph is currently published with these results.
+When profiling a new `io_uring` run, retain the raw `perf`, folded-stack, and
+flamegraph artifacts outside Git and summarize the top costs beside the
+throughput and tail-latency tables.

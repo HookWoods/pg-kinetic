@@ -54,7 +54,9 @@ async def exercise_asyncpg(url):
 async def exercise_sqlalchemy(url):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
-    if url.startswith("postgresql://"):
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(url, pool_size=1, max_overflow=0)
     try:

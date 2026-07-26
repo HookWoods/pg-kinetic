@@ -2,9 +2,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use pg_kinetic::{
     config::Config,
-    core::runtime::{RuntimeEngine, ShutdownReason},
+    core::cluster::runtime::{RuntimeEngine, ShutdownReason},
     proxy::Proxy,
-    proxy_runtime::snapshot::SnapshotStore,
+    proxy_runtime::observe::snapshot::SnapshotStore,
 };
 use tokio::{net::TcpListener, time};
 
@@ -27,7 +27,7 @@ async fn stable_thread_per_core_publishes_shards_and_drains() {
     assert_eq!(rows[0].shard_id, 0);
     assert_eq!(rows[1].shard_id, 1);
     assert!(rows.iter().all(|row| {
-        row.lifecycle_state == pg_kinetic::core::runtime::RuntimeLifecycleState::Ready
+        row.lifecycle_state == pg_kinetic::core::cluster::runtime::RuntimeLifecycleState::Ready
     }));
 
     assert!(lifecycle.begin_drain(ShutdownReason::AdminRequest));
@@ -43,14 +43,14 @@ async fn stable_thread_per_core_publishes_shards_and_drains() {
     let stopped_rows = snapshot_store.runtime_shard_snapshots();
     assert_eq!(stopped_rows.len(), 2);
     assert!(stopped_rows.iter().all(|row| {
-        row.lifecycle_state == pg_kinetic::core::runtime::RuntimeLifecycleState::Stopped
+        row.lifecycle_state == pg_kinetic::core::cluster::runtime::RuntimeLifecycleState::Stopped
     }));
 }
 
 async fn wait_for_runtime_shards(
     snapshot_store: &SnapshotStore,
     expected_rows: usize,
-) -> Vec<pg_kinetic::proxy_runtime::snapshot::RuntimeShardSnapshot> {
+) -> Vec<pg_kinetic::proxy_runtime::observe::snapshot::RuntimeShardSnapshot> {
     let deadline = time::Instant::now() + Duration::from_secs(5);
 
     while time::Instant::now() < deadline {

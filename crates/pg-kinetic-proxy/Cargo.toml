@@ -7,7 +7,7 @@ readme.workspace = true
 
 [features]
 default = []
-io-uring = ["dep:monoio"]
+io-uring = ["dep:monoio", "dep:monoio-rustls"]
 policy-wasm = ["dep:wasmi"]
 
 [dependencies]
@@ -45,6 +45,7 @@ wasmi = { version = "1.1.0", default-features = false, features = ["std", "wat"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 monoio = { version = "0.2.4", default-features = false, features = ["iouring", "macros"], optional = true }
+monoio-rustls = { version = "0.4.0", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "param"] }

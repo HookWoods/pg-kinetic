@@ -69,6 +69,16 @@ fn overload_error_responses_include_clear_fields() {
 
 #[tokio::test]
 async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = listener.local_addr().expect("backend addr");
+    tokio::spawn(async move {
+        loop {
+            let _ = listener.accept().await.expect("accept backend");
+        }
+    });
+
     let route = RouteKey::new(
         "pgkinetic",
         "postgres",
@@ -78,15 +88,19 @@ async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
     );
 
     let queue_full = BackendPool::new(
-        "127.0.0.1:1".parse().expect("backend addr"),
+        backend_addr,
         TlsConfig::default(),
+        2,
         1,
         1,
-        0,
         0,
         Duration::from_millis(5),
         "DISCARD ALL",
     );
+    let _held_queue_slot = queue_full
+        .checkout(route.clone())
+        .await
+        .expect("held queue slot");
     let queue_full_error = queue_full
         .checkout(route.clone())
         .await
@@ -97,15 +111,19 @@ async fn backpressure_checkout_queue_full_and_timeout_errors_are_distinct() {
     ));
 
     let timeout = BackendPool::new(
-        "127.0.0.1:1".parse().expect("backend addr"),
+        backend_addr,
         TlsConfig::default(),
+        2,
         1,
         1,
-        0,
         1,
         Duration::from_millis(5),
         "DISCARD ALL",
     );
+    let _held_timeout_slot = timeout
+        .checkout(route.clone())
+        .await
+        .expect("held timeout slot");
     let timeout_error = timeout.checkout(route).await.expect_err("timeout");
     assert!(matches!(
         timeout_error,

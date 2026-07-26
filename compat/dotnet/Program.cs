@@ -37,10 +37,12 @@ if (requested == "ef-core")
     return;
 }
 
+var connectionString = ToConnectionString(url);
+
 var started = Environment.TickCount64;
 try
 {
-    await using var dataSource = NpgsqlDataSource.Create(url);
+    await using var dataSource = NpgsqlDataSource.Create(connectionString);
     await using var connection = await dataSource.OpenConnectionAsync();
     await using (var command = new NpgsqlCommand("SELECT 1", connection))
     {
@@ -86,4 +88,25 @@ catch (Exception error)
         error_summary = $"{error.GetType().Name}: {error.Message}"
     }));
     Environment.ExitCode = 1;
+}
+
+static string ToConnectionString(string value)
+{
+    if (!value.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase)
+        && !value.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+    {
+        return value;
+    }
+
+    var uri = new Uri(value);
+    var credentials = uri.UserInfo.Split(':', 2);
+    var builder = new NpgsqlConnectionStringBuilder
+    {
+        Host = uri.Host,
+        Port = uri.Port > 0 ? uri.Port : 5432,
+        Database = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/')),
+        Username = credentials.Length > 0 ? Uri.UnescapeDataString(credentials[0]) : null,
+        Password = credentials.Length > 1 ? Uri.UnescapeDataString(credentials[1]) : null,
+    };
+    return builder.ConnectionString;
 }

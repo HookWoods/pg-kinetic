@@ -46,7 +46,7 @@ The proxy parses enough frontend and backend messages to understand startup para
 
 ## Runtime Engines
 
-Runtime engines plug in at accept and task scheduling boundaries. `thread_per_core` is the default stable engine, while `tokio_default` and `tokio_current_thread` remain stable selectable engines. `experimental_io_uring` is opt-in and outside the default release path.
+Runtime engines plug in at accept and task scheduling boundaries. `thread_per_core` is the default stable engine, while `tokio_default`, `tokio_current_thread`, and Linux [`io_uring`](./production-runtime.md#runtime-engine-selection) remain stable selectable engines. `io_uring` requires a binary compiled with the `io-uring` cargo feature.
 
 The engine does not change the documented safety model. TLS/authentication support, pooling behavior, read routing, admin snapshots, and recovery rules remain governed by the stable runtime contract for the selected engine.
 

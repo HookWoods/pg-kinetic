@@ -18,22 +18,22 @@ use pg_kinetic::{
         ShardTargetConfig, ShardingConfig, SocketConfig, TlsConfig,
     },
     core::{
-        lsn::PgLsn,
-        route::{QueryClass, RouteKey},
-        routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
-        sharding::{
+        cluster::lsn::PgLsn,
+        traffic::route::{QueryClass, RouteKey},
+        traffic::routing::{FallbackPolicy, FreshnessPolicy, ReadRoutingMode},
+        traffic::sharding::{
             ShardDrainPolicy, ShardId, ShardLifecycleState, ShardMigrationSafetyReport,
             ShardMigrationState, ShardRebalancePlan,
         },
     },
     proxy::Proxy,
     proxy_runtime::{
-        metrics as proxy_metrics,
-        sharding::RouteMapReloadErrorCode,
-        snapshot::{
+        observe::metrics as proxy_metrics,
+        observe::snapshot::{
             RouteMapReloadSnapshot, RoutePolicySnapshot, RouteSnapshot, ShardLifecycleSnapshot,
             ShardMigrationSafetySnapshot, SnapshotStore,
         },
+        routing::sharding::RouteMapReloadErrorCode,
     },
     wire::{
         backend::{parse_backend_frame, BackendFrame, ReadyStatus},
@@ -225,21 +225,21 @@ async fn sharding_metrics_use_bucketed_labels_and_reject_sensitive_data() {
     proxy_metrics::record_shard_route_decision(
         &route,
         Some("tenant-a"),
-        pg_kinetic::core::sharding::ShardStrategy::Hash,
-        pg_kinetic::core::sharding::ShardRouteReason::HashMatch,
+        pg_kinetic::core::traffic::sharding::ShardStrategy::Hash,
+        pg_kinetic::core::traffic::sharding::ShardRouteReason::HashMatch,
         "selected",
     );
     proxy_metrics::record_shard_multi_shard_rejection(
         &route,
         Some("tenant-b"),
-        pg_kinetic::core::sharding::MultiShardPolicy::FanOut,
-        pg_kinetic::core::sharding::ShardRouteReason::MultiShardRejected,
+        pg_kinetic::core::traffic::sharding::MultiShardPolicy::FanOut,
+        pg_kinetic::core::traffic::sharding::ShardRouteReason::MultiShardRejected,
         "rejected",
     );
     proxy_metrics::record_shard_primary_fallback(
         &route,
         Some("tenant-c"),
-        pg_kinetic::core::sharding::MultiShardPolicy::Reject,
+        pg_kinetic::core::traffic::sharding::MultiShardPolicy::Reject,
         "fallback",
     );
 

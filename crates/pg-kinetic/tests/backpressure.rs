@@ -6,7 +6,10 @@ use pg_kinetic::route::{QueryClass, RouteKey};
 use std::time::Duration;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 static METRICS_RECORDER: OnceLock<Arc<TestRecorder>> = OnceLock::new();
@@ -108,6 +111,40 @@ async fn grants_capacity_when_slot_available() {
     assert_eq!(gate.in_flight(), 1);
     drop(permit);
     assert_eq!(gate.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn dynamic_gate_ceiling_lowers_without_revoking_permits() {
+    let limit = Arc::new(AtomicUsize::new(2));
+    let gate = BackpressureGate::with_dynamic_limit(4, 1, Arc::clone(&limit));
+    let first = gate
+        .checkout(Duration::from_millis(10))
+        .await
+        .expect("first permit");
+    let second = gate
+        .checkout(Duration::from_millis(10))
+        .await
+        .expect("second permit");
+
+    gate.set_limit(1);
+
+    assert_eq!(gate.in_flight(), 2);
+    assert_eq!(gate.limit(), 1);
+    drop(second);
+    assert_eq!(gate.in_flight(), 1);
+    drop(first);
+    assert_eq!(gate.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn dynamic_gate_restore_never_exceeds_configured_capacity() {
+    let limit = Arc::new(AtomicUsize::new(1));
+    let gate = BackpressureGate::with_dynamic_limit(3, 1, Arc::clone(&limit));
+
+    gate.set_limit(99);
+
+    assert_eq!(gate.limit(), 3);
+    assert_eq!(limit.load(Ordering::Acquire), 3);
 }
 
 #[tokio::test]
