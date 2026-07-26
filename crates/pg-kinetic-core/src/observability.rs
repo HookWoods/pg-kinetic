@@ -1252,6 +1252,7 @@ impl LabelPolicy {
     pub const DRIVER: &'static str = "driver";
     pub const METRIC: &'static str = "metric";
     pub const FEATURE: &'static str = "feature";
+    pub const PRIORITY: &'static str = "priority";
     #[must_use]
     pub fn allows(label: &str) -> bool {
         matches!(
@@ -1297,6 +1298,7 @@ impl LabelPolicy {
                 | Self::DRIVER
                 | Self::METRIC
                 | Self::FEATURE
+                | Self::PRIORITY
         )
     }
 }
