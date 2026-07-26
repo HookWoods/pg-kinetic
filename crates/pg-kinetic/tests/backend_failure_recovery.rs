@@ -110,6 +110,9 @@ async fn spawn_proxy_with_backend(behavior: BackendBehavior) -> (SocketAddr, Arc
         },
         routes: Vec::new(),
         pools: Vec::new(),
+        guardrails: Default::default(),
+        audit: Default::default(),
+        resilience: Default::default(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,

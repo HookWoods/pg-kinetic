@@ -1503,13 +1503,6 @@ where
         self.sync_pool_snapshot();
     }
 
-    pub fn configure_resilience(&self, config: &ResilienceConfig) {
-        self.breaker.configure(BreakerConfig {
-            failure_threshold: config.breaker_failure_threshold,
-            cooldown: config.breaker_cooldown(),
-        });
-    }
-
     pub(crate) async fn checkout_with_mode<O>(
         self: &Arc<Self>,
         owner: O,

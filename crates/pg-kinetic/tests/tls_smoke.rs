@@ -85,6 +85,9 @@ fn base_config(
         },
         routes: Vec::new(),
         pools: Vec::new(),
+        guardrails: Default::default(),
+        audit: Default::default(),
+        resilience: Default::default(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,

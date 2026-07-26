@@ -64,6 +64,9 @@ async fn proxy_accepts_two_clients_with_one_backend_capacity() {
         },
         routes: Vec::new(),
         pools: Vec::new(),
+        guardrails: Default::default(),
+        audit: Default::default(),
+        resilience: Default::default(),
         runtime: Default::default(),
         capacity: CapacityConfig {
             max_clients: 10,
