@@ -45,16 +45,16 @@ impl AuditDispatcher {
         }
 
         let sink = config.sink.clone();
-        Some(Self::new_with_writer(move || open_sink(sink.as_ref())))
+        Self::new_with_writer(move || open_sink(sink.as_ref()))
     }
 
-    fn new_with_writer<F>(open_writer: F) -> Self
+    fn new_with_writer<F>(open_writer: F) -> Option<Self>
     where
         F: FnOnce() -> io::Result<Box<dyn Write + Send>> + Send + 'static,
     {
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(String::from("pg-kinetic-audit"))
             .spawn(move || {
                 let Ok(mut writer) = open_writer() else {
@@ -69,16 +69,24 @@ impl AuditDispatcher {
                         break;
                     }
                 }
-            })
-            .expect("audit worker thread must start");
+            });
+        if let Err(error) = worker {
+            tracing::warn!(error = %error, "audit worker thread did not start");
+            return None;
+        }
 
-        Self { sender, dropped }
+        Some(Self { sender, dropped })
     }
 
-    pub fn record(&self, record: AuditRecord) {
-        if let Err(TrySendError::Full(_)) = self.sender.try_send(record) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            crate::observe::metrics::record_audit_drop();
+    #[must_use]
+    pub fn record(&self, record: AuditRecord) -> bool {
+        match self.sender.try_send(record) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                crate::observe::metrics::record_audit_drop();
+                false
+            }
         }
     }
 
@@ -120,8 +128,9 @@ pub fn record_query(
         latency_ms: latency.as_millis().min(u64::MAX as u128) as u64,
         rows,
     };
-    dispatcher.record(record);
-    crate::observe::metrics::record_audit_record();
+    if dispatcher.record(record) {
+        crate::observe::metrics::record_audit_record();
+    }
 }
 
 fn open_sink(path: Option<&PathBuf>) -> io::Result<Box<dyn Write + Send>> {
@@ -216,8 +225,8 @@ mod tests {
             latency_ms: 1,
             rows: 1,
         };
-        dispatcher.record(record.clone());
-        dispatcher.record(record);
+        assert!(dispatcher.record(record.clone()));
+        assert!(!dispatcher.record(record));
         assert_eq!(dispatcher.dropped(), 1);
     }
 
@@ -225,8 +234,9 @@ mod tests {
     fn sink_failure_does_not_escape_worker() {
         let dispatcher = AuditDispatcher::new_with_writer(|| {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "test sink"))
-        });
-        dispatcher.record(AuditRecord {
+        })
+        .expect("worker thread starts");
+        let _ = dispatcher.record(AuditRecord {
             route: String::from("route"),
             identity: String::from("identity"),
             fingerprint: String::from("select ?"),
@@ -236,6 +246,27 @@ mod tests {
             latency_ms: 1,
             rows: 0,
         });
+    }
+
+    #[test]
+    fn disconnected_enqueue_is_dropped_and_not_accepted() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        let dispatcher = AuditDispatcher {
+            sender: tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        assert!(!dispatcher.record(AuditRecord {
+            route: String::from("route"),
+            identity: String::from("identity"),
+            fingerprint: String::from("select ?"),
+            template: String::from("select ?"),
+            query_class: String::from("write"),
+            outcome: String::from("ok"),
+            latency_ms: 1,
+            rows: 0,
+        }));
+        assert_eq!(dispatcher.dropped(), 1);
     }
 
     #[test]

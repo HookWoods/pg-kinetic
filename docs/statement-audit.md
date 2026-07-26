@@ -25,7 +25,8 @@ statement shape and should be treated as sensitive operational metadata.
 The queue is bounded and uses a nonblocking enqueue. When it is full, records
 are dropped and `pg_kinetic_audit_dropped_total` increases; query sessions are
 never held for audit I/O. Sink open, write, and flush failures stop the audit
-worker without stopping the proxy.
+worker without stopping the proxy; records attempted after worker exit are also
+counted as dropped and are not included in `pg_kinetic_audit_records_total`.
 
 Operators must restrict sink permissions, protect collected files and transport
 endpoints, and set retention according to their privacy and incident-response
