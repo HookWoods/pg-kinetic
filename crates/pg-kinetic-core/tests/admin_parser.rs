@@ -19,6 +19,10 @@ fn parses_supported_show_commands() {
         AdminCommand::Show(AdminView::Backpressure)
     );
     assert_eq!(
+        parse_admin_command("SHOW FAIRNESS;"),
+        AdminCommand::Show(AdminView::Fairness)
+    );
+    assert_eq!(
         parse_admin_command("show pressure"),
         AdminCommand::Show(AdminView::Pressure)
     );

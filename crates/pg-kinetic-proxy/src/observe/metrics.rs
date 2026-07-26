@@ -782,6 +782,15 @@ pub fn increment_backpressure_event(route: &RouteKey, outcome: &'static str) {
     .increment(1);
 }
 
+pub fn increment_route_shed(route: &RouteKey, priority: &'static str) {
+    metrics_crate::counter!(
+        pg_kinetic_core::constants::MetricName::RouteShedTotal.as_str(),
+        "route" => route.metric_label_shared(),
+        "priority" => priority
+    )
+    .increment(1);
+}
+
 pub fn record_route_wait(route: &RouteKey, wait_ms: f64, outcome: &'static str) {
     metrics_crate::histogram!(
         MetricName::RouteCheckoutWaitMs.as_str(),

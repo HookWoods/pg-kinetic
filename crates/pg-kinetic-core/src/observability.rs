@@ -283,6 +283,7 @@ pub enum MetricLabel {
     Reason,
     QueryClass,
     Route,
+    Priority,
     Source,
     Shard,
     Strategy,
@@ -328,6 +329,7 @@ impl MetricLabel {
             Self::Reason => "reason",
             Self::QueryClass => "query_class",
             Self::Route => "route",
+            Self::Priority => "priority",
             Self::Source => "source",
             Self::Shard => "shard",
             Self::Strategy => "strategy",
@@ -469,6 +471,7 @@ const SHARD_LIFECYCLE_LABELS: &[MetricLabel] = &[MetricLabel::Shard, MetricLabel
 const SHARD_COUNT_LABELS: &[MetricLabel] = &[MetricLabel::Shard];
 const ROUTE_OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Outcome];
 const ROUTE_SCOPE_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Scope];
+const ROUTE_PRIORITY_LABELS: &[MetricLabel] = &[MetricLabel::Route, MetricLabel::Priority];
 const TRIGGER_ACTION_OUTCOME_LABELS: &[MetricLabel] = &[
     MetricLabel::Trigger,
     MetricLabel::Action,
@@ -934,6 +937,14 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Route waiting checkout count",
         ROUTE_SCOPE_LABELS,
         "Route labels omit raw client addresses and stay derived from route identity only.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_route_shed_total",
+        MetricKind::Counter,
+        "1",
+        "Route shedding decisions by route and priority",
+        ROUTE_PRIORITY_LABELS,
+        "Route identity and the three priority values are bounded policy labels.",
     ),
     MetricDescriptor::new(
         "pg_kinetic_timeout_total",

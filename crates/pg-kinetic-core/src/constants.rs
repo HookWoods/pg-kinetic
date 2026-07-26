@@ -37,6 +37,7 @@ pub enum MetricName {
     RouteCheckoutWaitMs,
     RouteInFlight,
     RouteWaiting,
+    RouteShedTotal,
     TimeoutTotal,
     BufferLimitTotal,
 }
@@ -57,6 +58,7 @@ impl MetricName {
             Self::RouteCheckoutWaitMs => "pg_kinetic_route_checkout_wait_ms",
             Self::RouteInFlight => "pg_kinetic_route_in_flight",
             Self::RouteWaiting => "pg_kinetic_route_waiting",
+            Self::RouteShedTotal => "pg_kinetic_route_shed_total",
             Self::TimeoutTotal => "pg_kinetic_timeout_total",
             Self::BufferLimitTotal => "pg_kinetic_buffer_limit_total",
         }

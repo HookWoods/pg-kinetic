@@ -1,6 +1,7 @@
 use metrics::{Counter, Gauge, Histogram, Key, Metadata, Recorder};
 use pg_kinetic::backpressure::{
     BackpressureCoordinator, BackpressureError, BackpressureGate, RouteBackpressureSnapshot,
+    RouteFairnessConfig, RoutePriority,
 };
 use pg_kinetic::route::{QueryClass, RouteKey};
 use std::time::Duration;
@@ -47,6 +48,7 @@ fn qos_metric_labels_are_stable() {
     pg_kinetic::metrics::record_route_wait(&route, 12.5, "ok");
     pg_kinetic::metrics::record_route_in_flight(&route, 3);
     pg_kinetic::metrics::record_route_waiting(&route, 4);
+    pg_kinetic::metrics::increment_route_shed(&route, "sheddable");
     pg_kinetic::metrics::increment_timeout("idle_timeout");
     pg_kinetic::metrics::increment_timeout("query_timeout");
     pg_kinetic::metrics::increment_buffer_limit("buffer_limit");
@@ -93,6 +95,10 @@ fn qos_metric_labels_are_stable() {
     assert!(recorder.has_metric(
         "pg_kinetic_route_waiting",
         &[("route", route_label.as_str()), ("scope", "route")]
+    ));
+    assert!(recorder.has_metric(
+        "pg_kinetic_route_shed_total",
+        &[("route", route_label.as_str()), ("priority", "sheddable")]
     ));
     assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "idle_timeout")]));
     assert!(recorder.has_metric("pg_kinetic_timeout_total", &[("kind", "query_timeout")]));
@@ -314,6 +320,130 @@ async fn snapshots_expose_route_waiting_and_in_flight_counts() {
 
     drop(held);
     waiter.await.expect("waiter task completed");
+}
+
+#[tokio::test]
+async fn configured_route_cap_does_not_reduce_other_route_capacity() {
+    let coordinator = BackpressureCoordinator::with_capacity(3, 100, 4);
+    let route_a = route_key("api-a");
+    let route_b = route_key("api-b");
+    coordinator
+        .configure_route(
+            route_a.clone(),
+            RouteFairnessConfig {
+                max_in_flight: Some(2),
+                ..RouteFairnessConfig::default()
+            },
+        )
+        .expect("valid route policy");
+
+    let first = coordinator
+        .checkout(route_a.clone(), Duration::from_millis(10))
+        .await
+        .expect("first route A permit");
+    let second = coordinator
+        .checkout(route_a.clone(), Duration::from_millis(10))
+        .await
+        .expect("second route A permit");
+    assert_eq!(coordinator.route_snapshot(&route_a).in_flight, 2);
+
+    let other_route = coordinator
+        .checkout(route_b.clone(), Duration::from_millis(10))
+        .await
+        .expect("route B remains available");
+    assert_eq!(coordinator.global_snapshot().in_flight, 3);
+    assert_eq!(coordinator.route_snapshot(&route_b).in_flight, 1);
+
+    let capped = coordinator
+        .checkout(route_a, Duration::from_millis(1))
+        .await
+        .expect_err("route A cap is enforced");
+    assert_eq!(capped, BackpressureError::Timeout);
+    drop(other_route);
+    drop(second);
+    drop(first);
+}
+
+#[tokio::test]
+async fn sheddable_routes_are_rejected_before_critical_routes() {
+    let coordinator = BackpressureCoordinator::with_capacity(1, 10, 2);
+    let holder_route = route_key("holder");
+    let critical_route = route_key("critical");
+    let sheddable_route = route_key("batch");
+    coordinator
+        .configure_route(
+            critical_route.clone(),
+            RouteFairnessConfig {
+                priority: RoutePriority::Critical,
+                ..RouteFairnessConfig::default()
+            },
+        )
+        .expect("valid critical policy");
+    coordinator
+        .configure_route(
+            sheddable_route.clone(),
+            RouteFairnessConfig {
+                priority: RoutePriority::Sheddable,
+                ..RouteFairnessConfig::default()
+            },
+        )
+        .expect("valid sheddable policy");
+    let held = coordinator
+        .checkout(holder_route, Duration::from_millis(10))
+        .await
+        .expect("global capacity holder");
+
+    assert_eq!(
+        coordinator
+            .checkout(sheddable_route, Duration::from_millis(10))
+            .await
+            .expect_err("sheddable work is shed first"),
+        BackpressureError::QueueFull
+    );
+    let waiter = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .checkout(critical_route, Duration::from_millis(100))
+                .await
+                .expect("critical work waits for capacity")
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    drop(held);
+    waiter.await.expect("critical checkout completes");
+}
+
+#[tokio::test]
+async fn noisy_route_cannot_starve_second_client() {
+    let coordinator = BackpressureCoordinator::with_capacity(1, 1, 8);
+    let noisy = route_key("noisy");
+    let quiet = route_key("quiet");
+    let held = coordinator
+        .checkout(noisy.clone(), Duration::from_millis(10))
+        .await
+        .expect("initial noisy permit");
+    let quiet_waiter = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .checkout(quiet, Duration::from_millis(200))
+                .await
+                .expect("quiet client eventually gets capacity")
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    drop(held);
+
+    let quiet_permit = quiet_waiter.await.expect("quiet client is not starved");
+    drop(quiet_permit);
+    for _ in 0..8 {
+        let permit = coordinator
+            .checkout(noisy.clone(), Duration::from_millis(10))
+            .await
+            .expect("noisy route can continue after quiet client");
+        drop(permit);
+    }
 }
 
 fn install_metrics_recorder() -> Arc<TestRecorder> {

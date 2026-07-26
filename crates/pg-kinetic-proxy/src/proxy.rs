@@ -1737,6 +1737,9 @@ mod tests {
         let second_route = RouteKey::new("tenant", "bob", None, None, QueryClass::Default);
         let first_route_config = RouteConfig {
             primary: BackendEndpointConfig::default(),
+            weight: 1,
+            max_in_flight: None,
+            priority: crate::config::RoutePriority::Normal,
             replicas: Vec::new(),
             read_routing: ReadRoutingConfig {
                 read_routing_mode: ReadRoutingMode::PreferReplica,
@@ -1754,6 +1757,9 @@ mod tests {
                 address: "127.0.0.1:6544".parse().expect("valid backend address"),
                 ..BackendEndpointConfig::default()
             },
+            weight: 1,
+            max_in_flight: None,
+            priority: crate::config::RoutePriority::Normal,
             replicas: Vec::new(),
             read_routing: ReadRoutingConfig {
                 read_routing_mode: ReadRoutingMode::RequireReplica,

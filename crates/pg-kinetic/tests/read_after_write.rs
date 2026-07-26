@@ -335,6 +335,9 @@ async fn spawn_proxy(
             connect_timeout_ms: 100,
             tls_mode: pg_kinetic::config::BackendTlsMode::Disable,
         },
+        weight: 1,
+        max_in_flight: None,
+        priority: pg_kinetic::config::RoutePriority::Normal,
         replicas: vec![ReplicaConfig {
             address: replica_addr,
             connect_timeout_ms: 100,

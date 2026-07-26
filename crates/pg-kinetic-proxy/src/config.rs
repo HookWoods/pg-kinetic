@@ -1059,6 +1059,15 @@ fn validate_pool_configs(pools: &[PoolConfig]) -> Result<(), String> {
 pub struct RouteConfig {
     pub primary: BackendEndpointConfig,
 
+    #[serde(default = "default_route_weight")]
+    pub weight: u32,
+
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
+
+    #[serde(default)]
+    pub priority: RoutePriority,
+
     #[serde(default)]
     pub replicas: Vec<ReplicaConfig>,
 
@@ -1080,12 +1089,29 @@ impl RouteConfig {
                 address,
                 ..BackendEndpointConfig::default()
             },
+            weight: default_route_weight(),
+            max_in_flight: None,
+            priority: RoutePriority::Normal,
             replicas: Vec::new(),
             read_routing: ReadRoutingConfig::default(),
             freshness: FreshnessConfig::default(),
             ha: HaConfig::default(),
         }
     }
+}
+
+fn default_route_weight() -> u32 {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum RoutePriority {
+    Critical,
+    #[default]
+    Normal,
+    Sheddable,
 }
 
 impl Default for RouteConfig {
@@ -2412,6 +2438,14 @@ impl Config {
         self.capacity.validate()?;
         self.auth.validate()?;
         self.runtime.production.pressure.validate()?;
+        for route in self.effective_routes() {
+            if route.weight == 0 {
+                return Err("route weight must be greater than zero".to_string());
+            }
+            if route.max_in_flight == Some(0) {
+                return Err("route max_in_flight must be greater than zero".to_string());
+            }
+        }
         self.validate_pool_configs()
     }
 

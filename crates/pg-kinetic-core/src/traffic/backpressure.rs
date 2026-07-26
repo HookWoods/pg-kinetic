@@ -20,6 +20,43 @@ pub struct RouteBackpressureSnapshot {
     pub waiting: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RoutePriority {
+    Critical,
+    #[default]
+    Normal,
+    Sheddable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteFairnessConfig {
+    pub weight: usize,
+    pub max_in_flight: Option<usize>,
+    pub priority: RoutePriority,
+}
+
+impl Default for RouteFairnessConfig {
+    fn default() -> Self {
+        Self {
+            weight: 1,
+            max_in_flight: None,
+            priority: RoutePriority::Normal,
+        }
+    }
+}
+
+impl RouteFairnessConfig {
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.weight == 0 {
+            return Err("route fairness weight must be greater than zero");
+        }
+        if self.max_in_flight == Some(0) {
+            return Err("route fairness max_in_flight must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BackpressureGate {
     capacity: Arc<Semaphore>,
@@ -47,6 +84,7 @@ struct PermitCounter {
 pub struct BackpressureCoordinator {
     global: BackpressureGate,
     routes: Arc<Mutex<HashMap<RouteKey, BackpressureGate>>>,
+    policies: Arc<Mutex<HashMap<RouteKey, RouteFairnessConfig>>>,
     max_route_in_flight: usize,
     max_route_waiters: usize,
 }
@@ -227,20 +265,66 @@ impl BackpressureGate {
 impl BackpressureCoordinator {
     #[must_use]
     pub fn new(max_route_in_flight: usize, max_route_waiters: usize) -> Self {
+        Self::with_capacity(usize::MAX >> 3, max_route_in_flight, max_route_waiters)
+    }
+
+    #[must_use]
+    pub fn with_capacity(
+        max_in_flight: usize,
+        max_route_in_flight: usize,
+        max_route_waiters: usize,
+    ) -> Self {
         Self {
-            global: BackpressureGate::unbounded(max_route_waiters),
+            global: BackpressureGate::new(max_in_flight, max_route_waiters),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            policies: Arc::new(Mutex::new(HashMap::new())),
             max_route_in_flight,
             max_route_waiters,
         }
     }
 
+    pub fn configure_route(
+        &self,
+        route: RouteKey,
+        config: RouteFairnessConfig,
+    ) -> Result<(), &'static str> {
+        config.validate()?;
+        self.policies
+            .lock()
+            .expect("route fairness policy map poisoned")
+            .insert(route, config);
+        Ok(())
+    }
+
     fn route_gate(&self, route: &RouteKey) -> BackpressureGate {
         let mut routes = self.routes.lock().expect("route map poisoned");
+        let policy = self
+            .policies
+            .lock()
+            .expect("route fairness policy map poisoned")
+            .get(route)
+            .copied()
+            .unwrap_or_default();
+        let configured_weight = self
+            .policies
+            .lock()
+            .expect("route fairness policy map poisoned")
+            .values()
+            .map(|policy| policy.weight)
+            .sum::<usize>()
+            .max(1);
+        let weighted_limit = self
+            .max_route_in_flight
+            .saturating_mul(policy.weight)
+            .saturating_div(configured_weight)
+            .max(1);
         routes
             .entry(route.clone())
             .or_insert_with(|| {
-                BackpressureGate::new(self.max_route_in_flight, self.max_route_waiters)
+                BackpressureGate::new(
+                    policy.max_in_flight.unwrap_or(weighted_limit),
+                    self.max_route_waiters,
+                )
             })
             .clone()
     }
@@ -253,6 +337,18 @@ impl BackpressureCoordinator {
         let deadline = time::Instant::now() + timeout;
         let route_gate = self.route_gate(&route);
         let route_permit = route_gate.checkout_until(deadline).await?;
+        let priority = self
+            .policies
+            .lock()
+            .expect("route fairness policy map poisoned")
+            .get(&route)
+            .copied()
+            .unwrap_or_default()
+            .priority;
+        if priority == RoutePriority::Sheddable && self.global.in_flight() >= self.global.limit() {
+            drop(route_permit);
+            return Err(BackpressureError::QueueFull);
+        }
         let global_permit = self.global.checkout_until(deadline).await?;
 
         Ok(BackpressurePermit::join(route_permit, global_permit))

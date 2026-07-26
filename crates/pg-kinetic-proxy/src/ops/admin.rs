@@ -541,6 +541,7 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
         AdminView::Backpressure => {
             backpressure_table(&state.snapshot_store.backpressure_snapshots())
         }
+        AdminView::Fairness => fairness_table(config),
         AdminView::Policies => policies_table(
             state.snapshot_store.policy_status_snapshot(),
             &state.snapshot_store.policy_reload_snapshots(),
@@ -1228,6 +1229,38 @@ fn backpressure_table(backpressure: &[BackpressureSnapshot]) -> AdminTable {
                     snapshot.rejected.to_string(),
                     snapshot.timed_out.to_string(),
                     snapshot.canceled.to_string(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn fairness_table(config: &Config) -> AdminTable {
+    admin_table(
+        AdminView::Fairness,
+        &[
+            ("route", AdminColumnType::Int8),
+            ("weight", AdminColumnType::Int8),
+            ("max_in_flight", AdminColumnType::Int8),
+            ("priority", AdminColumnType::Text),
+        ],
+        config
+            .effective_routes()
+            .into_iter()
+            .enumerate()
+            .map(|(index, route)| {
+                AdminRow::new(vec![
+                    index.to_string(),
+                    route.weight.to_string(),
+                    route
+                        .max_in_flight
+                        .map_or_else(|| "unbounded".to_string(), |limit| limit.to_string()),
+                    match route.priority {
+                        crate::config::RoutePriority::Critical => "critical",
+                        crate::config::RoutePriority::Normal => "normal",
+                        crate::config::RoutePriority::Sheddable => "sheddable",
+                    }
+                    .to_string(),
                 ])
             })
             .collect(),
