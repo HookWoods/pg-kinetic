@@ -1473,25 +1473,23 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         )
         .await;
         let retry = match &result {
-            Ok(Err(error)) => {
-                error
-                    .downcast_ref::<BackendFailure>()
-                    .map(|failure| {
-                        !retry_attempted
-                            && retry_disposition(
-                                failure.kind,
-                                failure.response_started,
-                                safe_request_to_replay(
-                                    &frames,
-                                    &request_plans,
-                                    &session,
-                                    resilience.failover_replay_session_state,
-                                ),
-                            ) == RetryDisposition::RetryBeforeResponse
-                    })
-                    .unwrap_or(false)
-                    && resilience.failover_enabled
-            }
+            Ok(Err(error)) => error
+                .downcast_ref::<BackendFailure>()
+                .is_some_and(|failure| {
+                    !retry_attempted
+                        && retry_disposition(
+                            failure.kind,
+                            failure.response_started,
+                            safe_request_to_replay(&frames, &request_plans, &session, false)
+                                || (resilience.failover_enabled
+                                    && safe_request_to_replay(
+                                        &frames,
+                                        &request_plans,
+                                        &session,
+                                        resilience.failover_replay_session_state,
+                                    )),
+                        ) == RetryDisposition::RetryBeforeResponse
+                }),
             _ => false,
         };
         if !retry {
@@ -1500,10 +1498,16 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
 
         backend.mark_failed();
         discard_backend_with_cancel_unbind(cancel_registry, client_key, backend).await;
-        let Some(reconnect_timeout) =
-            bounded_reconnect_timeout(resilience.failover_max_reconnect(), query_deadline)
+        let max_reconnect = if resilience.failover_enabled {
+            resilience.failover_max_reconnect()
+        } else {
+            qos.query_timeout()
+        };
+        let Some(reconnect_timeout) = bounded_reconnect_timeout(max_reconnect, query_deadline)
         else {
-            metrics::record_failover_failed();
+            if resilience.failover_enabled {
+                metrics::record_failover_failed();
+            }
             error_response_and_ready_with_state(
                 client,
                 "57P01",
@@ -1557,7 +1561,9 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         let replacement = match replacement {
             Ok(Ok(replacement)) => replacement,
             _ => {
-                metrics::record_failover_failed();
+                if resilience.failover_enabled {
+                    metrics::record_failover_failed();
+                }
                 error_response_and_ready_with_state(
                     client,
                     "57P01",
@@ -1577,7 +1583,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         &result,
         Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)))
     );
-    if retry_attempted && matches!(&result, Ok(Ok(_))) {
+    if resilience.failover_enabled && retry_attempted && matches!(&result, Ok(Ok(_))) {
         metrics::record_failover_survived();
     }
     if !matches!(&result, Ok(Ok(ForwardOutcome::Flushed))) {
