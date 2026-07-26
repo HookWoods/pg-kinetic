@@ -27,7 +27,7 @@ async fn client_disconnect_after_begin_rolls_back_before_release() {
 
     run_client_query_and_read_response(proxy_addr, "begin").await;
 
-    let events = collect_events(&mut seen).await;
+    let events = collect_events_until(&mut seen, |event| event == "ROLLBACK").await;
     assert!(events.iter().any(|event| event == "begin"));
     assert!(events.iter().any(|event| event == "ROLLBACK"));
     assert!(!events.iter().any(|event| event == "SYNC"));
@@ -40,7 +40,7 @@ async fn client_terminate_after_begin_rolls_back_before_release() {
 
     run_client_query_then_terminate(proxy_addr, "begin").await;
 
-    let events = collect_events(&mut seen).await;
+    let events = collect_events_until(&mut seen, |event| event == "ROLLBACK").await;
     assert!(events.iter().any(|event| event == "begin"));
     assert!(events.iter().any(|event| event == "ROLLBACK"));
 }
@@ -114,7 +114,8 @@ async fn rollback_only_rolls_back_transactions_but_discards_streams() {
 
     run_client_query_and_read_response(transaction_addr, "begin").await;
 
-    let transaction_events = collect_events(&mut transaction_seen).await;
+    let transaction_events =
+        collect_events_until(&mut transaction_seen, |event| event == "ROLLBACK").await;
     assert!(transaction_events.iter().any(|event| event == "ROLLBACK"));
 
     let (stream_addr, mut stream_seen) = spawn_proxy_with_backend(
@@ -432,6 +433,31 @@ async fn collect_events(receiver: &mut mpsc::Receiver<String>) -> Vec<String> {
     let mut events = Vec::new();
     while let Ok(Some(event)) = time::timeout(Duration::from_millis(200), receiver.recv()).await {
         events.push(event);
+    }
+    events
+}
+
+async fn collect_events_until(
+    receiver: &mut mpsc::Receiver<String>,
+    predicate: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    let deadline = time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match time::timeout(remaining, receiver.recv()).await {
+            Ok(Some(event)) => {
+                let done = predicate(&event);
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            _ => break,
+        }
     }
     events
 }
