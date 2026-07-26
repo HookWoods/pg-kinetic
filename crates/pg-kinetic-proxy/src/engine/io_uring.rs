@@ -360,6 +360,7 @@ mod linux {
             read_after_write_protection_enabled: route_policy.read_after_write_protection_enabled,
             routing_planner: route_policy.routing_planner,
             snapshot_store: runtime_state.snapshot_store(),
+            audit_config: effective_config.audit.clone(),
             phase_recorder: crate::observe::telemetry::phase_timing_recorder(false),
             session_id: crate::proxy::next_session_id(),
             _backend: std::marker::PhantomData,

@@ -207,6 +207,9 @@ pub struct Config {
     pub observability: ObservabilityConfig,
 
     #[command(flatten)]
+    pub audit: AuditConfig,
+
+    #[command(flatten)]
     pub tls: TlsConfig,
 
     #[command(flatten)]
@@ -223,6 +226,59 @@ pub struct Config {
 
     #[command(flatten)]
     pub socket: SocketConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    #[arg(
+        long = "audit-enabled",
+        id = "audit-enabled",
+        env = "PG_KINETIC_AUDIT_ENABLED",
+        default_value_t = false
+    )]
+    pub enabled: bool,
+
+    #[arg(long = "audit-sink", id = "audit-sink", env = "PG_KINETIC_AUDIT_SINK")]
+    pub sink: Option<PathBuf>,
+
+    #[arg(
+        long = "audit-sample-rate",
+        id = "audit-sample-rate",
+        env = "PG_KINETIC_AUDIT_SAMPLE_RATE",
+        default_value_t = 1.0
+    )]
+    pub sample_rate: f64,
+
+    #[arg(
+        long = "audit-include-reads",
+        id = "audit-include-reads",
+        env = "PG_KINETIC_AUDIT_INCLUDE_READS",
+        default_value_t = false
+    )]
+    pub include_reads: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sink: None,
+            sample_rate: 1.0,
+            include_reads: false,
+        }
+    }
+}
+
+impl AuditConfig {
+    #[must_use]
+    pub fn sample_rate(&self) -> f64 {
+        if self.sample_rate.is_finite() {
+            self.sample_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Args, Serialize)]

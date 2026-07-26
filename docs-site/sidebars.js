@@ -54,6 +54,7 @@ const sidebars = {
         { type: 'doc', id: 'policy', label: 'Policy (Preview)' },
         { type: 'doc', id: 'mirroring', label: 'Mirroring (Not active)' },
         { type: 'doc', id: 'adaptive-ops', label: 'Adaptive Operations (Simulation)' },
+        'statement-audit',
         'metrics',
       ],
     },

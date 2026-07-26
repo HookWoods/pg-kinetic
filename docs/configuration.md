@@ -152,6 +152,10 @@ Use the rollout sequence `Observe -> review -> Enforce`: first collect bounded f
 | `observability.otel_enabled` | bool | `false` | `--otel-enabled` | `PG_KINETIC_OTEL_ENABLED` | restart | Export is disabled when false. |
 | `observability.otel_endpoint` | optional string | unset | `--otel-endpoint` | `PG_KINETIC_OTEL_ENDPOINT` | restart | Invalid endpoint fails at exporter setup/use. |
 | `observability.otel_service_name` | string | `pg-kinetic` | `--otel-service-name` | `PG_KINETIC_OTEL_SERVICE_NAME` | restart | Empty or misleading names affect telemetry identity. |
+| `audit.enabled` | bool | `false` | `--audit-enabled` | `PG_KINETIC_AUDIT_ENABLED` | restart | Enables bounded asynchronous statement audit records. |
+| `audit.sink` | optional path | unset | `--audit-sink` | `PG_KINETIC_AUDIT_SINK` | restart | JSON-lines destination; unset writes to stderr. Sink errors do not stop the proxy. |
+| `audit.sample_rate` | float | `1.0` | `--audit-sample-rate` | `PG_KINETIC_AUDIT_SAMPLE_RATE` | restart | Deterministic fingerprint-based sampling, clamped to `0.0..=1.0`. |
+| `audit.include_reads` | bool | `false` | `--audit-include-reads` | `PG_KINETIC_AUDIT_INCLUDE_READS` | restart | Includes read-class statements; writes and non-read classes remain eligible by default. |
 | `tls.client_tls_mode` | enum | `disable` | `--client-tls-mode` | `PG_KINETIC_CLIENT_TLS_MODE` | restart | Invalid enum fails parse. Values: `disable`, `allow`, `require`, `verify_client`. |
 | `tls.client_cert_path` | optional path | unset | `--client-cert-path` | `PG_KINETIC_CLIENT_TLS_CERT_PATH` | restart | TLS startup fails if required file cannot load. |
 | `tls.client_key_path` | optional path | unset | `--client-key-path` | `PG_KINETIC_CLIENT_TLS_KEY_PATH` | restart | TLS startup fails if required key cannot load. |

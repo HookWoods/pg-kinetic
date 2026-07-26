@@ -62,6 +62,8 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 | `pg_kinetic_runtime_readiness_state` | gauge | `state` | live proxy | Runtime readiness state. |
 | `pg_kinetic_runtime_shutdown_total` | counter | `reason` | shutdown path | Shutdown reasons. |
 | `pg_kinetic_protocol_phase_duration_ms` | histogram | `phase`, `outcome` | live proxy with `metrics_addr` configured | Detailed protocol phase timings. Controlled by `observability.phase_timing_sample_rate`; each session is either fully sampled or omitted, while core health, pool, error, and backpressure metrics remain available. |
+| `pg_kinetic_audit_records_total` | counter | none | audit enabled | Accepted metadata-only records. |
+| `pg_kinetic_audit_dropped_total` | counter | none | audit enabled | Records dropped when the bounded audit queue is full. |
 
 Set `phase_timing_sample_rate = 0.0` to disable detailed phase histogram samples while retaining the mandatory operational metrics. The default is `1.0`. A session's phase sequence is sampled as one unit, so partial phase sequences are not produced by the sampler.
 

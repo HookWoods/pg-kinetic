@@ -27,6 +27,7 @@ use pg_kinetic_core::{
     traffic::sharding::{ShardDrainPolicy, ShardId, ShardLifecycleState, ShardRebalancePlan},
 };
 
+use crate::audit::AuditDispatcher;
 use crate::config::{
     AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
 };
@@ -837,6 +838,7 @@ pub struct SnapshotStore {
     inner: Arc<RwLock<SnapshotStoreInner>>,
     query_stats: QueryStats,
     guardrails: Arc<RwLock<Option<Arc<GuardrailRegistry>>>>,
+    audit: Arc<RwLock<Option<AuditDispatcher>>>,
 }
 
 #[derive(Debug, Default)]
@@ -880,6 +882,7 @@ impl Default for SnapshotStore {
             inner: Arc::new(RwLock::new(SnapshotStoreInner::default())),
             query_stats: QueryStats::new(),
             guardrails: Arc::new(RwLock::new(None)),
+            audit: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -922,6 +925,15 @@ impl SnapshotStore {
 
     pub fn set_guardrails(&self, guardrails: Arc<GuardrailRegistry>) {
         *self.guardrails.write().expect("guardrails store poisoned") = Some(guardrails);
+    }
+
+    pub fn set_audit(&self, audit: Option<AuditDispatcher>) {
+        *self.audit.write().expect("audit store poisoned") = audit;
+    }
+
+    #[must_use]
+    pub fn audit(&self) -> Option<AuditDispatcher> {
+        self.audit.read().expect("audit store poisoned").clone()
     }
 
     #[must_use]

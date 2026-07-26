@@ -852,6 +852,14 @@ pub fn record_query_stat(
     }
 }
 
+pub fn record_audit_record() {
+    metrics_crate::counter!("pg_kinetic_audit_records_total").increment(1);
+}
+
+pub fn record_audit_drop() {
+    metrics_crate::counter!("pg_kinetic_audit_dropped_total").increment(1);
+}
+
 pub fn record_guardrail_denial(rule: crate::guardrails::GuardrailRule) {
     metrics_crate::counter!("pg_kinetic_guardrail_denials_total", "rule" => rule.as_str())
         .increment(1);

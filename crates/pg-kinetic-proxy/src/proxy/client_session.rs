@@ -46,6 +46,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) read_after_write_timeout: Duration,
     pub(crate) read_after_write_protection_enabled: bool,
     pub(crate) snapshot_store: SnapshotStore,
+    pub(crate) audit_config: crate::config::AuditConfig,
     pub(crate) phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
     pub(crate) session_id: u64,
     pub(crate) _backend: std::marker::PhantomData<(B, O)>,
@@ -402,6 +403,7 @@ where
         read_after_write_timeout,
         read_after_write_protection_enabled,
         snapshot_store,
+        audit_config,
         phase_recorder,
         session_id,
         _backend: _,
@@ -524,6 +526,7 @@ where
                 if frames.is_empty() {
                     continue;
                 }
+                let cycle_started = Instant::now();
                 wait_for_client_activity_after_timeout = false;
                 let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
                 let request_plans = match request_plans_for_frames(
@@ -778,6 +781,26 @@ where
                                     backend,
                                 )
                                 .await;
+                            }
+                            if let Some(audit) = snapshot_store.audit() {
+                                let elapsed = cycle_started.elapsed();
+                                for request_plan in &request_plans {
+                                    let fingerprint = pg_kinetic_core::fingerprint::fingerprint_sql(
+                                        request_plan.sql.as_ref(),
+                                    );
+                                    if !fingerprint.is_empty() {
+                                        crate::audit::record_query(
+                                            &audit,
+                                            audit_config,
+                                            &route,
+                                            request_plan.analysis(),
+                                            &fingerprint,
+                                            "ok",
+                                            elapsed,
+                                            progress.rows,
+                                        );
+                                    }
+                                }
                             }
                         }
                         crate::engine::io_runtime::BackendForwardOutcome::Flushed => {
@@ -1100,6 +1123,7 @@ pub(super) async fn handle_client(
                     routing_planner: &routing_planner,
                     session_id,
                     snapshot_store: &snapshot_store,
+                    audit_config: &config.audit,
                     phase_recorder: phase_recorder.as_ref(),
                     debug_sampler,
                     mirror_dispatcher: &mirror_dispatcher,
@@ -1217,6 +1241,7 @@ struct FrameCycleRequest<'a> {
     routing_planner: &'a ReadRoutingPlanner,
     session_id: u64,
     snapshot_store: &'a SnapshotStore,
+    audit_config: &'a crate::config::AuditConfig,
     phase_recorder: &'a dyn telemetry::PhaseTimingRecorder,
     debug_sampler: DebugSampler,
     mirror_dispatcher: &'a MirrorDispatcher,
@@ -1260,6 +1285,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         routing_planner,
         session_id,
         snapshot_store,
+        audit_config,
         phase_recorder,
         debug_sampler,
         mirror_dispatcher,
@@ -1503,6 +1529,18 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
             let rows = if index == 0 { progress.rows } else { 0 };
             query_stats.record(&fingerprint, &fingerprint, elapsed, rows, error);
             metrics::record_query_stat(&query_stats, &fingerprint, elapsed, rows, error);
+            if let Some(audit) = snapshot_store.audit() {
+                crate::audit::record_query(
+                    &audit,
+                    audit_config,
+                    session_route,
+                    request_plan.analysis(),
+                    &fingerprint,
+                    if error { "error" } else { "ok" },
+                    elapsed,
+                    rows,
+                );
+            }
         }
     }
     let outcome = handle_forward_result(ForwardResultRequest {
