@@ -31,6 +31,7 @@ use crate::config::{
     AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
 };
 use crate::observe::metrics;
+use crate::query_stats::{QueryStatView, QueryStats};
 use crate::routing::policy::{PolicyReloadErrorCode, PolicyReloadResult};
 use crate::routing::sharding::{RouteMapReloadErrorCode, RouteMapReloadResult};
 use crate::routing::RoutingTarget;
@@ -833,6 +834,7 @@ impl LimitsSnapshot {
 #[derive(Clone, Debug)]
 pub struct SnapshotStore {
     inner: Arc<RwLock<SnapshotStoreInner>>,
+    query_stats: QueryStats,
 }
 
 #[derive(Debug, Default)]
@@ -874,6 +876,7 @@ impl Default for SnapshotStore {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(SnapshotStoreInner::default())),
+            query_stats: QueryStats::new(),
         }
     }
 }
@@ -902,6 +905,16 @@ impl SnapshotStore {
     #[must_use]
     pub fn recovery_handle(&self) -> RecoverySnapshotHandle {
         RecoverySnapshotHandle::new(Arc::clone(&self.inner))
+    }
+
+    #[must_use]
+    pub fn query_stats(&self) -> QueryStats {
+        self.query_stats.clone()
+    }
+
+    #[must_use]
+    pub fn top_query_stats(&self) -> Vec<QueryStatView> {
+        self.query_stats.top()
     }
 
     #[must_use]

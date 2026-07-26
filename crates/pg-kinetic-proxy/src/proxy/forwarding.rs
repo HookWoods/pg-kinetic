@@ -631,6 +631,12 @@ pub(super) fn classify_backend_frames(
     let mut drain = crate::engine::io_runtime::BackendResponseDrain::resume(shape, *progress);
     let event = drain.drain_with(backend_buffer, forwarded_frames, |frame| {
         state.progress.response_started = true;
+        if frame.tag == u8::from(BackendTag::DataRow) {
+            state.progress.rows = state.progress.rows.saturating_add(1);
+        }
+        if frame.tag == u8::from(BackendTag::ErrorResponse) {
+            state.progress.error = true;
+        }
         if let Some(sqlstate) = frame.sqlstate() {
             metrics::increment_sqlstate(sqlstate);
             let scope = state.prepared.invalidate_for_sqlstate(sqlstate, backend_id);

@@ -1276,6 +1276,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         session_started,
     } = request;
     let current_query_id = *mirror_query_id;
+    let cycle_started = Instant::now();
     *mirror_query_id = mirror_query_id.wrapping_add(1);
     let full_routing_analysis = route_read_routing_mode != ReadRoutingMode::Off;
     let request_plans =
@@ -1467,6 +1468,21 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         &result,
         Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)))
     );
+    if !matches!(&result, Ok(Ok(ForwardOutcome::Flushed))) {
+        let error = progress.error || result.is_err() || matches!(&result, Ok(Err(_)) | Err(_));
+        let elapsed = cycle_started.elapsed();
+        let query_stats = snapshot_store.query_stats();
+        for (index, request_plan) in request_plans.iter().enumerate() {
+            let fingerprint =
+                pg_kinetic_core::fingerprint::fingerprint_sql(request_plan.sql.as_ref());
+            if fingerprint.is_empty() {
+                continue;
+            }
+            let rows = if index == 0 { progress.rows } else { 0 };
+            query_stats.record(&fingerprint, &fingerprint, elapsed, rows, error);
+            metrics::record_query_stat(&query_stats, &fingerprint, elapsed, rows, error);
+        }
+    }
     let outcome = handle_forward_result(ForwardResultRequest {
         backend,
         result,

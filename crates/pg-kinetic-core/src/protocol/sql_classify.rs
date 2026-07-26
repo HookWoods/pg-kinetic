@@ -389,6 +389,117 @@ pub fn for_each_top_level_statement<'a>(sql: &'a str, mut visit: impl FnMut(&'a 
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SqlToken {
+    Comment,
+    Literal,
+    Word(String),
+    Symbol(String),
+}
+
+pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
+    let mut tokens = Vec::new();
+    let mut iter = sql.char_indices().peekable();
+    while let Some((start, ch)) = iter.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && matches!(iter.peek(), Some((_, '-'))) {
+            iter.next();
+            while let Some((_, next)) = iter.next() {
+                if next == '\n' {
+                    break;
+                }
+            }
+            tokens.push(SqlToken::Comment);
+            continue;
+        }
+        if ch == '/' && matches!(iter.peek(), Some((_, '*'))) {
+            iter.next();
+            let mut closed = false;
+            while let Some((_, next)) = iter.next() {
+                if next == '*' && matches!(iter.peek(), Some((_, '/'))) {
+                    iter.next();
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                break;
+            }
+            tokens.push(SqlToken::Comment);
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            while let Some((_, next)) = iter.next() {
+                if next == quote {
+                    if matches!(iter.peek(), Some((_, escaped)) if *escaped == quote) {
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            tokens.push(SqlToken::Literal);
+            continue;
+        }
+        if ch == '$' {
+            let raw = &sql[start..];
+            if let Some(tag_end) = raw[1..].find('$') {
+                let delimiter_end = tag_end + 2;
+                let delimiter = &raw[..delimiter_end];
+                if let Some(body_end) = raw[delimiter_end..].find(delimiter) {
+                    let token_end = delimiter_end + body_end + delimiter.len();
+                    for _ in 0..raw[..token_end].chars().count().saturating_sub(1) {
+                        iter.next();
+                    }
+                    tokens.push(SqlToken::Literal);
+                    continue;
+                }
+            }
+        }
+        if ch.is_ascii_digit() {
+            while matches!(iter.peek(), Some((_, next)) if next.is_ascii_alphanumeric() || *next == '.' || *next == '_')
+            {
+                iter.next();
+            }
+            tokens.push(SqlToken::Literal);
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            let end = iter
+                .peek()
+                .map(|(index, _)| *index)
+                .unwrap_or_else(|| sql.len());
+            let mut word = String::from(ch);
+            word.push_str(&sql[end..]);
+            let word_len = word
+                .char_indices()
+                .find(|(_, next)| !(next.is_ascii_alphanumeric() || *next == '_' || *next == '$'))
+                .map(|(index, _)| index)
+                .unwrap_or(word.len());
+            let word = word[..word_len].to_owned();
+            for _ in 0..word.chars().count().saturating_sub(1) {
+                iter.next();
+            }
+            if word.starts_with('$') && word[1..].chars().all(|next| next.is_ascii_digit()) {
+                tokens.push(SqlToken::Literal);
+            } else {
+                tokens.push(SqlToken::Word(word));
+            }
+            continue;
+        }
+        let end = iter
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or_else(|| sql.len());
+        let symbol = sql[start..end].to_owned();
+        tokens.push(SqlToken::Symbol(symbol));
+    }
+    tokens
+}
+
 fn find_matching_paren(sql: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut state = ScanState::Normal;

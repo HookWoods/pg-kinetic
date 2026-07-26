@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod cluster;
 pub mod constants;
+pub mod fingerprint;
 pub mod lab;
 pub mod observability;
 pub mod protocol;

@@ -14,6 +14,7 @@ use tokio::{
 };
 use tokio_rustls::rustls::ServerConfig;
 
+use crate::query_stats::QueryStatView;
 use crate::{
     config::{Config, MultiShardPolicyConfig, ShardScopeConfig, ShardTargetConfig, ShardingConfig},
     net::socket,
@@ -566,9 +567,38 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
         }
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), config),
+        AdminView::TopQueries => top_queries_table(&state.snapshot_store.top_query_stats()),
     };
 
     Some(admin_table_response(table))
+}
+
+fn top_queries_table(stats: &[QueryStatView]) -> AdminTable {
+    let rows = stats
+        .iter()
+        .map(|stat| {
+            AdminRow::new(vec![
+                stat.fingerprint.clone(),
+                stat.sample.clone(),
+                stat.count.to_string(),
+                stat.errors.to_string(),
+                stat.rows.to_string(),
+                format!("{:.3}", stat.total_latency_ms),
+            ])
+        })
+        .collect();
+    admin_table(
+        AdminView::TopQueries,
+        &[
+            ("fingerprint", AdminColumnType::Text),
+            ("sample", AdminColumnType::Text),
+            ("count", AdminColumnType::Int8),
+            ("errors", AdminColumnType::Int8),
+            ("rows", AdminColumnType::Int8),
+            ("total_latency_ms", AdminColumnType::Float8),
+        ],
+        rows,
+    )
 }
 
 fn clients_table(

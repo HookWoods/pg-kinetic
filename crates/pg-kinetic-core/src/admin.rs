@@ -37,6 +37,7 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
         ["show", "migrations"] => AdminCommand::Show(AdminView::Migrations),
         ["show", "settings"] => AdminCommand::Show(AdminView::Settings),
         ["show", "limits"] => AdminCommand::Show(AdminView::Limits),
+        ["show", "top", "queries"] => AdminCommand::Show(AdminView::TopQueries),
         ["pause"] => AdminCommand::Pause,
         ["resume"] => AdminCommand::Resume,
         ["reload"] => AdminCommand::Reload,
@@ -86,6 +87,7 @@ pub enum AdminView {
     Migrations,
     Settings,
     Limits,
+    TopQueries,
 }
 
 impl AdminView {
@@ -116,6 +118,7 @@ impl AdminView {
             Self::Migrations => "migrations",
             Self::Settings => "settings",
             Self::Limits => "limits",
+            Self::TopQueries => "top queries",
         }
     }
 }
@@ -235,5 +238,9 @@ mod tests {
             parse_admin_command("SHOW RUNTIME POOLS"),
             AdminCommand::Unknown(_)
         ));
+        assert_eq!(
+            parse_admin_command("SHOW TOP QUERIES;").view(),
+            Some(AdminView::TopQueries)
+        );
     }
 }

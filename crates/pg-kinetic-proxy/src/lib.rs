@@ -7,6 +7,7 @@ pub mod observe;
 pub mod ops;
 pub mod pool;
 pub mod proxy;
+pub mod query_stats;
 pub mod routing;
 
 pub use observe::health::{EndpointHealthProbe, EndpointHealthSnapshot};

@@ -188,6 +188,8 @@ pub(super) enum IdleTimeoutKind {
 #[derive(Default)]
 pub(super) struct QueryProgress {
     pub(super) response_started: bool,
+    pub(super) rows: u64,
+    pub(super) error: bool,
 }
 
 pub(super) struct CancelSessionGuard {

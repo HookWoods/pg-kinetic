@@ -7,6 +7,7 @@ use crate::observe::snapshot::{
     ReplicaHealthSnapshot, RouteCheckoutSnapshot, RouteMapReloadSnapshot, RuntimeSnapshot,
     ServerSnapshot, ShardLifecycleSnapshot, ShardMigrationSafetySnapshot, SnapshotStore,
 };
+use crate::query_stats::QueryStats;
 use crate::routing::sharding::RouteMapReloadErrorCode;
 use crate::routing::{RoutingReason as ProxyRoutingReason, RoutingTarget};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -822,6 +823,24 @@ pub fn increment_buffer_limit(kind: &'static str) {
         "kind" => kind
     )
     .increment(1);
+}
+
+pub fn record_query_stat(
+    stats: &QueryStats,
+    fingerprint: &str,
+    latency: Duration,
+    rows: u64,
+    error: bool,
+) {
+    let bucket = stats.metric_bucket(fingerprint);
+    metrics_crate::counter!("pg_kinetic_query_count_total", "query" => bucket.clone()).increment(1);
+    metrics_crate::histogram!("pg_kinetic_query_latency_ms", "query" => bucket.clone())
+        .record(latency.as_secs_f64() * 1_000.0);
+    metrics_crate::counter!("pg_kinetic_query_rows_total", "query" => bucket.clone())
+        .increment(rows);
+    if error {
+        metrics_crate::counter!("pg_kinetic_query_errors_total", "query" => bucket).increment(1);
+    }
 }
 
 pub fn record_read_after_write(outcome: FreshnessStatus) {
