@@ -358,6 +358,7 @@ mod linux {
             route_fallback_policy: route_policy.routing_planner.fallback_policy(),
             read_after_write_timeout: route_policy.read_after_write_timeout,
             read_after_write_protection_enabled: route_policy.read_after_write_protection_enabled,
+            resilience: effective_config.resilience.clone(),
             routing_planner: route_policy.routing_planner,
             snapshot_store: runtime_state.snapshot_store(),
             audit_config: effective_config.audit.clone(),

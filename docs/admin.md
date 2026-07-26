@@ -50,6 +50,8 @@ Unset optional fields render as `<none>`.
 | `SHOW RECOVERY` | Recovery trigger/action/outcome counts plus the latest error text for each combination. |
 | `SHOW BACKPRESSURE` | Per-route waiting, in-flight, rejected, timed-out, and canceled counts. |
 | `SHOW ROUTES` | Per-route client and backend counts plus primary and replica counts, routing mode, fallback policy, freshness policy, and read-after-write timeout. |
+| `SHOW TOP QUERIES` | Bounded query fingerprint analytics: fingerprint, representative template, counts, latency, rows, and error count. |
+| `SHOW GUARDRAILS` | Guardrail mode, hard-rule switches, observed fingerprint count, allowlist count, and last allowlist reload metadata. |
 | `SHOW ROUTE MAPS` | Route-map snapshot fields when route-map data exists. Preview-only for live traffic today. |
 | `SHOW SHARDS` | Shard lifecycle snapshot fields when shard data exists. Preview-only for live traffic today. |
 | `SHOW MIGRATIONS` | Migration snapshot fields when migration data exists. Preview-only for live traffic today. |
@@ -60,7 +62,7 @@ Unset optional fields render as `<none>`.
 | `SHOW PERFORMANCE` | Regression-budget thresholds and outcomes, profile and process-metric status, process CPU and resident-memory samples, and proxy performance counters. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
-| `SHOW RESILIENCE` | Per-backend breaker state and consecutive failures, plus bounded hedge configuration. |
+| `SHOW RESILIENCE` | Per-backend breaker state and consecutive failures, reserved hedge configuration, and transparent failover settings. |
 | `PAUSE` | Queues new backend checkouts without killing connected clients or in-flight queries. |
 | `RESUME` | Releases clients waiting behind `PAUSE`. |
 | `RELOAD` | Applies the configured config file immediately when the change is reload-compatible; incompatible changes are rejected with the reason surfaced as an error. |
@@ -70,7 +72,7 @@ Unset optional fields render as `<none>`.
 | View family | Availability |
 | --- | --- |
 | `SHOW CLIENTS`, `SHOW POOLS`, `SHOW SERVERS`, `SHOW RUNTIME`, `SHOW SETTINGS`, `SHOW LIMITS` | Available when the admin listener is enabled. Empty rows mean no matching in-process snapshot has been recorded yet. |
-| `SHOW PREPARED`, `SHOW PINNING`, `SHOW RECOVERY`, `SHOW BACKPRESSURE`, `SHOW ROUTES` | Available when runtime paths have recorded their snapshots; rows can be empty on idle systems. |
+| `SHOW PREPARED`, `SHOW PINNING`, `SHOW RECOVERY`, `SHOW BACKPRESSURE`, `SHOW ROUTES`, `SHOW TOP QUERIES`, `SHOW GUARDRAILS`, `SHOW RESILIENCE` | Available when runtime paths have recorded their snapshots; rows can be empty on idle systems. |
 | `SHOW POLICIES`, `SHOW POLICY DECISIONS`, `SHOW POLICY AUDIT` | Snapshot surfaces for policy models and audit events. They do not prove live policy enforcement unless the runtime path records such events. |
 | `SHOW ROUTE MAPS`, `SHOW SHARDS`, `SHOW MIGRATIONS` | Preview/model snapshot surfaces. They are not evidence that live traffic is sharded. |
 | `SHOW MIRRORING` | Returns disabled/default mirror state unless a runtime path records mirror summaries; live traffic mirroring is not active today. |
@@ -94,6 +96,9 @@ Unset optional fields render as `<none>`.
 | `SHOW PINNING` | `client_id`, `backend_id`, `route_key`, `reason`, `duration_ms` |
 | `SHOW RECOVERY` | `trigger`, `action`, `outcome`, `count`, `last_error` |
 | `SHOW BACKPRESSURE` | `route_key`, `waiting`, `in_flight`, `rejected`, `timed_out`, `canceled` |
+| `SHOW TOP QUERIES` | `fingerprint`, `template`, `count`, `avg_latency_ms`, `max_latency_ms`, `rows`, `errors` |
+| `SHOW GUARDRAILS` | `mode`, `block_unqualified_dml`, `block_ddl`, `observed_fingerprints`, `allowlist_entries`, `allowlist_loaded_at`, `allowlist_last_error` |
+| `SHOW RESILIENCE` | `backend`, `breaker_state`, `consecutive_failures`, `breaker_failure_threshold`, `breaker_cooldown_ms`, `hedging_enabled`, `hedge_delay_ms`, `failover_enabled`, `failover_max_reconnect_ms`, `failover_replay_session_state` |
 | `SHOW POLICIES` | `policy_id`, `policy_version`, `policy_mode`, `source`, `enabled`, `last_reload_outcome`, `error_code` |
 | `SHOW POLICY DECISIONS` | `policy_id`, `policy_version`, `hook_point`, `action`, `outcome`, `reason`, `route`, `shard`, `target_role`, `context` |
 | `SHOW POLICY AUDIT` | `kind`, `policy_id`, `policy_version`, `hook_point`, `action`, `outcome`, `reason`, `route`, `shard`, `target_role`, `context` |

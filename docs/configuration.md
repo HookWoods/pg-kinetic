@@ -192,6 +192,14 @@ Use the rollout sequence `Observe -> review -> Enforce`: first collect bounded f
 | `resilience.breaker_cooldown_ms` | milliseconds | `5000` | `--breaker-cooldown-ms` | `PG_KINETIC_BREAKER_COOLDOWN_MS` | restart | Cooldown before one half-open recovery probe. |
 | `resilience.hedging_enabled` | bool | `false` | `--hedging-enabled` | `PG_KINETIC_HEDGING_ENABLED` | restart | Reserved safe read-hedge gate; duplicate backend forwarding remains disabled. |
 | `resilience.hedge_delay_ms` | milliseconds | `25` | `--hedge-delay-ms` | `PG_KINETIC_HEDGE_DELAY_MS` | restart | Delay used by a future safe read-hedge executor. |
+| `resilience.failover_enabled` | bool | `false` | `--failover-enabled` | `PG_KINETIC_FAILOVER_ENABLED` | restart | Enables one bounded retry for replay-safe reads when the backend is lost before any response bytes are sent. |
+| `resilience.failover_max_reconnect_ms` | milliseconds | `1000` | `--failover-max-reconnect-ms` | `PG_KINETIC_FAILOVER_MAX_RECONNECT_MS` | restart | Upper bound for replacement backend checkout during transparent failover; also bounded by the current query timeout. |
+| `resilience.failover_replay_session_state` | bool | `true` | `--failover-replay-session-state` | `PG_KINETIC_FAILOVER_REPLAY_SESSION_STATE` | restart | Replays tracked safe session settings such as `application_name`, `search_path`, `timezone`, `datestyle`, and `extra_float_digits` before retrying eligible reads. |
+
+The hedge fields are inactive reservation points. Setting
+`resilience.hedging_enabled = true` does not duplicate read forwarding in the
+current runtime. Use [Transparent failover](./transparent-failover.md) for the
+implemented retry behavior.
 
 ## Runtime Lifecycle Fields
 

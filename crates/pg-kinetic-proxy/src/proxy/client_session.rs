@@ -45,6 +45,7 @@ pub(crate) struct SharedClientSessionContext<B, O, P> {
     pub(crate) route_fallback_policy: FallbackPolicy,
     pub(crate) read_after_write_timeout: Duration,
     pub(crate) read_after_write_protection_enabled: bool,
+    pub(crate) resilience: crate::config::ResilienceConfig,
     pub(crate) snapshot_store: SnapshotStore,
     pub(crate) audit_config: crate::config::AuditConfig,
     pub(crate) phase_recorder: Arc<dyn telemetry::PhaseTimingRecorder>,
@@ -402,6 +403,7 @@ where
         route_fallback_policy,
         read_after_write_timeout,
         read_after_write_protection_enabled,
+        resilience,
         snapshot_store,
         audit_config,
         phase_recorder,
@@ -606,6 +608,7 @@ where
                         "monoio cycle routing produced unsupported target: {target:?}"
                     ));
                 }
+                let retry_target = target.clone();
                 let reuse_held_backend = should_reuse_held_backend(
                     &session,
                     held_backend.as_ref().map(|backend| backend.backend_id()),
@@ -735,26 +738,191 @@ where
                         return Err(error).context("plan monoio cycle");
                     }
                 };
-                let mut runtime_backend = LeaseRuntimeBackend {
-                    lease: &mut backend,
+                let mut retry_attempted = false;
+                let query_deadline = Instant::now() + query_timeout;
+                let result = loop {
+                    let mut runtime_backend = LeaseRuntimeBackend {
+                        lease: &mut backend,
+                    };
+                    let forward = forward_runtime_cycle(
+                        &mut client,
+                        &mut runtime_backend,
+                        &planned.backend_bytes,
+                        shape,
+                        planned.injected_parse_completes,
+                        &mut backend_buffer,
+                        max_backend_buffer_bytes,
+                    );
+                    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                    let result = crate::engine::io_runtime::monoio_timeout(
+                        query_deadline
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default(),
+                        forward,
+                    )
+                    .await;
+                    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                    let result = crate::engine::io_runtime::tokio_timeout(
+                        query_deadline
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default(),
+                        forward,
+                    )
+                    .await;
+                    drop(runtime_backend);
+
+                    let retry = match &result {
+                        Ok(Err(error)) => {
+                            error
+                                .downcast_ref::<BackendFailure>()
+                                .is_some_and(|failure| {
+                                    !retry_attempted
+                                        && retry_disposition(
+                                            failure.kind,
+                                            failure.response_started,
+                                            safe_request_to_replay(
+                                                &frames,
+                                                &request_plans,
+                                                &session,
+                                                false,
+                                            ) || (resilience.failover_enabled
+                                                && safe_request_to_replay(
+                                                    &frames,
+                                                    &request_plans,
+                                                    &session,
+                                                    resilience.failover_replay_session_state,
+                                                )),
+                                        ) == RetryDisposition::RetryBeforeResponse
+                                })
+                        }
+                        _ => false,
+                    };
+                    if !retry {
+                        break result;
+                    }
+
+                    backend.mark_failed();
+                    discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend).await;
+                    let max_reconnect = if resilience.failover_enabled {
+                        resilience.failover_max_reconnect()
+                    } else {
+                        query_timeout
+                    };
+                    let Some(reconnect_timeout) =
+                        bounded_reconnect_timeout(max_reconnect, query_deadline)
+                    else {
+                        if resilience.failover_enabled {
+                            metrics::record_failover_failed();
+                        }
+                        write_shared_error_response(
+                            &mut client,
+                            "57P01",
+                            "backend connection lost; failover reconnect timed out",
+                        )
+                        .await?;
+                        continue 'session;
+                    };
+                    let replay_frames = if resilience.failover_replay_session_state {
+                        replay_frames(&session)
+                    } else {
+                        Vec::new()
+                    };
+                    let replacement = async {
+                        let mut replacement = pool
+                            .checkout_shared_target(route.clone(), &route_pools, &retry_target)
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!("backend failover checkout failed: {error:?}")
+                            })?;
+                        let requires_startup = replacement.requires_startup();
+                        let mut startup_backend = LeaseRuntimeBackend {
+                            lease: &mut replacement,
+                        };
+                        crate::proxy::bootstrap_backend_streams(
+                            &mut startup_backend,
+                            requires_startup,
+                            &backend_startup_packet,
+                            backend_credentials.as_deref(),
+                        )
+                        .await
+                        .context("bootstrap replacement backend during failover")?;
+                        drop(startup_backend);
+
+                        if !replay_frames.is_empty() {
+                            let mut replay_bytes = BytesMut::new();
+                            for frame in &replay_frames {
+                                replay_bytes.extend_from_slice(&encode_frontend_frame(frame));
+                            }
+                            let replay_shape =
+                                crate::engine::io_runtime::FrontendCycleShape::from_frames(
+                                    &replay_frames,
+                                );
+                            let mut replay_backend_buffer = BytesMut::with_capacity(16 * 1024);
+                            let mut discard_client = DiscardRuntimeStream;
+                            let mut replay_backend = LeaseRuntimeBackend {
+                                lease: &mut replacement,
+                            };
+                            let status = forward_runtime_cycle(
+                                &mut discard_client,
+                                &mut replay_backend,
+                                &replay_bytes,
+                                replay_shape,
+                                0,
+                                &mut replay_backend_buffer,
+                                max_backend_buffer_bytes,
+                            )
+                            .await
+                            .context("replay virtual session during failover")?;
+                            drop(replay_backend);
+                            anyhow::ensure!(
+                                matches!(
+                                    status,
+                                    crate::engine::io_runtime::BackendForwardOutcome::Ready(
+                                        ReadyStatus::Idle
+                                    )
+                                ),
+                                "unexpected failover replay status: {status:?}"
+                            );
+                        }
+
+                        Ok::<_, anyhow::Error>(replacement)
+                    };
+                    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                    let replacement =
+                        crate::engine::io_runtime::monoio_timeout(reconnect_timeout, replacement)
+                            .await;
+                    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                    let replacement =
+                        crate::engine::io_runtime::tokio_timeout(reconnect_timeout, replacement)
+                            .await;
+                    backend = match replacement {
+                        Ok(Ok(replacement)) => replacement,
+                        _ => {
+                            if resilience.failover_enabled {
+                                metrics::record_failover_failed();
+                            }
+                            write_shared_error_response(
+                                &mut client,
+                                "57P01",
+                                "backend connection lost; failover unavailable",
+                            )
+                            .await?;
+                            continue 'session;
+                        }
+                    };
+                    bind_cancel_target_for_backend(&cancel_registry, client_key, &backend);
+                    previous_backend_id = Some(backend.backend_id());
+                    retry_attempted = true;
                 };
-                let forward = forward_runtime_cycle(
-                    &mut client,
-                    &mut runtime_backend,
-                    &planned.backend_bytes,
-                    shape,
-                    planned.injected_parse_completes,
-                    &mut backend_buffer,
-                    max_backend_buffer_bytes,
-                );
-                #[cfg(all(target_os = "linux", feature = "io-uring"))]
-                let result =
-                    crate::engine::io_runtime::monoio_timeout(query_timeout, forward).await;
-                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-                let result = crate::engine::io_runtime::tokio_timeout(query_timeout, forward).await;
+                if resilience.failover_enabled && retry_attempted && matches!(&result, Ok(Ok(_))) {
+                    metrics::record_failover_survived();
+                }
                 match result {
                     Ok(Ok(outcome)) => match outcome {
                         crate::engine::io_runtime::BackendForwardOutcome::Ready(status) => {
+                            let mut runtime_backend = LeaseRuntimeBackend {
+                                lease: &mut backend,
+                            };
                             if should_probe_read_after_write(
                                 committed_write_transaction,
                                 read_after_write_protection_enabled,
@@ -804,18 +972,15 @@ where
                             }
                         }
                         crate::engine::io_runtime::BackendForwardOutcome::Flushed => {
-                            drop(runtime_backend);
                             held_backend = Some(backend);
                         }
                     },
                     Ok(Err(error)) => {
-                        drop(runtime_backend);
                         discard_backend_with_cancel_unbind(&cancel_registry, client_key, backend)
                             .await;
                         return Err(error);
                     }
                     Err(_) => {
-                        drop(runtime_backend);
                         metrics_crate::counter!(
                             MetricName::TimeoutTotal.as_str(),
                             "kind" => "query"

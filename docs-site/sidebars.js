@@ -50,6 +50,7 @@ const sidebars = {
       items: [
         'admin',
         'read-routing',
+        'transparent-failover',
         { type: 'doc', id: 'sharding', label: 'Sharding (Preview)' },
         { type: 'doc', id: 'policy', label: 'Policy (Preview)' },
         { type: 'doc', id: 'mirroring', label: 'Mirroring (Not active)' },

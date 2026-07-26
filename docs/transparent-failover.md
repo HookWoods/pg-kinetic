@@ -5,6 +5,11 @@ Reconnect work is bounded by both `resilience.failover_max_reconnect_ms` and
 the current query timeout. A replacement backend must pass the normal route,
 breaker, backpressure, authentication, and pool checkout path.
 
+The default Tokio runtime and the Linux `io_uring` runtime use the same safety
+policy: only replay-safe reads can be retried, and only when the backend is lost
+before any response bytes are sent. Partial backend frames count as response
+started, so they are not replayed across a replacement backend.
+
 ## Session matrix
 
 | Session state | v1 behavior |
@@ -19,3 +24,16 @@ breaker, backpressure, authentication, and pool checkout path.
 `pg_kinetic_failover_survived_total` counts successful bounded retries.
 `pg_kinetic_failover_failed_total` counts enabled failover attempts that cannot
 safely complete. Both metrics are unlabeled counters.
+
+## Runtime validation
+
+The `io_uring` path is compiled only on Linux with the `io-uring` cargo feature.
+Validate binaries that enable it on a Linux host:
+
+```bash
+cargo check -p pg-kinetic-proxy --features io-uring --locked
+cargo test -p pg-kinetic-proxy --features io-uring --lib runtime_forwarding
+```
+
+Local macOS builds can validate the shared retry classification tests, but they
+do not compile the gated Monoio accept/session path.

@@ -37,8 +37,14 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 | `pg_kinetic_route_checkout_wait_ms` | histogram | `route`, `outcome` | live proxy | Measures per-route wait time. |
 | `pg_kinetic_route_in_flight` | gauge | `route`, `scope` | live proxy | Shows route in-flight work. |
 | `pg_kinetic_route_waiting` | gauge | `route`, `scope` | live proxy | Shows route waiters. |
+| `pg_kinetic_route_shed_total` | counter | `route`, `priority` | route fairness | Counts route shedding decisions for bounded priority classes. |
 | `pg_kinetic_timeout_total` | counter | `kind` | live proxy | Records query, idle-client, and idle-transaction timeouts. |
 | `pg_kinetic_buffer_limit_total` | counter | `kind` | live proxy | Records client/backend buffer cap hits. |
+| `pg_kinetic_query_count_total` | counter | `query` | query analytics enabled by traffic | Counts completed query fingerprints using bounded top-query buckets. |
+| `pg_kinetic_query_latency_ms` | histogram | `query` | query analytics enabled by traffic | Measures elapsed query time for bounded fingerprint buckets. |
+| `pg_kinetic_query_rows_total` | counter | `query` | query analytics enabled by traffic | Counts returned rows for bounded fingerprint buckets. |
+| `pg_kinetic_query_errors_total` | counter | `query` | query analytics enabled by traffic | Counts failed query cycles for bounded fingerprint buckets. |
+| `pg_kinetic_guardrail_denials_total` | counter | `rule` | guardrails observe/enforce paths | Counts fixed guardrail denial categories. |
 | `pg_kinetic_route_decisions_total` | counter | `route`, `target_role`, `query_class` | live read routing | Records primary/replica routing decisions. |
 | `pg_kinetic_route_fallbacks_total` | counter | `route`, `reason`, `fallback_policy` | live read routing | Records primary fallback, waits, and rejections. |
 | `pg_kinetic_read_after_write_wait_ms` | histogram | `route`, `outcome` | live read routing | Measures read-after-write waits. |
@@ -50,6 +56,11 @@ Metric availability follows the active runtime paths. Metrics for preview-only o
 | `pg_kinetic_backend_cleanup_total` | counter | `action` | live proxy | Counts cleanup decisions. |
 | `pg_kinetic_backend_recovery_total` | counter | `trigger`, `action`, `outcome` | live proxy | Counts backend recovery paths. |
 | `pg_kinetic_backend_sqlstate_total` | counter | `sqlstate` | live proxy | Counts normalized SQLSTATEs. |
+| `pg_kinetic_breaker_state` | gauge | `backend`, `state` | resilience enabled or backend snapshots recorded | Shows current per-backend circuit-breaker state. |
+| `pg_kinetic_breaker_fast_rejections_total` | counter | none | resilience breaker open | Counts requests rejected before backend checkout because the breaker is open. |
+| `pg_kinetic_hedge_decisions_total` | counter | `outcome`, `reason` | reserved hedge evaluator | Reserved bounded hedge decision counter; duplicate backend forwarding remains disabled. |
+| `pg_kinetic_failover_survived_total` | counter | none | transparent failover enabled | Counts replay-safe requests that succeeded after a bounded backend replacement retry. |
+| `pg_kinetic_failover_failed_total` | counter | none | transparent failover enabled | Counts enabled failover attempts that could not safely complete. |
 | `pg_kinetic_tls_handshakes_total` | counter | `scope`, `mode` | TLS enabled | Counts client/backend TLS handshakes. |
 | `pg_kinetic_tls_failures_total` | counter | `scope`, `mode`, `reason` | TLS enabled | Counts TLS failures. |
 | `pg_kinetic_auth_attempts_total` | counter | `mode` | auth path enabled | Counts auth attempts. |

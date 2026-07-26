@@ -313,20 +313,85 @@ where
 {
     crate::engine::io_runtime::write_all_to(backend, cycle)
         .await
-        .context("write frontend cycle to backend")?;
+        .map_err(|error| {
+            backend_failure(
+                BackendFailureKind::Write,
+                false,
+                anyhow::Error::new(error).context("write frontend cycle to backend"),
+            )
+        })?;
     let mut response_drain =
         crate::engine::io_runtime::BackendResponseDrain::for_cycle(shape, injected_parse_completes);
-    crate::engine::io_runtime::forward_backend_until_cycle_complete(
+    forward_runtime_backend_until_cycle_complete(
         backend,
         client,
         backend_buffer,
         &mut response_drain,
         max_backend_buffer_bytes,
-        "read backend response",
-        "write backend response",
-        "backend closed during response",
     )
     .await
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "io-uring")))]
+async fn forward_runtime_backend_until_cycle_complete<B, C>(
+    backend: &mut B,
+    client: &mut C,
+    backend_buffer: &mut BytesMut,
+    drain: &mut crate::engine::io_runtime::BackendResponseDrain,
+    max_backend_buffer_bytes: usize,
+) -> anyhow::Result<crate::engine::io_runtime::BackendForwardOutcome>
+where
+    B: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
+    C: crate::engine::io_runtime::RuntimeByteStream + ?Sized,
+{
+    if !drain.expects_ready() && drain.flush_cycle_complete() {
+        return Ok(crate::engine::io_runtime::BackendForwardOutcome::Flushed);
+    }
+
+    loop {
+        let read = crate::engine::io_runtime::read_from(backend, backend_buffer)
+            .await
+            .map_err(|error| {
+                backend_failure(
+                    BackendFailureKind::Read,
+                    drain.response_started() || !backend_buffer.is_empty(),
+                    anyhow::Error::new(error).context("read backend response"),
+                )
+            })?;
+        if read == 0 {
+            return Err(backend_failure(
+                BackendFailureKind::Read,
+                drain.response_started() || !backend_buffer.is_empty(),
+                anyhow::anyhow!("backend closed during response"),
+            ));
+        }
+
+        match crate::engine::io_runtime::drain_backend_response_bytes(
+            backend_buffer,
+            drain,
+            max_backend_buffer_bytes,
+        )? {
+            crate::engine::io_runtime::BackendBytesDrainEvent::Bytes { bytes, ready } => {
+                if !bytes.is_empty() {
+                    crate::engine::io_runtime::write_all_to(client, &bytes)
+                        .await
+                        .context("write backend response")?;
+                }
+                if let Some(status) = ready {
+                    return Ok(crate::engine::io_runtime::BackendForwardOutcome::Ready(
+                        status,
+                    ));
+                }
+                if !drain.expects_ready() && drain.flush_cycle_complete() {
+                    return Ok(crate::engine::io_runtime::BackendForwardOutcome::Flushed);
+                }
+            }
+            crate::engine::io_runtime::BackendBytesDrainEvent::BufferLimitExceeded => {
+                anyhow::bail!("backend response exceeded configured buffer limit");
+            }
+            crate::engine::io_runtime::BackendBytesDrainEvent::NeedMoreBytes => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +680,107 @@ mod generic_tests {
             outcome,
             crate::engine::io_runtime::BackendForwardOutcome::Flushed
         ));
+        assert!(client.writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_classifies_backend_close_before_response() {
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+
+        let error = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"Q",
+            cycle_shape(&[FrontendTag::Query]),
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect_err("backend close before response is retry-classified");
+        let failure = error
+            .downcast_ref::<BackendFailure>()
+            .expect("structured backend failure");
+
+        assert_eq!(failure.kind, BackendFailureKind::Read);
+        assert!(!failure.response_started);
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_classifies_backend_close_after_response_started() {
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::from([BytesMut::from(&b"E\x00\x00\x00\x05\x00"[..])]),
+            writes: Vec::new(),
+        };
+
+        let error = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"Q",
+            cycle_shape(&[FrontendTag::Query]),
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect_err("backend close after response is not retry-safe");
+        let failure = error
+            .downcast_ref::<BackendFailure>()
+            .expect("structured backend failure");
+
+        assert_eq!(failure.kind, BackendFailureKind::Read);
+        assert!(failure.response_started);
+        assert_eq!(
+            client.writes,
+            vec![BytesMut::from(&b"E\x00\x00\x00\x05\x00"[..])]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_forwarding_treats_partial_frame_as_response_started() {
+        let mut client = MemoryBackendStream {
+            id: 2,
+            reads: VecDeque::new(),
+            writes: Vec::new(),
+        };
+        let mut backend = MemoryBackendStream {
+            id: 1,
+            reads: VecDeque::from([BytesMut::from(&b"E\x00\x00"[..])]),
+            writes: Vec::new(),
+        };
+
+        let error = forward_runtime_cycle(
+            &mut client,
+            &mut backend,
+            b"Q",
+            cycle_shape(&[FrontendTag::Query]),
+            0,
+            &mut BytesMut::new(),
+            1024,
+        )
+        .await
+        .expect_err("partial backend frame is not retry-safe");
+        let failure = error
+            .downcast_ref::<BackendFailure>()
+            .expect("structured backend failure");
+
+        assert_eq!(failure.kind, BackendFailureKind::Read);
+        assert!(failure.response_started);
         assert!(client.writes.is_empty());
     }
 }
