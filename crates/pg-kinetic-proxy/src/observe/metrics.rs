@@ -843,6 +843,11 @@ pub fn record_query_stat(
     }
 }
 
+pub fn record_guardrail_denial(rule: crate::guardrails::GuardrailRule) {
+    metrics_crate::counter!("pg_kinetic_guardrail_denials_total", "rule" => rule.as_str())
+        .increment(1);
+}
+
 pub fn record_read_after_write(outcome: FreshnessStatus) {
     metrics_crate::counter!(
         MetricName::ReadAfterWriteTotal.as_str(),

@@ -93,6 +93,22 @@ Each pool is bounded by the lower of the global `capacity.max_backends` and its 
 
 v1 uses a single shared backend service identity: pg-kinetic does not infer per-pool credentials. In pass-through authentication, client credentials continue to be forwarded according to the existing auth configuration; pool entries only select the configured `backend_addr`.
 
+## Query Guardrails
+
+Guardrails run after the existing SQL analysis and fingerprinting step and before backend checkout. Defaults keep them disabled.
+
+```toml
+[guardrails]
+mode = "observe"
+block_unqualified_dml = true
+block_ddl = true
+allowlist_file = "/etc/pg-kinetic/query-fingerprints.txt"
+```
+
+Use the rollout sequence `Observe -> review -> Enforce`: first collect bounded fingerprint observations, review the resulting fingerprint shapes without exposing query literals, then populate the bounded allowlist and switch to `enforce`. Observe mode allows traffic. Enforce mode allows only allowlisted fingerprints; hard rules remain denials in enforce mode. Invalid allowlist reloads keep the last valid atomic snapshot.
+
+`SHOW GUARDRAILS` reports only mode, hard-rule switches, and bounded counts. Denials use SQLSTATE `42501` and a generic message. `pg_kinetic_guardrail_denials_total` uses only the fixed rule labels `unqualified_dml`, `ddl`, and `unknown_fingerprint`.
+
 ## Runtime Field Reference
 
 | Field | Type | Default | CLI | Environment | Reload | Failure mode |
@@ -111,6 +127,10 @@ v1 uses a single shared backend service identity: pg-kinetic does not infer per-
 | `performance.recovery_mode` | enum | `recover` | `--recovery-mode` | `PG_KINETIC_RECOVERY_MODE` | restart | Invalid enum fails parse. Values: `recover`, `rollback_only`, `drop`. |
 | `performance.recovery_timeout_ms` | milliseconds | `5000` | `--recovery-timeout-ms` | `PG_KINETIC_RECOVERY_TIMEOUT_MS` | restart | Recovery exceeding this duration discards the backend. |
 | `performance.backend_reset_query` | string | `DISCARD ALL` | `--backend-reset-query` | `PG_KINETIC_BACKEND_RESET_QUERY` | restart | Invalid SQL fails at backend execution time. |
+| `guardrails.mode` | enum | `off` | `--guardrails-mode` | `PG_KINETIC_GUARDRAILS_MODE` | restart | Values are `off`, `observe`, and `enforce`. |
+| `guardrails.block_unqualified_dml` | bool | `false` | `--guardrails-block-unqualified-dml` | `PG_KINETIC_GUARDRAILS_BLOCK_UNQUALIFIED_DML` | restart | In enforce mode, conservatively blocks unqualified `DELETE` and `UPDATE` statements. |
+| `guardrails.block_ddl` | bool | `false` | `--guardrails-block-ddl` | `PG_KINETIC_GUARDRAILS_BLOCK_DDL` | restart | In enforce mode, blocks classified DDL statements before backend checkout. |
+| `guardrails.allowlist_file` | optional path | unset | `--guardrails-allowlist-file` | `PG_KINETIC_GUARDRAILS_ALLOWLIST_FILE` | reload | New files replace the bounded allowlist atomically; invalid files leave the previous snapshot active. |
 | `qos.max_route_in_flight` | integer | `100` | `--max-route-in-flight` | `PG_KINETIC_MAX_ROUTE_IN_FLIGHT` | restart | Route concurrency above the cap queues or rejects. |
 | `qos.max_route_waiters` | integer | `1000` | `--max-route-waiters` | `PG_KINETIC_MAX_ROUTE_WAITERS` | restart | Excess route waiters are rejected. |
 | `qos.query_timeout_ms` | milliseconds | `30000` | `--query-timeout-ms` | `PG_KINETIC_QUERY_TIMEOUT_MS` | restart | Query cycle times out after this duration. |

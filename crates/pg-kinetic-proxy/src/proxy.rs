@@ -924,6 +924,9 @@ impl Proxy {
             .set_settings_snapshot(SettingsSnapshot::from_config(&effective_config));
         self.snapshot_store
             .set_limits_snapshot(LimitsSnapshot::from_config(&effective_config));
+        self.snapshot_store.set_guardrails(Arc::new(
+            crate::guardrails::GuardrailRegistry::from_config(&effective_config.guardrails)?,
+        ));
         let active_config = Arc::new(RwLock::new(effective_config.clone()));
         let backend_credentials = reload::BackendCredentialCache::from_config(&effective_config)?;
         let auth_query_service = Arc::new(AuthQueryService::new(

@@ -567,10 +567,36 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
         }
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), config),
+        AdminView::Guardrails => guardrails_table(state, config),
         AdminView::TopQueries => top_queries_table(&state.snapshot_store.top_query_stats()),
     };
 
     Some(admin_table_response(table))
+}
+
+fn guardrails_table(state: &AdminState, config: &Config) -> AdminTable {
+    let (allowlist_len, observation_len) = state
+        .snapshot_store
+        .guardrails()
+        .map(|registry| (registry.allowlist_len(), registry.observation_len()))
+        .unwrap_or((0, 0));
+    AdminTable::new(
+        AdminView::Guardrails,
+        vec![
+            AdminColumn::new("mode", AdminColumnType::Text),
+            AdminColumn::new("block_unqualified_dml", AdminColumnType::Bool),
+            AdminColumn::new("block_ddl", AdminColumnType::Bool),
+            AdminColumn::new("allowlist_entries", AdminColumnType::Int8),
+            AdminColumn::new("observed_fingerprints", AdminColumnType::Int8),
+        ],
+        vec![AdminRow::new(vec![
+            config.guardrails.mode.as_str().to_owned(),
+            config.guardrails.block_unqualified_dml.to_string(),
+            config.guardrails.block_ddl.to_string(),
+            allowlist_len.to_string(),
+            observation_len.to_string(),
+        ])],
+    )
 }
 
 fn top_queries_table(stats: &[QueryStatView]) -> AdminTable {

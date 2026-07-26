@@ -42,6 +42,49 @@ pub fn classify_sql(sql: &str) -> QueryClass {
 }
 
 #[must_use]
+pub fn is_ddl(sql: &str) -> bool {
+    let tokens = tokenize_sql(sql);
+    matches!(tokens.iter().find(|token| matches!(token, SqlToken::Word(_))), Some(SqlToken::Word(word)) if matches!(word.to_ascii_lowercase().as_str(), "create" | "alter" | "drop" | "truncate" | "grant" | "revoke" | "comment"))
+}
+
+#[must_use]
+pub fn is_unqualified_dml(sql: &str) -> bool {
+    let tokens = tokenize_sql(sql);
+    let Some(SqlToken::Word(word)) = tokens
+        .iter()
+        .find(|token| matches!(token, SqlToken::Word(_)))
+    else {
+        return false;
+    };
+    let command = word.to_ascii_lowercase();
+    if command == "delete" {
+        return contains_top_level_word(&tokens, "from")
+            && !contains_top_level_word(&tokens, "where");
+    }
+    if command == "update" {
+        return contains_top_level_word(&tokens, "set")
+            && !contains_top_level_word(&tokens, "where");
+    }
+    false
+}
+
+fn contains_top_level_word(tokens: &[SqlToken], target: &str) -> bool {
+    let mut depth = 0usize;
+    tokens.iter().any(|token| match token {
+        SqlToken::Symbol(symbol) if symbol == "(" => {
+            depth += 1;
+            false
+        }
+        SqlToken::Symbol(symbol) if symbol == ")" => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        SqlToken::Word(word) => depth == 0 && word.eq_ignore_ascii_case(target),
+        _ => false,
+    })
+}
+
+#[must_use]
 pub fn extract_routing_hint(sql: &str) -> RoutingHint {
     let mut rest = sql.trim_start();
 

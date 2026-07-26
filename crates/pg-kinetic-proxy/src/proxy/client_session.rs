@@ -481,7 +481,7 @@ where
     let mut held_backend: Option<crate::pool::PooledBackendLease<B, O>> = None;
     let mut wait_for_client_activity_after_timeout = false;
 
-    loop {
+    'session: loop {
         let idle_timeout_kind = if session.pin_reason().is_some() {
             IdleTimeoutKind::Transaction
         } else {
@@ -545,6 +545,22 @@ where
                         return Err(error);
                     }
                 };
+                if let Some(guardrails) = snapshot_store.guardrails() {
+                    for plan in &request_plans {
+                        if let crate::guardrails::GuardrailDecision::Deny(rule) =
+                            guardrails.evaluate(plan.analysis(), plan.sql.as_ref())
+                        {
+                            metrics::record_guardrail_denial(rule);
+                            write_shared_error_response(
+                                &mut client,
+                                SqlState::InsufficientPrivilege.as_str(),
+                                "query rejected by configured safety policy",
+                            )
+                            .await?;
+                            continue 'session;
+                        }
+                    }
+                }
                 let committed_write_transaction = match update_transaction_state_from_request_plans(
                     &mut session,
                     &request_plans,

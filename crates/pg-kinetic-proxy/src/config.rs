@@ -5,6 +5,7 @@ use std::{
 use clap::{Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::guardrails::GuardrailsConfig;
 use pg_kinetic_core::{
     cluster::adaptive::{AdaptiveMode, TunableKnob},
     cluster::cleanup::PoolMode as CorePoolMode,
@@ -192,6 +193,9 @@ pub struct Config {
 
     #[command(flatten)]
     pub performance: PerformanceConfig,
+
+    #[command(flatten)]
+    pub guardrails: GuardrailsConfig,
 
     #[command(flatten)]
     pub qos: QosConfig,
@@ -2419,6 +2423,7 @@ impl Config {
             && self.capacity == next.capacity
             && self.pool_lifecycle == next.pool_lifecycle
             && self.performance == next.performance
+            && self.guardrails == next.guardrails
             && self.qos.max_route_in_flight == next.qos.max_route_in_flight
             && self.qos.max_route_waiters == next.qos.max_route_waiters
             && self.qos.idle_client_timeout_ms == next.qos.idle_client_timeout_ms

@@ -30,6 +30,7 @@ use pg_kinetic_core::{
 use crate::config::{
     AuthFailureMessageMode, AuthMode, BackendTlsMode, ClientTlsMode, Config, ShardingConfig,
 };
+use crate::guardrails::GuardrailRegistry;
 use crate::observe::metrics;
 use crate::query_stats::{QueryStatView, QueryStats};
 use crate::routing::policy::{PolicyReloadErrorCode, PolicyReloadResult};
@@ -835,6 +836,7 @@ impl LimitsSnapshot {
 pub struct SnapshotStore {
     inner: Arc<RwLock<SnapshotStoreInner>>,
     query_stats: QueryStats,
+    guardrails: Arc<RwLock<Option<Arc<GuardrailRegistry>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -877,6 +879,7 @@ impl Default for SnapshotStore {
         Self {
             inner: Arc::new(RwLock::new(SnapshotStoreInner::default())),
             query_stats: QueryStats::new(),
+            guardrails: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -915,6 +918,18 @@ impl SnapshotStore {
     #[must_use]
     pub fn top_query_stats(&self) -> Vec<QueryStatView> {
         self.query_stats.top()
+    }
+
+    pub fn set_guardrails(&self, guardrails: Arc<GuardrailRegistry>) {
+        *self.guardrails.write().expect("guardrails store poisoned") = Some(guardrails);
+    }
+
+    #[must_use]
+    pub fn guardrails(&self) -> Option<Arc<GuardrailRegistry>> {
+        self.guardrails
+            .read()
+            .expect("guardrails store poisoned")
+            .clone()
     }
 
     #[must_use]

@@ -37,6 +37,7 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
         ["show", "migrations"] => AdminCommand::Show(AdminView::Migrations),
         ["show", "settings"] => AdminCommand::Show(AdminView::Settings),
         ["show", "limits"] => AdminCommand::Show(AdminView::Limits),
+        ["show", "guardrails"] => AdminCommand::Show(AdminView::Guardrails),
         ["show", "top", "queries"] => AdminCommand::Show(AdminView::TopQueries),
         ["pause"] => AdminCommand::Pause,
         ["resume"] => AdminCommand::Resume,
@@ -87,6 +88,7 @@ pub enum AdminView {
     Migrations,
     Settings,
     Limits,
+    Guardrails,
     TopQueries,
 }
 
@@ -118,6 +120,7 @@ impl AdminView {
             Self::Migrations => "migrations",
             Self::Settings => "settings",
             Self::Limits => "limits",
+            Self::Guardrails => "guardrails",
             Self::TopQueries => "top queries",
         }
     }

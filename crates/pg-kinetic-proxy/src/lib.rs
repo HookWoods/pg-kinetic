@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cancel;
 pub mod config;
 pub mod engine;
+pub mod guardrails;
 pub mod net;
 pub mod observe;
 pub mod ops;

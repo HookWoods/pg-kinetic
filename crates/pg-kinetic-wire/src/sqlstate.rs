@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlState {
     TooManyConnections,
+    InsufficientPrivilege,
     QueryCanceled,
     OperatorIntervention,
     CannotConnectNow,
@@ -16,6 +17,7 @@ impl SqlState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TooManyConnections => "53300",
+            Self::InsufficientPrivilege => "42501",
             Self::QueryCanceled => "57014",
             Self::OperatorIntervention => "57000",
             Self::CannotConnectNow => "57P03",
@@ -31,6 +33,7 @@ impl SqlState {
     pub fn parse(code: &str) -> Option<Self> {
         match code {
             "53300" => Some(Self::TooManyConnections),
+            "42501" => Some(Self::InsufficientPrivilege),
             "57014" => Some(Self::QueryCanceled),
             "57000" => Some(Self::OperatorIntervention),
             "57P03" => Some(Self::CannotConnectNow),
