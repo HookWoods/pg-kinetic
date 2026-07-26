@@ -60,6 +60,7 @@ Unset optional fields render as `<none>`.
 | `SHOW PERFORMANCE` | Regression-budget thresholds and outcomes, profile and process-metric status, process CPU and resident-memory samples, and proxy performance counters. |
 | `SHOW SETTINGS` | Current runtime settings, sanitized for public display. |
 | `SHOW LIMITS` | Effective capacity, timeout, and admin limits. |
+| `SHOW RESILIENCE` | Per-backend breaker state and consecutive failures, plus bounded hedge configuration. |
 | `PAUSE` | Queues new backend checkouts without killing connected clients or in-flight queries. |
 | `RESUME` | Releases clients waiting behind `PAUSE`. |
 | `RELOAD` | Applies the configured config file immediately when the change is reload-compatible; incompatible changes are rejected with the reason surfaced as an error. |

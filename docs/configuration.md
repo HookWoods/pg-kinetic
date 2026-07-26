@@ -188,6 +188,10 @@ Use the rollout sequence `Observe -> review -> Enforce`: first collect bounded f
 | `socket.tcp_send_buffer_bytes` | optional bytes | unset | `--tcp-send-buffer-bytes` | `PG_KINETIC_TCP_SEND_BUFFER_BYTES` | restart | Unsupported values fail only in strict mode. |
 | `socket.tcp_recv_buffer_bytes` | optional bytes | unset | `--tcp-recv-buffer-bytes` | `PG_KINETIC_TCP_RECV_BUFFER_BYTES` | restart | Unsupported values fail only in strict mode. |
 | `socket.strict_socket_option_mode` | bool | `false` | `--strict-socket-option-mode` | `PG_KINETIC_STRICT_SOCKET_OPTION_MODE` | restart | Startup fails on unsupported socket options when true. |
+| `resilience.breaker_failure_threshold` | integer | `5` | `--breaker-failure-threshold` | `PG_KINETIC_BREAKER_FAILURE_THRESHOLD` | restart | Consecutive backend failures before opening the per-backend breaker. |
+| `resilience.breaker_cooldown_ms` | milliseconds | `5000` | `--breaker-cooldown-ms` | `PG_KINETIC_BREAKER_COOLDOWN_MS` | restart | Cooldown before one half-open recovery probe. |
+| `resilience.hedging_enabled` | bool | `false` | `--hedging-enabled` | `PG_KINETIC_HEDGING_ENABLED` | restart | Reserved safe read-hedge gate; duplicate backend forwarding remains disabled. |
+| `resilience.hedge_delay_ms` | milliseconds | `25` | `--hedge-delay-ms` | `PG_KINETIC_HEDGE_DELAY_MS` | restart | Delay used by a future safe read-hedge executor. |
 
 ## Runtime Lifecycle Fields
 

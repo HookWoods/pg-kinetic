@@ -139,6 +139,9 @@ pub enum MetricName {
     PreparedCacheMissesTotal,
     ObservabilityHotPathAllocationsTotal,
     IdleClients,
+    BreakerState,
+    BreakerFastRejectionsTotal,
+    HedgeDecisionsTotal,
 }
 
 impl MetricName {
@@ -215,6 +218,9 @@ impl MetricName {
                 "pg_kinetic_observability_hot_path_allocations_total"
             }
             Self::IdleClients => "pg_kinetic_idle_clients",
+            Self::BreakerState => "pg_kinetic_breaker_state",
+            Self::BreakerFastRejectionsTotal => "pg_kinetic_breaker_fast_rejections_total",
+            Self::HedgeDecisionsTotal => "pg_kinetic_hedge_decisions_total",
         }
     }
 }
@@ -264,6 +270,7 @@ impl MetricKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricLabel {
     Action,
+    Backend,
     Event,
     Endpoint,
     Engine,
@@ -310,6 +317,7 @@ impl MetricLabel {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Action => "action",
+            Self::Backend => "backend",
             Self::Event => "event",
             Self::Endpoint => "endpoint",
             Self::Engine => "engine",
@@ -388,6 +396,8 @@ const EVENT_LABELS: &[MetricLabel] = &[MetricLabel::Event];
 const REASON_LABELS: &[MetricLabel] = &[MetricLabel::Reason];
 const ACTION_LABELS: &[MetricLabel] = &[MetricLabel::Action];
 const OUTCOME_LABELS: &[MetricLabel] = &[MetricLabel::Outcome];
+const BREAKER_LABELS: &[MetricLabel] = &[MetricLabel::Backend, MetricLabel::State];
+const HEDGE_LABELS: &[MetricLabel] = &[MetricLabel::Outcome, MetricLabel::Reason];
 const ROUTE_DECISION_LABELS: &[MetricLabel] = &[
     MetricLabel::Route,
     MetricLabel::TargetRole,
@@ -1146,6 +1156,30 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         NO_LABELS,
         "Single gauge without labels.",
     ),
+    MetricDescriptor::new(
+        "pg_kinetic_breaker_state",
+        MetricKind::Gauge,
+        "1",
+        "Current per-backend circuit-breaker state.",
+        BREAKER_LABELS,
+        "Backend labels are configured role/index values and state is bounded.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_breaker_fast_rejections_total",
+        MetricKind::Counter,
+        "1",
+        "Fast rejections caused by an open backend circuit breaker.",
+        NO_LABELS,
+        "Single counter without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_hedge_decisions_total",
+        MetricKind::Counter,
+        "1",
+        "Bounded read-hedge eligibility decisions.",
+        HEDGE_LABELS,
+        "Outcome and reason values are fixed implementation categories.",
+    ),
 ];
 
 #[must_use]
@@ -1158,6 +1192,7 @@ pub struct LabelPolicy;
 
 impl LabelPolicy {
     pub const ACTION: &'static str = "action";
+    pub const BACKEND: &'static str = "backend";
     pub const PHASE: &'static str = "phase";
     pub const OUTCOME: &'static str = "outcome";
     pub const ENDPOINT: &'static str = "endpoint";
@@ -1202,6 +1237,7 @@ impl LabelPolicy {
         matches!(
             label,
             Self::ACTION
+                | Self::BACKEND
                 | Self::PHASE
                 | Self::OUTCOME
                 | Self::ENDPOINT

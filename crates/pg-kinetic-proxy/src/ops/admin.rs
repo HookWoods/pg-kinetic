@@ -569,10 +569,42 @@ fn render_admin_view(state: &AdminState, config: &Config, view: AdminView) -> Op
         AdminView::Settings => settings_table(&state.snapshot_store.settings_snapshot()),
         AdminView::Limits => limits_table(&state.snapshot_store.limits_snapshot(), config),
         AdminView::Guardrails => guardrails_table(state, config),
+        AdminView::Resilience => resilience_table(&state.route_pool_registry, config),
         AdminView::TopQueries => top_queries_table(&state.snapshot_store.top_query_stats()),
     };
 
     Some(admin_table_response(table))
+}
+
+fn resilience_table(registry: &RoutePoolRegistry, config: &Config) -> AdminTable {
+    let rows = registry
+        .resilience_snapshots()
+        .into_iter()
+        .map(|(backend, state, failures)| {
+            AdminRow::new(vec![
+                backend,
+                state.as_str().to_owned(),
+                failures.to_string(),
+                config.resilience.breaker_failure_threshold.to_string(),
+                config.resilience.breaker_cooldown_ms.to_string(),
+                config.resilience.hedging_enabled.to_string(),
+                config.resilience.hedge_delay_ms.to_string(),
+            ])
+        })
+        .collect();
+    admin_table(
+        AdminView::Resilience,
+        &[
+            ("backend", AdminColumnType::Text),
+            ("state", AdminColumnType::Text),
+            ("consecutive_failures", AdminColumnType::Int8),
+            ("failure_threshold", AdminColumnType::Int8),
+            ("cooldown_ms", AdminColumnType::Int8),
+            ("hedging_enabled", AdminColumnType::Bool),
+            ("hedge_delay_ms", AdminColumnType::Int8),
+        ],
+        rows,
+    )
 }
 
 fn guardrails_table(state: &AdminState, config: &Config) -> AdminTable {

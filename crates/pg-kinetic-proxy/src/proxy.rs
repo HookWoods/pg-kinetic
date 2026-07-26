@@ -1564,6 +1564,7 @@ fn build_route_pools(
         global_backend_available.clone(),
         Some(Arc::clone(&pressure_route_in_flight_limit)),
     );
+    primary_pool.configure_resilience(&config.resilience);
     let primary = BackendPoolRef::primary(primary_pool);
     primary.attach_snapshot_store(snapshot_store.clone());
 
@@ -1586,6 +1587,7 @@ fn build_route_pools(
                 global_backend_available.clone(),
                 Some(Arc::clone(&pressure_route_in_flight_limit)),
             );
+            pool.configure_resilience(&config.resilience);
             BackendPoolRef::replica(index as u64 + 1, replica.weight as usize, pool)
         })
         .collect();

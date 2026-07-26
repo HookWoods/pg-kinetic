@@ -116,6 +116,29 @@ pub fn record_pool_checkout(wait_ms: f64, stage: &'static str, outcome: &'static
     }
 }
 
+pub fn record_breaker_state(backend: &str, state: &str) {
+    metrics_crate::gauge!(
+        ObservabilityMetricName::BreakerState.as_str(),
+        "backend" => backend.to_owned(),
+        "state" => state.to_owned(),
+    )
+    .set(1.0);
+}
+
+pub fn record_breaker_fast_rejection() {
+    metrics_crate::counter!(ObservabilityMetricName::BreakerFastRejectionsTotal.as_str())
+        .increment(1);
+}
+
+pub fn record_hedge_decision(outcome: &'static str, reason: &'static str) {
+    metrics_crate::counter!(
+        ObservabilityMetricName::HedgeDecisionsTotal.as_str(),
+        "outcome" => outcome,
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
 pub fn record_runtime_lifecycle_state(state: RuntimeLifecycleState) {
     for candidate in [
         RuntimeLifecycleState::Starting,

@@ -39,6 +39,7 @@ pub fn parse_admin_command(sql: &str) -> AdminCommand {
         ["show", "settings"] => AdminCommand::Show(AdminView::Settings),
         ["show", "limits"] => AdminCommand::Show(AdminView::Limits),
         ["show", "guardrails"] => AdminCommand::Show(AdminView::Guardrails),
+        ["show", "resilience"] => AdminCommand::Show(AdminView::Resilience),
         ["show", "top", "queries"] => AdminCommand::Show(AdminView::TopQueries),
         ["pause"] => AdminCommand::Pause,
         ["resume"] => AdminCommand::Resume,
@@ -91,6 +92,7 @@ pub enum AdminView {
     Settings,
     Limits,
     Guardrails,
+    Resilience,
     TopQueries,
 }
 
@@ -124,6 +126,7 @@ impl AdminView {
             Self::Settings => "settings",
             Self::Limits => "limits",
             Self::Guardrails => "guardrails",
+            Self::Resilience => "resilience",
             Self::TopQueries => "top queries",
         }
     }
@@ -247,6 +250,10 @@ mod tests {
         assert_eq!(
             parse_admin_command("SHOW TOP QUERIES;").view(),
             Some(AdminView::TopQueries)
+        );
+        assert_eq!(
+            parse_admin_command("SHOW RESILIENCE").view(),
+            Some(AdminView::Resilience)
         );
     }
 }

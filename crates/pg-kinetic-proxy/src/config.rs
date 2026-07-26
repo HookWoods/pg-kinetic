@@ -210,6 +210,9 @@ pub struct Config {
     pub audit: AuditConfig,
 
     #[command(flatten)]
+    pub resilience: ResilienceConfig,
+
+    #[command(flatten)]
     pub tls: TlsConfig,
 
     #[command(flatten)]
@@ -226,6 +229,61 @@ pub struct Config {
 
     #[command(flatten)]
     pub socket: SocketConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
+#[serde(default)]
+pub struct ResilienceConfig {
+    #[arg(
+        long = "breaker-failure-threshold",
+        env = "PG_KINETIC_BREAKER_FAILURE_THRESHOLD",
+        default_value_t = 5
+    )]
+    pub breaker_failure_threshold: usize,
+
+    #[arg(
+        long = "breaker-cooldown-ms",
+        env = "PG_KINETIC_BREAKER_COOLDOWN_MS",
+        default_value_t = 5_000
+    )]
+    pub breaker_cooldown_ms: u64,
+
+    #[arg(
+        long = "hedging-enabled",
+        env = "PG_KINETIC_HEDGING_ENABLED",
+        default_value_t = false
+    )]
+    pub hedging_enabled: bool,
+
+    #[arg(
+        long = "hedge-delay-ms",
+        env = "PG_KINETIC_HEDGE_DELAY_MS",
+        default_value_t = 25
+    )]
+    pub hedge_delay_ms: u64,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            breaker_failure_threshold: 5,
+            breaker_cooldown_ms: 5_000,
+            hedging_enabled: false,
+            hedge_delay_ms: 25,
+        }
+    }
+}
+
+impl ResilienceConfig {
+    #[must_use]
+    pub const fn breaker_cooldown(&self) -> Duration {
+        Duration::from_millis(self.breaker_cooldown_ms)
+    }
+
+    #[must_use]
+    pub const fn hedge_delay(&self) -> Duration {
+        Duration::from_millis(self.hedge_delay_ms)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Args, Serialize)]
@@ -2494,6 +2552,11 @@ impl Config {
         self.capacity.validate()?;
         self.auth.validate()?;
         self.runtime.production.pressure.validate()?;
+        if self.resilience.breaker_failure_threshold == 0 {
+            return Err(
+                "resilience breaker failure threshold must be greater than zero".to_string(),
+            );
+        }
         for route in self.effective_routes() {
             if route.weight == 0 {
                 return Err("route weight must be greater than zero".to_string());
@@ -2514,6 +2577,7 @@ impl Config {
             && self.pool_lifecycle == next.pool_lifecycle
             && self.performance == next.performance
             && self.guardrails == next.guardrails
+            && self.resilience == next.resilience
             && self.qos.max_route_in_flight == next.qos.max_route_in_flight
             && self.qos.max_route_waiters == next.qos.max_route_waiters
             && self.qos.idle_client_timeout_ms == next.qos.idle_client_timeout_ms

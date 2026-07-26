@@ -17,10 +17,11 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::routing::{RoutingReason, RoutingTarget};
 use crate::{
-    config::{PoolLifecycleConfig, SocketConfig, TlsConfig},
+    config::{PoolLifecycleConfig, ResilienceConfig, SocketConfig, TlsConfig},
     observe::metrics::{self, RouteMetricHandles},
     observe::snapshot::{PoolLifecycleSnapshot, PoolSnapshot, SnapshotStore},
     pool::backend::Backend,
+    resilience::{BackendBreaker, BreakerConfig, BreakerState},
 };
 use pg_kinetic_core::{
     traffic::backpressure::{BackpressureError, BackpressureGate, BackpressurePermit},
@@ -55,6 +56,7 @@ where
     backends: BackendStore<T>,
     snapshot_store: ArcSwapOption<SnapshotStore>,
     health: Arc<AtomicBool>,
+    breaker: Arc<BackendBreaker>,
     max_waiters: usize,
     route_max_in_flight: usize,
     route_max_waiters: usize,
@@ -406,6 +408,7 @@ where
 pub(crate) struct BackendLeaseState<O> {
     pool: O,
     health: Arc<AtomicBool>,
+    breaker: Arc<BackendBreaker>,
     permit: Option<BackpressurePermit>,
     route_key: RouteKey,
     route_gate: BackpressureGate,
@@ -417,6 +420,7 @@ impl<O> BackendLeaseState<O> {
     pub(crate) const fn new(
         pool: O,
         health: Arc<AtomicBool>,
+        breaker: Arc<BackendBreaker>,
         permit: Option<BackpressurePermit>,
         route_key: RouteKey,
         route_gate: BackpressureGate,
@@ -425,6 +429,7 @@ impl<O> BackendLeaseState<O> {
         Self {
             pool,
             health,
+            breaker,
             permit,
             route_key,
             route_gate,
@@ -439,6 +444,12 @@ impl<O> BackendLeaseState<O> {
 
     fn mark_failed(&self) {
         self.health.store(false, Ordering::Release);
+        self.breaker.record_failure(Instant::now());
+    }
+
+    fn mark_succeeded(&self) {
+        self.health.store(true, Ordering::Release);
+        self.breaker.record_success();
     }
 
     fn take_permit(&mut self) {
@@ -475,6 +486,9 @@ impl BackendLeaseOwner<Backend> for Arc<BackendPool> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
+    #[error("backend circuit breaker is open")]
+    CircuitOpen,
+
     #[error("backend checkout rejected: {0}")]
     Backpressure(#[from] BackpressureError),
 
@@ -500,6 +514,7 @@ struct BackendPoolRefInner {
     role: BackendRole,
     weight: usize,
     healthy: Arc<AtomicBool>,
+    breaker: Arc<BackendBreaker>,
     waiting_hint: AtomicUsize,
     pool: Arc<BackendPool>,
 }
@@ -591,11 +606,29 @@ impl BackendPoolRef {
 
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.inner.healthy.load(Ordering::Acquire)
+        let state = self.inner.breaker.state(Instant::now());
+        let backend_label = format!("{}-{}", self.inner.role.as_str(), self.inner.id);
+        metrics::record_breaker_state(&backend_label, state.as_str());
+        self.inner.healthy.load(Ordering::Acquire) || state == BreakerState::HalfOpen
     }
 
     pub fn set_healthy(&self, healthy: bool) {
         self.inner.healthy.store(healthy, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn breaker_state(&self) -> BreakerState {
+        self.inner.breaker.state(Instant::now())
+    }
+
+    #[must_use]
+    pub fn breaker_failures(&self) -> usize {
+        self.inner.breaker.failures()
+    }
+
+    #[must_use]
+    pub fn resilience_label(&self) -> String {
+        format!("{}-{}", self.inner.role.as_str(), self.inner.id)
     }
 
     #[must_use]
@@ -655,6 +688,7 @@ impl BackendPoolRef {
                 role,
                 weight: weight.max(1),
                 healthy: Arc::clone(&pool.core.health),
+                breaker: Arc::clone(&pool.core.breaker),
                 waiting_hint: AtomicUsize::new(0),
                 pool,
             }),
@@ -914,6 +948,23 @@ impl RoutePoolRegistry {
             .map(|(key, pools)| (key.clone(), pools.snapshot()))
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| left.0.metric_label().cmp(&right.0.metric_label()));
+        snapshots
+    }
+
+    #[must_use]
+    pub fn resilience_snapshots(&self) -> Vec<(String, BreakerState, usize)> {
+        let routes = self.routes.read().expect("route registry poisoned");
+        let mut snapshots = Vec::new();
+        for (route, pools) in routes.iter() {
+            for backend in std::iter::once(pools.primary()).chain(pools.replicas().iter()) {
+                snapshots.push((
+                    format!("{}/{}", route.metric_label(), backend.resilience_label()),
+                    backend.breaker_state(),
+                    backend.breaker_failures(),
+                ));
+            }
+        }
+        snapshots.sort_by(|left, right| left.0.cmp(&right.0));
         snapshots
     }
 
@@ -1250,6 +1301,13 @@ impl ShardedPoolRegistry {
 }
 
 impl BackendPool {
+    pub fn configure_resilience(&self, config: &ResilienceConfig) {
+        self.core.breaker.configure(BreakerConfig {
+            failure_threshold: config.breaker_failure_threshold,
+            cooldown: config.breaker_cooldown(),
+        });
+    }
+
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1445,6 +1503,13 @@ where
         self.sync_pool_snapshot();
     }
 
+    pub fn configure_resilience(&self, config: &ResilienceConfig) {
+        self.breaker.configure(BreakerConfig {
+            failure_threshold: config.breaker_failure_threshold,
+            cooldown: config.breaker_cooldown(),
+        });
+    }
+
     pub(crate) async fn checkout_with_mode<O>(
         self: &Arc<Self>,
         owner: O,
@@ -1454,6 +1519,10 @@ where
     where
         O: BackendLeaseOwner<T>,
     {
+        if !self.breaker.allow_request(Instant::now()) {
+            metrics::record_breaker_fast_rejection();
+            return Err(PoolError::CircuitOpen);
+        }
         let route_gate_started = Instant::now();
         let route_gate = self.route_gate(&route);
         let route_gate_wait_ms = route_gate_started.elapsed().as_secs_f64() * 1_000.0;
@@ -1523,6 +1592,7 @@ where
                             let lease = BackendLeaseState::new(
                                 owner.clone(),
                                 Arc::clone(&self.health),
+                                Arc::clone(&self.breaker),
                                 Some(BackpressurePermit::join(route_permit, permit)),
                                 checkout_route.clone(),
                                 route_gate_gate.clone(),
@@ -1550,6 +1620,7 @@ where
                 let lease = BackendLeaseState::new(
                     owner.clone(),
                     Arc::clone(&self.health),
+                    Arc::clone(&self.breaker),
                     Some(BackpressurePermit::join(route_permit, permit)),
                     checkout_route.clone(),
                     route_gate_gate.clone(),
@@ -1568,6 +1639,7 @@ where
                     let lease = BackendLeaseState::new(
                         owner.clone(),
                         Arc::clone(&self.health),
+                        Arc::clone(&self.breaker),
                         Some(BackpressurePermit::join(route_permit, permit)),
                         checkout_route.clone(),
                         route_gate_gate.clone(),
@@ -1599,6 +1671,7 @@ where
             let lease = BackendLeaseState::new(
                 owner.clone(),
                 Arc::clone(&self.health),
+                Arc::clone(&self.breaker),
                 Some(BackpressurePermit::join(route_permit, permit)),
                 checkout_route.clone(),
                 route_gate_gate.clone(),
@@ -1829,6 +1902,7 @@ where
             ),
             snapshot_store: ArcSwapOption::empty(),
             health: Arc::new(AtomicBool::new(true)),
+            breaker: Arc::new(BackendBreaker::new(BreakerConfig::default())),
             max_waiters,
             route_max_in_flight,
             route_max_waiters,
@@ -1854,6 +1928,7 @@ where
             backends: BackendStore::new(lifecycle.max_size, None, None),
             snapshot_store: ArcSwapOption::empty(),
             health: Arc::new(AtomicBool::new(true)),
+            breaker: Arc::new(BackendBreaker::new(BreakerConfig::default())),
             max_waiters: 1,
             route_max_in_flight: 1,
             route_max_waiters: 1,
@@ -1981,6 +2056,7 @@ where
     match result {
         Ok(_) => "ok",
         Err(PoolError::Backpressure(error)) => backpressure_outcome(*error),
+        Err(PoolError::CircuitOpen) => "circuit_open",
         Err(PoolError::Connect(_)) => "error",
     }
 }
@@ -2030,6 +2106,7 @@ where
 
     pub async fn release(mut self) {
         if let Some(backend) = self.backend.take() {
+            self.lease.mark_succeeded();
             backend.mark_idle(Some(self.lease.route_key.clone()));
             self.lease.pool.return_backend(backend).await;
         }
@@ -2260,6 +2337,7 @@ mod tests {
         let lease = BackendLeaseState::new(
             Arc::clone(&pool),
             Arc::clone(&pool.core.health),
+            Arc::clone(&pool.core.breaker),
             Some(permit),
             route.clone(),
             route_gate,
@@ -2427,6 +2505,7 @@ mod tests {
         let lease = BackendLeaseState::new(
             owner,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(BackendBreaker::new(BreakerConfig::default())),
             Some(permit),
             route,
             route_gate,

@@ -140,6 +140,22 @@ pub(super) async fn checkout_backend(
             timer.finish(MetricOutcome::Canceled);
             return Err(CheckoutFailure::Close);
         }
+        Err(crate::pool::PoolError::CircuitOpen) => {
+            telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
+                DebugSample::backend_checkout(
+                    request.session_id,
+                    request.route.clone(),
+                    checkout_mode_label(request.mode),
+                    MetricOutcome::Rejected,
+                    started.elapsed(),
+                )
+            });
+            timer.finish(MetricOutcome::Rejected);
+            return Err(CheckoutFailure::Postgres {
+                sqlstate: CANNOT_CONNECT_NOW_SQLSTATE,
+                message: "backend temporarily unavailable",
+            });
+        }
         Err(crate::pool::PoolError::Connect(error)) => {
             telemetry::emit_debug_sample_with(&request.debug_sampler, request.session_id, || {
                 DebugSample::backend_checkout(
