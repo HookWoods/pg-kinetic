@@ -142,6 +142,8 @@ pub enum MetricName {
     BreakerState,
     BreakerFastRejectionsTotal,
     HedgeDecisionsTotal,
+    FailoverSurvivedTotal,
+    FailoverFailedTotal,
 }
 
 impl MetricName {
@@ -221,6 +223,8 @@ impl MetricName {
             Self::BreakerState => "pg_kinetic_breaker_state",
             Self::BreakerFastRejectionsTotal => "pg_kinetic_breaker_fast_rejections_total",
             Self::HedgeDecisionsTotal => "pg_kinetic_hedge_decisions_total",
+            Self::FailoverSurvivedTotal => "pg_kinetic_failover_survived_total",
+            Self::FailoverFailedTotal => "pg_kinetic_failover_failed_total",
         }
     }
 }
@@ -1179,6 +1183,22 @@ static METRIC_CATALOG: &[MetricDescriptor] = &[
         "Bounded read-hedge eligibility decisions.",
         HEDGE_LABELS,
         "Outcome and reason values are fixed implementation categories.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_failover_survived_total",
+        MetricKind::Counter,
+        "1",
+        "Replay-safe client requests that survived backend loss.",
+        NO_LABELS,
+        "Single counter without labels.",
+    ),
+    MetricDescriptor::new(
+        "pg_kinetic_failover_failed_total",
+        MetricKind::Counter,
+        "1",
+        "Client failover attempts that could not safely complete.",
+        NO_LABELS,
+        "Single counter without labels.",
     ),
 ];
 

@@ -1142,6 +1142,7 @@ pub(super) async fn handle_client(
                     recovery_snapshot_handle: &recovery_snapshot_handle,
                     route_application_name: &mut route_application_name,
                     session_route: &mut session_route,
+                    resilience: &config.resilience,
                     route_pools: &route_pools,
                     backend_startup_packet: &backend_startup_packet,
                     session: &mut session,
@@ -1260,6 +1261,7 @@ struct FrameCycleRequest<'a> {
     recovery_snapshot_handle: &'a RecoverySnapshotHandle,
     route_application_name: &'a mut Option<String>,
     session_route: &'a mut RouteKey,
+    resilience: &'a crate::config::ResilienceConfig,
     route_pools: &'a Arc<RoutePools>,
     backend_startup_packet: &'a BytesMut,
     session: &'a mut VirtualSession,
@@ -1304,6 +1306,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         recovery_snapshot_handle,
         route_application_name,
         session_route,
+        resilience,
         route_pools,
         backend_startup_packet,
         session,
@@ -1443,6 +1446,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         .map(|plan| plan.command.clone())
         .collect();
     let mut retry_attempted = false;
+    let query_deadline = Instant::now() + qos.query_timeout();
     let (result, progress) = loop {
         let mut progress = QueryProgress::default();
         let mut state = ForwardCycleState {
@@ -1453,7 +1457,9 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
             progress: &mut progress,
         };
         let result = timeout(
-            qos.query_timeout(),
+            query_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default(),
             forward_message_cycle(
                 client,
                 &mut backend,
@@ -1467,17 +1473,25 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         )
         .await;
         let retry = match &result {
-            Ok(Err(error)) => error
-                .downcast_ref::<BackendFailure>()
-                .map(|failure| {
-                    !retry_attempted
-                        && retry_disposition(
-                            failure.kind,
-                            failure.response_started,
-                            safe_request_to_replay(&frames, &request_plans, &session),
-                        ) == RetryDisposition::RetryBeforeResponse
-                })
-                .unwrap_or(false),
+            Ok(Err(error)) => {
+                error
+                    .downcast_ref::<BackendFailure>()
+                    .map(|failure| {
+                        !retry_attempted
+                            && retry_disposition(
+                                failure.kind,
+                                failure.response_started,
+                                safe_request_to_replay(
+                                    &frames,
+                                    &request_plans,
+                                    &session,
+                                    resilience.failover_replay_session_state,
+                                ),
+                            ) == RetryDisposition::RetryBeforeResponse
+                    })
+                    .unwrap_or(false)
+                    && resilience.failover_enabled
+            }
             _ => false,
         };
         if !retry {
@@ -1486,26 +1500,73 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
 
         backend.mark_failed();
         discard_backend_with_cancel_unbind(cancel_registry, client_key, backend).await;
-        pause.wait_if_paused().await;
-        let Ok(replacement) = checkout_backend(CheckoutBackendRequest {
-            route_pools: &route_pools,
-            route: route.clone(),
-            target: retry_target.clone(),
-            context: "checkout backend for failure retry",
-            mode: CheckoutMode::AllowConnect,
-            session_id,
-            debug_sampler,
-            phase_recorder,
-            snapshot_store,
-            startup_packet: backend_startup_packet,
-            backend_credentials,
-            read_after_write_state: session.read_after_write_state(),
-            record_snapshot: false,
-            bootstrap_backend: true,
-        })
-        .await
+        let Some(reconnect_timeout) =
+            bounded_reconnect_timeout(resilience.failover_max_reconnect(), query_deadline)
         else {
+            metrics::record_failover_failed();
+            error_response_and_ready_with_state(
+                client,
+                "57P01",
+                "backend connection lost; failover reconnect timed out",
+                ReadyStatus::Idle,
+            )
+            .await?;
             return Ok(FrameCycleOutcome::Finish);
+        };
+        let replay_frames = if resilience.failover_replay_session_state {
+            replay_frames(session)
+        } else {
+            Vec::new()
+        };
+        let replacement = timeout(reconnect_timeout, async {
+            pause.wait_if_paused().await;
+            let mut replacement = checkout_backend(CheckoutBackendRequest {
+                route_pools: &route_pools,
+                route: route.clone(),
+                target: retry_target.clone(),
+                context: "checkout backend for failure retry",
+                mode: CheckoutMode::AllowConnect,
+                session_id,
+                debug_sampler,
+                phase_recorder,
+                snapshot_store,
+                startup_packet: backend_startup_packet,
+                backend_credentials,
+                read_after_write_state: session.read_after_write_state(),
+                record_snapshot: false,
+                bootstrap_backend: true,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("backend failover checkout failed: {error:?}"))?;
+            if !replay_frames.is_empty() {
+                let status = execute_backend_batch(
+                    &mut replacement,
+                    &replay_frames,
+                    qos.max_backend_buffer_bytes,
+                )
+                .await
+                .context("replay virtual session during failover")?;
+                anyhow::ensure!(
+                    status == ReadyStatus::Idle,
+                    "unexpected failover replay status: {status:?}"
+                );
+            }
+            Ok::<PooledBackend, anyhow::Error>(replacement)
+        })
+        .await;
+        let replacement = match replacement {
+            Ok(Ok(replacement)) => replacement,
+            _ => {
+                metrics::record_failover_failed();
+                error_response_and_ready_with_state(
+                    client,
+                    "57P01",
+                    "backend connection lost; failover unavailable",
+                    ReadyStatus::Idle,
+                )
+                .await?;
+                return Ok(FrameCycleOutcome::Finish);
+            }
         };
         backend = replacement;
         bind_cancel_target(cancel_registry, client_key, &backend);
@@ -1516,6 +1577,9 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         &result,
         Ok(Ok(ForwardOutcome::ClientDisconnectedAfterReady(_)))
     );
+    if retry_attempted && matches!(&result, Ok(Ok(_))) {
+        metrics::record_failover_survived();
+    }
     if !matches!(&result, Ok(Ok(ForwardOutcome::Flushed))) {
         let error = progress.error || result.is_err() || matches!(&result, Ok(Err(_)) | Err(_));
         let elapsed = cycle_started.elapsed();
@@ -1556,6 +1620,7 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
         qos,
         route_application_name,
         session_route,
+        resilience,
         session,
         prepared,
         performance,
@@ -1602,6 +1667,7 @@ struct ForwardResultRequest<'a> {
     qos: &'a crate::config::QosConfig,
     route_application_name: &'a Option<String>,
     session_route: &'a mut RouteKey,
+    resilience: &'a crate::config::ResilienceConfig,
     session: &'a mut VirtualSession,
     prepared: &'a PreparedCatalog,
     performance: &'a crate::config::PerformanceConfig,
@@ -1635,6 +1701,7 @@ async fn handle_forward_result(
         qos,
         route_application_name,
         session_route,
+        resilience,
         session,
         prepared,
         performance,
@@ -1744,13 +1811,30 @@ async fn handle_forward_result(
             if let Some(failure) = error.downcast_ref::<BackendFailure>() {
                 backend.mark_failed();
                 if !failure.response_started {
-                    error_response_and_ready_with_state(
-                        client,
-                        CONNECTION_FAILURE_SQLSTATE,
-                        "backend connection failed before response",
-                        ReadyStatus::Idle,
-                    )
-                    .await?;
+                    if let Some(pin_reason) = session.pin_reason() {
+                        if resilience.failover_enabled {
+                            metrics::record_failover_failed();
+                        }
+                        let ready_status = failover_ready_status(pin_reason);
+                        error_response_and_ready_with_state(
+                            client,
+                            "57P01",
+                            "backend connection lost; failover unavailable for this session state",
+                            ready_status,
+                        )
+                        .await?;
+                    } else {
+                        if resilience.failover_enabled {
+                            metrics::record_failover_failed();
+                        }
+                        error_response_and_ready_with_state(
+                            client,
+                            CONNECTION_FAILURE_SQLSTATE,
+                            "backend connection failed before response",
+                            ReadyStatus::Idle,
+                        )
+                        .await?;
+                    }
                 }
             }
             discard_backend_with_cancel_unbind(cancel_registry, client_key, backend).await;
@@ -1790,6 +1874,13 @@ async fn handle_forward_result(
     }
 
     Ok(FrameCycleOutcome::Continue)
+}
+
+fn failover_ready_status(pin_reason: PinReason) -> ReadyStatus {
+    match pin_reason {
+        PinReason::OpenTransaction | PinReason::FailedTransaction => ReadyStatus::FailedTransaction,
+        _ => ReadyStatus::Idle,
+    }
 }
 
 struct ReadyBackendRequest<'a> {
@@ -2377,6 +2468,24 @@ mod tests {
     }
 
     #[test]
+    fn failover_replays_only_tracked_safe_session_settings() {
+        let mut session = VirtualSession::default();
+        session.apply_sql(classify("set application_name = 'api'"));
+        session.apply_sql(classify("set search_path = app, public"));
+
+        let replay = session.replay_sql();
+        assert_eq!(replay.len(), 2);
+        assert!(replay
+            .iter()
+            .any(|sql| sql.starts_with("SET application_name")));
+        assert!(replay.iter().any(|sql| sql.starts_with("SET search_path")));
+
+        session.apply_sql(classify("set statement_timeout = 1"));
+        assert_eq!(session.pin_reason(), Some(PinReason::SessionState));
+        assert_eq!(session.replay_sql().len(), 2);
+    }
+
+    #[test]
     fn unpinned_session_releases_held_backend_before_retargeting() {
         let mut session = VirtualSession::default();
         session.apply_sql(classify("begin"));
@@ -2422,6 +2531,26 @@ mod tests {
             true,
             ReadyStatus::InTransaction
         ));
+    }
+
+    #[test]
+    fn failover_unsafe_states_return_a_failed_transaction_status_only_for_transactions() {
+        assert_eq!(
+            failover_ready_status(PinReason::OpenTransaction),
+            ReadyStatus::FailedTransaction
+        );
+        assert_eq!(
+            failover_ready_status(PinReason::FailedTransaction),
+            ReadyStatus::FailedTransaction
+        );
+        assert_eq!(
+            failover_ready_status(PinReason::SessionState),
+            ReadyStatus::Idle
+        );
+        assert_eq!(
+            failover_ready_status(PinReason::UnknownProtocolState),
+            ReadyStatus::Idle
+        );
     }
 
     #[test]

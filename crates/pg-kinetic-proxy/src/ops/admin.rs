@@ -589,6 +589,9 @@ fn resilience_table(registry: &RoutePoolRegistry, config: &Config) -> AdminTable
                 config.resilience.breaker_cooldown_ms.to_string(),
                 config.resilience.hedging_enabled.to_string(),
                 config.resilience.hedge_delay_ms.to_string(),
+                config.resilience.failover_enabled.to_string(),
+                config.resilience.failover_max_reconnect_ms.to_string(),
+                config.resilience.failover_replay_session_state.to_string(),
             ])
         })
         .collect();
@@ -602,6 +605,9 @@ fn resilience_table(registry: &RoutePoolRegistry, config: &Config) -> AdminTable
             ("cooldown_ms", AdminColumnType::Int8),
             ("hedging_enabled", AdminColumnType::Bool),
             ("hedge_delay_ms", AdminColumnType::Int8),
+            ("failover_enabled", AdminColumnType::Bool),
+            ("failover_max_reconnect_ms", AdminColumnType::Int8),
+            ("failover_replay_session_state", AdminColumnType::Bool),
         ],
         rows,
     )

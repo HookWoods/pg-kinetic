@@ -1,5 +1,31 @@
 use super::*;
 
+pub(super) fn bounded_reconnect_timeout(
+    max_reconnect: Duration,
+    query_deadline: Instant,
+) -> Option<Duration> {
+    let remaining = query_deadline.checked_duration_since(Instant::now())?;
+    Some(std::cmp::min(max_reconnect, remaining))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_timeout_is_bounded_by_config_and_query_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let timeout = bounded_reconnect_timeout(Duration::from_secs(1), deadline)
+            .expect("deadline is still active");
+        assert!(timeout <= Duration::from_millis(50));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let timeout = bounded_reconnect_timeout(Duration::from_millis(25), deadline)
+            .expect("deadline is still active");
+        assert!(timeout <= Duration::from_millis(25));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendFailureKind {
     Connect,

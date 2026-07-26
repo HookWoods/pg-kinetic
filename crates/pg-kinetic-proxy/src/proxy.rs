@@ -148,7 +148,7 @@ pub(crate) use client_session::{
     handle_client_session, SharedBackendPool, SharedClientSessionContext,
 };
 pub(crate) use connection::ClientConnection;
-use connection::{backend_failure, BackendFailure};
+use connection::{backend_failure, bounded_reconnect_timeout, BackendFailure};
 pub use connection::{retry_disposition, BackendFailureKind, RetryDisposition};
 use forwarding::*;
 use recovery::*;

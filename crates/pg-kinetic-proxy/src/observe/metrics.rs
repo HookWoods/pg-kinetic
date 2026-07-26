@@ -139,6 +139,14 @@ pub fn record_hedge_decision(outcome: &'static str, reason: &'static str) {
     .increment(1);
 }
 
+pub fn record_failover_survived() {
+    metrics_crate::counter!(ObservabilityMetricName::FailoverSurvivedTotal.as_str()).increment(1);
+}
+
+pub fn record_failover_failed() {
+    metrics_crate::counter!(ObservabilityMetricName::FailoverFailedTotal.as_str()).increment(1);
+}
+
 pub fn record_runtime_lifecycle_state(state: RuntimeLifecycleState) {
     for candidate in [
         RuntimeLifecycleState::Starting,

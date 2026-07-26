@@ -167,6 +167,7 @@ pub(super) fn safe_request_to_replay(
     frames: &[FrontendFrame],
     plans: &[RequestPlan<'_>],
     session: &VirtualSession,
+    replay_session_state: bool,
 ) -> bool {
     !frames.is_empty()
         && frames
@@ -175,7 +176,7 @@ pub(super) fn safe_request_to_replay(
         && plans.len() == 1
         && plans[0].analysis().query_class().routes_to_replica()
         && session.pin_reason().is_none()
-        && !session.has_replayable_settings()
+        && (replay_session_state || !session.has_replayable_settings())
 }
 
 pub(super) fn mirror_sql_command_for_request_plan(

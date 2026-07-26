@@ -235,6 +235,27 @@ pub struct Config {
 #[serde(default)]
 pub struct ResilienceConfig {
     #[arg(
+        long = "failover-enabled",
+        env = "PG_KINETIC_FAILOVER_ENABLED",
+        default_value_t = false
+    )]
+    pub failover_enabled: bool,
+
+    #[arg(
+        long = "failover-max-reconnect-ms",
+        env = "PG_KINETIC_FAILOVER_MAX_RECONNECT_MS",
+        default_value_t = 1_000
+    )]
+    pub failover_max_reconnect_ms: u64,
+
+    #[arg(
+        long = "failover-replay-session-state",
+        env = "PG_KINETIC_FAILOVER_REPLAY_SESSION_STATE",
+        default_value_t = true
+    )]
+    pub failover_replay_session_state: bool,
+
+    #[arg(
         long = "breaker-failure-threshold",
         env = "PG_KINETIC_BREAKER_FAILURE_THRESHOLD",
         default_value_t = 5
@@ -266,6 +287,9 @@ pub struct ResilienceConfig {
 impl Default for ResilienceConfig {
     fn default() -> Self {
         Self {
+            failover_enabled: false,
+            failover_max_reconnect_ms: 1_000,
+            failover_replay_session_state: true,
             breaker_failure_threshold: 5,
             breaker_cooldown_ms: 5_000,
             hedging_enabled: false,
@@ -275,6 +299,11 @@ impl Default for ResilienceConfig {
 }
 
 impl ResilienceConfig {
+    #[must_use]
+    pub const fn failover_max_reconnect(&self) -> Duration {
+        Duration::from_millis(self.failover_max_reconnect_ms)
+    }
+
     #[must_use]
     pub const fn breaker_cooldown(&self) -> Duration {
         Duration::from_millis(self.breaker_cooldown_ms)
@@ -2557,6 +2586,12 @@ impl Config {
                 "resilience breaker failure threshold must be greater than zero".to_string(),
             );
         }
+        if self.resilience.failover_enabled && self.resilience.failover_max_reconnect_ms == 0 {
+            return Err(
+                "resilience failover max reconnect must be greater than zero when enabled"
+                    .to_string(),
+            );
+        }
         for route in self.effective_routes() {
             if route.weight == 0 {
                 return Err("route weight must be greater than zero".to_string());
@@ -3141,6 +3176,12 @@ mod tests {
                 .expect("valid socket")
         );
         assert_eq!(config.capacity.max_clients, 10_000);
+        assert!(!config.resilience.failover_enabled);
+        assert_eq!(
+            config.resilience.failover_max_reconnect(),
+            Duration::from_secs(1)
+        );
+        assert!(config.resilience.failover_replay_session_state);
         assert_eq!(config.capacity.max_backends, 100);
         assert_eq!(config.capacity.max_checkout_waiters, 1_000);
         assert_eq!(config.pool_lifecycle, PoolLifecycleConfig::default());
@@ -3291,6 +3332,20 @@ mod tests {
             .expect_err("zero backend capacity must fail");
 
         assert_eq!(error, "capacity.max_backends must be greater than zero");
+    }
+
+    #[test]
+    fn rejects_zero_failover_reconnect_when_enabled() {
+        let mut config = Config::default();
+        config.resilience.failover_enabled = true;
+        config.resilience.failover_max_reconnect_ms = 0;
+
+        assert_eq!(
+            config.validate(),
+            Err(String::from(
+                "resilience failover max reconnect must be greater than zero when enabled"
+            ))
+        );
     }
 
     #[test]
