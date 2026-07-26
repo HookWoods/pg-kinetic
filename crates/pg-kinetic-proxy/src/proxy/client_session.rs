@@ -545,20 +545,18 @@ where
                         return Err(error);
                     }
                 };
-                if let Some(guardrails) = snapshot_store.guardrails() {
-                    for plan in &request_plans {
-                        if let crate::guardrails::GuardrailDecision::Deny(rule) =
-                            guardrails.evaluate(plan.analysis(), plan.sql.as_ref())
-                        {
-                            metrics::record_guardrail_denial(rule);
-                            write_shared_error_response(
-                                &mut client,
-                                SqlState::InsufficientPrivilege.as_str(),
-                                "query rejected by configured safety policy",
-                            )
-                            .await?;
-                            continue 'session;
-                        }
+                for plan in &request_plans {
+                    if let Some(rule) =
+                        guardrail_denial(&snapshot_store, plan.analysis(), plan.sql.as_ref())
+                    {
+                        metrics::record_guardrail_denial(rule);
+                        write_shared_error_response(
+                            &mut client,
+                            SqlState::InsufficientPrivilege.as_str(),
+                            "query rejected by configured safety policy",
+                        )
+                        .await?;
+                        continue 'session;
                     }
                 }
                 let committed_write_transaction = match update_transaction_state_from_request_plans(
@@ -1298,6 +1296,14 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
     let request_plans =
         request_plans_for_frames(&prepared, &frames, full_routing_analysis, sql_plan_cache)
             .context("build request plan before backend checkout")?;
+    for plan in &request_plans {
+        if let Some(rule) = guardrail_denial(&snapshot_store, plan.analysis(), plan.sql.as_ref()) {
+            metrics::record_guardrail_denial(rule);
+            error_response_and_ready(client, qos, "query rejected by configured safety policy")
+                .await?;
+            return Ok(FrameCycleOutcome::Continue);
+        }
+    }
     let committed_write_transaction =
         update_transaction_state_from_request_plans(session, &request_plans, full_routing_analysis)
             .context("update transaction state before backend checkout")?;
@@ -1531,6 +1537,18 @@ async fn handle_frame_cycle(request: FrameCycleRequest<'_>) -> anyhow::Result<Fr
     .await?;
     drop(request_plans);
     Ok(outcome)
+}
+
+fn guardrail_denial(
+    snapshot_store: &SnapshotStore,
+    analysis: pg_kinetic_core::protocol::sql_classify::SqlAnalysis,
+    sql: &str,
+) -> Option<crate::guardrails::GuardrailRule> {
+    let registry = snapshot_store.guardrails()?;
+    match registry.evaluate(analysis, sql) {
+        crate::guardrails::GuardrailDecision::Allow => None,
+        crate::guardrails::GuardrailDecision::Deny(rule) => Some(rule),
+    }
 }
 
 struct ForwardResultRequest<'a> {
@@ -2366,5 +2384,35 @@ mod tests {
             true,
             ReadyStatus::InTransaction
         ));
+    }
+
+    #[test]
+    fn default_frame_cycle_guardrail_check_denies_before_checkout() {
+        let snapshot_store = SnapshotStore::new();
+        let config = crate::guardrails::GuardrailsConfig {
+            mode: crate::guardrails::GuardrailMode::Enforce,
+            block_unqualified_dml: true,
+            ..Default::default()
+        };
+        snapshot_store.set_guardrails(Arc::new(
+            crate::guardrails::GuardrailRegistry::from_config(&config).unwrap(),
+        ));
+
+        assert_eq!(
+            guardrail_denial(
+                &snapshot_store,
+                pg_kinetic_core::protocol::sql_classify::analyze_sql("DELETE FROM t"),
+                "DELETE FROM t",
+            ),
+            Some(crate::guardrails::GuardrailRule::UnqualifiedDml)
+        );
+        assert_eq!(
+            guardrail_denial(
+                &snapshot_store,
+                pg_kinetic_core::protocol::sql_classify::analyze_sql("DELETE FROM t WHERE id = 1"),
+                "DELETE FROM t WHERE id = 1",
+            ),
+            Some(crate::guardrails::GuardrailRule::UnknownFingerprint)
+        );
     }
 }
