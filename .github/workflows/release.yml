@@ -54,7 +54,7 @@ jobs:
 
       - name: Upload redacted release evidence
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: v1.0.0-rc.1-release-evidence
           path: target/release-evidence

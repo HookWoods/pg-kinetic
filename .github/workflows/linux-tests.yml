@@ -68,7 +68,7 @@ jobs:
             | tee target/release-evidence/linux/compose.log
       - name: Publish Linux failure evidence
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: linux-compose-evidence
           path: target/release-evidence/linux

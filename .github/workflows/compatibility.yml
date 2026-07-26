@@ -95,7 +95,7 @@ jobs:
             | tee target/release-evidence/compatibility/compose.log
       - name: Upload compatibility evidence
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: compatibility-evidence-${{ matrix.language }}
           path: target/release-evidence/compatibility
@@ -156,7 +156,7 @@ jobs:
             | tee target/release-evidence/compatibility/compose.log
       - name: Upload compatibility evidence
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: compatibility-framework-evidence
           path: target/release-evidence/compatibility
