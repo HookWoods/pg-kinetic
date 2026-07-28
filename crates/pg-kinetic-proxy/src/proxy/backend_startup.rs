@@ -522,6 +522,41 @@ mod tests {
         assert_eq!(client.written, synthetic_startup_ready(true, &[], (12, 34)));
     }
 
+    #[tokio::test]
+    async fn startup_stream_helper_omits_auth_ok_for_locally_authenticated_reused_backend() {
+        let startup_packet = BytesMut::from(&b"startup"[..]);
+        let mut client = MemoryStream::default();
+        let mut backend = MemoryStream::default();
+        let pool = ProxyBufferPool::new(
+            BufferReusePolicy::default(),
+            OversizedBufferPolicy::default(),
+        );
+        let mut lease = pool.acquire();
+
+        proxy_startup_streams(
+            &mut client,
+            &mut backend,
+            false,
+            &startup_packet,
+            1024,
+            1024,
+            false,
+            false,
+            None,
+            lease.buffers_mut(),
+            Some((12, 34)),
+        )
+        .await
+        .expect("reused backend startup succeeds after local auth");
+
+        assert!(backend.written.is_empty());
+        assert!(!client.written.starts_with(&encoded_auth_ok()));
+        assert_eq!(
+            client.written,
+            synthetic_startup_ready(false, &[], (12, 34))
+        );
+    }
+
     #[derive(Default)]
     struct MemoryStream {
         reads: VecDeque<BytesMut>,

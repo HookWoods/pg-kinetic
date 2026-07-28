@@ -93,17 +93,25 @@ services:
       context: ..
       args:
         PG_KINETIC_BENCH_RUSTFLAGS: ${PG_KINETIC_BENCH_RUSTFLAGS:-}
+        PG_KINETIC_BENCH_FEATURES: ${PG_KINETIC_BENCH_FEATURES:-}
       dockerfile_inline: |
         FROM rust:1.88-bookworm AS builder
         ARG PG_KINETIC_BENCH_RUSTFLAGS
+        ARG PG_KINETIC_BENCH_FEATURES
         ENV RUSTFLAGS=$$PG_KINETIC_BENCH_RUSTFLAGS
         WORKDIR /src
         COPY . .
-        RUN cargo build --release -p pg-kinetic
+        RUN if [ -n "$$PG_KINETIC_BENCH_FEATURES" ]; then \
+              cargo build --release -p pg-kinetic --features "$$PG_KINETIC_BENCH_FEATURES"; \
+            else \
+              cargo build --release -p pg-kinetic; \
+            fi
         FROM debian:bookworm-slim
         COPY --from=builder /src/target/release/pg-kinetic /usr/local/bin/pg-kinetic
         EXPOSE 6543
         ENTRYPOINT ["/usr/local/bin/pg-kinetic"]
+    security_opt:
+      - seccomp=unconfined
     entrypoint:
       - /bin/sh
       - -ec
@@ -121,6 +129,7 @@ services:
       - "19090:9090"
     environment:
       PG_KINETIC_RUNTIME_ENGINE: "${PG_KINETIC_RUNTIME_ENGINE:-thread_per_core}"
+      PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED: "${PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED:-false}"
       PG_KINETIC_LISTEN_ADDR: "0.0.0.0:6543"
       PG_KINETIC_BACKEND_ADDR: "postgres:5432"
       PG_KINETIC_METRICS_ADDR: "0.0.0.0:9090"

@@ -279,6 +279,10 @@ where
             );
             ("", true)
         }
+        crate::pool::PoolError::CircuitOpen => {
+            tracing::warn!(reason = "circuit_open", "backend checkout rejected");
+            ("backend circuit breaker is open", false)
+        }
         crate::pool::PoolError::Connect(error) => {
             tracing::warn!(error = %error, "backend connection failed during checkout");
             return Err(error);
@@ -435,6 +439,8 @@ where
             auth::ClientAuthOutcome::Rejected => return Ok(()),
         }
     }
+    let backend_auth_forwarding_enabled =
+        matches!(auth.auth_mode, crate::config::AuthMode::PassThrough);
     let mut startup_proxied = true;
     let mut previous_backend_id = match pool.checkout_shared(route.clone(), &route_pools).await {
         Ok(mut startup_backend_lease) => {
@@ -449,8 +455,8 @@ where
                 &backend_startup_packet,
                 max_client_buffer_bytes,
                 max_backend_buffer_bytes,
-                true,
-                true,
+                backend_auth_forwarding_enabled,
+                backend_auth_forwarding_enabled,
                 backend_credentials.as_deref(),
                 buffers.buffers_mut(),
                 Some(client_key),
@@ -661,8 +667,8 @@ where
                         &backend_startup_packet,
                         max_client_buffer_bytes,
                         max_backend_buffer_bytes,
-                        true,
-                        true,
+                        backend_auth_forwarding_enabled,
+                        backend_auth_forwarding_enabled,
                         backend_credentials.as_deref(),
                         buffers.buffers_mut(),
                         Some(client_key),
@@ -959,7 +965,7 @@ where
                                     if !fingerprint.is_empty() {
                                         crate::audit::record_query(
                                             &audit,
-                                            audit_config,
+                                            &audit_config,
                                             &route,
                                             request_plan.analysis(),
                                             &fingerprint,

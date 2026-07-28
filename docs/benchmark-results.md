@@ -137,6 +137,22 @@ export PG_KINETIC_POOL_MAX_SIZE=512
 sudo -E docker compose -f bench/compose.yml --profile comparison up -d --wait --build
 ```
 
+For the Linux `io_uring` benchmark target, build the benchmark image with the
+`io-uring` cargo feature and opt in to the runtime explicitly:
+
+```bash
+export PG_KINETIC_BENCH_FEATURES=io-uring
+export PG_KINETIC_RUNTIME_ENGINE=io_uring
+export PG_KINETIC_EXPERIMENTAL_RUNTIME_ENABLED=true
+export PG_KINETIC_PHASE_TIMING_SAMPLE_RATE=0.0
+
+sudo -E docker compose -f bench/compose.yml up -d --wait --build pg-kinetic driver
+```
+
+The benchmark compose service runs pg-kinetic with `seccomp=unconfined` because
+Docker's default seccomp profile blocks the `io_uring_setup` syscall used by
+monoio.
+
 Each isolated PostgreSQL backend was initialized before measurement:
 
 ```bash

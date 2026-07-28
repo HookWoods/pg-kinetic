@@ -241,7 +241,11 @@ mod linux {
                 )
                 .await
                 {
-                    tracing::debug!(shard_id, error = %error, "io_uring connection ended");
+                    tracing::debug!(
+                        shard_id,
+                        error = %format_args!("{error:#}"),
+                        "io_uring connection ended"
+                    );
                 }
                 drop(client_capacity_guard);
                 drop(session_guard);
