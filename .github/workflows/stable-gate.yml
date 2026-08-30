@@ -33,7 +33,7 @@ jobs:
         run: bash scripts/release/assert-contract.sh
       - name: Upload stable release evidence
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: stable-release-evidence
           path: target/release-evidence
