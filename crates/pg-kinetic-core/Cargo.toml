@@ -6,10 +6,10 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", default-features = false, features = ["derive", "std"] }
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 pg-kinetic-wire = { path = "../pg-kinetic-wire" }
 sha2 = "0.11"
