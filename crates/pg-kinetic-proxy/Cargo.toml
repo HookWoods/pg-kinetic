@@ -13,11 +13,11 @@ policy-wasm = ["dep:wasmi"]
 [dependencies]
 anyhow = "1"
 arc-swap = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", default-features = false, features = ["derive", "env", "error-context", "help", "std", "usage"] }
 core_affinity = "0.8"
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 md-5 = "0.11"
 opentelemetry = "0.32"
@@ -41,7 +41,7 @@ tokio = { version = "1", default-features = false, features = ["io-util", "macro
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing-opentelemetry = "0.33"
 tracing = "0.1"
-wasmi = { version = "1.1.0", default-features = false, features = ["std", "wat"], optional = true }
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "wat"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 monoio = { version = "0.2.4", default-features = false, features = ["iouring", "macros"], optional = true }
